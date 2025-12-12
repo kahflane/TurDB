@@ -1,0 +1,1576 @@
+{
+  "workflow": {
+    "codeQualityRules": {
+      "documentation": "80-100 line block comment at top of each file. No inline comments. Doc comments (///) for public API only.",
+      "errorHandling": "Use eyre exclusively. Every error must include context (operation, resource, reason). No custom error enums.",
+      "followPatterns": "Study existing code in src/ directories. Follow established patterns. Reference Go implementation for logic.",
+      "naming": "Follow Rust naming conventions. snake_case for functions/variables, PascalCase for types.",
+      "noPartialWork": "Each task must be 100% complete before marking done=true",
+      "noPlaceholders": "NEVER write TODO comments or placeholder implementations. Complete each task fully.",
+      "testsMustPass": "All tests must pass before committing. Run 'cargo test' to verify",
+      "zeroAllocation": "CRUD operations must not allocate. Use arenas for query-scoped allocations.",
+      "zeroCopy": "Return &[u8] slices from mmap. Never clone page data."
+    },
+    "commitConvention": {
+      "examples": [
+        "feat(storage): implement SIEVE cache eviction algorithm",
+        "feat(btree): add slot array with prefix hints for fast lookup",
+        "test(hnsw): add benchmarks for SQ8 quantized distance",
+        "fix(mvcc): correct version chain visibility check"
+      ],
+      "format": "<type>(<scope>): <description>",
+      "scopes": [
+        "storage - Storage engine (pager, mmap, cache, wal)",
+        "btree - B-tree index implementation",
+        "hnsw - HNSW vector index",
+        "mvcc - Transaction/concurrency",
+        "sql - SQL parser/planner/executor",
+        "record - Row serialization",
+        "schema - Catalog and schema management",
+        "api - Public API",
+        "cli - Command-line interface"
+      ],
+      "types": {
+        "docs": "Documentation updates",
+        "feat": "New feature implementation",
+        "fix": "Bug fix",
+        "perf": "Performance improvement",
+        "refactor": "Code refactoring without behavior change",
+        "test": "Adding or updating tests"
+      }
+    },
+    "concurrency": {
+      "avoidConflicts": "Before starting, check 'git worktree list' for active feature worktrees",
+      "cleanup": "After merging a feature, remove the worktree: 'git worktree remove ./tur-feature-<name>'",
+      "mergeStrategy": "Each feature worktree is isolated. After completion, merge from the worktree or create PR",
+      "multipleAgents": "Multiple agents can work on DIFFERENT features simultaneously using git worktrees",
+      "worktreeNaming": "Directory: ./tur-feature-<feature-title-kebab-case>, Branch: feature/<feature-title-kebab-case>"
+    },
+    "mandatorySteps": {
+      "beforeStarting": [
+        "Read this entire workflow section carefully",
+        "Check active worktrees: run 'git worktree list' to see active feature worktrees",
+        "Pick ONE feature where isCompleted=false AND no worktree exists for it",
+        "Review CLAUDE.md for Rust-specific guidelines",
+        "Review migration.md for architectural context"
+      ],
+      "implementationCycle": [
+        "STEP 1: Create feature worktree with dedicated directory",
+        "  → Run: git worktree add ./tur-feature-<feature-title-kebab-case> -b feature/<feature-title-kebab-case>",
+        "  → Change directory: cd ./tur-feature-<feature-title-kebab-case>",
+        "",
+        "STEP 2: For EACH task in the feature.tasks array (in order):",
+        "  ",
+        "  2a. ANALYZE THE TASK",
+        "     → Read the task description carefully",
+        "     → Identify what files need to be created/modified",
+        "     → Check Go implementation in ../pkg/ for logic reference",
+        "     → Review CLAUDE.md for Rust-specific patterns",
+        "  ",
+        "  2b. WRITE TEST FIRST (RED phase)",
+        "     → Create or update test module in tests/ directory",
+        "     → Write specific test case for this task",
+        "     → Run: cargo test",
+        "     → VERIFY test FAILS (if it passes, test is wrong or task already done)",
+        "  ",
+        "  2c. IMPLEMENT CODE (GREEN phase)",
+        "     → Write MINIMAL code to make the test pass",
+        "     → Ensure zero-copy and zero-allocation where required",
+        "     → Focus on making THIS test pass",
+        "     → Run: cargo test",
+        "     → VERIFY test now PASSES",
+        "  ",
+        "  2d. REFACTOR (if needed)",
+        "     → Clean up code while keeping tests green",
+        "     → Run: cargo clippy -- -D warnings",
+        "     → Run: cargo fmt",
+        "     → Run: cargo test (ensure still passing)",
+        "  ",
+        "  2e. UPDATE FEATURE LIST",
+        "     → Edit rust/.claude/feature-list.json",
+        "     → Find this exact task in the feature",
+        "     → Change 'done': false to 'done': true",
+        "  ",
+        "  2f. COMMIT",
+        "     → Run: git add .",
+        "     → Run: git commit -m 'feat(<scope>): <task-description>'",
+        "  ",
+        "  REPEAT 2a-2f for ALL tasks in the feature",
+        "",
+        "STEP 3: Complete feature",
+        "  → Verify ALL tasks have 'done': true",
+        "  → Run: cargo test",
+        "  → Run: cargo clippy -- -D warnings",
+        "  → Run: cargo build --release",
+        "  → Update feature-list.json: set 'isCompleted': true",
+        "  → Commit: git commit -m 'feat(<scope>): complete feature implementation'",
+        "",
+        "STEP 4: Report completion",
+        "  → List completed tasks",
+        "  → Show test results",
+        "  → Report any blockers or dependencies discovered"
+      ]
+    },
+    "method": "TDD (Test-Driven Development)",
+    "objective": "Achieve CONCRETE, WORKING implementation of TurDB Rust features. Zero-copy, zero allocation, 16KB pages, 1MB RAM minimum.",
+    "referenceResources": {
+      "goImplementation": [
+        "../pkg/pager/ - Page management reference",
+        "../pkg/btree/ - B-tree implementation reference",
+        "../pkg/hnsw/ - HNSW index reference",
+        "../pkg/mvcc/ - MVCC implementation reference"
+      ],
+      "projectDocs": [
+        "CLAUDE.md - Rust-specific development guidelines",
+        "migration.md - Architecture and migration plan"
+      ],
+      "testExamples": "Look at Rust crate tests for testing patterns"
+    },
+    "testingGuidelines": {
+      "coverage": "Aim for >80% code coverage per module",
+      "examples": [
+        "#[test] fn sieve_cache_evicts_unvisited_first() { ... }",
+        "#[test] fn btree_slot_array_finds_by_prefix() { ... }",
+        "#[test] fn record_zero_copy_text_access() { ... }"
+      ],
+      "location": "Tests in #[cfg(test)] mod tests { } at end of file, or tests/ directory for integration",
+      "naming": "fn test_function_scenario() with snake_case",
+      "structure": "Arrange-Act-Assert pattern"
+    },
+    "troubleshooting": {
+      "conflictingWorktree": "Feature worktree already exists? Pick a different feature.",
+      "lifetimeErrors": "Borrow checker issues? Review CLAUDE.md zero-copy patterns. Consider arena allocation.",
+      "missingDependencies": "Task depends on another incomplete feature? Note as blocker. Implement dependency first.",
+      "testWontFail": "Test passes immediately? Either task is already done, or test isn't testing the right thing.",
+      "testWontPass": "Can't make test pass? Break task into smaller steps. Study Go implementation.",
+      "worktreeCleanup": "When done: 'git worktree remove <path>' to clean up"
+    }
+  },
+  "features": [
+    {
+      "title": "Storage - Memory-Mapped File",
+      "description": "Memory-mapped file storage with 16KB pages",
+      "isCompleted": true,
+      "priority": 1,
+      "phase": 1,
+      "tasks": [
+        {
+          "task": "Define MmapStorage struct with file handle and mmap region",
+          "done": true
+        },
+        {
+          "task": "Implement open() to memory-map existing file",
+          "done": true
+        },
+        {
+          "task": "Implement create() to create and initialize new database file",
+          "done": true
+        },
+        {
+          "task": "Implement page() returning &[u8] slice (zero-copy)",
+          "done": true
+        },
+        {
+          "task": "Implement page_mut() returning &mut [u8] slice",
+          "done": true
+        },
+        {
+          "task": "Implement grow() to extend file and remap",
+          "done": true
+        },
+        {
+          "task": "Add sync() for fsync to disk",
+          "done": true
+        },
+        {
+          "task": "Handle mmap remap on grow (update existing page references)",
+          "done": true
+        }
+      ]
+    },
+    {
+      "title": "Storage - Page Types and Layout",
+      "description": "Page type definitions and 16KB page header layout",
+      "isCompleted": true,
+      "priority": 2,
+      "phase": 1,
+      "tasks": [
+        {
+          "task": "Define PageType enum (BTreeInterior, BTreeLeaf, HnswNode, HnswMeta, Overflow, FreeList)",
+          "done": true
+        },
+        {
+          "task": "Define PageHeader struct with zerocopy derives",
+          "done": true
+        },
+        {
+          "task": "Implement PAGE_SIZE constant (16384)",
+          "done": true
+        },
+        {
+          "task": "Implement header read from &[u8] (zero-copy cast)",
+          "done": true
+        },
+        {
+          "task": "Implement header write to &mut [u8]",
+          "done": true
+        },
+        {
+          "task": "Add page validation (magic bytes, checksum)",
+          "done": true
+        }
+      ]
+    },
+    {
+      "title": "Storage - SIEVE Page Cache",
+      "description": "SIEVE cache eviction with lock sharding (64 shards)",
+      "isCompleted": true,
+      "priority": 3,
+      "phase": 1,
+      "tasks": [
+        {
+          "task": "Define CacheEntry with AtomicBool visited flag",
+          "done": true
+        },
+        {
+          "task": "Define CacheShard with entries, index, and hand pointer",
+          "done": true
+        },
+        {
+          "task": "Implement PageCache with 64 RwLock<CacheShard> shards",
+          "done": true
+        },
+        {
+          "task": "Implement shard_for() hash function",
+          "done": true
+        },
+        {
+          "task": "Implement SIEVE evict() algorithm (skip visited, clear flag)",
+          "done": true
+        },
+        {
+          "task": "Implement access() to set visited flag",
+          "done": true
+        },
+        {
+          "task": "Implement get() returning pinned page reference",
+          "done": true
+        },
+        {
+          "task": "Implement pin/unpin with reference counting",
+          "done": true
+        },
+        {
+          "task": "Pre-allocate all page buffers at startup (32 pages = 512KB)",
+          "done": true
+        }
+      ]
+    },
+    {
+      "title": "Storage - Freelist Management",
+      "description": "Track and allocate free pages",
+      "isCompleted": false,
+      "priority": 4,
+      "phase": 1,
+      "tasks": [
+        {
+          "task": "Define Freelist struct with head_page and free_count",
+          "done": false
+        },
+        {
+          "task": "Define trunk page format (next_trunk, count, page_numbers)",
+          "done": false
+        },
+        {
+          "task": "Implement allocate() to get free page",
+          "done": false
+        },
+        {
+          "task": "Implement release() to return page to freelist",
+          "done": false
+        },
+        {
+          "task": "Implement sync() to persist freelist to disk",
+          "done": false
+        },
+        {
+          "task": "Handle trunk page overflow (create new trunk)",
+          "done": false
+        }
+      ]
+    },
+    {
+      "title": "Storage - Multi-File Manager",
+      "description": "MySQL-style file-per-table architecture",
+      "isCompleted": false,
+      "priority": 5,
+      "phase": 1,
+      "tasks": [
+        {
+          "task": "Define FileManager struct with base_path and table files map",
+          "done": false
+        },
+        {
+          "task": "Define TableFiles struct (data, indexes HashMap)",
+          "done": false
+        },
+        {
+          "task": "Implement create_schema() to create schema directory",
+          "done": false
+        },
+        {
+          "task": "Implement create_table() to create .tbd file",
+          "done": false
+        },
+        {
+          "task": "Implement drop_table() to remove table files",
+          "done": false
+        },
+        {
+          "task": "Implement table_data() returning MmapStorage reference",
+          "done": false
+        },
+        {
+          "task": "Implement table_index() returning index MmapStorage",
+          "done": false
+        },
+        {
+          "task": "Handle max open files limit (LRU close inactive)",
+          "done": false
+        },
+        {
+          "task": "Write turdb.meta global metadata file",
+          "done": false
+        }
+      ]
+    },
+    {
+      "title": "B-Tree - Slot Array Node",
+      "description": "B+Tree leaf node with slot array and prefix hints",
+      "isCompleted": false,
+      "priority": 6,
+      "phase": 2,
+      "tasks": [
+        {
+          "task": "Define Slot struct (4-byte prefix, offset, key_len)",
+          "done": false
+        },
+        {
+          "task": "Define LeafPageHeader struct",
+          "done": false
+        },
+        {
+          "task": "Define LeafNode<'a> borrowing from page",
+          "done": false
+        },
+        {
+          "task": "Implement extract_prefix() for first 4 bytes",
+          "done": false
+        },
+        {
+          "task": "Implement find_key() with prefix comparison first",
+          "done": false
+        },
+        {
+          "task": "Implement key_at() returning &[u8] (zero-copy)",
+          "done": false
+        },
+        {
+          "task": "Implement value_at() returning &[u8] (zero-copy)",
+          "done": false
+        },
+        {
+          "task": "Implement insert_cell() with slot array update",
+          "done": false
+        },
+        {
+          "task": "Implement delete_cell() with compaction",
+          "done": false
+        }
+      ]
+    },
+    {
+      "title": "B-Tree - Interior Node with Suffix Truncation",
+      "description": "Interior nodes with minimal separator keys",
+      "isCompleted": false,
+      "priority": 7,
+      "phase": 2,
+      "tasks": [
+        {
+          "task": "Define InteriorPageHeader struct",
+          "done": false
+        },
+        {
+          "task": "Define InteriorNode<'a> borrowing from page",
+          "done": false
+        },
+        {
+          "task": "Implement compute_separator() for suffix truncation",
+          "done": false
+        },
+        {
+          "task": "Implement find_child() returning child page number",
+          "done": false
+        },
+        {
+          "task": "Implement insert_separator() after split",
+          "done": false
+        },
+        {
+          "task": "Store right_child in header",
+          "done": false
+        }
+      ]
+    },
+    {
+      "title": "B-Tree - Big-Endian Key Encoding",
+      "description": "Byte-comparable key encoding for memcmp",
+      "isCompleted": false,
+      "priority": 8,
+      "phase": 2,
+      "tasks": [
+        {
+          "task": "Implement encode_null() as 0x01",
+          "done": false
+        },
+        {
+          "task": "Implement encode_int() with XOR flip and big-endian",
+          "done": false
+        },
+        {
+          "task": "Implement encode_float() with sign bit manipulation",
+          "done": false
+        },
+        {
+          "task": "Implement encode_text() with null terminator",
+          "done": false
+        },
+        {
+          "task": "Implement encode_blob() with length prefix or null terminator",
+          "done": false
+        },
+        {
+          "task": "Implement decode functions for each type",
+          "done": false
+        },
+        {
+          "task": "Verify byte ordering preserves sort order",
+          "done": false
+        }
+      ]
+    },
+    {
+      "title": "B-Tree - Tree Operations",
+      "description": "Insert, delete, search with node splitting",
+      "isCompleted": false,
+      "priority": 9,
+      "phase": 2,
+      "tasks": [
+        {
+          "task": "Define BTree struct with root page and storage reference",
+          "done": false
+        },
+        {
+          "task": "Implement search() traversing from root to leaf",
+          "done": false
+        },
+        {
+          "task": "Implement insert() with leaf insertion",
+          "done": false
+        },
+        {
+          "task": "Implement split_leaf() when leaf is full",
+          "done": false
+        },
+        {
+          "task": "Implement split_interior() when interior is full",
+          "done": false
+        },
+        {
+          "task": "Implement delete() with cell removal",
+          "done": false
+        },
+        {
+          "task": "Handle underflow (optional: simple delete without rebalance)",
+          "done": false
+        }
+      ]
+    },
+    {
+      "title": "B-Tree - Cursor with Prefetching",
+      "description": "Iterator cursor with madvise prefetching",
+      "isCompleted": false,
+      "priority": 10,
+      "phase": 2,
+      "tasks": [
+        {
+          "task": "Define Cursor<'a> with tree reference and position",
+          "done": false
+        },
+        {
+          "task": "Implement seek() to position at key",
+          "done": false
+        },
+        {
+          "task": "Implement seek_first() to position at first key",
+          "done": false
+        },
+        {
+          "task": "Implement seek_last() to position at last key",
+          "done": false
+        },
+        {
+          "task": "Implement next() with prefetch_pages()",
+          "done": false
+        },
+        {
+          "task": "Implement prev() for reverse iteration",
+          "done": false
+        },
+        {
+          "task": "Implement prefetch_pages() using madvise MADV_WILLNEED",
+          "done": false
+        },
+        {
+          "task": "Implement key() returning Option<&[u8]> (zero-copy)",
+          "done": false
+        },
+        {
+          "task": "Implement value() returning Option<&[u8]> (zero-copy)",
+          "done": false
+        }
+      ]
+    },
+    {
+      "title": "Record - Zero-Copy Serialization",
+      "description": "SQLite-compatible record format with zero-copy access",
+      "isCompleted": false,
+      "priority": 11,
+      "phase": 3,
+      "tasks": [
+        {
+          "task": "Define Record<'a> borrowing from page buffer",
+          "done": false
+        },
+        {
+          "task": "Implement parse() computing column offsets once",
+          "done": false
+        },
+        {
+          "task": "Implement is_null() checking serial type",
+          "done": false
+        },
+        {
+          "task": "Implement get_int() reading integer by serial type",
+          "done": false
+        },
+        {
+          "task": "Implement get_float() reading 64-bit float",
+          "done": false
+        },
+        {
+          "task": "Implement get_text() returning &str (zero-copy)",
+          "done": false
+        },
+        {
+          "task": "Implement get_blob() returning &[u8] (zero-copy)",
+          "done": false
+        }
+      ]
+    },
+    {
+      "title": "Record - Builder with Buffer Reuse",
+      "description": "Record builder that reuses buffers across inserts",
+      "isCompleted": false,
+      "priority": 12,
+      "phase": 3,
+      "tasks": [
+        {
+          "task": "Define RecordBuilder with pre-allocated header and data buffers",
+          "done": false
+        },
+        {
+          "task": "Implement push_null() adding serial type 0",
+          "done": false
+        },
+        {
+          "task": "Implement push_int() with optimal serial type selection",
+          "done": false
+        },
+        {
+          "task": "Implement push_float() with serial type 7",
+          "done": false
+        },
+        {
+          "task": "Implement push_text() with serial type encoding",
+          "done": false
+        },
+        {
+          "task": "Implement push_blob() with serial type encoding",
+          "done": false
+        },
+        {
+          "task": "Implement finish() returning &[u8] of complete record",
+          "done": false
+        },
+        {
+          "task": "Implement reset() clearing without deallocation",
+          "done": false
+        }
+      ]
+    },
+    {
+      "title": "Encoding - Varint",
+      "description": "SQLite-compatible varint encoding",
+      "isCompleted": false,
+      "priority": 13,
+      "phase": 3,
+      "tasks": [
+        {
+          "task": "Implement encode_varint() writing 1-9 bytes",
+          "done": false
+        },
+        {
+          "task": "Implement decode_varint() returning (value, bytes_read)",
+          "done": false
+        },
+        {
+          "task": "Implement varint_len() returning encoded length",
+          "done": false
+        },
+        {
+          "task": "Optimize decode with lookup table",
+          "done": false
+        }
+      ]
+    },
+    {
+      "title": "Schema - Multi-Schema Catalog",
+      "description": "Catalog supporting multiple schemas (root, turdb_catalog, user schemas)",
+      "isCompleted": false,
+      "priority": 14,
+      "phase": 4,
+      "tasks": [
+        {
+          "task": "Define Schema struct with id, name, tables HashMap",
+          "done": false
+        },
+        {
+          "task": "Define Catalog struct with schemas HashMap and default_schema",
+          "done": false
+        },
+        {
+          "task": "Implement create_schema() adding new schema",
+          "done": false
+        },
+        {
+          "task": "Implement drop_schema() removing schema",
+          "done": false
+        },
+        {
+          "task": "Implement resolve_table() with schema.table syntax",
+          "done": false
+        },
+        {
+          "task": "Initialize root schema and turdb_catalog on create",
+          "done": false
+        }
+      ]
+    },
+    {
+      "title": "Schema - Table Definition",
+      "description": "Table and column definitions with constraints",
+      "isCompleted": false,
+      "priority": 15,
+      "phase": 4,
+      "tasks": [
+        {
+          "task": "Define ColumnDef struct with name, data_type, constraints",
+          "done": false
+        },
+        {
+          "task": "Define TableDef struct with columns, primary_key, indexes",
+          "done": false
+        },
+        {
+          "task": "Define IndexDef struct with columns, unique flag, index type",
+          "done": false
+        },
+        {
+          "task": "Define Constraint enum (NotNull, PrimaryKey, Unique, ForeignKey, Check)",
+          "done": false
+        },
+        {
+          "task": "Implement create_table() adding to schema",
+          "done": false
+        },
+        {
+          "task": "Implement drop_table() removing from schema",
+          "done": false
+        },
+        {
+          "task": "Implement get_table() returning &TableDef",
+          "done": false
+        }
+      ]
+    },
+    {
+      "title": "Schema - Persistence",
+      "description": "Persist catalog to turdb.meta file",
+      "isCompleted": false,
+      "priority": 16,
+      "phase": 4,
+      "tasks": [
+        {
+          "task": "Define catalog page format in metadata file",
+          "done": false
+        },
+        {
+          "task": "Implement serialize_catalog() to bytes",
+          "done": false
+        },
+        {
+          "task": "Implement deserialize_catalog() from bytes",
+          "done": false
+        },
+        {
+          "task": "Implement lazy loading (schema names only at startup)",
+          "done": false
+        },
+        {
+          "task": "Implement save() persisting catalog changes",
+          "done": false
+        }
+      ]
+    },
+    {
+      "title": "Types - Value Representation",
+      "description": "Type-safe value representation without boxing",
+      "isCompleted": false,
+      "priority": 17,
+      "phase": 4,
+      "tasks": [
+        {
+          "task": "Define Value enum (Null, Int, Float, Text, Blob, Vector)",
+          "done": false
+        },
+        {
+          "task": "Define DataType enum for column types",
+          "done": false
+        },
+        {
+          "task": "Define TypeAffinity enum (Integer, Real, Text, Blob, Numeric)",
+          "done": false
+        },
+        {
+          "task": "Implement type coercion between affinities",
+          "done": false
+        },
+        {
+          "task": "Implement comparison for Value",
+          "done": false
+        }
+      ]
+    },
+    {
+      "title": "SQL - Lexer",
+      "description": "Zero-copy SQL tokenizer",
+      "isCompleted": false,
+      "priority": 18,
+      "phase": 5,
+      "tasks": [
+        {
+          "task": "Define Token<'a> enum with borrowed strings",
+          "done": false
+        },
+        {
+          "task": "Define Keyword enum for SQL keywords",
+          "done": false
+        },
+        {
+          "task": "Define Lexer<'a> with input slice and position",
+          "done": false
+        },
+        {
+          "task": "Implement next_token() returning Token<'a>",
+          "done": false
+        },
+        {
+          "task": "Implement keyword matching via perfect hash or match",
+          "done": false
+        },
+        {
+          "task": "Handle string literals with escape sequences",
+          "done": false
+        },
+        {
+          "task": "Handle numeric literals (int, float, hex)",
+          "done": false
+        },
+        {
+          "task": "Handle identifiers (including quoted)",
+          "done": false
+        }
+      ]
+    },
+    {
+      "title": "SQL - Parser",
+      "description": "SQL parser with arena-allocated AST",
+      "isCompleted": false,
+      "priority": 19,
+      "phase": 5,
+      "tasks": [
+        {
+          "task": "Define Statement<'a> enum for all SQL statements",
+          "done": false
+        },
+        {
+          "task": "Define Expr<'a> enum for expressions",
+          "done": false
+        },
+        {
+          "task": "Define Parser<'a> with lexer and arena reference",
+          "done": false
+        },
+        {
+          "task": "Implement parse_statement() dispatching by keyword",
+          "done": false
+        },
+        {
+          "task": "Implement parse_select() for SELECT statements",
+          "done": false
+        },
+        {
+          "task": "Implement parse_insert() for INSERT statements",
+          "done": false
+        },
+        {
+          "task": "Implement parse_update() for UPDATE statements",
+          "done": false
+        },
+        {
+          "task": "Implement parse_delete() for DELETE statements",
+          "done": false
+        },
+        {
+          "task": "Implement parse_create_table() for CREATE TABLE",
+          "done": false
+        },
+        {
+          "task": "Implement parse_create_index() for CREATE INDEX",
+          "done": false
+        },
+        {
+          "task": "Implement parse_create_schema() for CREATE SCHEMA",
+          "done": false
+        },
+        {
+          "task": "Implement parse_expr() with operator precedence",
+          "done": false
+        }
+      ]
+    },
+    {
+      "title": "SQL - Query Planner",
+      "description": "Query planning with index selection",
+      "isCompleted": false,
+      "priority": 20,
+      "phase": 5,
+      "tasks": [
+        {
+          "task": "Define PlanNode<'a> enum (Scan, IndexScan, Filter, etc.)",
+          "done": false
+        },
+        {
+          "task": "Define Planner<'a> with catalog and arena references",
+          "done": false
+        },
+        {
+          "task": "Implement plan_select() creating execution plan",
+          "done": false
+        },
+        {
+          "task": "Implement plan_insert() for INSERT plans",
+          "done": false
+        },
+        {
+          "task": "Implement plan_update() for UPDATE plans",
+          "done": false
+        },
+        {
+          "task": "Implement plan_delete() for DELETE plans",
+          "done": false
+        },
+        {
+          "task": "Implement index selection based on predicates",
+          "done": false
+        },
+        {
+          "task": "Implement join ordering optimization",
+          "done": false
+        }
+      ]
+    },
+    {
+      "title": "SQL - Executor (Volcano Model)",
+      "description": "Pull-based query execution with streaming",
+      "isCompleted": false,
+      "priority": 21,
+      "phase": 5,
+      "tasks": [
+        {
+          "task": "Define Executor trait with open/next/close",
+          "done": false
+        },
+        {
+          "task": "Implement ScanExecutor for full table scan",
+          "done": false
+        },
+        {
+          "task": "Implement IndexScanExecutor for index-based scan",
+          "done": false
+        },
+        {
+          "task": "Implement FilterExecutor for predicate filtering",
+          "done": false
+        },
+        {
+          "task": "Implement ProjectExecutor for column projection",
+          "done": false
+        },
+        {
+          "task": "Implement SortExecutor with external sort fallback",
+          "done": false
+        },
+        {
+          "task": "Implement LimitExecutor for LIMIT clause",
+          "done": false
+        },
+        {
+          "task": "Implement AggregateExecutor for GROUP BY",
+          "done": false
+        }
+      ]
+    },
+    {
+      "title": "SQL - Grace Hash Join",
+      "description": "Memory-constrained hash join with partitioning",
+      "isCompleted": false,
+      "priority": 22,
+      "phase": 5,
+      "tasks": [
+        {
+          "task": "Define GraceHashJoin struct with partition files",
+          "done": false
+        },
+        {
+          "task": "Implement partition_build_side() writing to partition files",
+          "done": false
+        },
+        {
+          "task": "Implement partition_probe_side() writing to partition files",
+          "done": false
+        },
+        {
+          "task": "Implement execute() joining partition pairs",
+          "done": false
+        },
+        {
+          "task": "Implement build_in_memory_hash_table() for partition",
+          "done": false
+        },
+        {
+          "task": "Calculate optimal partition count based on memory budget",
+          "done": false
+        }
+      ]
+    },
+    {
+      "title": "HNSW - Graph Structure",
+      "description": "HNSW graph with quantization support",
+      "isCompleted": false,
+      "priority": 23,
+      "phase": 6,
+      "tasks": [
+        {
+          "task": "Define HnswIndex struct with dimension, M, ef parameters",
+          "done": false
+        },
+        {
+          "task": "Define QuantizationType enum (None, SQ8, PQ)",
+          "done": false
+        },
+        {
+          "task": "Define HnswNode struct with neighbors per level",
+          "done": false
+        },
+        {
+          "task": "Define VectorRef enum (F32, SQ8)",
+          "done": false
+        },
+        {
+          "task": "Implement node serialization to page",
+          "done": false
+        },
+        {
+          "task": "Implement node deserialization from page",
+          "done": false
+        }
+      ]
+    },
+    {
+      "title": "HNSW - SIMD Distance Functions",
+      "description": "AVX2 and NEON accelerated distance calculations",
+      "isCompleted": false,
+      "priority": 24,
+      "phase": 6,
+      "tasks": [
+        {
+          "task": "Define Distance trait with compute methods",
+          "done": false
+        },
+        {
+          "task": "Implement euclidean_scalar() fallback",
+          "done": false
+        },
+        {
+          "task": "Implement euclidean_avx2() using _mm256 intrinsics",
+          "done": false
+        },
+        {
+          "task": "Implement euclidean_neon() using vld1q intrinsics",
+          "done": false
+        },
+        {
+          "task": "Implement cosine distance (normalized dot product)",
+          "done": false
+        },
+        {
+          "task": "Implement inner product distance",
+          "done": false
+        },
+        {
+          "task": "Add runtime CPU feature detection",
+          "done": false
+        }
+      ]
+    },
+    {
+      "title": "HNSW - SQ8 Quantization",
+      "description": "Scalar quantization for 4x memory reduction",
+      "isCompleted": false,
+      "priority": 25,
+      "phase": 6,
+      "tasks": [
+        {
+          "task": "Define SQ8Vector struct with min, scale, data",
+          "done": false
+        },
+        {
+          "task": "Implement encode() converting f32 to u8",
+          "done": false
+        },
+        {
+          "task": "Implement decode() converting u8 back to f32",
+          "done": false
+        },
+        {
+          "task": "Implement distance_l2() for quantized vectors",
+          "done": false
+        },
+        {
+          "task": "Implement sq8_distance_avx2() using SAD instructions",
+          "done": false
+        },
+        {
+          "task": "Implement rerank with full precision vectors",
+          "done": false
+        }
+      ]
+    },
+    {
+      "title": "HNSW - Search Algorithm",
+      "description": "k-NN search with greedy and beam search",
+      "isCompleted": false,
+      "priority": 26,
+      "phase": 6,
+      "tasks": [
+        {
+          "task": "Implement greedy_search() for upper levels",
+          "done": false
+        },
+        {
+          "task": "Implement beam_search() for level 0",
+          "done": false
+        },
+        {
+          "task": "Implement search() combining both phases",
+          "done": false
+        },
+        {
+          "task": "Support quantized search with reranking",
+          "done": false
+        },
+        {
+          "task": "Implement insert() with level selection",
+          "done": false
+        },
+        {
+          "task": "Implement delete() marking node as deleted",
+          "done": false
+        }
+      ]
+    },
+    {
+      "title": "MVCC - Transaction Manager",
+      "description": "Transaction lifecycle and timestamp allocation",
+      "isCompleted": false,
+      "priority": 27,
+      "phase": 7,
+      "tasks": [
+        {
+          "task": "Define TxnId type and TxnState enum",
+          "done": false
+        },
+        {
+          "task": "Define TransactionManager with AtomicU64 timestamp",
+          "done": false
+        },
+        {
+          "task": "Define Transaction struct with start/commit timestamps",
+          "done": false
+        },
+        {
+          "task": "Implement begin() allocating start timestamp",
+          "done": false
+        },
+        {
+          "task": "Implement commit() allocating commit timestamp",
+          "done": false
+        },
+        {
+          "task": "Implement rollback() aborting transaction",
+          "done": false
+        },
+        {
+          "task": "Track active transactions for visibility",
+          "done": false
+        }
+      ]
+    },
+    {
+      "title": "MVCC - Version Chains",
+      "description": "Multi-version row storage with visibility",
+      "isCompleted": false,
+      "priority": 28,
+      "phase": 7,
+      "tasks": [
+        {
+          "task": "Define RowVersion struct with txn_id, commit_ts, data, prev",
+          "done": false
+        },
+        {
+          "task": "Define VersionChain with AtomicPtr<RowVersion>",
+          "done": false
+        },
+        {
+          "task": "Implement read() finding visible version for snapshot",
+          "done": false
+        },
+        {
+          "task": "Implement install_version() adding new version",
+          "done": false
+        },
+        {
+          "task": "Implement has_newer_version() for conflict detection",
+          "done": false
+        },
+        {
+          "task": "Implement garbage collection of old versions",
+          "done": false
+        }
+      ]
+    },
+    {
+      "title": "MVCC - Conflict Detection",
+      "description": "Write-write conflict detection and resolution",
+      "isCompleted": false,
+      "priority": 29,
+      "phase": 7,
+      "tasks": [
+        {
+          "task": "Track write set during transaction",
+          "done": false
+        },
+        {
+          "task": "Check for conflicts at commit time",
+          "done": false
+        },
+        {
+          "task": "Abort on write-write conflict",
+          "done": false
+        },
+        {
+          "task": "Install all versions atomically on commit",
+          "done": false
+        }
+      ]
+    },
+    {
+      "title": "WAL - Frame Format",
+      "description": "Write-ahead log frame structure",
+      "isCompleted": false,
+      "priority": 30,
+      "phase": 8,
+      "tasks": [
+        {
+          "task": "Define WalFrameHeader with page_no, db_size, checksum",
+          "done": false
+        },
+        {
+          "task": "Define Wal struct with dir, current segment",
+          "done": false
+        },
+        {
+          "task": "Define WalSegment struct with file, sequence, offset",
+          "done": false
+        },
+        {
+          "task": "Implement write_frame() appending to WAL",
+          "done": false
+        },
+        {
+          "task": "Implement read_frame() with checksum validation",
+          "done": false
+        },
+        {
+          "task": "Implement sync() for durability",
+          "done": false
+        }
+      ]
+    },
+    {
+      "title": "WAL - Checkpointing",
+      "description": "Copy WAL frames back to main database",
+      "isCompleted": false,
+      "priority": 31,
+      "phase": 8,
+      "tasks": [
+        {
+          "task": "Implement checkpoint() copying frames to pages",
+          "done": false
+        },
+        {
+          "task": "Implement truncate() after successful checkpoint",
+          "done": false
+        },
+        {
+          "task": "Support incremental checkpoint (partial)",
+          "done": false
+        },
+        {
+          "task": "Coordinate checkpoint with active readers",
+          "done": false
+        }
+      ]
+    },
+    {
+      "title": "WAL - Crash Recovery",
+      "description": "Recover database state from WAL after crash",
+      "isCompleted": false,
+      "priority": 32,
+      "phase": 8,
+      "tasks": [
+        {
+          "task": "Detect incomplete WAL on open",
+          "done": false
+        },
+        {
+          "task": "Validate frame checksums",
+          "done": false
+        },
+        {
+          "task": "Replay valid frames to recover state",
+          "done": false
+        },
+        {
+          "task": "Truncate WAL after recovery",
+          "done": false
+        }
+      ]
+    },
+    {
+      "title": "API - Database Handle",
+      "description": "Public Database struct and lifecycle",
+      "isCompleted": false,
+      "priority": 33,
+      "phase": 9,
+      "tasks": [
+        {
+          "task": "Define Database struct combining all components",
+          "done": false
+        },
+        {
+          "task": "Implement open() loading existing database",
+          "done": false
+        },
+        {
+          "task": "Implement create() initializing new database",
+          "done": false
+        },
+        {
+          "task": "Implement close() with proper cleanup",
+          "done": false
+        },
+        {
+          "task": "Implement Drop for automatic cleanup",
+          "done": false
+        }
+      ]
+    },
+    {
+      "title": "API - Builder Pattern",
+      "description": "Fluent database configuration",
+      "isCompleted": false,
+      "priority": 34,
+      "phase": 9,
+      "tasks": [
+        {
+          "task": "Define DatabaseBuilder struct",
+          "done": false
+        },
+        {
+          "task": "Implement path() setting database path",
+          "done": false
+        },
+        {
+          "task": "Implement page_cache_size() setting cache pages",
+          "done": false
+        },
+        {
+          "task": "Implement memory_budget() setting total budget",
+          "done": false
+        },
+        {
+          "task": "Implement read_only() for read-only mode",
+          "done": false
+        },
+        {
+          "task": "Implement open() creating Database",
+          "done": false
+        }
+      ]
+    },
+    {
+      "title": "API - Query Interface",
+      "description": "SQL query execution interface",
+      "isCompleted": false,
+      "priority": 35,
+      "phase": 9,
+      "tasks": [
+        {
+          "task": "Define QueryBuilder struct with sql and params",
+          "done": false
+        },
+        {
+          "task": "Implement query() returning QueryBuilder",
+          "done": false
+        },
+        {
+          "task": "Implement bind() adding parameter",
+          "done": false
+        },
+        {
+          "task": "Implement fetch_one() returning single Row",
+          "done": false
+        },
+        {
+          "task": "Implement fetch_all() returning Vec<Row>",
+          "done": false
+        },
+        {
+          "task": "Implement fetch_iter() returning streaming iterator",
+          "done": false
+        },
+        {
+          "task": "Implement execute() for non-SELECT statements",
+          "done": false
+        }
+      ]
+    },
+    {
+      "title": "API - Row Access",
+      "description": "Type-safe row column access",
+      "isCompleted": false,
+      "priority": 36,
+      "phase": 9,
+      "tasks": [
+        {
+          "task": "Define Row struct with columns and names",
+          "done": false
+        },
+        {
+          "task": "Define FromValue trait for type conversion",
+          "done": false
+        },
+        {
+          "task": "Implement get<T>() by column index",
+          "done": false
+        },
+        {
+          "task": "Implement get_by_name<T>() by column name",
+          "done": false
+        },
+        {
+          "task": "Implement try_get<T>() returning Option",
+          "done": false
+        },
+        {
+          "task": "Implement FromValue for i64, f64, String, Vec<u8>",
+          "done": false
+        }
+      ]
+    },
+    {
+      "title": "Testing - Storage Layer",
+      "description": "Tests for mmap, cache, freelist",
+      "isCompleted": false,
+      "priority": 37,
+      "phase": 10,
+      "tasks": [
+        {
+          "task": "Test mmap page access is zero-copy",
+          "done": false
+        },
+        {
+          "task": "Test SIEVE eviction prefers unvisited pages",
+          "done": false
+        },
+        {
+          "task": "Test lock sharding reduces contention",
+          "done": false
+        },
+        {
+          "task": "Test freelist allocation and release cycle",
+          "done": false
+        },
+        {
+          "task": "Test file manager creates correct directory structure",
+          "done": false
+        }
+      ]
+    },
+    {
+      "title": "Testing - B-Tree Layer",
+      "description": "Tests for B-tree operations",
+      "isCompleted": false,
+      "priority": 38,
+      "phase": 10,
+      "tasks": [
+        {
+          "task": "Test slot array finds key by prefix",
+          "done": false
+        },
+        {
+          "task": "Test suffix truncation produces minimal separators",
+          "done": false
+        },
+        {
+          "task": "Test big-endian key encoding preserves order",
+          "done": false
+        },
+        {
+          "task": "Test cursor prefetching calls madvise",
+          "done": false
+        },
+        {
+          "task": "Test insert/delete/search correctness",
+          "done": false
+        },
+        {
+          "task": "Test node splitting maintains invariants",
+          "done": false
+        }
+      ]
+    },
+    {
+      "title": "Testing - HNSW Layer",
+      "description": "Tests for vector search",
+      "isCompleted": false,
+      "priority": 39,
+      "phase": 10,
+      "tasks": [
+        {
+          "task": "Test SIMD distance matches scalar",
+          "done": false
+        },
+        {
+          "task": "Test SQ8 quantization preserves approximate distances",
+          "done": false
+        },
+        {
+          "task": "Test k-NN search recall on synthetic data",
+          "done": false
+        },
+        {
+          "task": "Benchmark search latency (target: <10ms for 1M vectors)",
+          "done": false
+        }
+      ]
+    },
+    {
+      "title": "Testing - Memory Constraints",
+      "description": "Verify 1MB RAM operation",
+      "isCompleted": false,
+      "priority": 40,
+      "phase": 10,
+      "tasks": [
+        {
+          "task": "Test database opens with 1MB memory budget",
+          "done": false
+        },
+        {
+          "task": "Test CRUD operations stay within budget",
+          "done": false
+        },
+        {
+          "task": "Test large query spills to disk gracefully",
+          "done": false
+        },
+        {
+          "task": "Profile for unexpected allocations during CRUD",
+          "done": false
+        }
+      ]
+    },
+    {
+      "title": "Benchmarks - Performance Targets",
+      "description": "Verify performance targets are met",
+      "isCompleted": false,
+      "priority": 41,
+      "phase": 10,
+      "tasks": [
+        {
+          "task": "Benchmark point read (target: <1µs cached)",
+          "done": false
+        },
+        {
+          "task": "Benchmark sequential scan (target: >1M rows/sec)",
+          "done": false
+        },
+        {
+          "task": "Benchmark insert throughput (target: >100K rows/sec)",
+          "done": false
+        },
+        {
+          "task": "Benchmark k-NN search (target: <10ms for 1M vectors, k=10)",
+          "done": false
+        },
+        {
+          "task": "Compare against Go implementation",
+          "done": false
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,29 @@
+[package]
+name = "turdb"
+version = "0.1.0"
+edition = "2021"
+description = "High-performance embedded database with SQLite-inspired row storage and native vector search"
+license = "MIT"
+
+[dependencies]
+eyre = "0.6"
+parking_lot = "0.12"
+memmap2 = "0.9"
+zerocopy = { version = "0.8", features = ["derive"] }
+bumpalo = "3.14"
+smallvec = "1.11"
+hashbrown = "0.14"
+
+[dev-dependencies]
+tempfile = "3.10"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
+
+[profile.dev]
+opt-level = 1
+debug = true
