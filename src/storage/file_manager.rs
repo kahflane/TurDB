@@ -203,6 +203,15 @@ impl<K: Clone + Eq + std::hash::Hash, V> LruFileCache<K, V> {
         }
     }
 
+    pub fn get_mut(&mut self, key: &K) -> Option<&mut V> {
+        if self.map.contains_key(key) {
+            self.touch(key);
+            self.map.get_mut(key)
+        } else {
+            None
+        }
+    }
+
     pub fn insert(&mut self, key: K, value: V) {
         if self.map.contains_key(&key) {
             self.touch(&key);
@@ -244,11 +253,11 @@ impl<K: Clone + Eq + std::hash::Hash, V> LruFileCache<K, V> {
     }
 }
 
-#[derive(Debug)]
 pub struct FileManager {
     base_path: PathBuf,
     max_open_files: usize,
     meta_storage: MmapStorage,
+    open_files: LruFileCache<FileKey, MmapStorage>,
 }
 
 impl FileManager {
@@ -289,6 +298,7 @@ impl FileManager {
             base_path,
             max_open_files,
             meta_storage,
+            open_files: LruFileCache::new(max_open_files),
         })
     }
 
@@ -298,6 +308,10 @@ impl FileManager {
 
     pub fn max_open_files(&self) -> usize {
         self.max_open_files
+    }
+
+    pub fn open_file_count(&self) -> usize {
+        self.open_files.len()
     }
 
     pub fn meta_storage(&self) -> &MmapStorage {
@@ -428,6 +442,108 @@ impl FileManager {
     pub fn index_exists(&self, schema: &str, table: &str, index_name: &str) -> bool {
         let index_path = self.index_file_path(schema, table, index_name);
         index_path.exists()
+    }
+
+    pub fn table_data(&mut self, schema: &str, table: &str) -> Result<&MmapStorage> {
+        ensure!(
+            self.table_exists(schema, table),
+            "table '{}.{}' does not exist",
+            schema,
+            table
+        );
+
+        let key = FileKey::TableData {
+            schema: schema.to_string(),
+            table: table.to_string(),
+        };
+
+        if self.open_files.get(&key).is_none() {
+            let path = self.table_file_path(schema, table);
+            let storage = MmapStorage::open(&path)?;
+            self.open_files.insert(key.clone(), storage);
+        }
+
+        Ok(self.open_files.get(&key).unwrap())
+    }
+
+    pub fn table_data_mut(&mut self, schema: &str, table: &str) -> Result<&mut MmapStorage> {
+        ensure!(
+            self.table_exists(schema, table),
+            "table '{}.{}' does not exist",
+            schema,
+            table
+        );
+
+        let key = FileKey::TableData {
+            schema: schema.to_string(),
+            table: table.to_string(),
+        };
+
+        if self.open_files.get(&key).is_none() {
+            let path = self.table_file_path(schema, table);
+            let storage = MmapStorage::open(&path)?;
+            self.open_files.insert(key.clone(), storage);
+        }
+
+        Ok(self.open_files.get_mut(&key).unwrap())
+    }
+
+    pub fn index_data(
+        &mut self,
+        schema: &str,
+        table: &str,
+        index_name: &str,
+    ) -> Result<&MmapStorage> {
+        ensure!(
+            self.index_exists(schema, table, index_name),
+            "index '{}.{}.{}' does not exist",
+            schema,
+            table,
+            index_name
+        );
+
+        let key = FileKey::Index {
+            schema: schema.to_string(),
+            table: table.to_string(),
+            index_name: index_name.to_string(),
+        };
+
+        if self.open_files.get(&key).is_none() {
+            let path = self.index_file_path(schema, table, index_name);
+            let storage = MmapStorage::open(&path)?;
+            self.open_files.insert(key.clone(), storage);
+        }
+
+        Ok(self.open_files.get(&key).unwrap())
+    }
+
+    pub fn index_data_mut(
+        &mut self,
+        schema: &str,
+        table: &str,
+        index_name: &str,
+    ) -> Result<&mut MmapStorage> {
+        ensure!(
+            self.index_exists(schema, table, index_name),
+            "index '{}.{}.{}' does not exist",
+            schema,
+            table,
+            index_name
+        );
+
+        let key = FileKey::Index {
+            schema: schema.to_string(),
+            table: table.to_string(),
+            index_name: index_name.to_string(),
+        };
+
+        if self.open_files.get(&key).is_none() {
+            let path = self.index_file_path(schema, table, index_name);
+            let storage = MmapStorage::open(&path)?;
+            self.open_files.insert(key.clone(), storage);
+        }
+
+        Ok(self.open_files.get_mut(&key).unwrap())
     }
 
     fn list_indexes(&self, schema: &str, table: &str) -> Result<Vec<String>> {
@@ -727,5 +843,70 @@ mod tests {
 
         assert!(!fm.table_exists(DEFAULT_SCHEMA, "users"));
         assert!(!fm.index_exists(DEFAULT_SCHEMA, "users", "email_idx"));
+    }
+
+    #[test]
+    fn table_data_returns_mmap_storage() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("testdb");
+
+        let mut fm = FileManager::create(&db_path, DEFAULT_MAX_OPEN_FILES).unwrap();
+
+        fm.create_table(DEFAULT_SCHEMA, "users", 42).unwrap();
+
+        let storage = fm.table_data(DEFAULT_SCHEMA, "users").unwrap();
+
+        let page = storage.page(0).unwrap();
+        assert_eq!(&page[..16], TABLE_MAGIC);
+        let table_id = u64::from_le_bytes(page[16..24].try_into().unwrap());
+        assert_eq!(table_id, 42);
+    }
+
+    #[test]
+    fn table_data_caches_open_files() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("testdb");
+
+        let mut fm = FileManager::create(&db_path, DEFAULT_MAX_OPEN_FILES).unwrap();
+
+        fm.create_table(DEFAULT_SCHEMA, "users", 1).unwrap();
+
+        let _storage1 = fm.table_data(DEFAULT_SCHEMA, "users").unwrap();
+
+        assert_eq!(fm.open_file_count(), 1);
+
+        let _storage2 = fm.table_data(DEFAULT_SCHEMA, "users").unwrap();
+
+        assert_eq!(fm.open_file_count(), 1);
+    }
+
+    #[test]
+    fn table_data_fails_for_nonexistent_table() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("testdb");
+
+        let mut fm = FileManager::create(&db_path, DEFAULT_MAX_OPEN_FILES).unwrap();
+
+        let result = fm.table_data(DEFAULT_SCHEMA, "nonexistent");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn index_data_returns_mmap_storage() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("testdb");
+
+        let mut fm = FileManager::create(&db_path, DEFAULT_MAX_OPEN_FILES).unwrap();
+
+        fm.create_table(DEFAULT_SCHEMA, "users", 1).unwrap();
+        fm.create_index(DEFAULT_SCHEMA, "users", "email_idx", 99, true)
+            .unwrap();
+
+        let storage = fm.index_data(DEFAULT_SCHEMA, "users", "email_idx").unwrap();
+
+        let page = storage.page(0).unwrap();
+        assert_eq!(&page[..16], INDEX_MAGIC);
+        let index_id = u64::from_le_bytes(page[16..24].try_into().unwrap());
+        assert_eq!(index_id, 99);
     }
 }
