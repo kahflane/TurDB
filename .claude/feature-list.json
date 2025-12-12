@@ -348,45 +348,45 @@
     {
       "title": "B-Tree - Slot Array Node",
       "description": "B+Tree leaf node with slot array and prefix hints",
-      "isCompleted": false,
+      "isCompleted": true,
       "priority": 6,
       "phase": 2,
       "tasks": [
         {
           "task": "Define Slot struct (4-byte prefix, offset, key_len)",
-          "done": false
+          "done": true
         },
         {
           "task": "Define LeafPageHeader struct",
-          "done": false
+          "done": true
         },
         {
           "task": "Define LeafNode<'a> borrowing from page",
-          "done": false
+          "done": true
         },
         {
           "task": "Implement extract_prefix() for first 4 bytes",
-          "done": false
+          "done": true
         },
         {
           "task": "Implement find_key() with prefix comparison first",
-          "done": false
+          "done": true
         },
         {
           "task": "Implement key_at() returning &[u8] (zero-copy)",
-          "done": false
+          "done": true
         },
         {
           "task": "Implement value_at() returning &[u8] (zero-copy)",
-          "done": false
+          "done": true
         },
         {
           "task": "Implement insert_cell() with slot array update",
-          "done": false
+          "done": true
         },
         {
           "task": "Implement delete_cell() with compaction",
-          "done": false
+          "done": true
         }
       ]
     },
