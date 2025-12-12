@@ -193,6 +193,34 @@ pub fn encode_float(f: f64, buf: &mut Vec<u8>) {
     }
 }
 
+pub fn encode_text(s: &str, buf: &mut Vec<u8>) {
+    buf.push(type_prefix::TEXT);
+    encode_escaped_bytes(s.as_bytes(), buf);
+}
+
+pub fn encode_blob(data: &[u8], buf: &mut Vec<u8>) {
+    buf.push(type_prefix::BLOB);
+    encode_escaped_bytes(data, buf);
+}
+
+fn encode_escaped_bytes(data: &[u8], buf: &mut Vec<u8>) {
+    for &byte in data {
+        match byte {
+            0x00 => {
+                buf.push(0x00);
+                buf.push(0xFF);
+            }
+            0xFF => {
+                buf.push(0xFF);
+                buf.push(0x00);
+            }
+            b => buf.push(b),
+        }
+    }
+    buf.push(0x00);
+    buf.push(0x00);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -312,5 +340,87 @@ mod tests {
         let original = encoded.clone();
         encoded.sort();
         assert_eq!(encoded, original, "encoded floats should already be sorted");
+    }
+
+    #[test]
+    fn encode_text_empty_string() {
+        let mut buf = Vec::new();
+        encode_text("", &mut buf);
+        assert_eq!(buf, vec![type_prefix::TEXT, 0x00, 0x00]);
+    }
+
+    #[test]
+    fn encode_text_simple_string() {
+        let mut buf = Vec::new();
+        encode_text("hello", &mut buf);
+        assert_eq!(buf[0], type_prefix::TEXT);
+        assert_eq!(&buf[1..6], b"hello");
+        assert_eq!(&buf[6..], &[0x00, 0x00]);
+    }
+
+    #[test]
+    fn encode_text_escapes_null_byte() {
+        let mut buf = Vec::new();
+        encode_text("a\x00b", &mut buf);
+        assert_eq!(buf[0], type_prefix::TEXT);
+        assert_eq!(buf[1], b'a');
+        assert_eq!(&buf[2..4], &[0x00, 0xFF]);
+        assert_eq!(buf[4], b'b');
+        assert_eq!(&buf[5..], &[0x00, 0x00]);
+    }
+
+    #[test]
+    fn encode_blob_empty() {
+        let mut buf = Vec::new();
+        encode_blob(&[], &mut buf);
+        assert_eq!(buf, vec![type_prefix::BLOB, 0x00, 0x00]);
+    }
+
+    #[test]
+    fn encode_blob_simple() {
+        let mut buf = Vec::new();
+        encode_blob(b"hello", &mut buf);
+        assert_eq!(buf[0], type_prefix::BLOB);
+        assert_eq!(&buf[1..6], b"hello");
+        assert_eq!(&buf[6..], &[0x00, 0x00]);
+    }
+
+    #[test]
+    fn encode_blob_escapes_null_byte() {
+        let mut buf = Vec::new();
+        encode_blob(&[b'a', 0x00, b'b'], &mut buf);
+        assert_eq!(buf[0], type_prefix::BLOB);
+        assert_eq!(buf[1], b'a');
+        assert_eq!(&buf[2..4], &[0x00, 0xFF]);
+        assert_eq!(buf[4], b'b');
+        assert_eq!(&buf[5..], &[0x00, 0x00]);
+    }
+
+    #[test]
+    fn encode_blob_escapes_0xff_byte() {
+        let mut buf = Vec::new();
+        encode_blob(&[b'a', 0xFF, b'b'], &mut buf);
+        assert_eq!(buf[0], type_prefix::BLOB);
+        assert_eq!(buf[1], b'a');
+        assert_eq!(&buf[2..4], &[0xFF, 0x00]);
+        assert_eq!(buf[4], b'b');
+        assert_eq!(&buf[5..], &[0x00, 0x00]);
+    }
+
+    #[test]
+    fn encode_text_preserves_ordering() {
+        let values = ["", "a", "aa", "ab", "b", "hello", "world"];
+        let mut encoded: Vec<Vec<u8>> = values
+            .iter()
+            .map(|&v| {
+                let mut buf = Vec::new();
+                encode_text(v, &mut buf);
+                buf
+            })
+            .collect();
+
+        let original = encoded.clone();
+        encoded.sort();
+        assert_eq!(encoded, original, "encoded texts should already be sorted");
     }
 }

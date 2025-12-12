@@ -444,11 +444,11 @@
         },
         {
           "task": "Implement encode_text() with null terminator",
-          "done": false
+          "done": true
         },
         {
           "task": "Implement encode_blob() with length prefix or null terminator",
-          "done": false
+          "done": true
         },
         {
           "task": "Implement decode functions for each type",
