@@ -43,7 +43,9 @@
 //! - `view`: RecordView for zero-copy reading
 //! - `builder`: RecordBuilder for construction
 //! - `jsonb`: JSONB binary format with O(log n) key lookup
+//! - `array`: SQL array format with O(1) element access
 
+pub mod array;
 pub mod builder;
 pub mod jsonb;
 pub mod schema;
@@ -53,6 +55,7 @@ pub mod view;
 #[cfg(test)]
 mod tests;
 
+pub use array::{ArrayBuilder, ArrayView};
 pub use builder::RecordBuilder;
 pub use jsonb::{JsonbBuilder, JsonbBuilderValue, JsonbValue, JsonbView};
 pub use schema::Schema;

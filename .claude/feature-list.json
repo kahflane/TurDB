@@ -723,41 +723,41 @@
     {
       "title": "Record - Array and JSONB Formats",
       "description": "O(1) array element access and O(log n) JSONB key lookup with zero-copy views",
-      "isCompleted": false,
+      "isCompleted": true,
       "priority": 13,
       "phase": 3,
       "tasks": [
         {
           "task": "Define ArrayView<'a> with total_size, ndims, elem_type, count, offsets",
-          "done": false
+          "done": true
         },
         {
           "task": "Implement ArrayView::len() and elem_type() from header",
-          "done": false
+          "done": true
         },
         {
           "task": "Implement ArrayView::get_element(idx) with O(1) access (skip offsets for fixed-width)",
-          "done": false
+          "done": true
         },
         {
           "task": "Implement ArrayBuilder for serializing arrays",
-          "done": false
+          "done": true
         },
         {
           "task": "Define JsonbView<'a> with header and sorted entries table",
-          "done": false
+          "done": true
         },
         {
-          "task": "Implement JsonbView::get_key() with binary search O(log n)",
-          "done": false
+          "task": "Implement JsonbView::get() with binary search O(log n)",
+          "done": true
         },
         {
-          "task": "Implement JsonbView::get_array_element() for JSON arrays",
-          "done": false
+          "task": "Implement JsonbView::array_get() for JSON arrays",
+          "done": true
         },
         {
           "task": "Implement JsonbBuilder for serializing JSONB with sorted keys",
-          "done": false
+          "done": true
         }
       ]
     },
