@@ -261,6 +261,42 @@ pub struct FileManager {
 }
 
 impl FileManager {
+    pub fn open<P: AsRef<Path>>(path: P, max_open_files: usize) -> Result<Self> {
+        let base_path = path.as_ref().to_path_buf();
+        let max_open_files = max_open_files.max(MIN_MAX_OPEN_FILES);
+
+        ensure!(
+            base_path.exists(),
+            "database directory '{}' does not exist",
+            base_path.display()
+        );
+
+        let meta_path = base_path.join(META_FILE_NAME);
+        ensure!(
+            meta_path.exists(),
+            "metadata file '{}' does not exist",
+            meta_path.display()
+        );
+
+        let meta_storage = MmapStorage::open(&meta_path)?;
+
+        let page = meta_storage.page(0)?;
+        ensure!(
+            &page[..16] == META_MAGIC,
+            "invalid database: magic bytes mismatch"
+        );
+
+        let version = u32::from_le_bytes(page[16..20].try_into().unwrap());
+        ensure!(version == 1, "unsupported database version: {}", version);
+
+        Ok(Self {
+            base_path,
+            max_open_files,
+            meta_storage,
+            open_files: LruFileCache::new(max_open_files),
+        })
+    }
+
     pub fn create<P: AsRef<Path>>(path: P, max_open_files: usize) -> Result<Self> {
         let base_path = path.as_ref().to_path_buf();
         let max_open_files = max_open_files.max(MIN_MAX_OPEN_FILES);
@@ -987,5 +1023,71 @@ mod tests {
         let storage = MmapStorage::open(&table_path).unwrap();
         let page = storage.page(0).unwrap();
         assert_eq!(page[100], 0xAB);
+    }
+
+    #[test]
+    fn meta_file_has_correct_header() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("testdb");
+
+        let fm = FileManager::create(&db_path, DEFAULT_MAX_OPEN_FILES).unwrap();
+
+        let page = fm.meta_storage().page(0).unwrap();
+
+        assert_eq!(&page[..16], META_MAGIC);
+
+        let version = u32::from_le_bytes(page[16..20].try_into().unwrap());
+        assert_eq!(version, 1);
+
+        let page_size = u32::from_le_bytes(page[20..24].try_into().unwrap());
+        assert_eq!(page_size, crate::storage::PAGE_SIZE as u32);
+    }
+
+    #[test]
+    fn open_existing_database() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("testdb");
+
+        {
+            let mut fm = FileManager::create(&db_path, DEFAULT_MAX_OPEN_FILES).unwrap();
+            fm.create_table(DEFAULT_SCHEMA, "users", 42).unwrap();
+            fm.sync_all().unwrap();
+        }
+
+        let mut fm = FileManager::open(&db_path, DEFAULT_MAX_OPEN_FILES).unwrap();
+
+        assert!(fm.table_exists(DEFAULT_SCHEMA, "users"));
+        let storage = fm.table_data(DEFAULT_SCHEMA, "users").unwrap();
+        let page = storage.page(0).unwrap();
+        let table_id = u64::from_le_bytes(page[16..24].try_into().unwrap());
+        assert_eq!(table_id, 42);
+    }
+
+    #[test]
+    fn open_fails_for_nonexistent_database() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("nonexistent");
+
+        let result = FileManager::open(&db_path, DEFAULT_MAX_OPEN_FILES);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn open_validates_magic_bytes() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("testdb");
+
+        fs::create_dir_all(&db_path).unwrap();
+        fs::create_dir_all(db_path.join(DEFAULT_SCHEMA)).unwrap();
+
+        let meta_path = db_path.join(META_FILE_NAME);
+        let mut storage = MmapStorage::create(&meta_path, 1).unwrap();
+        let page = storage.page_mut(0).unwrap();
+        page[..16].copy_from_slice(b"Invalid Magic!!!");
+        storage.sync().unwrap();
+        drop(storage);
+
+        let result = FileManager::open(&db_path, DEFAULT_MAX_OPEN_FILES);
+        assert!(result.is_err());
     }
 }
