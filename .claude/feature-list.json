@@ -459,11 +459,31 @@
           "done": true
         },
         {
+          "task": "Implement encode_time() with signed i64 microseconds XOR encoding",
+          "done": true
+        },
+        {
           "task": "Implement encode_timestamp() with signed i64 XOR encoding",
           "done": true
         },
         {
+          "task": "Implement encode_timestamptz() with timestamp + timezone offset",
+          "done": true
+        },
+        {
+          "task": "Implement encode_interval() with months, days, microseconds",
+          "done": true
+        },
+        {
           "task": "Implement encode_uuid() with 16-byte fixed encoding",
+          "done": true
+        },
+        {
+          "task": "Implement encode_inet() for IPv4/IPv6 addresses",
+          "done": true
+        },
+        {
+          "task": "Implement encode_macaddr() with 6-byte MAC address",
           "done": true
         },
         {
@@ -475,11 +495,27 @@
           "done": true
         },
         {
+          "task": "Implement encode_tuple() with element separators",
+          "done": true
+        },
+        {
+          "task": "Implement encode_range() with bounds and flags",
+          "done": true
+        },
+        {
           "task": "Implement encode_enum() with type_id and ordinal",
           "done": true
         },
         {
           "task": "Implement encode_composite() with type_id and fields",
+          "done": true
+        },
+        {
+          "task": "Implement encode_domain() with type_id and value",
+          "done": true
+        },
+        {
+          "task": "Implement encode_vector() for float32 embeddings",
           "done": true
         },
         {
