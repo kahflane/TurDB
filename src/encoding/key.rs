@@ -163,6 +163,18 @@ pub fn encode_null(buf: &mut Vec<u8>) {
     buf.push(type_prefix::NULL);
 }
 
+pub fn encode_int(n: i64, buf: &mut Vec<u8>) {
+    if n < 0 {
+        buf.push(type_prefix::NEG_INT);
+        buf.extend((n as u64).to_be_bytes());
+    } else if n == 0 {
+        buf.push(type_prefix::ZERO);
+    } else {
+        buf.push(type_prefix::POS_INT);
+        buf.extend((n as u64).to_be_bytes());
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -172,5 +184,47 @@ mod tests {
         let mut buf = Vec::new();
         encode_null(&mut buf);
         assert_eq!(buf, vec![type_prefix::NULL]);
+    }
+
+    #[test]
+    fn encode_int_zero_produces_single_byte() {
+        let mut buf = Vec::new();
+        encode_int(0, &mut buf);
+        assert_eq!(buf, vec![type_prefix::ZERO]);
+    }
+
+    #[test]
+    fn encode_int_positive_produces_prefix_and_bytes() {
+        let mut buf = Vec::new();
+        encode_int(1, &mut buf);
+        assert_eq!(buf[0], type_prefix::POS_INT);
+        assert_eq!(buf.len(), 9);
+        assert_eq!(&buf[1..], 1_u64.to_be_bytes());
+    }
+
+    #[test]
+    fn encode_int_negative_produces_prefix_and_twos_complement() {
+        let mut buf = Vec::new();
+        encode_int(-1, &mut buf);
+        assert_eq!(buf[0], type_prefix::NEG_INT);
+        assert_eq!(buf.len(), 9);
+        assert_eq!(&buf[1..], (-1_i64 as u64).to_be_bytes());
+    }
+
+    #[test]
+    fn encode_int_preserves_ordering() {
+        let values = [-1000, -100, -1, 0, 1, 100, 1000];
+        let mut encoded: Vec<Vec<u8>> = values
+            .iter()
+            .map(|&v| {
+                let mut buf = Vec::new();
+                encode_int(v, &mut buf);
+                buf
+            })
+            .collect();
+
+        let original = encoded.clone();
+        encoded.sort();
+        assert_eq!(encoded, original, "encoded keys should already be sorted");
     }
 }
