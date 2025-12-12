@@ -56,8 +56,9 @@
       ],
       "implementationCycle": [
         "STEP 1: Create feature worktree with dedicated directory",
-        "  → Run: git worktree add ./tur-feature-<feature-title-kebab-case> -b feature/<feature-title-kebab-case>",
-        "  → Change directory: cd ./tur-feature-<feature-title-kebab-case>",
+        "  Note: Worktree directory: /Users/julfikar/Documents/PassionFruit.nosync/tur/rust/.worktrees",
+        "  → Run: git worktree add ./.worktrees/tur-feature-<feature-title-kebab-case> -b feature/<feature-title-kebab-case>",
+        "  → Change directory: cd ./.worktrees/tur-feature-<feature-title-kebab-case>",
         "",
         "STEP 2: For EACH task in the feature.tasks array (in order):",
         "  ",

@@ -8,7 +8,10 @@
       "Skill(superpowers:test-driven-development)",
       "Skill(superpowers:using-superpowers)",
       "Skill(superpowers:using-git-worktrees)",
-      "Bash(git worktree:*)"
+      "Bash(git worktree:*)",
+      "Bash(git add:*)",
+      "Bash(git commit:*)",
+      "Skill(superpowers:finishing-a-development-branch)"
     ]
   }
 }
