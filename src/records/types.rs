@@ -51,6 +51,16 @@ pub enum DataType {
     Blob = 21,
     Vector = 22,
     Jsonb = 23,
+    Decimal = 30,
+    Interval = 31,
+    Int4Range = 40,
+    Int8Range = 41,
+    DateRange = 42,
+    TimestampRange = 43,
+    Enum = 50,
+    Point = 60,
+    Box = 61,
+    Circle = 62,
 }
 
 impl DataType {
@@ -74,6 +84,16 @@ impl DataType {
             DataType::Blob => None,
             DataType::Vector => None,
             DataType::Jsonb => None,
+            DataType::Decimal => None,
+            DataType::Interval => Some(16),
+            DataType::Int4Range => Some(9),
+            DataType::Int8Range => Some(17),
+            DataType::DateRange => Some(9),
+            DataType::TimestampRange => Some(17),
+            DataType::Enum => Some(4),
+            DataType::Point => Some(16),
+            DataType::Box => Some(32),
+            DataType::Circle => Some(24),
         }
     }
 
@@ -94,5 +114,79 @@ impl ColumnDef {
             name: name.into(),
             data_type,
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Range<T> {
+    pub lower: Option<T>,
+    pub upper: Option<T>,
+    pub lower_inclusive: bool,
+    pub upper_inclusive: bool,
+    pub is_empty: bool,
+}
+
+impl<T> Range<T> {
+    pub fn empty() -> Self {
+        Self {
+            lower: None,
+            upper: None,
+            lower_inclusive: false,
+            upper_inclusive: false,
+            is_empty: true,
+        }
+    }
+
+    pub fn new(
+        lower: Option<T>,
+        upper: Option<T>,
+        lower_inclusive: bool,
+        upper_inclusive: bool,
+    ) -> Self {
+        Self {
+            lower,
+            upper,
+            lower_inclusive,
+            upper_inclusive,
+            is_empty: false,
+        }
+    }
+}
+
+pub mod range_flags {
+    pub const EMPTY: u8 = 0x01;
+    pub const LOWER_INCLUSIVE: u8 = 0x02;
+    pub const UPPER_INCLUSIVE: u8 = 0x04;
+    pub const LOWER_INFINITE: u8 = 0x08;
+    pub const UPPER_INFINITE: u8 = 0x10;
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct DecimalView<'a> {
+    data: &'a [u8],
+}
+
+impl<'a> DecimalView<'a> {
+    pub fn new(data: &'a [u8]) -> Self {
+        Self { data }
+    }
+
+    pub fn is_negative(&self) -> bool {
+        self.data.first().map(|b| b & 0x80 != 0).unwrap_or(false)
+    }
+
+    pub fn scale(&self) -> i16 {
+        if self.data.len() < 3 {
+            return 0;
+        }
+        i16::from_le_bytes([self.data[1], self.data[2]])
+    }
+
+    pub fn digits(&self) -> i128 {
+        if self.data.len() < 19 {
+            return 0;
+        }
+        let bytes: [u8; 16] = self.data[3..19].try_into().unwrap_or([0; 16]);
+        i128::from_le_bytes(bytes)
     }
 }
