@@ -101,10 +101,14 @@ pub enum DataType {
     Date = 6,
     Time = 7,
     Timestamp = 8,
-    Uuid = 9,
-    MacAddr = 10,
+    TimestampTz = 9,
+    Uuid = 10,
+    MacAddr = 11,
+    Inet4 = 12,
+    Inet6 = 13,
     Text = 20,
     Blob = 21,
+    Vector = 22,
 }
 
 impl DataType {
@@ -119,10 +123,14 @@ impl DataType {
             DataType::Date => Some(4),
             DataType::Time => Some(8),
             DataType::Timestamp => Some(8),
+            DataType::TimestampTz => Some(12),
             DataType::Uuid => Some(16),
             DataType::MacAddr => Some(6),
+            DataType::Inet4 => Some(4),
+            DataType::Inet6 => Some(16),
             DataType::Text => None,
             DataType::Blob => None,
+            DataType::Vector => None,
         }
     }
 
@@ -204,7 +212,7 @@ impl Schema {
     }
 
     pub fn null_bitmap_size(column_count: usize) -> usize {
-        (column_count + 7) / 8
+        column_count.div_ceil(8)
     }
 }
 
@@ -458,6 +466,265 @@ impl<'a> RecordView<'a> {
             return Ok(None);
         }
         self.get_blob(col_idx).map(Some)
+    }
+
+    pub fn get_bool_opt(&self, col_idx: usize) -> Result<Option<bool>> {
+        if self.is_null_or_missing(col_idx) {
+            return Ok(None);
+        }
+        self.get_bool(col_idx).map(Some)
+    }
+
+    pub fn get_date_opt(&self, col_idx: usize) -> Result<Option<i32>> {
+        if self.is_null_or_missing(col_idx) {
+            return Ok(None);
+        }
+        self.get_date(col_idx).map(Some)
+    }
+
+    pub fn get_time_opt(&self, col_idx: usize) -> Result<Option<i64>> {
+        if self.is_null_or_missing(col_idx) {
+            return Ok(None);
+        }
+        self.get_time(col_idx).map(Some)
+    }
+
+    pub fn get_timestamp_opt(&self, col_idx: usize) -> Result<Option<i64>> {
+        if self.is_null_or_missing(col_idx) {
+            return Ok(None);
+        }
+        self.get_timestamp(col_idx).map(Some)
+    }
+
+    pub fn get_uuid_opt(&self, col_idx: usize) -> Result<Option<&'a [u8; 16]>> {
+        if self.is_null_or_missing(col_idx) {
+            return Ok(None);
+        }
+        self.get_uuid(col_idx).map(Some)
+    }
+
+    pub fn get_macaddr_opt(&self, col_idx: usize) -> Result<Option<&'a [u8; 6]>> {
+        if self.is_null_or_missing(col_idx) {
+            return Ok(None);
+        }
+        self.get_macaddr(col_idx).map(Some)
+    }
+
+    pub fn get_timestamptz(&self, col_idx: usize) -> Result<(i64, i32)> {
+        let offset = self.get_fixed_col_offset(col_idx);
+        let micros_bytes: [u8; 8] = self.data[offset..offset + 8].try_into().map_err(|_| {
+            eyre::eyre!(
+                "insufficient data for timestamptz micros at col {}",
+                col_idx
+            )
+        })?;
+        let offset_bytes: [u8; 4] =
+            self.data[offset + 8..offset + 12].try_into().map_err(|_| {
+                eyre::eyre!(
+                    "insufficient data for timestamptz offset at col {}",
+                    col_idx
+                )
+            })?;
+        Ok((
+            i64::from_le_bytes(micros_bytes),
+            i32::from_le_bytes(offset_bytes),
+        ))
+    }
+
+    pub fn get_timestamptz_opt(&self, col_idx: usize) -> Result<Option<(i64, i32)>> {
+        if self.is_null_or_missing(col_idx) {
+            return Ok(None);
+        }
+        self.get_timestamptz(col_idx).map(Some)
+    }
+
+    pub fn get_inet4(&self, col_idx: usize) -> Result<&'a [u8; 4]> {
+        let offset = self.get_fixed_col_offset(col_idx);
+        self.data[offset..offset + 4]
+            .try_into()
+            .map_err(|_| eyre::eyre!("insufficient data for inet4 at col {}", col_idx))
+    }
+
+    pub fn get_inet4_opt(&self, col_idx: usize) -> Result<Option<&'a [u8; 4]>> {
+        if self.is_null_or_missing(col_idx) {
+            return Ok(None);
+        }
+        self.get_inet4(col_idx).map(Some)
+    }
+
+    pub fn get_inet6(&self, col_idx: usize) -> Result<&'a [u8; 16]> {
+        let offset = self.get_fixed_col_offset(col_idx);
+        self.data[offset..offset + 16]
+            .try_into()
+            .map_err(|_| eyre::eyre!("insufficient data for inet6 at col {}", col_idx))
+    }
+
+    pub fn get_inet6_opt(&self, col_idx: usize) -> Result<Option<&'a [u8; 16]>> {
+        if self.is_null_or_missing(col_idx) {
+            return Ok(None);
+        }
+        self.get_inet6(col_idx).map(Some)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ColumnValue {
+    Null,
+    Fixed { offset: usize, len: usize },
+    Variable { idx: usize },
+}
+
+pub struct RecordBuilder<'a> {
+    schema: &'a Schema,
+    null_bitmap: Vec<u8>,
+    fixed_data: Vec<u8>,
+    var_data: Vec<Vec<u8>>,
+    column_values: Vec<ColumnValue>,
+}
+
+impl<'a> RecordBuilder<'a> {
+    pub fn new(schema: &'a Schema) -> Self {
+        let bitmap_size = Schema::null_bitmap_size(schema.column_count());
+        let mut null_bitmap = vec![0u8; bitmap_size];
+        for i in 0..schema.column_count() {
+            let byte_idx = i / 8;
+            let bit_idx = i % 8;
+            null_bitmap[byte_idx] |= 1 << bit_idx;
+        }
+
+        let fixed_data = vec![0u8; schema.total_fixed_size()];
+        let var_data = vec![Vec::new(); schema.var_column_count()];
+        let column_values = vec![ColumnValue::Null; schema.column_count()];
+
+        Self {
+            schema,
+            null_bitmap,
+            fixed_data,
+            var_data,
+            column_values,
+        }
+    }
+
+    pub fn set_null(&mut self, col_idx: usize) {
+        let byte_idx = col_idx / 8;
+        let bit_idx = col_idx % 8;
+        self.null_bitmap[byte_idx] |= 1 << bit_idx;
+        self.column_values[col_idx] = ColumnValue::Null;
+    }
+
+    fn clear_null(&mut self, col_idx: usize) {
+        let byte_idx = col_idx / 8;
+        let bit_idx = col_idx % 8;
+        self.null_bitmap[byte_idx] &= !(1 << bit_idx);
+    }
+
+    fn set_fixed_bytes(&mut self, col_idx: usize, bytes: &[u8]) {
+        self.clear_null(col_idx);
+        let offset = self.schema.fixed_offset(col_idx);
+        self.fixed_data[offset..offset + bytes.len()].copy_from_slice(bytes);
+        self.column_values[col_idx] = ColumnValue::Fixed {
+            offset,
+            len: bytes.len(),
+        };
+    }
+
+    pub fn set_bool(&mut self, col_idx: usize, value: bool) -> Result<()> {
+        self.set_fixed_bytes(col_idx, &[if value { 1 } else { 0 }]);
+        Ok(())
+    }
+
+    pub fn set_int2(&mut self, col_idx: usize, value: i16) -> Result<()> {
+        self.set_fixed_bytes(col_idx, &value.to_le_bytes());
+        Ok(())
+    }
+
+    pub fn set_int4(&mut self, col_idx: usize, value: i32) -> Result<()> {
+        self.set_fixed_bytes(col_idx, &value.to_le_bytes());
+        Ok(())
+    }
+
+    pub fn set_int8(&mut self, col_idx: usize, value: i64) -> Result<()> {
+        self.set_fixed_bytes(col_idx, &value.to_le_bytes());
+        Ok(())
+    }
+
+    pub fn set_float4(&mut self, col_idx: usize, value: f32) -> Result<()> {
+        self.set_fixed_bytes(col_idx, &value.to_le_bytes());
+        Ok(())
+    }
+
+    pub fn set_float8(&mut self, col_idx: usize, value: f64) -> Result<()> {
+        self.set_fixed_bytes(col_idx, &value.to_le_bytes());
+        Ok(())
+    }
+
+    pub fn set_date(&mut self, col_idx: usize, days: i32) -> Result<()> {
+        self.set_fixed_bytes(col_idx, &days.to_le_bytes());
+        Ok(())
+    }
+
+    pub fn set_time(&mut self, col_idx: usize, micros: i64) -> Result<()> {
+        self.set_fixed_bytes(col_idx, &micros.to_le_bytes());
+        Ok(())
+    }
+
+    pub fn set_timestamp(&mut self, col_idx: usize, micros: i64) -> Result<()> {
+        self.set_fixed_bytes(col_idx, &micros.to_le_bytes());
+        Ok(())
+    }
+
+    pub fn set_uuid(&mut self, col_idx: usize, uuid: &[u8; 16]) -> Result<()> {
+        self.set_fixed_bytes(col_idx, uuid);
+        Ok(())
+    }
+
+    pub fn set_macaddr(&mut self, col_idx: usize, mac: &[u8; 6]) -> Result<()> {
+        self.set_fixed_bytes(col_idx, mac);
+        Ok(())
+    }
+
+    pub fn set_text(&mut self, col_idx: usize, text: &str) -> Result<()> {
+        self.set_blob(col_idx, text.as_bytes())
+    }
+
+    pub fn set_blob(&mut self, col_idx: usize, data: &[u8]) -> Result<()> {
+        self.clear_null(col_idx);
+        let var_idx = self
+            .schema
+            .var_column_index(col_idx)
+            .ok_or_else(|| eyre::eyre!("column {} is not a variable column", col_idx))?;
+        self.var_data[var_idx] = data.to_vec();
+        self.column_values[col_idx] = ColumnValue::Variable { idx: var_idx };
+        Ok(())
+    }
+
+    pub fn build(&self) -> Result<Vec<u8>> {
+        let bitmap_size = self.null_bitmap.len();
+        let offset_table_size = self.schema.var_column_count() * 2;
+        let header_len = 2 + bitmap_size + offset_table_size;
+
+        let mut result = Vec::with_capacity(
+            header_len
+                + self.fixed_data.len()
+                + self.var_data.iter().map(|v| v.len()).sum::<usize>(),
+        );
+
+        result.extend((header_len as u16).to_le_bytes());
+        result.extend(&self.null_bitmap);
+
+        let mut var_offset: u16 = 0;
+        for var_data in &self.var_data {
+            var_offset += var_data.len() as u16;
+            result.extend(var_offset.to_le_bytes());
+        }
+
+        result.extend(&self.fixed_data);
+
+        for var_data in &self.var_data {
+            result.extend(var_data);
+        }
+
+        Ok(result)
     }
 }
 
@@ -1008,5 +1275,244 @@ mod tests {
 
         assert_eq!(view.get_int4_opt(0).unwrap(), None);
         assert_eq!(view.get_int4_opt(2).unwrap(), None);
+    }
+
+    #[test]
+    fn get_bool_opt_returns_none_for_null() {
+        let schema = Schema::new(vec![ColumnDef::new("flag", DataType::Bool)]);
+        let data = vec![0x03, 0x00, 0b0000_0001, 0x01];
+
+        let view = RecordView::new(&data, &schema).unwrap();
+        assert_eq!(view.get_bool_opt(0).unwrap(), None);
+    }
+
+    #[test]
+    fn get_date_opt_returns_none_for_null() {
+        let schema = Schema::new(vec![ColumnDef::new("d", DataType::Date)]);
+        let data = vec![0x03, 0x00, 0b0000_0001];
+
+        let view = RecordView::new(&data, &schema).unwrap();
+        assert_eq!(view.get_date_opt(0).unwrap(), None);
+    }
+
+    #[test]
+    fn get_time_opt_returns_none_for_null() {
+        let schema = Schema::new(vec![ColumnDef::new("t", DataType::Time)]);
+        let data = vec![0x03, 0x00, 0b0000_0001];
+
+        let view = RecordView::new(&data, &schema).unwrap();
+        assert_eq!(view.get_time_opt(0).unwrap(), None);
+    }
+
+    #[test]
+    fn get_timestamp_opt_returns_none_for_null() {
+        let schema = Schema::new(vec![ColumnDef::new("ts", DataType::Timestamp)]);
+        let data = vec![0x03, 0x00, 0b0000_0001];
+
+        let view = RecordView::new(&data, &schema).unwrap();
+        assert_eq!(view.get_timestamp_opt(0).unwrap(), None);
+    }
+
+    #[test]
+    fn get_uuid_opt_returns_none_for_null() {
+        let schema = Schema::new(vec![ColumnDef::new("id", DataType::Uuid)]);
+        let data = vec![0x03, 0x00, 0b0000_0001];
+
+        let view = RecordView::new(&data, &schema).unwrap();
+        assert_eq!(view.get_uuid_opt(0).unwrap(), None);
+    }
+
+    #[test]
+    fn get_macaddr_opt_returns_none_for_null() {
+        let schema = Schema::new(vec![ColumnDef::new("mac", DataType::MacAddr)]);
+        let data = vec![0x03, 0x00, 0b0000_0001];
+
+        let view = RecordView::new(&data, &schema).unwrap();
+        assert_eq!(view.get_macaddr_opt(0).unwrap(), None);
+    }
+
+    #[test]
+    fn data_type_timestamptz_fixed_size() {
+        assert_eq!(DataType::TimestampTz.fixed_size(), Some(12));
+    }
+
+    #[test]
+    fn data_type_inet4_fixed_size() {
+        assert_eq!(DataType::Inet4.fixed_size(), Some(4));
+    }
+
+    #[test]
+    fn data_type_inet6_fixed_size() {
+        assert_eq!(DataType::Inet6.fixed_size(), Some(16));
+    }
+
+    #[test]
+    fn data_type_vector_is_variable() {
+        assert!(DataType::Vector.is_variable());
+    }
+
+    #[test]
+    fn get_timestamptz_reads_correctly() {
+        let schema = Schema::new(vec![ColumnDef::new("ts", DataType::TimestampTz)]);
+
+        let mut data = vec![0x03, 0x00, 0x00];
+        data.extend(1702300000000000_i64.to_le_bytes());
+        data.extend((-300_i32).to_le_bytes());
+
+        let view = RecordView::new(&data, &schema).unwrap();
+
+        let (micros, offset_secs) = view.get_timestamptz(0).unwrap();
+        assert_eq!(micros, 1702300000000000);
+        assert_eq!(offset_secs, -300);
+    }
+
+    #[test]
+    fn get_inet4_reads_correctly() {
+        let schema = Schema::new(vec![ColumnDef::new("ip", DataType::Inet4)]);
+
+        let data = vec![0x03, 0x00, 0x00, 192, 168, 1, 1];
+
+        let view = RecordView::new(&data, &schema).unwrap();
+
+        let ip = view.get_inet4(0).unwrap();
+        assert_eq!(ip, &[192, 168, 1, 1]);
+    }
+
+    #[test]
+    fn get_inet6_reads_correctly() {
+        let schema = Schema::new(vec![ColumnDef::new("ip", DataType::Inet6)]);
+
+        let ipv6: [u8; 16] = [
+            0x20, 0x01, 0x0d, 0xb8, 0x85, 0xa3, 0x00, 0x00, 0x00, 0x00, 0x8a, 0x2e, 0x03, 0x70,
+            0x73, 0x34,
+        ];
+
+        let mut data = vec![0x03, 0x00, 0x00];
+        data.extend(ipv6);
+
+        let view = RecordView::new(&data, &schema).unwrap();
+
+        let ip = view.get_inet6(0).unwrap();
+        assert_eq!(ip, &ipv6);
+    }
+
+    #[test]
+    fn record_builder_creates_simple_record() {
+        let schema = Schema::new(vec![
+            ColumnDef::new("id", DataType::Int4),
+            ColumnDef::new("age", DataType::Int2),
+        ]);
+
+        let mut builder = RecordBuilder::new(&schema);
+        builder.set_int4(0, 42).unwrap();
+        builder.set_int2(1, 25).unwrap();
+
+        let data = builder.build().unwrap();
+
+        let view = RecordView::new(&data, &schema).unwrap();
+        assert_eq!(view.get_int4(0).unwrap(), 42);
+        assert_eq!(view.get_int2(1).unwrap(), 25);
+    }
+
+    #[test]
+    fn record_builder_handles_null_values() {
+        let schema = Schema::new(vec![
+            ColumnDef::new("id", DataType::Int4),
+            ColumnDef::new("age", DataType::Int4),
+        ]);
+
+        let mut builder = RecordBuilder::new(&schema);
+        builder.set_int4(0, 42).unwrap();
+        builder.set_null(1);
+
+        let data = builder.build().unwrap();
+
+        let view = RecordView::new(&data, &schema).unwrap();
+        assert_eq!(view.get_int4(0).unwrap(), 42);
+        assert!(view.is_null(1));
+    }
+
+    #[test]
+    fn record_builder_with_variable_columns() {
+        let schema = Schema::new(vec![
+            ColumnDef::new("id", DataType::Int4),
+            ColumnDef::new("name", DataType::Text),
+        ]);
+
+        let mut builder = RecordBuilder::new(&schema);
+        builder.set_int4(0, 1).unwrap();
+        builder.set_text(1, "hello").unwrap();
+
+        let data = builder.build().unwrap();
+
+        let view = RecordView::new(&data, &schema).unwrap();
+        assert_eq!(view.get_int4(0).unwrap(), 1);
+        assert_eq!(view.get_text(1).unwrap(), "hello");
+    }
+
+    #[test]
+    fn record_builder_with_multiple_variable_columns() {
+        let schema = Schema::new(vec![
+            ColumnDef::new("name", DataType::Text),
+            ColumnDef::new("bio", DataType::Blob),
+        ]);
+
+        let mut builder = RecordBuilder::new(&schema);
+        builder.set_text(0, "alice").unwrap();
+        builder.set_blob(1, &[0xDE, 0xAD, 0xBE, 0xEF]).unwrap();
+
+        let data = builder.build().unwrap();
+
+        let view = RecordView::new(&data, &schema).unwrap();
+        assert_eq!(view.get_text(0).unwrap(), "alice");
+        assert_eq!(view.get_blob(1).unwrap(), &[0xDE, 0xAD, 0xBE, 0xEF]);
+    }
+
+    #[test]
+    fn record_builder_roundtrip_all_fixed_types() {
+        let schema = Schema::new(vec![
+            ColumnDef::new("b", DataType::Bool),
+            ColumnDef::new("i2", DataType::Int2),
+            ColumnDef::new("i4", DataType::Int4),
+            ColumnDef::new("i8", DataType::Int8),
+            ColumnDef::new("f4", DataType::Float4),
+            ColumnDef::new("f8", DataType::Float8),
+            ColumnDef::new("d", DataType::Date),
+            ColumnDef::new("t", DataType::Time),
+            ColumnDef::new("ts", DataType::Timestamp),
+            ColumnDef::new("u", DataType::Uuid),
+            ColumnDef::new("mac", DataType::MacAddr),
+        ]);
+
+        let uuid: [u8; 16] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16];
+        let mac: [u8; 6] = [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF];
+
+        let mut builder = RecordBuilder::new(&schema);
+        builder.set_bool(0, true).unwrap();
+        builder.set_int2(1, 1234).unwrap();
+        builder.set_int4(2, 567890).unwrap();
+        builder.set_int8(3, 123456789012345).unwrap();
+        builder.set_float4(4, 1.5).unwrap();
+        builder.set_float8(5, 2.5).unwrap();
+        builder.set_date(6, 19000).unwrap();
+        builder.set_time(7, 43200000000).unwrap();
+        builder.set_timestamp(8, 1702300000000000).unwrap();
+        builder.set_uuid(9, &uuid).unwrap();
+        builder.set_macaddr(10, &mac).unwrap();
+
+        let data = builder.build().unwrap();
+
+        let view = RecordView::new(&data, &schema).unwrap();
+        assert!(view.get_bool(0).unwrap());
+        assert_eq!(view.get_int2(1).unwrap(), 1234);
+        assert_eq!(view.get_int4(2).unwrap(), 567890);
+        assert_eq!(view.get_int8(3).unwrap(), 123456789012345);
+        assert!((view.get_float4(4).unwrap() - 1.5).abs() < 0.001);
+        assert!((view.get_float8(5).unwrap() - 2.5).abs() < 0.001);
+        assert_eq!(view.get_date(6).unwrap(), 19000);
+        assert_eq!(view.get_time(7).unwrap(), 43200000000);
+        assert_eq!(view.get_timestamp(8).unwrap(), 1702300000000000);
+        assert_eq!(view.get_uuid(9).unwrap(), &uuid);
+        assert_eq!(view.get_macaddr(10).unwrap(), &mac);
     }
 }
