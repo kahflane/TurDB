@@ -139,6 +139,7 @@ pub enum InsertResult {
 
 pub struct Cursor<'a> {
     storage: &'a MmapStorage,
+    root_page: u32,
     current_page: u32,
     current_index: usize,
     exhausted: bool,
@@ -587,6 +588,7 @@ impl<'a> BTree<'a> {
                     let exhausted = leaf.cell_count() == 0;
                     return Ok(Cursor {
                         storage: self.storage,
+                        root_page: self.root_page,
                         current_page,
                         current_index: 0,
                         exhausted,
@@ -627,6 +629,7 @@ impl<'a> BTree<'a> {
                     let exhausted = index >= leaf.cell_count() as usize;
                     return Ok(Cursor {
                         storage: self.storage,
+                        root_page: self.root_page,
                         current_page,
                         current_index: index,
                         exhausted,
@@ -639,6 +642,47 @@ impl<'a> BTree<'a> {
                 }
                 _ => bail!(
                     "unexpected page type {:?} during cursor_seek at page {}",
+                    header.page_type(),
+                    current_page
+                ),
+            }
+        }
+    }
+
+    pub fn cursor_last(&self) -> Result<Cursor<'_>> {
+        let mut current_page = self.root_page;
+
+        loop {
+            let page_data = self.storage.page(current_page)?;
+            let header = PageHeader::from_bytes(page_data)?;
+
+            match header.page_type() {
+                PageType::BTreeLeaf => {
+                    let leaf = LeafNode::from_page(page_data)?;
+                    let cell_count = leaf.cell_count() as usize;
+                    if cell_count == 0 {
+                        return Ok(Cursor {
+                            storage: self.storage,
+                            root_page: self.root_page,
+                            current_page,
+                            current_index: 0,
+                            exhausted: true,
+                        });
+                    }
+                    return Ok(Cursor {
+                        storage: self.storage,
+                        root_page: self.root_page,
+                        current_page,
+                        current_index: cell_count - 1,
+                        exhausted: false,
+                    });
+                }
+                PageType::BTreeInterior => {
+                    let interior = InteriorNode::from_page(page_data)?;
+                    current_page = interior.right_child();
+                }
+                _ => bail!(
+                    "unexpected page type {:?} during cursor_last at page {}",
                     header.page_type(),
                     current_page
                 ),
@@ -699,6 +743,108 @@ impl<'a> Cursor<'a> {
         }
 
         Ok(true)
+    }
+
+    pub fn prev(&mut self) -> Result<bool> {
+        if self.exhausted {
+            return Ok(false);
+        }
+
+        if self.current_index > 0 {
+            self.current_index -= 1;
+            return Ok(true);
+        }
+
+        let prev_leaf = self.find_prev_leaf()?;
+        match prev_leaf {
+            Some((page_no, last_index)) => {
+                self.current_page = page_no;
+                self.current_index = last_index;
+                Ok(true)
+            }
+            None => {
+                self.exhausted = true;
+                Ok(false)
+            }
+        }
+    }
+
+    fn find_prev_leaf(&self) -> Result<Option<(u32, usize)>> {
+        let current_key = self.key()?;
+        let mut current_page = self.root_page;
+        let mut path: SmallVec<[(u32, usize); MAX_TREE_DEPTH]> = SmallVec::new();
+
+        loop {
+            let page_data = self.storage.page(current_page)?;
+            let header = PageHeader::from_bytes(page_data)?;
+
+            match header.page_type() {
+                PageType::BTreeLeaf => break,
+                PageType::BTreeInterior => {
+                    let interior = InteriorNode::from_page(page_data)?;
+                    let (child_page, slot_idx) = interior.find_child(current_key)?;
+                    let idx = slot_idx.unwrap_or(interior.cell_count() as usize);
+                    path.push((current_page, idx));
+                    current_page = child_page;
+                }
+                _ => bail!(
+                    "unexpected page type {:?} during find_prev_leaf at page {}",
+                    header.page_type(),
+                    current_page
+                ),
+            }
+        }
+
+        while let Some((parent_page, child_idx)) = path.pop() {
+            if child_idx > 0 {
+                let page_data = self.storage.page(parent_page)?;
+                let interior = InteriorNode::from_page(page_data)?;
+
+                let prev_child = if child_idx == 1 {
+                    interior.slot_at(0)?.child_page
+                } else if child_idx > 1 {
+                    let target_idx = child_idx - 1;
+                    if target_idx < interior.cell_count() as usize {
+                        interior.slot_at(target_idx)?.child_page
+                    } else {
+                        interior.right_child()
+                    }
+                } else {
+                    continue;
+                };
+
+                return self.find_rightmost_in_subtree(prev_child);
+            }
+        }
+
+        Ok(None)
+    }
+
+    fn find_rightmost_in_subtree(&self, mut page_no: u32) -> Result<Option<(u32, usize)>> {
+        loop {
+            let page_data = self.storage.page(page_no)?;
+            let header = PageHeader::from_bytes(page_data)?;
+
+            match header.page_type() {
+                PageType::BTreeLeaf => {
+                    let leaf = LeafNode::from_page(page_data)?;
+                    let count = leaf.cell_count() as usize;
+                    if count == 0 {
+                        return Ok(None);
+                    }
+                    return Ok(Some((page_no, count - 1)));
+                }
+                PageType::BTreeInterior => {
+                    let interior = InteriorNode::from_page(page_data)?;
+                    page_no = interior.right_child();
+                }
+                _ => bail!(
+                    "unexpected page type {:?} during find_rightmost at page {}",
+                    header.page_type(),
+                    page_no
+                ),
+            }
+        }
     }
 }
 
@@ -1068,5 +1214,97 @@ mod tests {
 
         assert!(key.as_ptr() >= page.as_ptr());
         assert!(value.as_ptr() >= page.as_ptr());
+    }
+
+    #[test]
+    fn cursor_last_positions_at_end() {
+        let (_dir, mut storage) = create_test_storage(10);
+        let mut btree = BTree::create(&mut storage, 0).unwrap();
+
+        btree.insert(b"alpha", b"1").unwrap();
+        btree.insert(b"bravo", b"2").unwrap();
+        btree.insert(b"charlie", b"3").unwrap();
+        btree.insert(b"delta", b"4").unwrap();
+
+        let cursor = btree.cursor_last().unwrap();
+        assert!(cursor.valid());
+        assert_eq!(cursor.key().unwrap(), b"delta");
+        assert_eq!(cursor.value().unwrap(), b"4");
+    }
+
+    #[test]
+    fn cursor_last_on_empty_tree() {
+        let (_dir, mut storage) = create_test_storage(5);
+        let btree = BTree::create(&mut storage, 0).unwrap();
+
+        let cursor = btree.cursor_last().unwrap();
+        assert!(!cursor.valid());
+    }
+
+    #[test]
+    fn cursor_prev_iterates_backwards() {
+        let (_dir, mut storage) = create_test_storage(10);
+        let mut btree = BTree::create(&mut storage, 0).unwrap();
+
+        btree.insert(b"alpha", b"1").unwrap();
+        btree.insert(b"bravo", b"2").unwrap();
+        btree.insert(b"charlie", b"3").unwrap();
+
+        let mut cursor = btree.cursor_last().unwrap();
+        assert!(cursor.valid());
+        assert_eq!(cursor.key().unwrap(), b"charlie");
+
+        assert!(cursor.prev().unwrap());
+        assert_eq!(cursor.key().unwrap(), b"bravo");
+
+        assert!(cursor.prev().unwrap());
+        assert_eq!(cursor.key().unwrap(), b"alpha");
+
+        assert!(!cursor.prev().unwrap());
+        assert!(!cursor.valid());
+    }
+
+    #[test]
+    fn cursor_prev_on_first_element() {
+        let (_dir, mut storage) = create_test_storage(5);
+        let mut btree = BTree::create(&mut storage, 0).unwrap();
+
+        btree.insert(b"only", b"one").unwrap();
+
+        let mut cursor = btree.cursor_first().unwrap();
+        assert!(cursor.valid());
+        assert_eq!(cursor.key().unwrap(), b"only");
+
+        assert!(!cursor.prev().unwrap());
+        assert!(!cursor.valid());
+    }
+
+    #[test]
+    fn cursor_prev_across_multiple_pages() {
+        let (_dir, mut storage) = create_test_storage(20);
+        let mut btree = BTree::create(&mut storage, 0).unwrap();
+
+        for i in (0..100).rev() {
+            let key = format!("key{:03}", i);
+            let value = format!("val{:03}", i);
+            btree.insert(key.as_bytes(), value.as_bytes()).unwrap();
+        }
+
+        let mut cursor = btree.cursor_last().unwrap();
+        let mut count = 99;
+
+        while cursor.valid() {
+            let expected_key = format!("key{:03}", count);
+            assert_eq!(cursor.key().unwrap(), expected_key.as_bytes());
+
+            if count == 0 {
+                assert!(!cursor.prev().unwrap());
+            } else {
+                assert!(cursor.prev().unwrap());
+                count -= 1;
+            }
+        }
+
+        assert_eq!(count, 0);
     }
 }
