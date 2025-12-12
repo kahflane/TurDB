@@ -80,4 +80,5 @@
 //! - `transaction`: MVCC and WAL
 
 pub mod btree;
+pub mod encoding;
 pub mod storage;
