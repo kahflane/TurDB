@@ -175,6 +175,24 @@ pub fn encode_int(n: i64, buf: &mut Vec<u8>) {
     }
 }
 
+pub fn encode_float(f: f64, buf: &mut Vec<u8>) {
+    if f.is_nan() {
+        buf.push(type_prefix::NAN);
+    } else if f == f64::NEG_INFINITY {
+        buf.push(type_prefix::NEG_INFINITY);
+    } else if f == f64::INFINITY {
+        buf.push(type_prefix::POS_INFINITY);
+    } else if f < 0.0 {
+        buf.push(type_prefix::NEG_FLOAT);
+        buf.extend((!f.to_bits()).to_be_bytes());
+    } else if f == 0.0 {
+        buf.push(type_prefix::ZERO);
+    } else {
+        buf.push(type_prefix::POS_FLOAT);
+        buf.extend((f.to_bits() ^ (1u64 << 63)).to_be_bytes());
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -226,5 +244,73 @@ mod tests {
         let original = encoded.clone();
         encoded.sort();
         assert_eq!(encoded, original, "encoded keys should already be sorted");
+    }
+
+    #[test]
+    fn encode_float_zero_produces_single_byte() {
+        let mut buf = Vec::new();
+        encode_float(0.0, &mut buf);
+        assert_eq!(buf, vec![type_prefix::ZERO]);
+    }
+
+    #[test]
+    fn encode_float_positive_uses_pos_float_prefix() {
+        let mut buf = Vec::new();
+        encode_float(1.5, &mut buf);
+        assert_eq!(buf[0], type_prefix::POS_FLOAT);
+        assert_eq!(buf.len(), 9);
+    }
+
+    #[test]
+    fn encode_float_negative_uses_neg_float_prefix() {
+        let mut buf = Vec::new();
+        encode_float(-1.5, &mut buf);
+        assert_eq!(buf[0], type_prefix::NEG_FLOAT);
+        assert_eq!(buf.len(), 9);
+    }
+
+    #[test]
+    fn encode_float_infinity() {
+        let mut pos_inf = Vec::new();
+        encode_float(f64::INFINITY, &mut pos_inf);
+        assert_eq!(pos_inf, vec![type_prefix::POS_INFINITY]);
+
+        let mut neg_inf = Vec::new();
+        encode_float(f64::NEG_INFINITY, &mut neg_inf);
+        assert_eq!(neg_inf, vec![type_prefix::NEG_INFINITY]);
+    }
+
+    #[test]
+    fn encode_float_nan() {
+        let mut buf = Vec::new();
+        encode_float(f64::NAN, &mut buf);
+        assert_eq!(buf, vec![type_prefix::NAN]);
+    }
+
+    #[test]
+    fn encode_float_preserves_ordering() {
+        let values = [
+            f64::NEG_INFINITY,
+            -1000.0,
+            -1.5,
+            -0.001,
+            0.0,
+            0.001,
+            1.5,
+            1000.0,
+            f64::INFINITY,
+        ];
+        let mut encoded: Vec<Vec<u8>> = values
+            .iter()
+            .map(|&v| {
+                let mut buf = Vec::new();
+                encode_float(v, &mut buf);
+                buf
+            })
+            .collect();
+
+        let original = encoded.clone();
+        encoded.sort();
+        assert_eq!(encoded, original, "encoded floats should already be sorted");
     }
 }
