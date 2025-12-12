@@ -163,6 +163,14 @@ pub fn encode_null(buf: &mut Vec<u8>) {
     buf.push(type_prefix::NULL);
 }
 
+pub fn encode_bool(b: bool, buf: &mut Vec<u8>) {
+    buf.push(if b {
+        type_prefix::TRUE
+    } else {
+        type_prefix::FALSE
+    });
+}
+
 pub fn encode_int(n: i64, buf: &mut Vec<u8>) {
     if n < 0 {
         buf.push(type_prefix::NEG_INT);
@@ -203,6 +211,106 @@ pub fn encode_blob(data: &[u8], buf: &mut Vec<u8>) {
     encode_escaped_bytes(data, buf);
 }
 
+pub fn encode_date(days: i32, buf: &mut Vec<u8>) {
+    buf.push(type_prefix::DATE);
+    buf.extend(((days as u32) ^ (1u32 << 31)).to_be_bytes());
+}
+
+pub fn encode_timestamp(micros: i64, buf: &mut Vec<u8>) {
+    buf.push(type_prefix::TIMESTAMP);
+    buf.extend(((micros as u64) ^ (1u64 << 63)).to_be_bytes());
+}
+
+pub fn encode_uuid(uuid: &[u8; 16], buf: &mut Vec<u8>) {
+    buf.push(type_prefix::UUID);
+    buf.extend(uuid);
+}
+
+pub fn encode_array<F>(elements: &[F], buf: &mut Vec<u8>, encode_elem: impl Fn(&F, &mut Vec<u8>)) {
+    buf.push(type_prefix::ARRAY);
+    for (i, elem) in elements.iter().enumerate() {
+        if i > 0 {
+            buf.push(0x01);
+        }
+        encode_elem(elem, buf);
+    }
+    buf.push(0x00);
+}
+
+pub fn encode_enum(type_id: u32, ordinal: u32, buf: &mut Vec<u8>) {
+    buf.push(type_prefix::ENUM);
+    buf.extend(type_id.to_be_bytes());
+    buf.extend(ordinal.to_be_bytes());
+}
+
+pub fn encode_composite<F>(
+    type_id: u32,
+    fields: &[F],
+    buf: &mut Vec<u8>,
+    encode_field: impl Fn(&F, &mut Vec<u8>),
+) {
+    buf.push(type_prefix::COMPOSITE);
+    buf.extend(type_id.to_be_bytes());
+    for (i, field) in fields.iter().enumerate() {
+        if i > 0 {
+            buf.push(0x01);
+        }
+        encode_field(field, buf);
+    }
+    buf.push(0x00);
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum JsonValue<'a> {
+    Null,
+    Bool(bool),
+    Number(f64),
+    String(&'a str),
+    Array(&'a [JsonValue<'a>]),
+    Object(&'a [(&'a str, JsonValue<'a>)]),
+}
+
+pub fn encode_json(json: &JsonValue, buf: &mut Vec<u8>) {
+    match json {
+        JsonValue::Null => buf.push(type_prefix::JSON_NULL),
+        JsonValue::Bool(false) => buf.push(type_prefix::JSON_FALSE),
+        JsonValue::Bool(true) => buf.push(type_prefix::JSON_TRUE),
+        JsonValue::Number(n) => {
+            buf.push(type_prefix::JSON_NUMBER);
+            if *n < 0.0 {
+                buf.extend((!n.to_bits()).to_be_bytes());
+            } else {
+                buf.extend((n.to_bits() ^ (1u64 << 63)).to_be_bytes());
+            }
+        }
+        JsonValue::String(s) => {
+            buf.push(type_prefix::JSON_STRING);
+            encode_escaped_bytes(s.as_bytes(), buf);
+        }
+        JsonValue::Array(arr) => {
+            buf.push(type_prefix::JSON_ARRAY);
+            for (i, elem) in arr.iter().enumerate() {
+                if i > 0 {
+                    buf.push(0x01);
+                }
+                encode_json(elem, buf);
+            }
+            buf.push(0x00);
+        }
+        JsonValue::Object(obj) => {
+            buf.push(type_prefix::JSON_OBJECT);
+            for (i, (key, val)) in obj.iter().enumerate() {
+                if i > 0 {
+                    buf.push(0x01);
+                }
+                encode_escaped_bytes(key.as_bytes(), buf);
+                encode_json(val, buf);
+            }
+            buf.push(0x00);
+        }
+    }
+}
+
 fn encode_escaped_bytes(data: &[u8], buf: &mut Vec<u8>) {
     for &byte in data {
         match byte {
@@ -222,6 +330,43 @@ fn encode_escaped_bytes(data: &[u8], buf: &mut Vec<u8>) {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub enum Value<'a> {
+    Null,
+    Bool(bool),
+    Int(i64),
+    Float(f64),
+    Text(&'a str),
+    Blob(&'a [u8]),
+    Date(i32),
+    Timestamp(i64),
+    Uuid(&'a [u8; 16]),
+}
+
+pub fn encode_value(value: &Value, buf: &mut Vec<u8>) {
+    match value {
+        Value::Null => encode_null(buf),
+        Value::Bool(b) => encode_bool(*b, buf),
+        Value::Int(n) => encode_int(*n, buf),
+        Value::Float(f) => encode_float(*f, buf),
+        Value::Text(s) => encode_text(s, buf),
+        Value::Blob(b) => encode_blob(b, buf),
+        Value::Date(d) => encode_date(*d, buf),
+        Value::Timestamp(t) => encode_timestamp(*t, buf),
+        Value::Uuid(u) => encode_uuid(u, buf),
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum DecodedJson {
+    Null,
+    Bool(bool),
+    Number(f64),
+    String(String),
+    Array(Vec<DecodedJson>),
+    Object(Vec<(String, DecodedJson)>),
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub enum DecodedKey {
     Null,
     Bool(bool),
@@ -232,6 +377,19 @@ pub enum DecodedKey {
     Nan,
     Text(String),
     Blob(Vec<u8>),
+    Date(i32),
+    Timestamp(i64),
+    Uuid([u8; 16]),
+    Array(Vec<DecodedKey>),
+    Enum {
+        type_id: u32,
+        ordinal: u32,
+    },
+    Composite {
+        type_id: u32,
+        fields: Vec<DecodedKey>,
+    },
+    Json(DecodedJson),
 }
 
 use eyre::{bail, ensure, Result};
@@ -284,6 +442,51 @@ pub fn decode_key(data: &[u8]) -> Result<(DecodedKey, usize)> {
             let (decoded_bytes, consumed) = decode_escaped_bytes(&data[1..])?;
             Ok((DecodedKey::Blob(decoded_bytes), 1 + consumed))
         }
+        type_prefix::DATE => {
+            ensure!(data.len() >= 5, "truncated date");
+            let bytes: [u8; 4] = data[1..5].try_into().unwrap();
+            let encoded = u32::from_be_bytes(bytes);
+            let days = (encoded ^ (1u32 << 31)) as i32;
+            Ok((DecodedKey::Date(days), 5))
+        }
+        type_prefix::TIMESTAMP => {
+            ensure!(data.len() >= 9, "truncated timestamp");
+            let bytes: [u8; 8] = data[1..9].try_into().unwrap();
+            let encoded = u64::from_be_bytes(bytes);
+            let micros = (encoded ^ (1u64 << 63)) as i64;
+            Ok((DecodedKey::Timestamp(micros), 9))
+        }
+        type_prefix::UUID => {
+            ensure!(data.len() >= 17, "truncated uuid");
+            let bytes: [u8; 16] = data[1..17].try_into().unwrap();
+            Ok((DecodedKey::Uuid(bytes), 17))
+        }
+        type_prefix::ARRAY => {
+            let (elements, consumed) = decode_array_elements(&data[1..])?;
+            Ok((DecodedKey::Array(elements), 1 + consumed))
+        }
+        type_prefix::ENUM => {
+            ensure!(data.len() >= 9, "truncated enum");
+            let type_id = u32::from_be_bytes(data[1..5].try_into().unwrap());
+            let ordinal = u32::from_be_bytes(data[5..9].try_into().unwrap());
+            Ok((DecodedKey::Enum { type_id, ordinal }, 9))
+        }
+        type_prefix::COMPOSITE => {
+            ensure!(data.len() >= 5, "truncated composite");
+            let type_id = u32::from_be_bytes(data[1..5].try_into().unwrap());
+            let (fields, consumed) = decode_composite_fields(&data[5..])?;
+            Ok((DecodedKey::Composite { type_id, fields }, 5 + consumed))
+        }
+        type_prefix::JSON_NULL
+        | type_prefix::JSON_FALSE
+        | type_prefix::JSON_TRUE
+        | type_prefix::JSON_NUMBER
+        | type_prefix::JSON_STRING
+        | type_prefix::JSON_ARRAY
+        | type_prefix::JSON_OBJECT => {
+            let (json, consumed) = decode_json(data)?;
+            Ok((DecodedKey::Json(json), consumed))
+        }
         _ => bail!("unknown key prefix: 0x{:02X}", prefix),
     }
 }
@@ -327,6 +530,128 @@ fn decode_escaped_bytes(data: &[u8]) -> Result<(Vec<u8>, usize)> {
     bail!("missing terminator in escaped bytes");
 }
 
+fn decode_array_elements(data: &[u8]) -> Result<(Vec<DecodedKey>, usize)> {
+    let mut elements = Vec::new();
+    let mut i = 0;
+
+    while i < data.len() {
+        if data[i] == 0x00 {
+            return Ok((elements, i + 1));
+        }
+        if !elements.is_empty() {
+            ensure!(data[i] == 0x01, "expected element separator 0x01");
+            i += 1;
+        }
+        let (elem, consumed) = decode_key(&data[i..])?;
+        elements.push(elem);
+        i += consumed;
+    }
+
+    bail!("missing array terminator");
+}
+
+fn decode_composite_fields(data: &[u8]) -> Result<(Vec<DecodedKey>, usize)> {
+    let mut fields = Vec::new();
+    let mut i = 0;
+
+    while i < data.len() {
+        if data[i] == 0x00 {
+            return Ok((fields, i + 1));
+        }
+        if !fields.is_empty() {
+            ensure!(data[i] == 0x01, "expected field separator 0x01");
+            i += 1;
+        }
+        let (field, consumed) = decode_key(&data[i..])?;
+        fields.push(field);
+        i += consumed;
+    }
+
+    bail!("missing composite terminator");
+}
+
+fn decode_json(data: &[u8]) -> Result<(DecodedJson, usize)> {
+    ensure!(!data.is_empty(), "cannot decode empty json");
+
+    let prefix = data[0];
+    match prefix {
+        type_prefix::JSON_NULL => Ok((DecodedJson::Null, 1)),
+        type_prefix::JSON_FALSE => Ok((DecodedJson::Bool(false), 1)),
+        type_prefix::JSON_TRUE => Ok((DecodedJson::Bool(true), 1)),
+        type_prefix::JSON_NUMBER => {
+            ensure!(data.len() >= 9, "truncated json number");
+            let bytes: [u8; 8] = data[1..9].try_into().unwrap();
+            let encoded = u64::from_be_bytes(bytes);
+            let bits = if encoded & (1u64 << 63) != 0 {
+                encoded ^ (1u64 << 63)
+            } else {
+                !encoded
+            };
+            let val = f64::from_bits(bits);
+            Ok((DecodedJson::Number(val), 9))
+        }
+        type_prefix::JSON_STRING => {
+            let (decoded_bytes, consumed) = decode_escaped_bytes(&data[1..])?;
+            let text = String::from_utf8(decoded_bytes)
+                .map_err(|e| eyre::eyre!("invalid UTF-8 in json string: {}", e))?;
+            Ok((DecodedJson::String(text), 1 + consumed))
+        }
+        type_prefix::JSON_ARRAY => {
+            let (elements, consumed) = decode_json_array(&data[1..])?;
+            Ok((DecodedJson::Array(elements), 1 + consumed))
+        }
+        type_prefix::JSON_OBJECT => {
+            let (obj, consumed) = decode_json_object(&data[1..])?;
+            Ok((DecodedJson::Object(obj), 1 + consumed))
+        }
+        _ => bail!("unknown json prefix: 0x{:02X}", prefix),
+    }
+}
+
+fn decode_json_array(data: &[u8]) -> Result<(Vec<DecodedJson>, usize)> {
+    let mut elements = Vec::new();
+    let mut i = 0;
+
+    while i < data.len() {
+        if data[i] == 0x00 {
+            return Ok((elements, i + 1));
+        }
+        if !elements.is_empty() {
+            ensure!(data[i] == 0x01, "expected json element separator 0x01");
+            i += 1;
+        }
+        let (elem, consumed) = decode_json(&data[i..])?;
+        elements.push(elem);
+        i += consumed;
+    }
+
+    bail!("missing json array terminator");
+}
+
+fn decode_json_object(data: &[u8]) -> Result<(Vec<(String, DecodedJson)>, usize)> {
+    let mut entries = Vec::new();
+    let mut i = 0;
+
+    while i < data.len() {
+        if data[i] == 0x00 {
+            return Ok((entries, i + 1));
+        }
+        if !entries.is_empty() {
+            ensure!(data[i] == 0x01, "expected json object separator 0x01");
+            i += 1;
+        }
+        let (key_bytes, key_consumed) = decode_escaped_bytes(&data[i..])?;
+        let key = String::from_utf8(key_bytes)
+            .map_err(|e| eyre::eyre!("invalid UTF-8 in json object key: {}", e))?;
+        i += key_consumed;
+        let (val, val_consumed) = decode_json(&data[i..])?;
+        entries.push((key, val));
+        i += val_consumed;
+    }
+
+    bail!("missing json object terminator");
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -336,6 +661,377 @@ mod tests {
         let mut buf = Vec::new();
         encode_null(&mut buf);
         assert_eq!(buf, vec![type_prefix::NULL]);
+    }
+
+    #[test]
+    fn encode_bool_false_produces_0x02() {
+        let mut buf = Vec::new();
+        encode_bool(false, &mut buf);
+        assert_eq!(buf, vec![type_prefix::FALSE]);
+    }
+
+    #[test]
+    fn encode_bool_true_produces_0x03() {
+        let mut buf = Vec::new();
+        encode_bool(true, &mut buf);
+        assert_eq!(buf, vec![type_prefix::TRUE]);
+    }
+
+    #[test]
+    fn encode_bool_ordering() {
+        let mut false_buf = Vec::new();
+        encode_bool(false, &mut false_buf);
+
+        let mut true_buf = Vec::new();
+        encode_bool(true, &mut true_buf);
+
+        assert!(false_buf < true_buf, "FALSE should sort before TRUE");
+    }
+
+    #[test]
+    fn decode_bool_roundtrip() {
+        for &val in &[false, true] {
+            let mut buf = Vec::new();
+            encode_bool(val, &mut buf);
+            let (decoded, consumed) = decode_key(&buf).unwrap();
+            assert_eq!(decoded, DecodedKey::Bool(val));
+            assert_eq!(consumed, 1);
+        }
+    }
+
+    #[test]
+    fn encode_date_produces_prefix_and_4_bytes() {
+        let mut buf = Vec::new();
+        encode_date(19000, &mut buf);
+        assert_eq!(buf[0], type_prefix::DATE);
+        assert_eq!(buf.len(), 5);
+    }
+
+    #[test]
+    fn encode_date_preserves_ordering() {
+        let dates = [0_i32, 1000, 19000, 30000];
+        let mut encoded: Vec<Vec<u8>> = dates
+            .iter()
+            .map(|&d| {
+                let mut buf = Vec::new();
+                encode_date(d, &mut buf);
+                buf
+            })
+            .collect();
+
+        let original = encoded.clone();
+        encoded.sort();
+        assert_eq!(encoded, original, "encoded dates should already be sorted");
+    }
+
+    #[test]
+    fn decode_date_roundtrip() {
+        for &days in &[0_i32, 1000, 19000, -1000] {
+            let mut buf = Vec::new();
+            encode_date(days, &mut buf);
+            let (decoded, consumed) = decode_key(&buf).unwrap();
+            assert_eq!(decoded, DecodedKey::Date(days));
+            assert_eq!(consumed, 5);
+        }
+    }
+
+    #[test]
+    fn encode_timestamp_produces_prefix_and_8_bytes() {
+        let mut buf = Vec::new();
+        encode_timestamp(1_000_000_000_i64, &mut buf);
+        assert_eq!(buf[0], type_prefix::TIMESTAMP);
+        assert_eq!(buf.len(), 9);
+    }
+
+    #[test]
+    fn encode_timestamp_preserves_ordering() {
+        let timestamps = [-1000_i64, 0, 1000, 1_000_000_000];
+        let mut encoded: Vec<Vec<u8>> = timestamps
+            .iter()
+            .map(|&t| {
+                let mut buf = Vec::new();
+                encode_timestamp(t, &mut buf);
+                buf
+            })
+            .collect();
+
+        let original = encoded.clone();
+        encoded.sort();
+        assert_eq!(
+            encoded, original,
+            "encoded timestamps should already be sorted"
+        );
+    }
+
+    #[test]
+    fn decode_timestamp_roundtrip() {
+        for &micros in &[0_i64, 1_000_000, -1_000_000, i64::MAX, i64::MIN] {
+            let mut buf = Vec::new();
+            encode_timestamp(micros, &mut buf);
+            let (decoded, consumed) = decode_key(&buf).unwrap();
+            assert_eq!(decoded, DecodedKey::Timestamp(micros));
+            assert_eq!(consumed, 9);
+        }
+    }
+
+    #[test]
+    fn encode_uuid_produces_prefix_and_16_bytes() {
+        let uuid: [u8; 16] = [
+            0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc, 0xde, 0xf0, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66,
+            0x77, 0x88,
+        ];
+        let mut buf = Vec::new();
+        encode_uuid(&uuid, &mut buf);
+        assert_eq!(buf[0], type_prefix::UUID);
+        assert_eq!(buf.len(), 17);
+        assert_eq!(&buf[1..], &uuid);
+    }
+
+    #[test]
+    fn decode_uuid_roundtrip() {
+        let uuid: [u8; 16] = [
+            0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc, 0xde, 0xf0, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66,
+            0x77, 0x88,
+        ];
+        let mut buf = Vec::new();
+        encode_uuid(&uuid, &mut buf);
+        let (decoded, consumed) = decode_key(&buf).unwrap();
+        assert_eq!(decoded, DecodedKey::Uuid(uuid));
+        assert_eq!(consumed, 17);
+    }
+
+    #[test]
+    fn encode_array_empty() {
+        let elements: [i64; 0] = [];
+        let mut buf = Vec::new();
+        encode_array(&elements, &mut buf, |n, b| encode_int(*n, b));
+        assert_eq!(buf, vec![type_prefix::ARRAY, 0x00]);
+    }
+
+    #[test]
+    fn encode_array_with_elements() {
+        let elements = [1_i64, 2, 3];
+        let mut buf = Vec::new();
+        encode_array(&elements, &mut buf, |n, b| encode_int(*n, b));
+        assert_eq!(buf[0], type_prefix::ARRAY);
+        assert_eq!(*buf.last().unwrap(), 0x00);
+    }
+
+    #[test]
+    fn decode_array_roundtrip() {
+        let elements = [1_i64, 2, 3];
+        let mut buf = Vec::new();
+        encode_array(&elements, &mut buf, |n, b| encode_int(*n, b));
+        let (decoded, _) = decode_key(&buf).unwrap();
+        match decoded {
+            DecodedKey::Array(elems) => {
+                assert_eq!(elems.len(), 3);
+                assert_eq!(elems[0], DecodedKey::Int(1));
+                assert_eq!(elems[1], DecodedKey::Int(2));
+                assert_eq!(elems[2], DecodedKey::Int(3));
+            }
+            _ => panic!("expected array"),
+        }
+    }
+
+    #[test]
+    fn encode_enum_produces_prefix_and_8_bytes() {
+        let mut buf = Vec::new();
+        encode_enum(100, 5, &mut buf);
+        assert_eq!(buf[0], type_prefix::ENUM);
+        assert_eq!(buf.len(), 9);
+    }
+
+    #[test]
+    fn decode_enum_roundtrip() {
+        let mut buf = Vec::new();
+        encode_enum(100, 5, &mut buf);
+        let (decoded, consumed) = decode_key(&buf).unwrap();
+        assert_eq!(
+            decoded,
+            DecodedKey::Enum {
+                type_id: 100,
+                ordinal: 5
+            }
+        );
+        assert_eq!(consumed, 9);
+    }
+
+    #[test]
+    fn encode_composite_with_fields() {
+        let fields = [1_i64, 2_i64];
+        let mut buf = Vec::new();
+        encode_composite(42, &fields, &mut buf, |n, b| encode_int(*n, b));
+        assert_eq!(buf[0], type_prefix::COMPOSITE);
+        assert_eq!(*buf.last().unwrap(), 0x00);
+    }
+
+    #[test]
+    fn decode_composite_roundtrip() {
+        let fields = [1_i64, 2_i64];
+        let mut buf = Vec::new();
+        encode_composite(42, &fields, &mut buf, |n, b| encode_int(*n, b));
+        let (decoded, _) = decode_key(&buf).unwrap();
+        match decoded {
+            DecodedKey::Composite { type_id, fields } => {
+                assert_eq!(type_id, 42);
+                assert_eq!(fields.len(), 2);
+                assert_eq!(fields[0], DecodedKey::Int(1));
+                assert_eq!(fields[1], DecodedKey::Int(2));
+            }
+            _ => panic!("expected composite"),
+        }
+    }
+
+    #[test]
+    fn encode_json_null() {
+        let mut buf = Vec::new();
+        encode_json(&JsonValue::Null, &mut buf);
+        assert_eq!(buf, vec![type_prefix::JSON_NULL]);
+        let (decoded, _) = decode_key(&buf).unwrap();
+        assert_eq!(decoded, DecodedKey::Json(DecodedJson::Null));
+    }
+
+    #[test]
+    fn encode_json_bool() {
+        let mut buf = Vec::new();
+        encode_json(&JsonValue::Bool(true), &mut buf);
+        assert_eq!(buf, vec![type_prefix::JSON_TRUE]);
+
+        buf.clear();
+        encode_json(&JsonValue::Bool(false), &mut buf);
+        assert_eq!(buf, vec![type_prefix::JSON_FALSE]);
+    }
+
+    #[test]
+    fn encode_json_number_roundtrip() {
+        for &val in &[-1000.0_f64, -1.5, 0.0, 1.5, 1000.0] {
+            let mut buf = Vec::new();
+            encode_json(&JsonValue::Number(val), &mut buf);
+            let (decoded, _) = decode_key(&buf).unwrap();
+            match decoded {
+                DecodedKey::Json(DecodedJson::Number(n)) => assert_eq!(n, val),
+                _ => panic!("expected json number"),
+            }
+        }
+    }
+
+    #[test]
+    fn encode_json_string_roundtrip() {
+        let mut buf = Vec::new();
+        encode_json(&JsonValue::String("hello"), &mut buf);
+        let (decoded, _) = decode_key(&buf).unwrap();
+        match decoded {
+            DecodedKey::Json(DecodedJson::String(s)) => assert_eq!(s, "hello"),
+            _ => panic!("expected json string"),
+        }
+    }
+
+    #[test]
+    fn encode_json_array_roundtrip() {
+        let arr = [JsonValue::Number(1.0), JsonValue::Number(2.0)];
+        let mut buf = Vec::new();
+        encode_json(&JsonValue::Array(&arr), &mut buf);
+        let (decoded, _) = decode_key(&buf).unwrap();
+        match decoded {
+            DecodedKey::Json(DecodedJson::Array(elems)) => {
+                assert_eq!(elems.len(), 2);
+                assert_eq!(elems[0], DecodedJson::Number(1.0));
+                assert_eq!(elems[1], DecodedJson::Number(2.0));
+            }
+            _ => panic!("expected json array"),
+        }
+    }
+
+    #[test]
+    fn encode_json_object_roundtrip() {
+        let obj = [("key", JsonValue::String("value"))];
+        let mut buf = Vec::new();
+        encode_json(&JsonValue::Object(&obj), &mut buf);
+        let (decoded, _) = decode_key(&buf).unwrap();
+        match decoded {
+            DecodedKey::Json(DecodedJson::Object(entries)) => {
+                assert_eq!(entries.len(), 1);
+                assert_eq!(entries[0].0, "key");
+                assert_eq!(entries[0].1, DecodedJson::String("value".to_string()));
+            }
+            _ => panic!("expected json object"),
+        }
+    }
+
+    #[test]
+    fn encode_value_dispatcher_null() {
+        let mut buf = Vec::new();
+        encode_value(&Value::Null, &mut buf);
+        assert_eq!(buf, vec![type_prefix::NULL]);
+    }
+
+    #[test]
+    fn encode_value_dispatcher_bool() {
+        let mut buf = Vec::new();
+        encode_value(&Value::Bool(true), &mut buf);
+        assert_eq!(buf, vec![type_prefix::TRUE]);
+
+        buf.clear();
+        encode_value(&Value::Bool(false), &mut buf);
+        assert_eq!(buf, vec![type_prefix::FALSE]);
+    }
+
+    #[test]
+    fn encode_value_dispatcher_int() {
+        let mut buf = Vec::new();
+        encode_value(&Value::Int(42), &mut buf);
+        let (decoded, _) = decode_key(&buf).unwrap();
+        assert_eq!(decoded, DecodedKey::Int(42));
+    }
+
+    #[test]
+    fn encode_value_dispatcher_float() {
+        let mut buf = Vec::new();
+        encode_value(&Value::Float(3.14), &mut buf);
+        let (decoded, _) = decode_key(&buf).unwrap();
+        assert_eq!(decoded, DecodedKey::Float(3.14));
+    }
+
+    #[test]
+    fn encode_value_dispatcher_text() {
+        let mut buf = Vec::new();
+        encode_value(&Value::Text("hello"), &mut buf);
+        let (decoded, _) = decode_key(&buf).unwrap();
+        assert_eq!(decoded, DecodedKey::Text("hello".to_string()));
+    }
+
+    #[test]
+    fn encode_value_dispatcher_blob() {
+        let mut buf = Vec::new();
+        encode_value(&Value::Blob(&[1, 2, 3]), &mut buf);
+        let (decoded, _) = decode_key(&buf).unwrap();
+        assert_eq!(decoded, DecodedKey::Blob(vec![1, 2, 3]));
+    }
+
+    #[test]
+    fn encode_value_dispatcher_date() {
+        let mut buf = Vec::new();
+        encode_value(&Value::Date(19000), &mut buf);
+        let (decoded, _) = decode_key(&buf).unwrap();
+        assert_eq!(decoded, DecodedKey::Date(19000));
+    }
+
+    #[test]
+    fn encode_value_dispatcher_timestamp() {
+        let mut buf = Vec::new();
+        encode_value(&Value::Timestamp(1_000_000_000), &mut buf);
+        let (decoded, _) = decode_key(&buf).unwrap();
+        assert_eq!(decoded, DecodedKey::Timestamp(1_000_000_000));
+    }
+
+    #[test]
+    fn encode_value_dispatcher_uuid() {
+        let uuid: [u8; 16] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16];
+        let mut buf = Vec::new();
+        encode_value(&Value::Uuid(&uuid), &mut buf);
+        let (decoded, _) = decode_key(&buf).unwrap();
+        assert_eq!(decoded, DecodedKey::Uuid(uuid));
     }
 
     #[test]
