@@ -314,6 +314,16 @@ impl FileManager {
         self.open_files.len()
     }
 
+    pub fn sync_all(&mut self) -> Result<()> {
+        self.meta_storage.sync()?;
+
+        for storage in self.open_files.map.values() {
+            storage.sync()?;
+        }
+
+        Ok(())
+    }
+
     pub fn meta_storage(&self) -> &MmapStorage {
         &self.meta_storage
     }
@@ -908,5 +918,74 @@ mod tests {
         assert_eq!(&page[..16], INDEX_MAGIC);
         let index_id = u64::from_le_bytes(page[16..24].try_into().unwrap());
         assert_eq!(index_id, 99);
+    }
+
+    #[test]
+    fn lru_evicts_when_max_files_reached() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("testdb");
+
+        let mut fm = FileManager::create(&db_path, MIN_MAX_OPEN_FILES).unwrap();
+
+        for i in 0..MIN_MAX_OPEN_FILES + 2 {
+            fm.create_table(DEFAULT_SCHEMA, &format!("table_{}", i), i as u64)
+                .unwrap();
+        }
+
+        for i in 0..MIN_MAX_OPEN_FILES + 2 {
+            fm.table_data(DEFAULT_SCHEMA, &format!("table_{}", i))
+                .unwrap();
+        }
+
+        assert!(fm.open_file_count() <= MIN_MAX_OPEN_FILES);
+    }
+
+    #[test]
+    fn recently_accessed_files_not_evicted() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("testdb");
+
+        let mut fm = FileManager::create(&db_path, MIN_MAX_OPEN_FILES).unwrap();
+
+        for i in 0..MIN_MAX_OPEN_FILES + 2 {
+            fm.create_table(DEFAULT_SCHEMA, &format!("table_{}", i), i as u64)
+                .unwrap();
+        }
+
+        for i in 0..MIN_MAX_OPEN_FILES {
+            fm.table_data(DEFAULT_SCHEMA, &format!("table_{}", i))
+                .unwrap();
+        }
+
+        fm.table_data(DEFAULT_SCHEMA, "table_0").unwrap();
+
+        fm.table_data(DEFAULT_SCHEMA, &format!("table_{}", MIN_MAX_OPEN_FILES))
+            .unwrap();
+
+        let storage = fm.table_data(DEFAULT_SCHEMA, "table_0").unwrap();
+        assert_eq!(&storage.page(0).unwrap()[..16], TABLE_MAGIC);
+    }
+
+    #[test]
+    fn sync_flushes_all_open_files() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("testdb");
+
+        let mut fm = FileManager::create(&db_path, DEFAULT_MAX_OPEN_FILES).unwrap();
+
+        fm.create_table(DEFAULT_SCHEMA, "users", 1).unwrap();
+
+        {
+            let storage = fm.table_data_mut(DEFAULT_SCHEMA, "users").unwrap();
+            let page = storage.page_mut(0).unwrap();
+            page[100] = 0xAB;
+        }
+
+        fm.sync_all().unwrap();
+
+        let table_path = db_path.join(DEFAULT_SCHEMA).join("users.tbd");
+        let storage = MmapStorage::open(&table_path).unwrap();
+        let page = storage.page(0).unwrap();
+        assert_eq!(page[100], 0xAB);
     }
 }
