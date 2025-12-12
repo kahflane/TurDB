@@ -555,6 +555,7 @@ impl<'a> RecordView<'a> {
         ))
     }
 
+    #[allow(clippy::type_complexity)]
     pub fn get_box_opt(&self, col_idx: usize) -> Result<Option<((f64, f64), (f64, f64))>> {
         if self.is_null_or_missing(col_idx) {
             return Ok(None);
