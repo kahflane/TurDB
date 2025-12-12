@@ -109,6 +109,7 @@ pub enum DataType {
     Text = 20,
     Blob = 21,
     Vector = 22,
+    Jsonb = 23,
 }
 
 impl DataType {
@@ -385,6 +386,92 @@ impl<'a> RecordView<'a> {
     pub fn get_blob(&self, col_idx: usize) -> Result<&'a [u8]> {
         let (start, end) = self.get_var_bounds(col_idx)?;
         Ok(&self.data[start..end])
+    }
+
+    pub fn get_vector(&self, col_idx: usize) -> Result<&'a [f32]> {
+        let (start, end) = self.get_var_bounds(col_idx)?;
+        let bytes = &self.data[start..end];
+        if bytes.len() < 4 {
+            return Err(eyre::eyre!(
+                "vector data too short at col {}: {} bytes",
+                col_idx,
+                bytes.len()
+            ));
+        }
+        let len = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as usize;
+        let expected_size = 4 + len * 4;
+        if bytes.len() != expected_size {
+            return Err(eyre::eyre!(
+                "vector size mismatch at col {}: expected {} bytes, got {}",
+                col_idx,
+                expected_size,
+                bytes.len()
+            ));
+        }
+        let float_bytes = &bytes[4..];
+        if !float_bytes.len().is_multiple_of(4)
+            || !(float_bytes.as_ptr() as usize).is_multiple_of(4)
+        {
+            let mut floats = Vec::with_capacity(len);
+            for i in 0..len {
+                let offset = i * 4;
+                let f = f32::from_le_bytes([
+                    float_bytes[offset],
+                    float_bytes[offset + 1],
+                    float_bytes[offset + 2],
+                    float_bytes[offset + 3],
+                ]);
+                floats.push(f);
+            }
+            return Err(eyre::eyre!(
+                "vector data not aligned for zero-copy at col {}",
+                col_idx
+            ));
+        }
+        let floats = unsafe { std::slice::from_raw_parts(float_bytes.as_ptr() as *const f32, len) };
+        Ok(floats)
+    }
+
+    pub fn get_vector_copy(&self, col_idx: usize) -> Result<Vec<f32>> {
+        let (start, end) = self.get_var_bounds(col_idx)?;
+        let bytes = &self.data[start..end];
+        if bytes.len() < 4 {
+            return Err(eyre::eyre!(
+                "vector data too short at col {}: {} bytes",
+                col_idx,
+                bytes.len()
+            ));
+        }
+        let len = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as usize;
+        let expected_size = 4 + len * 4;
+        if bytes.len() != expected_size {
+            return Err(eyre::eyre!(
+                "vector size mismatch at col {}: expected {} bytes, got {}",
+                col_idx,
+                expected_size,
+                bytes.len()
+            ));
+        }
+        let float_bytes = &bytes[4..];
+        let mut floats = Vec::with_capacity(len);
+        for i in 0..len {
+            let offset = i * 4;
+            let f = f32::from_le_bytes([
+                float_bytes[offset],
+                float_bytes[offset + 1],
+                float_bytes[offset + 2],
+                float_bytes[offset + 3],
+            ]);
+            floats.push(f);
+        }
+        Ok(floats)
+    }
+
+    pub fn get_vector_opt(&self, col_idx: usize) -> Result<Option<Vec<f32>>> {
+        if self.is_null_or_missing(col_idx) {
+            return Ok(None);
+        }
+        self.get_vector_copy(col_idx).map(Some)
     }
 
     pub fn record_column_count(&self) -> usize {
@@ -695,6 +782,41 @@ impl<'a> RecordBuilder<'a> {
 
     pub fn set_macaddr(&mut self, col_idx: usize, mac: &[u8; 6]) -> Result<()> {
         self.set_fixed_bytes(col_idx, mac);
+        Ok(())
+    }
+
+    pub fn set_timestamptz(&mut self, col_idx: usize, micros: i64, offset_secs: i32) -> Result<()> {
+        self.clear_null(col_idx);
+        let offset = self.schema.fixed_offset(col_idx);
+        self.fixed_data[offset..offset + 8].copy_from_slice(&micros.to_le_bytes());
+        self.fixed_data[offset + 8..offset + 12].copy_from_slice(&offset_secs.to_le_bytes());
+        self.column_values[col_idx] = ColumnValue::Fixed { offset, len: 12 };
+        Ok(())
+    }
+
+    pub fn set_inet4(&mut self, col_idx: usize, ip: &[u8; 4]) -> Result<()> {
+        self.set_fixed_bytes(col_idx, ip);
+        Ok(())
+    }
+
+    pub fn set_inet6(&mut self, col_idx: usize, ip: &[u8; 16]) -> Result<()> {
+        self.set_fixed_bytes(col_idx, ip);
+        Ok(())
+    }
+
+    pub fn set_vector(&mut self, col_idx: usize, vec: &[f32]) -> Result<()> {
+        self.clear_null(col_idx);
+        let var_idx = self
+            .schema
+            .var_column_index(col_idx)
+            .ok_or_else(|| eyre::eyre!("column {} is not a variable column", col_idx))?;
+        let mut bytes = Vec::with_capacity(4 + vec.len() * 4);
+        bytes.extend((vec.len() as u32).to_le_bytes());
+        for &f in vec {
+            bytes.extend(f.to_le_bytes());
+        }
+        self.var_data[var_idx] = bytes;
+        self.column_values[col_idx] = ColumnValue::Variable { idx: var_idx };
         Ok(())
     }
 
@@ -1555,5 +1677,150 @@ mod tests {
         let view2 = RecordView::new(&data2, &schema).unwrap();
         assert_eq!(view2.get_int4(0).unwrap(), 200);
         assert_eq!(view2.get_text(1).unwrap(), "second");
+    }
+
+    #[test]
+    fn record_builder_set_timestamptz_roundtrip() {
+        let schema = Schema::new(vec![ColumnDef::new("ts", DataType::TimestampTz)]);
+
+        let mut builder = RecordBuilder::new(&schema);
+        builder
+            .set_timestamptz(0, 1702300000000000, -18000)
+            .unwrap();
+
+        let data = builder.build().unwrap();
+
+        let view = RecordView::new(&data, &schema).unwrap();
+        let (micros, offset_secs) = view.get_timestamptz(0).unwrap();
+        assert_eq!(micros, 1702300000000000);
+        assert_eq!(offset_secs, -18000);
+    }
+
+    #[test]
+    fn record_builder_set_inet4_roundtrip() {
+        let schema = Schema::new(vec![ColumnDef::new("ip", DataType::Inet4)]);
+
+        let mut builder = RecordBuilder::new(&schema);
+        builder.set_inet4(0, &[192, 168, 1, 1]).unwrap();
+
+        let data = builder.build().unwrap();
+
+        let view = RecordView::new(&data, &schema).unwrap();
+        assert_eq!(view.get_inet4(0).unwrap(), &[192, 168, 1, 1]);
+    }
+
+    #[test]
+    fn record_builder_set_inet6_roundtrip() {
+        let schema = Schema::new(vec![ColumnDef::new("ip", DataType::Inet6)]);
+
+        let ipv6: [u8; 16] = [
+            0x20, 0x01, 0x0d, 0xb8, 0x85, 0xa3, 0x00, 0x00, 0x00, 0x00, 0x8a, 0x2e, 0x03, 0x70,
+            0x73, 0x34,
+        ];
+
+        let mut builder = RecordBuilder::new(&schema);
+        builder.set_inet6(0, &ipv6).unwrap();
+
+        let data = builder.build().unwrap();
+
+        let view = RecordView::new(&data, &schema).unwrap();
+        assert_eq!(view.get_inet6(0).unwrap(), &ipv6);
+    }
+
+    #[test]
+    fn record_builder_set_vector_roundtrip() {
+        let schema = Schema::new(vec![ColumnDef::new("embedding", DataType::Vector)]);
+
+        let vector = vec![1.0_f32, 2.5, -3.0, 0.0, 4.25];
+
+        let mut builder = RecordBuilder::new(&schema);
+        builder.set_vector(0, &vector).unwrap();
+
+        let data = builder.build().unwrap();
+
+        let view = RecordView::new(&data, &schema).unwrap();
+        let result = view.get_vector_copy(0).unwrap();
+        assert_eq!(result.len(), 5);
+        for (a, b) in result.iter().zip(vector.iter()) {
+            assert!((a - b).abs() < 0.0001);
+        }
+    }
+
+    #[test]
+    fn record_builder_vector_with_fixed_column() {
+        let schema = Schema::new(vec![
+            ColumnDef::new("id", DataType::Int4),
+            ColumnDef::new("embedding", DataType::Vector),
+        ]);
+
+        let vector = vec![0.5_f32, 1.5, 2.5];
+
+        let mut builder = RecordBuilder::new(&schema);
+        builder.set_int4(0, 42).unwrap();
+        builder.set_vector(1, &vector).unwrap();
+
+        let data = builder.build().unwrap();
+
+        let view = RecordView::new(&data, &schema).unwrap();
+        assert_eq!(view.get_int4(0).unwrap(), 42);
+        let result = view.get_vector_copy(1).unwrap();
+        assert_eq!(result.len(), 3);
+        assert!((result[0] - 0.5).abs() < 0.0001);
+        assert!((result[1] - 1.5).abs() < 0.0001);
+        assert!((result[2] - 2.5).abs() < 0.0001);
+    }
+
+    #[test]
+    fn get_vector_opt_returns_none_for_null() {
+        let schema = Schema::new(vec![ColumnDef::new("embedding", DataType::Vector)]);
+
+        let mut builder = RecordBuilder::new(&schema);
+        builder.set_null(0);
+
+        let data = builder.build().unwrap();
+
+        let view = RecordView::new(&data, &schema).unwrap();
+        assert_eq!(view.get_vector_opt(0).unwrap(), None);
+    }
+
+    #[test]
+    fn record_builder_empty_vector() {
+        let schema = Schema::new(vec![ColumnDef::new("embedding", DataType::Vector)]);
+
+        let vector: Vec<f32> = vec![];
+
+        let mut builder = RecordBuilder::new(&schema);
+        builder.set_vector(0, &vector).unwrap();
+
+        let data = builder.build().unwrap();
+
+        let view = RecordView::new(&data, &schema).unwrap();
+        let result = view.get_vector_copy(0).unwrap();
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn record_builder_large_vector() {
+        let schema = Schema::new(vec![ColumnDef::new("embedding", DataType::Vector)]);
+
+        let vector: Vec<f32> = (0..1024).map(|i| i as f32 / 100.0).collect();
+
+        let mut builder = RecordBuilder::new(&schema);
+        builder.set_vector(0, &vector).unwrap();
+
+        let data = builder.build().unwrap();
+
+        let view = RecordView::new(&data, &schema).unwrap();
+        let result = view.get_vector_copy(0).unwrap();
+        assert_eq!(result.len(), 1024);
+        for (i, (&a, &b)) in result.iter().zip(vector.iter()).enumerate() {
+            assert!(
+                (a - b).abs() < 0.0001,
+                "mismatch at index {}: {} vs {}",
+                i,
+                a,
+                b
+            );
+        }
     }
 }

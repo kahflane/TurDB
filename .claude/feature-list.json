@@ -615,104 +615,218 @@
       ]
     },
     {
-      "title": "Record - Zero-Copy Serialization",
-      "description": "SQLite-compatible record format with zero-copy access",
+      "title": "Record - O(1) Column Access Format",
+      "description": "TurDB record format with O(1) column lookup, null bitmap, offset table for variable columns, and schema-dependent type storage",
       "isCompleted": false,
       "priority": 11,
       "phase": 3,
       "tasks": [
         {
-          "task": "Define Record<'a> borrowing from page buffer",
+          "task": "Define RecordView<'a> struct borrowing from page buffer with schema reference",
           "done": false
         },
         {
-          "task": "Implement parse() computing column offsets once",
+          "task": "Implement record header parsing (header_len u16, null bitmap, offset table)",
           "done": false
         },
         {
-          "task": "Implement is_null() checking serial type",
+          "task": "Implement is_null(col_idx) using null bitmap bit manipulation",
           "done": false
         },
         {
-          "task": "Implement get_int() reading integer by serial type",
+          "task": "Implement get_fixed_offset() calculating position from schema fixed-width sizes",
           "done": false
         },
         {
-          "task": "Implement get_float() reading 64-bit float",
+          "task": "Implement get_var_bounds() reading offset table for variable columns",
           "done": false
         },
         {
-          "task": "Implement get_text() returning &str (zero-copy)",
+          "task": "Implement get_int2/int4/int8() for fixed-width integers",
           "done": false
         },
         {
-          "task": "Implement get_blob() returning &[u8] (zero-copy)",
+          "task": "Implement get_float4/float8() for fixed-width floats",
+          "done": false
+        },
+        {
+          "task": "Implement get_text() returning &str (zero-copy from mmap)",
+          "done": false
+        },
+        {
+          "task": "Implement get_blob() returning &[u8] (zero-copy from mmap)",
+          "done": false
+        },
+        {
+          "task": "Implement get_timestamp/date/time() for date-time types",
+          "done": false
+        },
+        {
+          "task": "Implement get_uuid() returning &[u8; 16]",
+          "done": false
+        },
+        {
+          "task": "Add schema evolution support (missing columns return NULL or default)",
           "done": false
         }
       ]
     },
     {
       "title": "Record - Builder with Buffer Reuse",
-      "description": "Record builder that reuses buffers across inserts",
+      "description": "Record builder with null bitmap, offset table for variable columns, and schema-aware serialization",
       "isCompleted": false,
       "priority": 12,
       "phase": 3,
       "tasks": [
         {
-          "task": "Define RecordBuilder with pre-allocated header and data buffers",
+          "task": "Define RecordBuilder with schema, null_bitmap, offsets vec, and data buffer",
           "done": false
         },
         {
-          "task": "Implement push_null() adding serial type 0",
+          "task": "Implement new(schema) pre-allocating buffers based on column count",
           "done": false
         },
         {
-          "task": "Implement push_int() with optimal serial type selection",
+          "task": "Implement push_null(col_idx) setting bit in null bitmap",
           "done": false
         },
         {
-          "task": "Implement push_float() with serial type 7",
+          "task": "Implement push_int2/int4/int8() appending to data buffer",
           "done": false
         },
         {
-          "task": "Implement push_text() with serial type encoding",
+          "task": "Implement push_float4/float8() appending to data buffer",
           "done": false
         },
         {
-          "task": "Implement push_blob() with serial type encoding",
+          "task": "Implement push_text() recording offset and appending bytes",
           "done": false
         },
         {
-          "task": "Implement finish() returning &[u8] of complete record",
+          "task": "Implement push_blob() recording offset and appending bytes",
           "done": false
         },
         {
-          "task": "Implement reset() clearing without deallocation",
+          "task": "Implement push_timestamp/date/time() for date-time types",
+          "done": false
+        },
+        {
+          "task": "Implement finish() assembling header_len + null_bitmap + offsets + data",
+          "done": false
+        },
+        {
+          "task": "Implement reset() clearing buffers without deallocation",
           "done": false
         }
       ]
     },
     {
-      "title": "Encoding - Varint",
-      "description": "SQLite-compatible varint encoding",
+      "title": "Record - Array and JSONB Formats",
+      "description": "O(1) array element access and O(log n) JSONB key lookup with zero-copy views",
       "isCompleted": false,
       "priority": 13,
       "phase": 3,
       "tasks": [
         {
-          "task": "Implement encode_varint() writing 1-9 bytes",
+          "task": "Define ArrayView<'a> with total_size, ndims, elem_type, count, offsets",
           "done": false
         },
         {
-          "task": "Implement decode_varint() returning (value, bytes_read)",
+          "task": "Implement ArrayView::len() and elem_type() from header",
           "done": false
         },
         {
-          "task": "Implement varint_len() returning encoded length",
+          "task": "Implement ArrayView::get_element(idx) with O(1) access (skip offsets for fixed-width)",
           "done": false
         },
         {
-          "task": "Optimize decode with lookup table",
+          "task": "Implement ArrayBuilder for serializing arrays",
+          "done": false
+        },
+        {
+          "task": "Define JsonbView<'a> with header and sorted entries table",
+          "done": false
+        },
+        {
+          "task": "Implement JsonbView::get_key() with binary search O(log n)",
+          "done": false
+        },
+        {
+          "task": "Implement JsonbView::get_array_element() for JSON arrays",
+          "done": false
+        },
+        {
+          "task": "Implement JsonbBuilder for serializing JSONB with sorted keys",
+          "done": false
+        }
+      ]
+    },
+    {
+      "title": "Record - Composite and Nested Types",
+      "description": "Recursive record format for composite types with zero-copy nested access",
+      "isCompleted": false,
+      "priority": 14,
+      "phase": 3,
+      "tasks": [
+        {
+          "task": "Define CompositeView<'a> mirroring RecordView format",
+          "done": false
+        },
+        {
+          "task": "Implement RecordView::get_composite() returning nested view",
+          "done": false
+        },
+        {
+          "task": "Implement RecordView::get_array() returning ArrayView",
+          "done": false
+        },
+        {
+          "task": "Implement RecordView::get_jsonb() returning JsonbView",
+          "done": false
+        },
+        {
+          "task": "Implement RecordBuilder::push_composite() for nested records",
+          "done": false
+        },
+        {
+          "task": "Implement RecordBuilder::push_array() for array values",
+          "done": false
+        },
+        {
+          "task": "Implement RecordBuilder::push_jsonb() for JSONB values",
+          "done": false
+        },
+        {
+          "task": "Add depth-limited pointer safety checks (max nesting level)",
+          "done": false
+        }
+      ]
+    },
+    {
+      "title": "Encoding - Varint for Lengths",
+      "description": "Variable-length integer encoding for record lengths and cell sizes (NOT for type codes)",
+      "isCompleted": false,
+      "priority": 15,
+      "phase": 3,
+      "tasks": [
+        {
+          "task": "Implement encode_varint(value, buf) writing 1-9 bytes",
+          "done": false
+        },
+        {
+          "task": "Implement decode_varint(buf) returning (value, bytes_read)",
+          "done": false
+        },
+        {
+          "task": "Implement varint_len(value) returning encoded length without encoding",
+          "done": false
+        },
+        {
+          "task": "Move existing varint_size() from tree.rs to encoding/varint.rs",
+          "done": false
+        },
+        {
+          "task": "Add roundtrip tests for boundary values (240, 2287, 67823, u32::MAX, u64::MAX)",
           "done": false
         }
       ]
@@ -721,7 +835,7 @@
       "title": "Schema - Multi-Schema Catalog",
       "description": "Catalog supporting multiple schemas (root, turdb_catalog, user schemas)",
       "isCompleted": false,
-      "priority": 14,
+      "priority": 16,
       "phase": 4,
       "tasks": [
         {
@@ -754,7 +868,7 @@
       "title": "Schema - Table Definition",
       "description": "Table and column definitions with constraints",
       "isCompleted": false,
-      "priority": 15,
+      "priority": 17,
       "phase": 4,
       "tasks": [
         {
@@ -847,98 +961,262 @@
     },
     {
       "title": "SQL - Lexer",
-      "description": "Zero-copy SQL tokenizer",
+      "description": "Zero-copy SQL tokenizer supporting full SQL syntax including DDL, DML, subqueries, CTEs, batch operations, explain/analyze, stored procedures, functions, and all standard SQL operators",
       "isCompleted": false,
       "priority": 18,
       "phase": 5,
       "tasks": [
         {
-          "task": "Define Token<'a> enum with borrowed strings",
+          "task": "Define Token<'a> enum with borrowed strings for identifiers and literals",
           "done": false
         },
         {
-          "task": "Define Keyword enum for SQL keywords",
+          "task": "Define Keyword enum covering DDL (CREATE, ALTER, DROP, TRUNCATE), DML (SELECT, INSERT, UPDATE, DELETE, MERGE, UPSERT), query clauses (FROM, WHERE, GROUP BY, HAVING, ORDER BY, LIMIT, OFFSET, FETCH), joins (JOIN, INNER, LEFT, RIGHT, FULL, OUTER, CROSS, NATURAL, ON, USING), set operations (UNION, INTERSECT, EXCEPT, ALL, DISTINCT), subquery (IN, EXISTS, ANY, SOME, ALL), CTE (WITH, RECURSIVE), transactions (BEGIN, COMMIT, ROLLBACK, SAVEPOINT, RELEASE), constraints (PRIMARY KEY, FOREIGN KEY, REFERENCES, UNIQUE, CHECK, NOT NULL, DEFAULT, CASCADE, RESTRICT, SET NULL, SET DEFAULT), indexes (INDEX, USING, BTREE, HASH, GIN, GIST, HNSW), types (INTEGER, BIGINT, SMALLINT, REAL, DOUBLE, DECIMAL, NUMERIC, VARCHAR, CHAR, TEXT, BLOB, BOOLEAN, DATE, TIME, TIMESTAMP, INTERVAL, UUID, JSON, JSONB, VECTOR, ARRAY), procedural (FUNCTION, PROCEDURE, RETURNS, LANGUAGE, AS, DECLARE, BEGIN, END, IF, THEN, ELSE, ELSIF, WHILE, LOOP, FOR, RETURN, CALL, EXECUTE), explain (EXPLAIN, ANALYZE, VERBOSE, COSTS, BUFFERS, TIMING, FORMAT), schema (SCHEMA, DATABASE, TABLE, VIEW, MATERIALIZED, TRIGGER, SEQUENCE, TYPE, ENUM, DOMAIN), misc (CASE, WHEN, THEN, ELSE, END, CAST, COLLATE, LIKE, ILIKE, SIMILAR, BETWEEN, IS, NULL, TRUE, FALSE, AND, OR, NOT, AS, ASC, DESC, NULLS, FIRST, LAST, OVER, PARTITION, WINDOW, ROWS, RANGE, UNBOUNDED, PRECEDING, FOLLOWING, CURRENT, ROW)",
           "done": false
         },
         {
-          "task": "Define Lexer<'a> with input slice and position",
+          "task": "Define Lexer<'a> with input slice, position, line, column for error reporting",
           "done": false
         },
         {
-          "task": "Implement next_token() returning Token<'a>",
+          "task": "Implement next_token() returning Token<'a> with zero-copy string slices",
           "done": false
         },
         {
-          "task": "Implement keyword matching via perfect hash or match",
+          "task": "Implement keyword matching via phf perfect hash map for O(1) lookup",
           "done": false
         },
         {
-          "task": "Handle string literals with escape sequences",
+          "task": "Handle single-quoted string literals with '' escape for embedded quotes",
           "done": false
         },
         {
-          "task": "Handle numeric literals (int, float, hex)",
+          "task": "Handle double-quoted identifiers for case-sensitive/reserved word columns",
           "done": false
         },
         {
-          "task": "Handle identifiers (including quoted)",
+          "task": "Handle dollar-quoted strings ($$body$$, $tag$body$tag$) for procedure bodies",
+          "done": false
+        },
+        {
+          "task": "Handle numeric literals: integers, floats (1.5, .5, 1.), scientific notation (1e10, 1.5e-3), hex (0x1F), binary (0b1010), octal (0o17)",
+          "done": false
+        },
+        {
+          "task": "Handle identifiers: unquoted (starts with letter/_), quoted (\"), backtick-quoted (`), bracket-quoted ([]), Unicode escapes",
+          "done": false
+        },
+        {
+          "task": "Handle operators: comparison (=, <>, !=, <, >, <=, >=, <=>), arithmetic (+, -, *, /, %, ^, |/, ||/), bitwise (&, |, #, ~, <<, >>), string (||), JSON (->, ->>, #>, #>>), array (@>, <@, &&, ?), assignment (:=, =>)",
+          "done": false
+        },
+        {
+          "task": "Handle punctuation: parentheses, brackets, braces, comma, semicolon, colon, dot, double-colon (::), asterisk, question mark",
+          "done": false
+        },
+        {
+          "task": "Handle comments: single-line (-- comment), multi-line (/* comment */), nested multi-line",
+          "done": false
+        },
+        {
+          "task": "Handle parameter placeholders: positional ($1, $2), named (:name, @name), question mark (?)",
+          "done": false
+        },
+        {
+          "task": "Handle type casts: PostgreSQL-style (value::type), SQL standard (CAST(value AS type))",
+          "done": false
+        },
+        {
+          "task": "Handle array literals: ARRAY[1,2,3], '{1,2,3}'::int[]",
+          "done": false
+        },
+        {
+          "task": "Handle special tokens: EOF, Error with position info, Whitespace (when preserve_whitespace enabled)",
+          "done": false
+        },
+        {
+          "task": "Implement peek() and peek_nth() for parser lookahead without consuming",
+          "done": false
+        },
+        {
+          "task": "Implement span() returning byte range for error messages",
+          "done": false
+        },
+        {
+          "task": "Implement tokenize_all() returning Vec<Token> for debugging/testing",
+          "done": false
+        },
+        {
+          "task": "Add comprehensive tests for all token types and edge cases",
           "done": false
         }
       ]
     },
     {
       "title": "SQL - Parser",
-      "description": "SQL parser with arena-allocated AST",
+      "description": "SQL parser with arena-allocated AST supporting full SQL including nested queries, CTEs, batch operations, DDL, stored procedures, functions, explain/analyze",
       "isCompleted": false,
       "priority": 19,
       "phase": 5,
       "tasks": [
         {
-          "task": "Define Statement<'a> enum for all SQL statements",
+          "task": "Define Statement<'a> enum for all SQL statements (Select, Insert, Update, Delete, CreateTable, CreateIndex, CreateSchema, CreateFunction, CreateProcedure, CreateView, CreateTrigger, CreateType, AlterTable, AlterIndex, Drop, Truncate, Explain, Analyze, Begin, Commit, Rollback, Savepoint, Call, Execute, Set, Show)",
           "done": false
         },
         {
-          "task": "Define Expr<'a> enum for expressions",
+          "task": "Define Expr<'a> enum for expressions (Literal, Column, BinaryOp, UnaryOp, Function, Subquery, Case, Cast, Array, Between, In, Like, IsNull, Exists, ScalarSubquery, Row, Tuple)",
           "done": false
         },
         {
-          "task": "Define Parser<'a> with lexer and arena reference",
+          "task": "Define SelectStmt<'a> with WITH clause, SELECT list, FROM, WHERE, GROUP BY, HAVING, WINDOW, ORDER BY, LIMIT, OFFSET, FETCH, FOR UPDATE/SHARE, set operations",
           "done": false
         },
         {
-          "task": "Implement parse_statement() dispatching by keyword",
+          "task": "Define Parser<'a> with lexer, arena reference, and error accumulator for multi-error reporting",
           "done": false
         },
         {
-          "task": "Implement parse_select() for SELECT statements",
+          "task": "Implement parse_statement() dispatching by leading keyword",
           "done": false
         },
         {
-          "task": "Implement parse_insert() for INSERT statements",
+          "task": "Implement parse_select() supporting DISTINCT, column aliases, table aliases",
           "done": false
         },
         {
-          "task": "Implement parse_update() for UPDATE statements",
+          "task": "Implement parse_from_clause() with table references, joins, derived tables, lateral joins",
           "done": false
         },
         {
-          "task": "Implement parse_delete() for DELETE statements",
+          "task": "Implement parse_join() for INNER/LEFT/RIGHT/FULL/CROSS/NATURAL JOIN with ON/USING",
           "done": false
         },
         {
-          "task": "Implement parse_create_table() for CREATE TABLE",
+          "task": "Implement parse_subquery() for scalar, table, and correlated subqueries in FROM, WHERE, SELECT",
           "done": false
         },
         {
-          "task": "Implement parse_create_index() for CREATE INDEX",
+          "task": "Implement parse_cte() for WITH clause including RECURSIVE CTEs",
           "done": false
         },
         {
-          "task": "Implement parse_create_schema() for CREATE SCHEMA",
+          "task": "Implement parse_set_operation() for UNION/INTERSECT/EXCEPT [ALL|DISTINCT]",
           "done": false
         },
         {
-          "task": "Implement parse_expr() with operator precedence",
+          "task": "Implement parse_insert() supporting VALUES, SELECT, DEFAULT VALUES, RETURNING, ON CONFLICT",
+          "done": false
+        },
+        {
+          "task": "Implement parse_batch_insert() for INSERT with multiple value rows",
+          "done": false
+        },
+        {
+          "task": "Implement parse_update() with SET clause, FROM clause, WHERE, RETURNING",
+          "done": false
+        },
+        {
+          "task": "Implement parse_batch_update() for UPDATE with CASE expressions or joined tables",
+          "done": false
+        },
+        {
+          "task": "Implement parse_delete() with USING clause, WHERE, RETURNING",
+          "done": false
+        },
+        {
+          "task": "Implement parse_merge() for MERGE/UPSERT statements",
+          "done": false
+        },
+        {
+          "task": "Implement parse_create_table() with columns, constraints, LIKE, AS SELECT, IF NOT EXISTS",
+          "done": false
+        },
+        {
+          "task": "Implement parse_column_def() with type, constraints (NOT NULL, DEFAULT, PRIMARY KEY, UNIQUE, CHECK, REFERENCES)",
+          "done": false
+        },
+        {
+          "task": "Implement parse_table_constraint() for PRIMARY KEY, UNIQUE, FOREIGN KEY, CHECK constraints",
+          "done": false
+        },
+        {
+          "task": "Implement parse_alter_table() for ADD/DROP/ALTER COLUMN, ADD/DROP CONSTRAINT, RENAME",
+          "done": false
+        },
+        {
+          "task": "Implement parse_create_index() with UNIQUE, column list, INCLUDE, WHERE, USING method",
+          "done": false
+        },
+        {
+          "task": "Implement parse_drop() for DROP TABLE/INDEX/SCHEMA/FUNCTION/PROCEDURE/VIEW/TRIGGER with IF EXISTS, CASCADE/RESTRICT",
+          "done": false
+        },
+        {
+          "task": "Implement parse_truncate() for TRUNCATE TABLE with RESTART IDENTITY, CASCADE",
+          "done": false
+        },
+        {
+          "task": "Implement parse_create_schema() for CREATE SCHEMA with authorization",
+          "done": false
+        },
+        {
+          "task": "Implement parse_create_view() for CREATE [OR REPLACE] [MATERIALIZED] VIEW",
+          "done": false
+        },
+        {
+          "task": "Implement parse_create_function() for CREATE FUNCTION with parameters, return type, language, body",
+          "done": false
+        },
+        {
+          "task": "Implement parse_create_procedure() for CREATE PROCEDURE with parameters, language, body",
+          "done": false
+        },
+        {
+          "task": "Implement parse_create_trigger() for CREATE TRIGGER with timing, events, FOR EACH ROW/STATEMENT",
+          "done": false
+        },
+        {
+          "task": "Implement parse_create_type() for CREATE TYPE (enum, composite, domain)",
+          "done": false
+        },
+        {
+          "task": "Implement parse_call() for CALL procedure_name(args)",
+          "done": false
+        },
+        {
+          "task": "Implement parse_explain() for EXPLAIN [ANALYZE] [VERBOSE] [options] statement",
+          "done": false
+        },
+        {
+          "task": "Implement parse_transaction() for BEGIN/COMMIT/ROLLBACK/SAVEPOINT/RELEASE",
+          "done": false
+        },
+        {
+          "task": "Implement parse_expr() with Pratt parsing for operator precedence",
+          "done": false
+        },
+        {
+          "task": "Implement parse_case() for CASE WHEN expressions",
+          "done": false
+        },
+        {
+          "task": "Implement parse_function_call() with DISTINCT, ORDER BY, FILTER, OVER for window functions",
+          "done": false
+        },
+        {
+          "task": "Implement parse_window_spec() for PARTITION BY, ORDER BY, frame clause",
+          "done": false
+        },
+        {
+          "task": "Implement parse_aggregate() for COUNT, SUM, AVG, MIN, MAX, ARRAY_AGG, STRING_AGG, etc.",
+          "done": false
+        },
+        {
+          "task": "Implement error recovery to continue parsing after syntax errors",
+          "done": false
+        },
+        {
+          "task": "Add comprehensive tests for all statement types and edge cases",
           "done": false
         }
       ]
