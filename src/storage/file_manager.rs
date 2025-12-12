@@ -101,6 +101,7 @@
 //! Files are synced before closing to ensure durability. The Drop
 //! implementation ensures all files are properly closed and synced.
 
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -139,6 +140,108 @@ pub enum FileKey {
         table: String,
         index_name: String,
     },
+}
+
+#[derive(Debug, Default)]
+pub struct TableFiles {
+    data: Option<PathBuf>,
+    indexes: HashMap<String, PathBuf>,
+    hnsw_indexes: HashMap<String, PathBuf>,
+}
+
+impl TableFiles {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn data(&self) -> Option<&Path> {
+        self.data.as_deref()
+    }
+
+    pub fn set_data(&mut self, path: PathBuf) {
+        self.data = Some(path);
+    }
+
+    pub fn indexes(&self) -> &HashMap<String, PathBuf> {
+        &self.indexes
+    }
+
+    pub fn add_index(&mut self, name: String, path: PathBuf) {
+        self.indexes.insert(name, path);
+    }
+
+    pub fn hnsw_indexes(&self) -> &HashMap<String, PathBuf> {
+        &self.hnsw_indexes
+    }
+
+    pub fn add_hnsw_index(&mut self, name: String, path: PathBuf) {
+        self.hnsw_indexes.insert(name, path);
+    }
+}
+
+pub struct LruFileCache<K, V> {
+    capacity: usize,
+    order: Vec<K>,
+    map: HashMap<K, V>,
+}
+
+impl<K: Clone + Eq + std::hash::Hash, V> LruFileCache<K, V> {
+    pub fn new(capacity: usize) -> Self {
+        Self {
+            capacity,
+            order: Vec::with_capacity(capacity),
+            map: HashMap::with_capacity(capacity),
+        }
+    }
+
+    pub fn get(&mut self, key: &K) -> Option<&V> {
+        if self.map.contains_key(key) {
+            self.touch(key);
+            self.map.get(key)
+        } else {
+            None
+        }
+    }
+
+    pub fn insert(&mut self, key: K, value: V) {
+        if self.map.contains_key(&key) {
+            self.touch(&key);
+            self.map.insert(key, value);
+            return;
+        }
+
+        if self.order.len() >= self.capacity {
+            self.pop_lru();
+        }
+
+        self.order.push(key.clone());
+        self.map.insert(key, value);
+    }
+
+    pub fn pop_lru(&mut self) -> Option<(K, V)> {
+        if self.order.is_empty() {
+            return None;
+        }
+
+        let key = self.order.remove(0);
+        let value = self.map.remove(&key)?;
+        Some((key, value))
+    }
+
+    pub fn len(&self) -> usize {
+        self.map.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.map.is_empty()
+    }
+
+    fn touch(&mut self, key: &K) {
+        if let Some(pos) = self.order.iter().position(|k| k == key) {
+            let k = self.order.remove(pos);
+            self.order.push(k);
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -242,5 +345,49 @@ mod tests {
         let fm = FileManager::create(&db_path, 2).unwrap();
 
         assert_eq!(fm.max_open_files(), MIN_MAX_OPEN_FILES);
+    }
+
+    #[test]
+    fn table_files_stores_data_and_indexes() {
+        let table_files = TableFiles::new();
+
+        assert!(table_files.data().is_none());
+        assert!(table_files.indexes().is_empty());
+        assert!(table_files.hnsw_indexes().is_empty());
+    }
+
+    #[test]
+    fn lru_cache_evicts_least_recently_used() {
+        let mut cache: LruFileCache<u32, String> = LruFileCache::new(3);
+
+        cache.insert(1, "one".to_string());
+        cache.insert(2, "two".to_string());
+        cache.insert(3, "three".to_string());
+
+        assert_eq!(cache.len(), 3);
+
+        cache.get(&1);
+
+        cache.insert(4, "four".to_string());
+
+        assert!(cache.get(&1).is_some());
+        assert!(cache.get(&2).is_none());
+        assert!(cache.get(&3).is_some());
+        assert!(cache.get(&4).is_some());
+    }
+
+    #[test]
+    fn lru_cache_pop_lru_returns_oldest() {
+        let mut cache: LruFileCache<u32, String> = LruFileCache::new(3);
+
+        cache.insert(1, "one".to_string());
+        cache.insert(2, "two".to_string());
+        cache.insert(3, "three".to_string());
+
+        let (key, value) = cache.pop_lru().unwrap();
+
+        assert_eq!(key, 1);
+        assert_eq!(value, "one");
+        assert_eq!(cache.len(), 2);
     }
 }
