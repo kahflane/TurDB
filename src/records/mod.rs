@@ -56,5 +56,5 @@ mod tests;
 pub use builder::RecordBuilder;
 pub use jsonb::{JsonbBuilder, JsonbBuilderValue, JsonbValue, JsonbView};
 pub use schema::Schema;
-pub use types::{ColumnDef, DataType};
+pub use types::{range_flags, ColumnDef, DataType, DecimalView, Range};
 pub use view::RecordView;

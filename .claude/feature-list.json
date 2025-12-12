@@ -1910,6 +1910,163 @@
           "done": false
         }
       ]
+    },
+    {
+      "title": "Record - Additional Types (Decimal, Interval, Range, Enum, Geometric)",
+      "description": "Add PostgreSQL-compatible Decimal, Interval, Range, Enum, and Geometric types to record serialization with zero-copy access",
+      "isCompleted": false,
+      "priority": 42,
+      "phase": 3,
+      "tasks": [
+        {
+          "task": "Add Decimal DataType variant (variable-length, PostgreSQL-style fixed-point)",
+          "done": false
+        },
+        {
+          "task": "Implement Decimal struct with weight, scale, sign, digits",
+          "done": false
+        },
+        {
+          "task": "Implement DecimalView for zero-copy decimal access",
+          "done": false
+        },
+        {
+          "task": "Implement get_decimal() in RecordView returning DecimalView",
+          "done": false
+        },
+        {
+          "task": "Implement set_decimal() in RecordBuilder",
+          "done": false
+        },
+        {
+          "task": "Add Interval DataType variant (fixed 16 bytes)",
+          "done": false
+        },
+        {
+          "task": "Implement get_interval() returning (i64 micros, i32 days, i32 months)",
+          "done": false
+        },
+        {
+          "task": "Implement set_interval() in RecordBuilder",
+          "done": false
+        },
+        {
+          "task": "Add Int4Range DataType variant (fixed 9 bytes)",
+          "done": false
+        },
+        {
+          "task": "Add Int8Range DataType variant (fixed 17 bytes)",
+          "done": false
+        },
+        {
+          "task": "Add DateRange DataType variant (fixed 9 bytes)",
+          "done": false
+        },
+        {
+          "task": "Add TimestampRange DataType variant (fixed 17 bytes)",
+          "done": false
+        },
+        {
+          "task": "Add TimestampTzRange DataType variant (fixed 25 bytes)",
+          "done": false
+        },
+        {
+          "task": "Implement RangeBounds flags (empty, lower_inc, upper_inc, lower_inf, upper_inf)",
+          "done": false
+        },
+        {
+          "task": "Implement get_int4_range() returning Range<i32>",
+          "done": false
+        },
+        {
+          "task": "Implement get_int8_range() returning Range<i64>",
+          "done": false
+        },
+        {
+          "task": "Implement get_date_range() returning Range<i32>",
+          "done": false
+        },
+        {
+          "task": "Implement get_timestamp_range() returning Range<i64>",
+          "done": false
+        },
+        {
+          "task": "Implement get_timestamptz_range() returning Range<(i64, i32)>",
+          "done": false
+        },
+        {
+          "task": "Implement set_int4_range() in RecordBuilder",
+          "done": false
+        },
+        {
+          "task": "Implement set_int8_range() in RecordBuilder",
+          "done": false
+        },
+        {
+          "task": "Implement set_date_range() in RecordBuilder",
+          "done": false
+        },
+        {
+          "task": "Implement set_timestamp_range() in RecordBuilder",
+          "done": false
+        },
+        {
+          "task": "Implement set_timestamptz_range() in RecordBuilder",
+          "done": false
+        },
+        {
+          "task": "Add Enum DataType variant (fixed 4 bytes: u16 type_id + u16 ordinal)",
+          "done": false
+        },
+        {
+          "task": "Implement get_enum() returning (u16 type_id, u16 ordinal)",
+          "done": false
+        },
+        {
+          "task": "Implement set_enum() in RecordBuilder",
+          "done": false
+        },
+        {
+          "task": "Add Point DataType variant (fixed 16 bytes: f64 x, f64 y)",
+          "done": false
+        },
+        {
+          "task": "Add Box DataType variant (fixed 32 bytes: Point low, Point high)",
+          "done": false
+        },
+        {
+          "task": "Add Circle DataType variant (fixed 24 bytes: Point center, f64 radius)",
+          "done": false
+        },
+        {
+          "task": "Implement get_point() returning (f64, f64)",
+          "done": false
+        },
+        {
+          "task": "Implement get_box() returning ((f64, f64), (f64, f64))",
+          "done": false
+        },
+        {
+          "task": "Implement get_circle() returning ((f64, f64), f64)",
+          "done": false
+        },
+        {
+          "task": "Implement set_point() in RecordBuilder",
+          "done": false
+        },
+        {
+          "task": "Implement set_box() in RecordBuilder",
+          "done": false
+        },
+        {
+          "task": "Implement set_circle() in RecordBuilder",
+          "done": false
+        },
+        {
+          "task": "Add roundtrip tests for all new types",
+          "done": false
+        }
+      ]
     }
   ]
 }

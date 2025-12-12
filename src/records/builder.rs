@@ -20,6 +20,7 @@ use eyre::Result;
 
 use crate::records::jsonb::JsonbBuilder;
 use crate::records::schema::Schema;
+use crate::records::types::range_flags;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ColumnValue {
@@ -220,6 +221,196 @@ impl<'a> RecordBuilder<'a> {
             .var_column_index(col_idx)
             .ok_or_else(|| eyre::eyre!("column {} is not a variable column", col_idx))?;
         self.var_data[var_idx] = data.to_vec();
+        self.column_values[col_idx] = ColumnValue::Variable { idx: var_idx };
+        Ok(())
+    }
+
+    pub fn set_interval(
+        &mut self,
+        col_idx: usize,
+        micros: i64,
+        days: i32,
+        months: i32,
+    ) -> Result<()> {
+        self.clear_null(col_idx);
+        let offset = self.schema.fixed_offset(col_idx);
+        self.fixed_data[offset..offset + 8].copy_from_slice(&micros.to_le_bytes());
+        self.fixed_data[offset + 8..offset + 12].copy_from_slice(&days.to_le_bytes());
+        self.fixed_data[offset + 12..offset + 16].copy_from_slice(&months.to_le_bytes());
+        self.column_values[col_idx] = ColumnValue::Fixed { offset, len: 16 };
+        Ok(())
+    }
+
+    pub fn set_enum(&mut self, col_idx: usize, type_id: u16, ordinal: u16) -> Result<()> {
+        self.clear_null(col_idx);
+        let offset = self.schema.fixed_offset(col_idx);
+        self.fixed_data[offset..offset + 2].copy_from_slice(&type_id.to_le_bytes());
+        self.fixed_data[offset + 2..offset + 4].copy_from_slice(&ordinal.to_le_bytes());
+        self.column_values[col_idx] = ColumnValue::Fixed { offset, len: 4 };
+        Ok(())
+    }
+
+    pub fn set_point(&mut self, col_idx: usize, x: f64, y: f64) -> Result<()> {
+        self.clear_null(col_idx);
+        let offset = self.schema.fixed_offset(col_idx);
+        self.fixed_data[offset..offset + 8].copy_from_slice(&x.to_le_bytes());
+        self.fixed_data[offset + 8..offset + 16].copy_from_slice(&y.to_le_bytes());
+        self.column_values[col_idx] = ColumnValue::Fixed { offset, len: 16 };
+        Ok(())
+    }
+
+    pub fn set_box(&mut self, col_idx: usize, low: (f64, f64), high: (f64, f64)) -> Result<()> {
+        self.clear_null(col_idx);
+        let offset = self.schema.fixed_offset(col_idx);
+        self.fixed_data[offset..offset + 8].copy_from_slice(&low.0.to_le_bytes());
+        self.fixed_data[offset + 8..offset + 16].copy_from_slice(&low.1.to_le_bytes());
+        self.fixed_data[offset + 16..offset + 24].copy_from_slice(&high.0.to_le_bytes());
+        self.fixed_data[offset + 24..offset + 32].copy_from_slice(&high.1.to_le_bytes());
+        self.column_values[col_idx] = ColumnValue::Fixed { offset, len: 32 };
+        Ok(())
+    }
+
+    pub fn set_circle(&mut self, col_idx: usize, center: (f64, f64), radius: f64) -> Result<()> {
+        self.clear_null(col_idx);
+        let offset = self.schema.fixed_offset(col_idx);
+        self.fixed_data[offset..offset + 8].copy_from_slice(&center.0.to_le_bytes());
+        self.fixed_data[offset + 8..offset + 16].copy_from_slice(&center.1.to_le_bytes());
+        self.fixed_data[offset + 16..offset + 24].copy_from_slice(&radius.to_le_bytes());
+        self.column_values[col_idx] = ColumnValue::Fixed { offset, len: 24 };
+        Ok(())
+    }
+
+    pub fn set_int4_range(
+        &mut self,
+        col_idx: usize,
+        lower: Option<i32>,
+        upper: Option<i32>,
+        lower_inclusive: bool,
+        upper_inclusive: bool,
+    ) -> Result<()> {
+        self.clear_null(col_idx);
+        let offset = self.schema.fixed_offset(col_idx);
+
+        let mut flags: u8 = 0;
+        if lower_inclusive {
+            flags |= range_flags::LOWER_INCLUSIVE;
+        }
+        if upper_inclusive {
+            flags |= range_flags::UPPER_INCLUSIVE;
+        }
+        if lower.is_none() {
+            flags |= range_flags::LOWER_INFINITE;
+        }
+        if upper.is_none() {
+            flags |= range_flags::UPPER_INFINITE;
+        }
+
+        self.fixed_data[offset] = flags;
+        self.fixed_data[offset + 1..offset + 5].copy_from_slice(&lower.unwrap_or(0).to_le_bytes());
+        self.fixed_data[offset + 5..offset + 9].copy_from_slice(&upper.unwrap_or(0).to_le_bytes());
+        self.column_values[col_idx] = ColumnValue::Fixed { offset, len: 9 };
+        Ok(())
+    }
+
+    pub fn set_int4_range_empty(&mut self, col_idx: usize) -> Result<()> {
+        self.clear_null(col_idx);
+        let offset = self.schema.fixed_offset(col_idx);
+        self.fixed_data[offset] = range_flags::EMPTY;
+        self.fixed_data[offset + 1..offset + 9].fill(0);
+        self.column_values[col_idx] = ColumnValue::Fixed { offset, len: 9 };
+        Ok(())
+    }
+
+    pub fn set_int8_range(
+        &mut self,
+        col_idx: usize,
+        lower: Option<i64>,
+        upper: Option<i64>,
+        lower_inclusive: bool,
+        upper_inclusive: bool,
+    ) -> Result<()> {
+        self.clear_null(col_idx);
+        let offset = self.schema.fixed_offset(col_idx);
+
+        let mut flags: u8 = 0;
+        if lower_inclusive {
+            flags |= range_flags::LOWER_INCLUSIVE;
+        }
+        if upper_inclusive {
+            flags |= range_flags::UPPER_INCLUSIVE;
+        }
+        if lower.is_none() {
+            flags |= range_flags::LOWER_INFINITE;
+        }
+        if upper.is_none() {
+            flags |= range_flags::UPPER_INFINITE;
+        }
+
+        self.fixed_data[offset] = flags;
+        self.fixed_data[offset + 1..offset + 9].copy_from_slice(&lower.unwrap_or(0).to_le_bytes());
+        self.fixed_data[offset + 9..offset + 17].copy_from_slice(&upper.unwrap_or(0).to_le_bytes());
+        self.column_values[col_idx] = ColumnValue::Fixed { offset, len: 17 };
+        Ok(())
+    }
+
+    pub fn set_int8_range_empty(&mut self, col_idx: usize) -> Result<()> {
+        self.clear_null(col_idx);
+        let offset = self.schema.fixed_offset(col_idx);
+        self.fixed_data[offset] = range_flags::EMPTY;
+        self.fixed_data[offset + 1..offset + 17].fill(0);
+        self.column_values[col_idx] = ColumnValue::Fixed { offset, len: 17 };
+        Ok(())
+    }
+
+    pub fn set_date_range(
+        &mut self,
+        col_idx: usize,
+        lower: Option<i32>,
+        upper: Option<i32>,
+        lower_inclusive: bool,
+        upper_inclusive: bool,
+    ) -> Result<()> {
+        self.set_int4_range(col_idx, lower, upper, lower_inclusive, upper_inclusive)
+    }
+
+    pub fn set_date_range_empty(&mut self, col_idx: usize) -> Result<()> {
+        self.set_int4_range_empty(col_idx)
+    }
+
+    pub fn set_timestamp_range(
+        &mut self,
+        col_idx: usize,
+        lower: Option<i64>,
+        upper: Option<i64>,
+        lower_inclusive: bool,
+        upper_inclusive: bool,
+    ) -> Result<()> {
+        self.set_int8_range(col_idx, lower, upper, lower_inclusive, upper_inclusive)
+    }
+
+    pub fn set_timestamp_range_empty(&mut self, col_idx: usize) -> Result<()> {
+        self.set_int8_range_empty(col_idx)
+    }
+
+    pub fn set_decimal(
+        &mut self,
+        col_idx: usize,
+        digits: i128,
+        scale: i16,
+        is_negative: bool,
+    ) -> Result<()> {
+        self.clear_null(col_idx);
+        let var_idx = self
+            .schema
+            .var_column_index(col_idx)
+            .ok_or_else(|| eyre::eyre!("column {} is not a variable column", col_idx))?;
+
+        let mut bytes = Vec::with_capacity(19);
+        bytes.push(if is_negative { 0x80 } else { 0x00 });
+        bytes.extend(scale.to_le_bytes());
+        bytes.extend(digits.to_le_bytes());
+
+        self.var_data[var_idx] = bytes;
         self.column_values[col_idx] = ColumnValue::Variable { idx: var_idx };
         Ok(())
     }

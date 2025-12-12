@@ -20,6 +20,7 @@ use eyre::Result;
 
 use crate::records::jsonb::JsonbView;
 use crate::records::schema::Schema;
+use crate::records::types::{range_flags, DecimalView, Range};
 
 #[derive(Debug)]
 pub struct RecordView<'a> {
@@ -468,5 +469,230 @@ impl<'a> RecordView<'a> {
             return Ok(None);
         }
         self.get_inet6(col_idx).map(Some)
+    }
+
+    pub fn get_interval(&self, col_idx: usize) -> Result<(i64, i32, i32)> {
+        let offset = self.get_fixed_col_offset(col_idx);
+        let micros_bytes: [u8; 8] = self.data[offset..offset + 8]
+            .try_into()
+            .map_err(|_| eyre::eyre!("insufficient data for interval micros at col {}", col_idx))?;
+        let days_bytes: [u8; 4] = self.data[offset + 8..offset + 12]
+            .try_into()
+            .map_err(|_| eyre::eyre!("insufficient data for interval days at col {}", col_idx))?;
+        let months_bytes: [u8; 4] = self.data[offset + 12..offset + 16]
+            .try_into()
+            .map_err(|_| eyre::eyre!("insufficient data for interval months at col {}", col_idx))?;
+        Ok((
+            i64::from_le_bytes(micros_bytes),
+            i32::from_le_bytes(days_bytes),
+            i32::from_le_bytes(months_bytes),
+        ))
+    }
+
+    pub fn get_interval_opt(&self, col_idx: usize) -> Result<Option<(i64, i32, i32)>> {
+        if self.is_null_or_missing(col_idx) {
+            return Ok(None);
+        }
+        self.get_interval(col_idx).map(Some)
+    }
+
+    pub fn get_enum(&self, col_idx: usize) -> Result<(u16, u16)> {
+        let offset = self.get_fixed_col_offset(col_idx);
+        let type_id_bytes: [u8; 2] = self.data[offset..offset + 2]
+            .try_into()
+            .map_err(|_| eyre::eyre!("insufficient data for enum type_id at col {}", col_idx))?;
+        let ordinal_bytes: [u8; 2] = self.data[offset + 2..offset + 4]
+            .try_into()
+            .map_err(|_| eyre::eyre!("insufficient data for enum ordinal at col {}", col_idx))?;
+        Ok((
+            u16::from_le_bytes(type_id_bytes),
+            u16::from_le_bytes(ordinal_bytes),
+        ))
+    }
+
+    pub fn get_enum_opt(&self, col_idx: usize) -> Result<Option<(u16, u16)>> {
+        if self.is_null_or_missing(col_idx) {
+            return Ok(None);
+        }
+        self.get_enum(col_idx).map(Some)
+    }
+
+    pub fn get_point(&self, col_idx: usize) -> Result<(f64, f64)> {
+        let offset = self.get_fixed_col_offset(col_idx);
+        let x_bytes: [u8; 8] = self.data[offset..offset + 8]
+            .try_into()
+            .map_err(|_| eyre::eyre!("insufficient data for point x at col {}", col_idx))?;
+        let y_bytes: [u8; 8] = self.data[offset + 8..offset + 16]
+            .try_into()
+            .map_err(|_| eyre::eyre!("insufficient data for point y at col {}", col_idx))?;
+        Ok((f64::from_le_bytes(x_bytes), f64::from_le_bytes(y_bytes)))
+    }
+
+    pub fn get_point_opt(&self, col_idx: usize) -> Result<Option<(f64, f64)>> {
+        if self.is_null_or_missing(col_idx) {
+            return Ok(None);
+        }
+        self.get_point(col_idx).map(Some)
+    }
+
+    pub fn get_box(&self, col_idx: usize) -> Result<((f64, f64), (f64, f64))> {
+        let offset = self.get_fixed_col_offset(col_idx);
+        let lx_bytes: [u8; 8] = self.data[offset..offset + 8]
+            .try_into()
+            .map_err(|_| eyre::eyre!("insufficient data for box lx at col {}", col_idx))?;
+        let ly_bytes: [u8; 8] = self.data[offset + 8..offset + 16]
+            .try_into()
+            .map_err(|_| eyre::eyre!("insufficient data for box ly at col {}", col_idx))?;
+        let hx_bytes: [u8; 8] = self.data[offset + 16..offset + 24]
+            .try_into()
+            .map_err(|_| eyre::eyre!("insufficient data for box hx at col {}", col_idx))?;
+        let hy_bytes: [u8; 8] = self.data[offset + 24..offset + 32]
+            .try_into()
+            .map_err(|_| eyre::eyre!("insufficient data for box hy at col {}", col_idx))?;
+        Ok((
+            (f64::from_le_bytes(lx_bytes), f64::from_le_bytes(ly_bytes)),
+            (f64::from_le_bytes(hx_bytes), f64::from_le_bytes(hy_bytes)),
+        ))
+    }
+
+    pub fn get_box_opt(&self, col_idx: usize) -> Result<Option<((f64, f64), (f64, f64))>> {
+        if self.is_null_or_missing(col_idx) {
+            return Ok(None);
+        }
+        self.get_box(col_idx).map(Some)
+    }
+
+    pub fn get_circle(&self, col_idx: usize) -> Result<((f64, f64), f64)> {
+        let offset = self.get_fixed_col_offset(col_idx);
+        let cx_bytes: [u8; 8] = self.data[offset..offset + 8]
+            .try_into()
+            .map_err(|_| eyre::eyre!("insufficient data for circle cx at col {}", col_idx))?;
+        let cy_bytes: [u8; 8] = self.data[offset + 8..offset + 16]
+            .try_into()
+            .map_err(|_| eyre::eyre!("insufficient data for circle cy at col {}", col_idx))?;
+        let r_bytes: [u8; 8] = self.data[offset + 16..offset + 24]
+            .try_into()
+            .map_err(|_| eyre::eyre!("insufficient data for circle radius at col {}", col_idx))?;
+        Ok((
+            (f64::from_le_bytes(cx_bytes), f64::from_le_bytes(cy_bytes)),
+            f64::from_le_bytes(r_bytes),
+        ))
+    }
+
+    pub fn get_circle_opt(&self, col_idx: usize) -> Result<Option<((f64, f64), f64)>> {
+        if self.is_null_or_missing(col_idx) {
+            return Ok(None);
+        }
+        self.get_circle(col_idx).map(Some)
+    }
+
+    pub fn get_int4_range(&self, col_idx: usize) -> Result<Range<i32>> {
+        let offset = self.get_fixed_col_offset(col_idx);
+        let flags = self.data[offset];
+
+        if flags & range_flags::EMPTY != 0 {
+            return Ok(Range::empty());
+        }
+
+        let lower = if flags & range_flags::LOWER_INFINITE != 0 {
+            None
+        } else {
+            let bytes: [u8; 4] = self.data[offset + 1..offset + 5].try_into().map_err(|_| {
+                eyre::eyre!("insufficient data for int4_range lower at col {}", col_idx)
+            })?;
+            Some(i32::from_le_bytes(bytes))
+        };
+
+        let upper = if flags & range_flags::UPPER_INFINITE != 0 {
+            None
+        } else {
+            let bytes: [u8; 4] = self.data[offset + 5..offset + 9].try_into().map_err(|_| {
+                eyre::eyre!("insufficient data for int4_range upper at col {}", col_idx)
+            })?;
+            Some(i32::from_le_bytes(bytes))
+        };
+
+        Ok(Range::new(
+            lower,
+            upper,
+            flags & range_flags::LOWER_INCLUSIVE != 0,
+            flags & range_flags::UPPER_INCLUSIVE != 0,
+        ))
+    }
+
+    pub fn get_int4_range_opt(&self, col_idx: usize) -> Result<Option<Range<i32>>> {
+        if self.is_null_or_missing(col_idx) {
+            return Ok(None);
+        }
+        self.get_int4_range(col_idx).map(Some)
+    }
+
+    pub fn get_int8_range(&self, col_idx: usize) -> Result<Range<i64>> {
+        let offset = self.get_fixed_col_offset(col_idx);
+        let flags = self.data[offset];
+
+        if flags & range_flags::EMPTY != 0 {
+            return Ok(Range::empty());
+        }
+
+        let lower = if flags & range_flags::LOWER_INFINITE != 0 {
+            None
+        } else {
+            let bytes: [u8; 8] = self.data[offset + 1..offset + 9].try_into().map_err(|_| {
+                eyre::eyre!("insufficient data for int8_range lower at col {}", col_idx)
+            })?;
+            Some(i64::from_le_bytes(bytes))
+        };
+
+        let upper = if flags & range_flags::UPPER_INFINITE != 0 {
+            None
+        } else {
+            let bytes: [u8; 8] = self.data[offset + 9..offset + 17].try_into().map_err(|_| {
+                eyre::eyre!("insufficient data for int8_range upper at col {}", col_idx)
+            })?;
+            Some(i64::from_le_bytes(bytes))
+        };
+
+        Ok(Range::new(
+            lower,
+            upper,
+            flags & range_flags::LOWER_INCLUSIVE != 0,
+            flags & range_flags::UPPER_INCLUSIVE != 0,
+        ))
+    }
+
+    pub fn get_int8_range_opt(&self, col_idx: usize) -> Result<Option<Range<i64>>> {
+        if self.is_null_or_missing(col_idx) {
+            return Ok(None);
+        }
+        self.get_int8_range(col_idx).map(Some)
+    }
+
+    pub fn get_date_range(&self, col_idx: usize) -> Result<Range<i32>> {
+        self.get_int4_range(col_idx)
+    }
+
+    pub fn get_date_range_opt(&self, col_idx: usize) -> Result<Option<Range<i32>>> {
+        self.get_int4_range_opt(col_idx)
+    }
+
+    pub fn get_timestamp_range(&self, col_idx: usize) -> Result<Range<i64>> {
+        self.get_int8_range(col_idx)
+    }
+
+    pub fn get_timestamp_range_opt(&self, col_idx: usize) -> Result<Option<Range<i64>>> {
+        self.get_int8_range_opt(col_idx)
+    }
+
+    pub fn get_decimal(&self, col_idx: usize) -> Result<DecimalView<'a>> {
+        let (start, end) = self.get_var_bounds(col_idx)?;
+        Ok(DecimalView::new(&self.data[start..end]))
+    }
+
+    pub fn get_decimal_opt(&self, col_idx: usize) -> Result<Option<DecimalView<'a>>> {
+        if self.is_null_or_missing(col_idx) {
+            return Ok(None);
+        }
+        self.get_decimal(col_idx).map(Some)
     }
 }

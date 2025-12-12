@@ -1224,3 +1224,250 @@ fn jsonb_array_with_mixed_types() {
     assert_eq!(view.array_get(0).unwrap().unwrap(), JsonbValue::Null);
     assert_eq!(view.array_get(1).unwrap().unwrap(), JsonbValue::Bool(true));
 }
+
+#[test]
+fn data_type_interval_fixed_size() {
+    assert_eq!(DataType::Interval.fixed_size(), Some(16));
+}
+
+#[test]
+fn interval_roundtrip() {
+    let schema = Schema::new(vec![ColumnDef::new("duration", DataType::Interval)]);
+
+    let mut builder = RecordBuilder::new(&schema);
+    builder.set_interval(0, 3600_000_000, 5, 2).unwrap();
+
+    let data = builder.build().unwrap();
+    let view = RecordView::new(&data, &schema).unwrap();
+
+    let (micros, days, months) = view.get_interval(0).unwrap();
+    assert_eq!(micros, 3600_000_000);
+    assert_eq!(days, 5);
+    assert_eq!(months, 2);
+}
+
+#[test]
+fn data_type_enum_fixed_size() {
+    assert_eq!(DataType::Enum.fixed_size(), Some(4));
+}
+
+#[test]
+fn enum_roundtrip() {
+    let schema = Schema::new(vec![ColumnDef::new("status", DataType::Enum)]);
+
+    let mut builder = RecordBuilder::new(&schema);
+    builder.set_enum(0, 1, 42).unwrap();
+
+    let data = builder.build().unwrap();
+    let view = RecordView::new(&data, &schema).unwrap();
+
+    let (type_id, ordinal) = view.get_enum(0).unwrap();
+    assert_eq!(type_id, 1);
+    assert_eq!(ordinal, 42);
+}
+
+#[test]
+fn data_type_point_fixed_size() {
+    assert_eq!(DataType::Point.fixed_size(), Some(16));
+}
+
+#[test]
+fn point_roundtrip() {
+    let schema = Schema::new(vec![ColumnDef::new("location", DataType::Point)]);
+
+    let mut builder = RecordBuilder::new(&schema);
+    builder.set_point(0, 1.5, 2.5).unwrap();
+
+    let data = builder.build().unwrap();
+    let view = RecordView::new(&data, &schema).unwrap();
+
+    let (x, y) = view.get_point(0).unwrap();
+    assert!((x - 1.5).abs() < 0.0001);
+    assert!((y - 2.5).abs() < 0.0001);
+}
+
+#[test]
+fn data_type_box_fixed_size() {
+    assert_eq!(DataType::Box.fixed_size(), Some(32));
+}
+
+#[test]
+fn box_roundtrip() {
+    let schema = Schema::new(vec![ColumnDef::new("bounds", DataType::Box)]);
+
+    let mut builder = RecordBuilder::new(&schema);
+    builder.set_box(0, (0.0, 0.0), (10.0, 20.0)).unwrap();
+
+    let data = builder.build().unwrap();
+    let view = RecordView::new(&data, &schema).unwrap();
+
+    let ((lx, ly), (hx, hy)) = view.get_box(0).unwrap();
+    assert!((lx - 0.0).abs() < 0.0001);
+    assert!((ly - 0.0).abs() < 0.0001);
+    assert!((hx - 10.0).abs() < 0.0001);
+    assert!((hy - 20.0).abs() < 0.0001);
+}
+
+#[test]
+fn data_type_circle_fixed_size() {
+    assert_eq!(DataType::Circle.fixed_size(), Some(24));
+}
+
+#[test]
+fn circle_roundtrip() {
+    let schema = Schema::new(vec![ColumnDef::new("area", DataType::Circle)]);
+
+    let mut builder = RecordBuilder::new(&schema);
+    builder.set_circle(0, (5.0, 5.0), 3.0).unwrap();
+
+    let data = builder.build().unwrap();
+    let view = RecordView::new(&data, &schema).unwrap();
+
+    let ((cx, cy), radius) = view.get_circle(0).unwrap();
+    assert!((cx - 5.0).abs() < 0.0001);
+    assert!((cy - 5.0).abs() < 0.0001);
+    assert!((radius - 3.0).abs() < 0.0001);
+}
+
+#[test]
+fn data_type_int4_range_fixed_size() {
+    assert_eq!(DataType::Int4Range.fixed_size(), Some(9));
+}
+
+#[test]
+fn int4_range_roundtrip() {
+    let schema = Schema::new(vec![ColumnDef::new("range", DataType::Int4Range)]);
+
+    let mut builder = RecordBuilder::new(&schema);
+    builder
+        .set_int4_range(0, Some(10), Some(20), true, false)
+        .unwrap();
+
+    let data = builder.build().unwrap();
+    let view = RecordView::new(&data, &schema).unwrap();
+
+    let range = view.get_int4_range(0).unwrap();
+    assert_eq!(range.lower, Some(10));
+    assert_eq!(range.upper, Some(20));
+    assert!(range.lower_inclusive);
+    assert!(!range.upper_inclusive);
+    assert!(!range.is_empty);
+}
+
+#[test]
+fn int4_range_empty() {
+    let schema = Schema::new(vec![ColumnDef::new("range", DataType::Int4Range)]);
+
+    let mut builder = RecordBuilder::new(&schema);
+    builder.set_int4_range_empty(0).unwrap();
+
+    let data = builder.build().unwrap();
+    let view = RecordView::new(&data, &schema).unwrap();
+
+    let range = view.get_int4_range(0).unwrap();
+    assert!(range.is_empty);
+}
+
+#[test]
+fn data_type_int8_range_fixed_size() {
+    assert_eq!(DataType::Int8Range.fixed_size(), Some(17));
+}
+
+#[test]
+fn int8_range_roundtrip() {
+    let schema = Schema::new(vec![ColumnDef::new("range", DataType::Int8Range)]);
+
+    let mut builder = RecordBuilder::new(&schema);
+    builder
+        .set_int8_range(0, Some(100), Some(200), true, true)
+        .unwrap();
+
+    let data = builder.build().unwrap();
+    let view = RecordView::new(&data, &schema).unwrap();
+
+    let range = view.get_int8_range(0).unwrap();
+    assert_eq!(range.lower, Some(100));
+    assert_eq!(range.upper, Some(200));
+    assert!(range.lower_inclusive);
+    assert!(range.upper_inclusive);
+}
+
+#[test]
+fn data_type_date_range_fixed_size() {
+    assert_eq!(DataType::DateRange.fixed_size(), Some(9));
+}
+
+#[test]
+fn date_range_roundtrip() {
+    let schema = Schema::new(vec![ColumnDef::new("period", DataType::DateRange)]);
+
+    let mut builder = RecordBuilder::new(&schema);
+    builder
+        .set_date_range(0, Some(19000), Some(19365), true, false)
+        .unwrap();
+
+    let data = builder.build().unwrap();
+    let view = RecordView::new(&data, &schema).unwrap();
+
+    let range = view.get_date_range(0).unwrap();
+    assert_eq!(range.lower, Some(19000));
+    assert_eq!(range.upper, Some(19365));
+}
+
+#[test]
+fn data_type_timestamp_range_fixed_size() {
+    assert_eq!(DataType::TimestampRange.fixed_size(), Some(17));
+}
+
+#[test]
+fn timestamp_range_roundtrip() {
+    let schema = Schema::new(vec![ColumnDef::new("period", DataType::TimestampRange)]);
+
+    let mut builder = RecordBuilder::new(&schema);
+    builder
+        .set_timestamp_range(0, Some(1000000), Some(2000000), true, false)
+        .unwrap();
+
+    let data = builder.build().unwrap();
+    let view = RecordView::new(&data, &schema).unwrap();
+
+    let range = view.get_timestamp_range(0).unwrap();
+    assert_eq!(range.lower, Some(1000000));
+    assert_eq!(range.upper, Some(2000000));
+}
+
+#[test]
+fn data_type_decimal_is_variable() {
+    assert!(DataType::Decimal.is_variable());
+}
+
+#[test]
+fn decimal_roundtrip() {
+    let schema = Schema::new(vec![ColumnDef::new("amount", DataType::Decimal)]);
+
+    let mut builder = RecordBuilder::new(&schema);
+    builder.set_decimal(0, 12345, 2, false).unwrap();
+
+    let data = builder.build().unwrap();
+    let view = RecordView::new(&data, &schema).unwrap();
+
+    let decimal = view.get_decimal(0).unwrap();
+    assert_eq!(decimal.digits(), 12345);
+    assert_eq!(decimal.scale(), 2);
+    assert!(!decimal.is_negative());
+}
+
+#[test]
+fn decimal_negative_value() {
+    let schema = Schema::new(vec![ColumnDef::new("amount", DataType::Decimal)]);
+
+    let mut builder = RecordBuilder::new(&schema);
+    builder.set_decimal(0, 99999, 4, true).unwrap();
+
+    let data = builder.build().unwrap();
+    let view = RecordView::new(&data, &schema).unwrap();
+
+    let decimal = view.get_decimal(0).unwrap();
+    assert!(decimal.is_negative());
+    assert_eq!(decimal.scale(), 4);
+}
