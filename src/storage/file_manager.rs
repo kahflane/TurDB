@@ -105,7 +105,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use eyre::{Result, WrapErr};
+use eyre::{ensure, Result, WrapErr};
 
 use super::{MmapStorage, PAGE_SIZE};
 
@@ -307,6 +307,46 @@ impl FileManager {
     pub fn meta_storage_mut(&mut self) -> &mut MmapStorage {
         &mut self.meta_storage
     }
+
+    pub fn create_schema(&mut self, name: &str) -> Result<()> {
+        Self::validate_name(name)?;
+
+        let schema_path = self.base_path.join(name);
+
+        ensure!(!schema_path.exists(), "schema '{}' already exists", name);
+
+        fs::create_dir(&schema_path).wrap_err_with(|| {
+            format!(
+                "failed to create schema directory '{}'",
+                schema_path.display()
+            )
+        })?;
+
+        Ok(())
+    }
+
+    pub fn schema_exists(&self, name: &str) -> bool {
+        let schema_path = self.base_path.join(name);
+        schema_path.exists() && schema_path.is_dir()
+    }
+
+    fn validate_name(name: &str) -> Result<()> {
+        ensure!(!name.is_empty(), "name cannot be empty");
+        ensure!(
+            !name.contains('/') && !name.contains('\\'),
+            "name cannot contain path separators"
+        );
+        ensure!(
+            !name.contains(".."),
+            "name cannot contain parent directory references"
+        );
+        ensure!(
+            name.chars()
+                .all(|c| c.is_alphanumeric() || c == '_' || c == '-'),
+            "name can only contain alphanumeric characters, underscores, and hyphens"
+        );
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -389,5 +429,57 @@ mod tests {
         assert_eq!(key, 1);
         assert_eq!(value, "one");
         assert_eq!(cache.len(), 2);
+    }
+
+    #[test]
+    fn create_schema_creates_directory() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("testdb");
+
+        let mut fm = FileManager::create(&db_path, DEFAULT_MAX_OPEN_FILES).unwrap();
+
+        fm.create_schema("analytics").unwrap();
+
+        assert!(db_path.join("analytics").exists());
+        assert!(db_path.join("analytics").is_dir());
+    }
+
+    #[test]
+    fn create_schema_fails_for_existing() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("testdb");
+
+        let mut fm = FileManager::create(&db_path, DEFAULT_MAX_OPEN_FILES).unwrap();
+
+        fm.create_schema("myschema").unwrap();
+        let result = fm.create_schema("myschema");
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn create_schema_validates_name() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("testdb");
+
+        let mut fm = FileManager::create(&db_path, DEFAULT_MAX_OPEN_FILES).unwrap();
+
+        assert!(fm.create_schema("").is_err());
+        assert!(fm.create_schema("../escape").is_err());
+        assert!(fm.create_schema("with/slash").is_err());
+    }
+
+    #[test]
+    fn schema_exists_returns_correct_value() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("testdb");
+
+        let mut fm = FileManager::create(&db_path, DEFAULT_MAX_OPEN_FILES).unwrap();
+
+        assert!(fm.schema_exists(DEFAULT_SCHEMA));
+        assert!(!fm.schema_exists("nonexistent"));
+
+        fm.create_schema("newschema").unwrap();
+        assert!(fm.schema_exists("newschema"));
     }
 }
