@@ -426,7 +426,7 @@
     {
       "title": "B-Tree - Big-Endian Key Encoding",
       "description": "Byte-comparable key encoding for memcmp",
-      "isCompleted": false,
+      "isCompleted": true,
       "priority": 8,
       "phase": 2,
       "tasks": [
@@ -456,7 +456,7 @@
         },
         {
           "task": "Verify byte ordering preserves sort order",
-          "done": false
+          "done": true
         }
       ]
     },
