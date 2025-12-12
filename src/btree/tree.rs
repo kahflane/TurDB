@@ -65,7 +65,21 @@
 //! - Walks leaf pages via next_leaf pointers
 //! - Zero-copy key/value access
 //! - Uses madvise(MADV_WILLNEED) to prefetch upcoming pages
-//! - Supports forward iteration (backward requires separate implementation)
+//!
+//! ### Iteration Performance
+//!
+//! | Operation   | Within Page | Page Boundary |
+//! |-------------|-------------|---------------|
+//! | `advance()` | O(1)        | O(1)          |
+//! | `prev()`    | O(1)        | O(log N)      |
+//!
+//! Forward iteration (`advance()`) is O(1) because leaf nodes are singly-linked
+//! via `next_leaf` pointers. Backward iteration (`prev()`) requires O(log N)
+//! tree re-traversal when crossing page boundaries because there is no
+//! `prev_leaf` pointer.
+//!
+//! Future optimization: Add `prev_leaf` pointer to leaf header for O(1)
+//! backward traversal if backward scans become a bottleneck.
 //!
 //! ## Node Splitting
 //!
@@ -1306,5 +1320,72 @@ mod tests {
         }
 
         assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn cursor_prev_deep_tree_with_many_keys() {
+        let (_dir, mut storage) = create_test_storage(100);
+        let mut btree = BTree::create(&mut storage, 0).unwrap();
+
+        for i in 0..1500 {
+            let key = format!("key{:05}", i);
+            let value = format!("val{:05}", i);
+            btree.insert(key.as_bytes(), value.as_bytes()).unwrap();
+        }
+
+        let mut cursor = btree.cursor_last().unwrap();
+        assert!(cursor.valid());
+        assert_eq!(cursor.key().unwrap(), b"key01499");
+
+        let mut count = 1499;
+        while cursor.valid() {
+            let expected_key = format!("key{:05}", count);
+            assert_eq!(
+                cursor.key().unwrap(),
+                expected_key.as_bytes(),
+                "mismatch at count {}",
+                count
+            );
+
+            if count == 0 {
+                assert!(!cursor.prev().unwrap());
+            } else {
+                assert!(cursor.prev().unwrap());
+                count -= 1;
+            }
+        }
+
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn cursor_bidirectional_navigation() {
+        let (_dir, mut storage) = create_test_storage(20);
+        let mut btree = BTree::create(&mut storage, 0).unwrap();
+
+        for i in 0..200 {
+            let key = format!("key{:03}", i);
+            let value = format!("val{:03}", i);
+            btree.insert(key.as_bytes(), value.as_bytes()).unwrap();
+        }
+
+        let mut cursor = btree.cursor_seek(b"key100").unwrap();
+        assert!(cursor.valid());
+        assert_eq!(cursor.key().unwrap(), b"key100");
+
+        assert!(cursor.advance().unwrap());
+        assert_eq!(cursor.key().unwrap(), b"key101");
+
+        assert!(cursor.advance().unwrap());
+        assert_eq!(cursor.key().unwrap(), b"key102");
+
+        assert!(cursor.prev().unwrap());
+        assert_eq!(cursor.key().unwrap(), b"key101");
+
+        assert!(cursor.prev().unwrap());
+        assert_eq!(cursor.key().unwrap(), b"key100");
+
+        assert!(cursor.prev().unwrap());
+        assert_eq!(cursor.key().unwrap(), b"key099");
     }
 }
