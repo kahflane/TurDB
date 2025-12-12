@@ -47,6 +47,7 @@
 
 pub mod array;
 pub mod builder;
+pub mod composite;
 pub mod jsonb;
 pub mod schema;
 pub mod types;
@@ -57,6 +58,7 @@ mod tests;
 
 pub use array::{ArrayBuilder, ArrayView};
 pub use builder::RecordBuilder;
+pub use composite::{CompositeView, MAX_NESTING_DEPTH};
 pub use jsonb::{JsonbBuilder, JsonbBuilderValue, JsonbValue, JsonbView};
 pub use schema::Schema;
 pub use types::{range_flags, ColumnDef, DataType, DecimalView, Range};

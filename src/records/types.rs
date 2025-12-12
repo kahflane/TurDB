@@ -61,6 +61,8 @@ pub enum DataType {
     Point = 60,
     Box = 61,
     Circle = 62,
+    Composite = 70,
+    Array = 71,
 }
 
 impl DataType {
@@ -94,6 +96,8 @@ impl DataType {
             DataType::Point => Some(16),
             DataType::Box => Some(32),
             DataType::Circle => Some(24),
+            DataType::Composite => None,
+            DataType::Array => None,
         }
     }
 

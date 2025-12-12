@@ -415,6 +415,28 @@ impl<'a> RecordBuilder<'a> {
         Ok(())
     }
 
+    pub fn set_composite(&mut self, col_idx: usize, data: &[u8]) -> Result<()> {
+        self.clear_null(col_idx);
+        let var_idx = self
+            .schema
+            .var_column_index(col_idx)
+            .ok_or_else(|| eyre::eyre!("column {} is not a variable column", col_idx))?;
+        self.var_data[var_idx] = data.to_vec();
+        self.column_values[col_idx] = ColumnValue::Variable { idx: var_idx };
+        Ok(())
+    }
+
+    pub fn set_array(&mut self, col_idx: usize, data: &[u8]) -> Result<()> {
+        self.clear_null(col_idx);
+        let var_idx = self
+            .schema
+            .var_column_index(col_idx)
+            .ok_or_else(|| eyre::eyre!("column {} is not a variable column", col_idx))?;
+        self.var_data[var_idx] = data.to_vec();
+        self.column_values[col_idx] = ColumnValue::Variable { idx: var_idx };
+        Ok(())
+    }
+
     pub fn build(&self) -> Result<Vec<u8>> {
         let bitmap_size = self.null_bitmap.len();
         let offset_table_size = self.schema.var_column_count() * 2;

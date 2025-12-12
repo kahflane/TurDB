@@ -18,6 +18,8 @@
 
 use eyre::Result;
 
+use crate::records::array::ArrayView;
+use crate::records::composite::CompositeView;
 use crate::records::jsonb::JsonbView;
 use crate::records::schema::Schema;
 use crate::records::types::{range_flags, DecimalView, Range};
@@ -695,5 +697,35 @@ impl<'a> RecordView<'a> {
             return Ok(None);
         }
         self.get_decimal(col_idx).map(Some)
+    }
+
+    pub fn get_composite(&self, col_idx: usize, field_count: usize) -> Result<CompositeView<'a>> {
+        let (start, end) = self.get_var_bounds(col_idx)?;
+        let bytes = &self.data[start..end];
+        CompositeView::new(bytes, field_count)
+    }
+
+    pub fn get_composite_opt(
+        &self,
+        col_idx: usize,
+        field_count: usize,
+    ) -> Result<Option<CompositeView<'a>>> {
+        if self.is_null_or_missing(col_idx) {
+            return Ok(None);
+        }
+        self.get_composite(col_idx, field_count).map(Some)
+    }
+
+    pub fn get_array(&self, col_idx: usize) -> Result<ArrayView<'a>> {
+        let (start, end) = self.get_var_bounds(col_idx)?;
+        let bytes = &self.data[start..end];
+        ArrayView::new(bytes)
+    }
+
+    pub fn get_array_opt(&self, col_idx: usize) -> Result<Option<ArrayView<'a>>> {
+        if self.is_null_or_missing(col_idx) {
+            return Ok(None);
+        }
+        self.get_array(col_idx).map(Some)
     }
 }
