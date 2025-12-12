@@ -834,33 +834,33 @@
     {
       "title": "Schema - Multi-Schema Catalog",
       "description": "Catalog supporting multiple schemas (root, turdb_catalog, user schemas)",
-      "isCompleted": false,
+      "isCompleted": true,
       "priority": 16,
       "phase": 4,
       "tasks": [
         {
           "task": "Define Schema struct with id, name, tables HashMap",
-          "done": false
+          "done": true
         },
         {
           "task": "Define Catalog struct with schemas HashMap and default_schema",
-          "done": false
+          "done": true
         },
         {
           "task": "Implement create_schema() adding new schema",
-          "done": false
+          "done": true
         },
         {
           "task": "Implement drop_schema() removing schema",
-          "done": false
+          "done": true
         },
         {
           "task": "Implement resolve_table() with schema.table syntax",
-          "done": false
+          "done": true
         },
         {
           "task": "Initialize root schema and turdb_catalog on create",
-          "done": false
+          "done": true
         }
       ]
     },
