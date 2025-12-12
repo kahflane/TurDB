@@ -1,0 +1,472 @@
+//! # RecordView - Zero-Copy Record Access
+//!
+//! This module provides `RecordView` for reading records with O(1) column access.
+//! All getters return references into the underlying buffer for zero-copy operation.
+//!
+//! ## Usage
+//!
+//! ```ignore
+//! let record = RecordView::new(page_data, &schema)?;
+//! let name: &str = record.get_text(1)?;  // Zero-copy reference
+//! let age: i32 = record.get_int4(2)?;    // Direct read from buffer
+//! ```
+//!
+//! ## Thread Safety
+//!
+//! `RecordView` borrows immutably from a byte slice. Multiple `RecordView`
+//! instances can read the same data concurrently.
+
+use eyre::Result;
+
+use crate::records::jsonb::JsonbView;
+use crate::records::schema::Schema;
+
+#[derive(Debug)]
+pub struct RecordView<'a> {
+    data: &'a [u8],
+    schema: &'a Schema,
+}
+
+impl<'a> RecordView<'a> {
+    pub fn new(data: &'a [u8], schema: &'a Schema) -> Result<Self> {
+        eyre::ensure!(!data.is_empty(), "record data cannot be empty");
+        eyre::ensure!(data.len() >= 2, "record too small for header length");
+        Ok(Self { data, schema })
+    }
+
+    pub fn data(&self) -> &'a [u8] {
+        self.data
+    }
+
+    pub fn schema(&self) -> &'a Schema {
+        self.schema
+    }
+
+    pub fn header_len(&self) -> u16 {
+        u16::from_le_bytes([self.data[0], self.data[1]])
+    }
+
+    pub fn null_bitmap(&self) -> &'a [u8] {
+        let bitmap_size = Schema::null_bitmap_size(self.schema.column_count());
+        &self.data[2..2 + bitmap_size]
+    }
+
+    pub fn offset_table(&self) -> &'a [u8] {
+        let bitmap_size = Schema::null_bitmap_size(self.schema.column_count());
+        let offset_table_start = 2 + bitmap_size;
+        let offset_table_bytes = self.schema.var_column_count() * 2;
+        &self.data[offset_table_start..offset_table_start + offset_table_bytes]
+    }
+
+    pub fn data_offset(&self) -> usize {
+        self.header_len() as usize
+    }
+
+    pub fn is_null(&self, col_idx: usize) -> bool {
+        let byte_idx = col_idx / 8;
+        let bit_idx = col_idx % 8;
+        let bitmap = self.null_bitmap();
+        (bitmap[byte_idx] & (1 << bit_idx)) != 0
+    }
+
+    pub fn get_fixed_col_offset(&self, col_idx: usize) -> usize {
+        self.data_offset() + self.schema.fixed_offset(col_idx)
+    }
+
+    pub fn get_var_bounds(&self, col_idx: usize) -> Result<(usize, usize)> {
+        let var_idx = self
+            .schema
+            .var_column_index(col_idx)
+            .ok_or_else(|| eyre::eyre!("column {} is not a variable column", col_idx))?;
+
+        let offset_table = self.offset_table();
+        let var_data_start = self.data_offset() + self.schema.total_fixed_size();
+
+        let end_offset =
+            u16::from_le_bytes([offset_table[var_idx * 2], offset_table[var_idx * 2 + 1]]) as usize;
+
+        let start_offset = if var_idx == 0 {
+            0
+        } else {
+            u16::from_le_bytes([
+                offset_table[(var_idx - 1) * 2],
+                offset_table[(var_idx - 1) * 2 + 1],
+            ]) as usize
+        };
+
+        Ok((var_data_start + start_offset, var_data_start + end_offset))
+    }
+
+    pub fn get_bool(&self, col_idx: usize) -> Result<bool> {
+        let offset = self.get_fixed_col_offset(col_idx);
+        Ok(self.data[offset] != 0)
+    }
+
+    pub fn get_int2(&self, col_idx: usize) -> Result<i16> {
+        let offset = self.get_fixed_col_offset(col_idx);
+        let bytes: [u8; 2] = self.data[offset..offset + 2]
+            .try_into()
+            .map_err(|_| eyre::eyre!("insufficient data for int2 at col {}", col_idx))?;
+        Ok(i16::from_le_bytes(bytes))
+    }
+
+    pub fn get_int4(&self, col_idx: usize) -> Result<i32> {
+        let offset = self.get_fixed_col_offset(col_idx);
+        let bytes: [u8; 4] = self.data[offset..offset + 4]
+            .try_into()
+            .map_err(|_| eyre::eyre!("insufficient data for int4 at col {}", col_idx))?;
+        Ok(i32::from_le_bytes(bytes))
+    }
+
+    pub fn get_int8(&self, col_idx: usize) -> Result<i64> {
+        let offset = self.get_fixed_col_offset(col_idx);
+        let bytes: [u8; 8] = self.data[offset..offset + 8]
+            .try_into()
+            .map_err(|_| eyre::eyre!("insufficient data for int8 at col {}", col_idx))?;
+        Ok(i64::from_le_bytes(bytes))
+    }
+
+    pub fn get_float4(&self, col_idx: usize) -> Result<f32> {
+        let offset = self.get_fixed_col_offset(col_idx);
+        let bytes: [u8; 4] = self.data[offset..offset + 4]
+            .try_into()
+            .map_err(|_| eyre::eyre!("insufficient data for float4 at col {}", col_idx))?;
+        Ok(f32::from_le_bytes(bytes))
+    }
+
+    pub fn get_float8(&self, col_idx: usize) -> Result<f64> {
+        let offset = self.get_fixed_col_offset(col_idx);
+        let bytes: [u8; 8] = self.data[offset..offset + 8]
+            .try_into()
+            .map_err(|_| eyre::eyre!("insufficient data for float8 at col {}", col_idx))?;
+        Ok(f64::from_le_bytes(bytes))
+    }
+
+    pub fn get_date(&self, col_idx: usize) -> Result<i32> {
+        let offset = self.get_fixed_col_offset(col_idx);
+        let bytes: [u8; 4] = self.data[offset..offset + 4]
+            .try_into()
+            .map_err(|_| eyre::eyre!("insufficient data for date at col {}", col_idx))?;
+        Ok(i32::from_le_bytes(bytes))
+    }
+
+    pub fn get_time(&self, col_idx: usize) -> Result<i64> {
+        let offset = self.get_fixed_col_offset(col_idx);
+        let bytes: [u8; 8] = self.data[offset..offset + 8]
+            .try_into()
+            .map_err(|_| eyre::eyre!("insufficient data for time at col {}", col_idx))?;
+        Ok(i64::from_le_bytes(bytes))
+    }
+
+    pub fn get_timestamp(&self, col_idx: usize) -> Result<i64> {
+        let offset = self.get_fixed_col_offset(col_idx);
+        let bytes: [u8; 8] = self.data[offset..offset + 8]
+            .try_into()
+            .map_err(|_| eyre::eyre!("insufficient data for timestamp at col {}", col_idx))?;
+        Ok(i64::from_le_bytes(bytes))
+    }
+
+    pub fn get_uuid(&self, col_idx: usize) -> Result<&'a [u8; 16]> {
+        let offset = self.get_fixed_col_offset(col_idx);
+        self.data[offset..offset + 16]
+            .try_into()
+            .map_err(|_| eyre::eyre!("insufficient data for uuid at col {}", col_idx))
+    }
+
+    pub fn get_macaddr(&self, col_idx: usize) -> Result<&'a [u8; 6]> {
+        let offset = self.get_fixed_col_offset(col_idx);
+        self.data[offset..offset + 6]
+            .try_into()
+            .map_err(|_| eyre::eyre!("insufficient data for macaddr at col {}", col_idx))
+    }
+
+    pub fn get_text(&self, col_idx: usize) -> Result<&'a str> {
+        let (start, end) = self.get_var_bounds(col_idx)?;
+        let bytes = &self.data[start..end];
+        std::str::from_utf8(bytes)
+            .map_err(|e| eyre::eyre!("invalid UTF-8 in text column {}: {}", col_idx, e))
+    }
+
+    pub fn get_blob(&self, col_idx: usize) -> Result<&'a [u8]> {
+        let (start, end) = self.get_var_bounds(col_idx)?;
+        Ok(&self.data[start..end])
+    }
+
+    pub fn get_vector(&self, col_idx: usize) -> Result<&'a [f32]> {
+        let (start, end) = self.get_var_bounds(col_idx)?;
+        let bytes = &self.data[start..end];
+        if bytes.len() < 4 {
+            return Err(eyre::eyre!(
+                "vector data too short at col {}: {} bytes",
+                col_idx,
+                bytes.len()
+            ));
+        }
+        let len = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as usize;
+        let expected_size = 4 + len * 4;
+        if bytes.len() != expected_size {
+            return Err(eyre::eyre!(
+                "vector size mismatch at col {}: expected {} bytes, got {}",
+                col_idx,
+                expected_size,
+                bytes.len()
+            ));
+        }
+        let float_bytes = &bytes[4..];
+        if !float_bytes.len().is_multiple_of(4)
+            || !(float_bytes.as_ptr() as usize).is_multiple_of(4)
+        {
+            let mut floats = Vec::with_capacity(len);
+            for i in 0..len {
+                let offset = i * 4;
+                let f = f32::from_le_bytes([
+                    float_bytes[offset],
+                    float_bytes[offset + 1],
+                    float_bytes[offset + 2],
+                    float_bytes[offset + 3],
+                ]);
+                floats.push(f);
+            }
+            return Err(eyre::eyre!(
+                "vector data not aligned for zero-copy at col {}",
+                col_idx
+            ));
+        }
+        let floats = unsafe { std::slice::from_raw_parts(float_bytes.as_ptr() as *const f32, len) };
+        Ok(floats)
+    }
+
+    pub fn get_vector_copy(&self, col_idx: usize) -> Result<Vec<f32>> {
+        let (start, end) = self.get_var_bounds(col_idx)?;
+        let bytes = &self.data[start..end];
+        if bytes.len() < 4 {
+            return Err(eyre::eyre!(
+                "vector data too short at col {}: {} bytes",
+                col_idx,
+                bytes.len()
+            ));
+        }
+        let len = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as usize;
+        let expected_size = 4 + len * 4;
+        if bytes.len() != expected_size {
+            return Err(eyre::eyre!(
+                "vector size mismatch at col {}: expected {} bytes, got {}",
+                col_idx,
+                expected_size,
+                bytes.len()
+            ));
+        }
+        let float_bytes = &bytes[4..];
+        let mut floats = Vec::with_capacity(len);
+        for i in 0..len {
+            let offset = i * 4;
+            let f = f32::from_le_bytes([
+                float_bytes[offset],
+                float_bytes[offset + 1],
+                float_bytes[offset + 2],
+                float_bytes[offset + 3],
+            ]);
+            floats.push(f);
+        }
+        Ok(floats)
+    }
+
+    pub fn get_vector_opt(&self, col_idx: usize) -> Result<Option<Vec<f32>>> {
+        if self.is_null_or_missing(col_idx) {
+            return Ok(None);
+        }
+        self.get_vector_copy(col_idx).map(Some)
+    }
+
+    pub fn get_jsonb(&self, col_idx: usize) -> Result<JsonbView<'a>> {
+        let (start, end) = self.get_var_bounds(col_idx)?;
+        let bytes = &self.data[start..end];
+        JsonbView::new(bytes)
+    }
+
+    pub fn get_jsonb_opt(&self, col_idx: usize) -> Result<Option<JsonbView<'a>>> {
+        if self.is_null_or_missing(col_idx) {
+            return Ok(None);
+        }
+        self.get_jsonb(col_idx).map(Some)
+    }
+
+    pub fn record_column_count(&self) -> usize {
+        let data_len = self.data.len();
+        let header_len = self.header_len() as usize;
+
+        if data_len <= header_len {
+            return 0;
+        }
+
+        let available_fixed_data = data_len - header_len;
+        let mut col_count = 0;
+        let mut consumed = 0;
+
+        for col in self.schema.columns() {
+            if let Some(size) = col.data_type.fixed_size() {
+                if consumed + size > available_fixed_data {
+                    break;
+                }
+                consumed += size;
+            }
+            col_count += 1;
+        }
+
+        col_count
+    }
+
+    pub fn is_null_or_missing(&self, col_idx: usize) -> bool {
+        if col_idx >= self.record_column_count() {
+            return true;
+        }
+        self.is_null(col_idx)
+    }
+
+    pub fn get_int4_opt(&self, col_idx: usize) -> Result<Option<i32>> {
+        if self.is_null_or_missing(col_idx) {
+            return Ok(None);
+        }
+        self.get_int4(col_idx).map(Some)
+    }
+
+    pub fn get_int2_opt(&self, col_idx: usize) -> Result<Option<i16>> {
+        if self.is_null_or_missing(col_idx) {
+            return Ok(None);
+        }
+        self.get_int2(col_idx).map(Some)
+    }
+
+    pub fn get_int8_opt(&self, col_idx: usize) -> Result<Option<i64>> {
+        if self.is_null_or_missing(col_idx) {
+            return Ok(None);
+        }
+        self.get_int8(col_idx).map(Some)
+    }
+
+    pub fn get_float4_opt(&self, col_idx: usize) -> Result<Option<f32>> {
+        if self.is_null_or_missing(col_idx) {
+            return Ok(None);
+        }
+        self.get_float4(col_idx).map(Some)
+    }
+
+    pub fn get_float8_opt(&self, col_idx: usize) -> Result<Option<f64>> {
+        if self.is_null_or_missing(col_idx) {
+            return Ok(None);
+        }
+        self.get_float8(col_idx).map(Some)
+    }
+
+    pub fn get_text_opt(&self, col_idx: usize) -> Result<Option<&'a str>> {
+        if self.is_null_or_missing(col_idx) {
+            return Ok(None);
+        }
+        self.get_text(col_idx).map(Some)
+    }
+
+    pub fn get_blob_opt(&self, col_idx: usize) -> Result<Option<&'a [u8]>> {
+        if self.is_null_or_missing(col_idx) {
+            return Ok(None);
+        }
+        self.get_blob(col_idx).map(Some)
+    }
+
+    pub fn get_bool_opt(&self, col_idx: usize) -> Result<Option<bool>> {
+        if self.is_null_or_missing(col_idx) {
+            return Ok(None);
+        }
+        self.get_bool(col_idx).map(Some)
+    }
+
+    pub fn get_date_opt(&self, col_idx: usize) -> Result<Option<i32>> {
+        if self.is_null_or_missing(col_idx) {
+            return Ok(None);
+        }
+        self.get_date(col_idx).map(Some)
+    }
+
+    pub fn get_time_opt(&self, col_idx: usize) -> Result<Option<i64>> {
+        if self.is_null_or_missing(col_idx) {
+            return Ok(None);
+        }
+        self.get_time(col_idx).map(Some)
+    }
+
+    pub fn get_timestamp_opt(&self, col_idx: usize) -> Result<Option<i64>> {
+        if self.is_null_or_missing(col_idx) {
+            return Ok(None);
+        }
+        self.get_timestamp(col_idx).map(Some)
+    }
+
+    pub fn get_uuid_opt(&self, col_idx: usize) -> Result<Option<&'a [u8; 16]>> {
+        if self.is_null_or_missing(col_idx) {
+            return Ok(None);
+        }
+        self.get_uuid(col_idx).map(Some)
+    }
+
+    pub fn get_macaddr_opt(&self, col_idx: usize) -> Result<Option<&'a [u8; 6]>> {
+        if self.is_null_or_missing(col_idx) {
+            return Ok(None);
+        }
+        self.get_macaddr(col_idx).map(Some)
+    }
+
+    pub fn get_timestamptz(&self, col_idx: usize) -> Result<(i64, i32)> {
+        let offset = self.get_fixed_col_offset(col_idx);
+        let micros_bytes: [u8; 8] = self.data[offset..offset + 8].try_into().map_err(|_| {
+            eyre::eyre!(
+                "insufficient data for timestamptz micros at col {}",
+                col_idx
+            )
+        })?;
+        let offset_bytes: [u8; 4] =
+            self.data[offset + 8..offset + 12].try_into().map_err(|_| {
+                eyre::eyre!(
+                    "insufficient data for timestamptz offset at col {}",
+                    col_idx
+                )
+            })?;
+        Ok((
+            i64::from_le_bytes(micros_bytes),
+            i32::from_le_bytes(offset_bytes),
+        ))
+    }
+
+    pub fn get_timestamptz_opt(&self, col_idx: usize) -> Result<Option<(i64, i32)>> {
+        if self.is_null_or_missing(col_idx) {
+            return Ok(None);
+        }
+        self.get_timestamptz(col_idx).map(Some)
+    }
+
+    pub fn get_inet4(&self, col_idx: usize) -> Result<&'a [u8; 4]> {
+        let offset = self.get_fixed_col_offset(col_idx);
+        self.data[offset..offset + 4]
+            .try_into()
+            .map_err(|_| eyre::eyre!("insufficient data for inet4 at col {}", col_idx))
+    }
+
+    pub fn get_inet4_opt(&self, col_idx: usize) -> Result<Option<&'a [u8; 4]>> {
+        if self.is_null_or_missing(col_idx) {
+            return Ok(None);
+        }
+        self.get_inet4(col_idx).map(Some)
+    }
+
+    pub fn get_inet6(&self, col_idx: usize) -> Result<&'a [u8; 16]> {
+        let offset = self.get_fixed_col_offset(col_idx);
+        self.data[offset..offset + 16]
+            .try_into()
+            .map_err(|_| eyre::eyre!("insufficient data for inet6 at col {}", col_idx))
+    }
+
+    pub fn get_inet6_opt(&self, col_idx: usize) -> Result<Option<&'a [u8; 16]>> {
+        if self.is_null_or_missing(col_idx) {
+            return Ok(None);
+        }
+        self.get_inet6(col_idx).map(Some)
+    }
+}
