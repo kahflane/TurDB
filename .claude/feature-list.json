@@ -452,7 +452,7 @@
         },
         {
           "task": "Implement decode functions for each type",
-          "done": false
+          "done": true
         },
         {
           "task": "Verify byte ordering preserves sort order",
