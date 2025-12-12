@@ -605,6 +605,21 @@ impl<'a> RecordBuilder<'a> {
         }
     }
 
+    pub fn reset(&mut self) {
+        for i in 0..self.schema.column_count() {
+            let byte_idx = i / 8;
+            let bit_idx = i % 8;
+            self.null_bitmap[byte_idx] |= 1 << bit_idx;
+        }
+        self.fixed_data.fill(0);
+        for var in &mut self.var_data {
+            var.clear();
+        }
+        for val in &mut self.column_values {
+            *val = ColumnValue::Null;
+        }
+    }
+
     pub fn set_null(&mut self, col_idx: usize) {
         let byte_idx = col_idx / 8;
         let bit_idx = col_idx % 8;
@@ -1514,5 +1529,31 @@ mod tests {
         assert_eq!(view.get_timestamp(8).unwrap(), 1702300000000000);
         assert_eq!(view.get_uuid(9).unwrap(), &uuid);
         assert_eq!(view.get_macaddr(10).unwrap(), &mac);
+    }
+
+    #[test]
+    fn record_builder_reset_allows_reuse() {
+        let schema = Schema::new(vec![
+            ColumnDef::new("id", DataType::Int4),
+            ColumnDef::new("name", DataType::Text),
+        ]);
+
+        let mut builder = RecordBuilder::new(&schema);
+        builder.set_int4(0, 100).unwrap();
+        builder.set_text(1, "first").unwrap();
+        let data1 = builder.build().unwrap();
+
+        let view1 = RecordView::new(&data1, &schema).unwrap();
+        assert_eq!(view1.get_int4(0).unwrap(), 100);
+        assert_eq!(view1.get_text(1).unwrap(), "first");
+
+        builder.reset();
+        builder.set_int4(0, 200).unwrap();
+        builder.set_text(1, "second").unwrap();
+        let data2 = builder.build().unwrap();
+
+        let view2 = RecordView::new(&data2, &schema).unwrap();
+        assert_eq!(view2.get_int4(0).unwrap(), 200);
+        assert_eq!(view2.get_text(1).unwrap(), "second");
     }
 }
