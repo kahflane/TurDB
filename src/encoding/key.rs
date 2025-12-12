@@ -226,6 +226,98 @@ pub fn encode_uuid(uuid: &[u8; 16], buf: &mut Vec<u8>) {
     buf.extend(uuid);
 }
 
+pub fn encode_time(micros: i64, buf: &mut Vec<u8>) {
+    buf.push(type_prefix::TIME);
+    buf.extend(((micros as u64) ^ (1u64 << 63)).to_be_bytes());
+}
+
+pub fn encode_timestamptz(micros: i64, tz_offset_mins: i16, buf: &mut Vec<u8>) {
+    buf.push(type_prefix::TIMESTAMPTZ);
+    buf.extend(((micros as u64) ^ (1u64 << 63)).to_be_bytes());
+    buf.extend(((tz_offset_mins as u16) ^ (1u16 << 15)).to_be_bytes());
+}
+
+pub fn encode_interval(months: i32, days: i32, micros: i64, buf: &mut Vec<u8>) {
+    buf.push(type_prefix::INTERVAL);
+    buf.extend(((months as u32) ^ (1u32 << 31)).to_be_bytes());
+    buf.extend(((days as u32) ^ (1u32 << 31)).to_be_bytes());
+    buf.extend(((micros as u64) ^ (1u64 << 63)).to_be_bytes());
+}
+
+pub fn encode_inet(is_ipv6: bool, addr: &[u8], prefix_len: u8, buf: &mut Vec<u8>) {
+    buf.push(type_prefix::INET);
+    buf.push(if is_ipv6 { 1 } else { 0 });
+    buf.push(prefix_len);
+    if is_ipv6 {
+        buf.extend(&addr[..16]);
+    } else {
+        buf.extend(&addr[..4]);
+    }
+}
+
+pub fn encode_macaddr(addr: &[u8; 6], buf: &mut Vec<u8>) {
+    buf.push(type_prefix::MACADDR);
+    buf.extend(addr);
+}
+
+pub fn encode_tuple<F>(elements: &[F], buf: &mut Vec<u8>, encode_elem: impl Fn(&F, &mut Vec<u8>)) {
+    buf.push(type_prefix::TUPLE);
+    for (i, elem) in elements.iter().enumerate() {
+        if i > 0 {
+            buf.push(0x01);
+        }
+        encode_elem(elem, buf);
+    }
+    buf.push(0x00);
+}
+
+pub fn encode_range<T>(
+    lower: Option<&T>,
+    upper: Option<&T>,
+    lower_inclusive: bool,
+    upper_inclusive: bool,
+    buf: &mut Vec<u8>,
+    encode_bound: impl Fn(&T, &mut Vec<u8>),
+) {
+    buf.push(type_prefix::RANGE);
+    let flags: u8 = (if lower.is_none() { 0x01 } else { 0 })
+        | (if upper.is_none() { 0x02 } else { 0 })
+        | (if lower_inclusive { 0x04 } else { 0 })
+        | (if upper_inclusive { 0x08 } else { 0 });
+    buf.push(flags);
+    if let Some(l) = lower {
+        encode_bound(l, buf);
+    }
+    if let Some(u) = upper {
+        encode_bound(u, buf);
+    }
+}
+
+pub fn encode_domain<F>(
+    type_id: u32,
+    value: &F,
+    buf: &mut Vec<u8>,
+    encode_val: impl Fn(&F, &mut Vec<u8>),
+) {
+    buf.push(type_prefix::DOMAIN);
+    buf.extend(type_id.to_be_bytes());
+    encode_val(value, buf);
+}
+
+pub fn encode_vector(dimensions: &[f32], buf: &mut Vec<u8>) {
+    buf.push(type_prefix::VECTOR);
+    buf.extend((dimensions.len() as u32).to_be_bytes());
+    for &dim in dimensions {
+        let bits = dim.to_bits();
+        let encoded = if dim < 0.0 {
+            !bits
+        } else {
+            bits ^ (1u32 << 31)
+        };
+        buf.extend(encoded.to_be_bytes());
+    }
+}
+
 pub fn encode_array<F>(elements: &[F], buf: &mut Vec<u8>, encode_elem: impl Fn(&F, &mut Vec<u8>)) {
     buf.push(type_prefix::ARRAY);
     for (i, elem) in elements.iter().enumerate() {
@@ -378,9 +470,32 @@ pub enum DecodedKey {
     Text(String),
     Blob(Vec<u8>),
     Date(i32),
+    Time(i64),
     Timestamp(i64),
+    TimestampTz {
+        micros: i64,
+        tz_offset_mins: i16,
+    },
+    Interval {
+        months: i32,
+        days: i32,
+        micros: i64,
+    },
     Uuid([u8; 16]),
+    Inet {
+        is_ipv6: bool,
+        addr: Vec<u8>,
+        prefix_len: u8,
+    },
+    MacAddr([u8; 6]),
     Array(Vec<DecodedKey>),
+    Tuple(Vec<DecodedKey>),
+    Range {
+        lower: Option<Box<DecodedKey>>,
+        upper: Option<Box<DecodedKey>>,
+        lower_inclusive: bool,
+        upper_inclusive: bool,
+    },
     Enum {
         type_id: u32,
         ordinal: u32,
@@ -389,6 +504,11 @@ pub enum DecodedKey {
         type_id: u32,
         fields: Vec<DecodedKey>,
     },
+    Domain {
+        type_id: u32,
+        value: Box<DecodedKey>,
+    },
+    Vector(Vec<f32>),
     Json(DecodedJson),
 }
 
@@ -449,6 +569,13 @@ pub fn decode_key(data: &[u8]) -> Result<(DecodedKey, usize)> {
             let days = (encoded ^ (1u32 << 31)) as i32;
             Ok((DecodedKey::Date(days), 5))
         }
+        type_prefix::TIME => {
+            ensure!(data.len() >= 9, "truncated time");
+            let bytes: [u8; 8] = data[1..9].try_into().unwrap();
+            let encoded = u64::from_be_bytes(bytes);
+            let micros = (encoded ^ (1u64 << 63)) as i64;
+            Ok((DecodedKey::Time(micros), 9))
+        }
         type_prefix::TIMESTAMP => {
             ensure!(data.len() >= 9, "truncated timestamp");
             let bytes: [u8; 8] = data[1..9].try_into().unwrap();
@@ -456,14 +583,104 @@ pub fn decode_key(data: &[u8]) -> Result<(DecodedKey, usize)> {
             let micros = (encoded ^ (1u64 << 63)) as i64;
             Ok((DecodedKey::Timestamp(micros), 9))
         }
+        type_prefix::TIMESTAMPTZ => {
+            ensure!(data.len() >= 11, "truncated timestamptz");
+            let ts_bytes: [u8; 8] = data[1..9].try_into().unwrap();
+            let tz_bytes: [u8; 2] = data[9..11].try_into().unwrap();
+            let encoded_ts = u64::from_be_bytes(ts_bytes);
+            let encoded_tz = u16::from_be_bytes(tz_bytes);
+            let micros = (encoded_ts ^ (1u64 << 63)) as i64;
+            let tz_offset_mins = (encoded_tz ^ (1u16 << 15)) as i16;
+            Ok((
+                DecodedKey::TimestampTz {
+                    micros,
+                    tz_offset_mins,
+                },
+                11,
+            ))
+        }
+        type_prefix::INTERVAL => {
+            ensure!(data.len() >= 17, "truncated interval");
+            let m_bytes: [u8; 4] = data[1..5].try_into().unwrap();
+            let d_bytes: [u8; 4] = data[5..9].try_into().unwrap();
+            let u_bytes: [u8; 8] = data[9..17].try_into().unwrap();
+            let months = (u32::from_be_bytes(m_bytes) ^ (1u32 << 31)) as i32;
+            let days = (u32::from_be_bytes(d_bytes) ^ (1u32 << 31)) as i32;
+            let micros = (u64::from_be_bytes(u_bytes) ^ (1u64 << 63)) as i64;
+            Ok((
+                DecodedKey::Interval {
+                    months,
+                    days,
+                    micros,
+                },
+                17,
+            ))
+        }
         type_prefix::UUID => {
             ensure!(data.len() >= 17, "truncated uuid");
             let bytes: [u8; 16] = data[1..17].try_into().unwrap();
             Ok((DecodedKey::Uuid(bytes), 17))
         }
+        type_prefix::INET => {
+            ensure!(data.len() >= 3, "truncated inet");
+            let is_ipv6 = data[1] != 0;
+            let prefix_len = data[2];
+            let addr_len = if is_ipv6 { 16 } else { 4 };
+            ensure!(data.len() >= 3 + addr_len, "truncated inet address");
+            let addr = data[3..3 + addr_len].to_vec();
+            Ok((
+                DecodedKey::Inet {
+                    is_ipv6,
+                    addr,
+                    prefix_len,
+                },
+                3 + addr_len,
+            ))
+        }
+        type_prefix::MACADDR => {
+            ensure!(data.len() >= 7, "truncated macaddr");
+            let bytes: [u8; 6] = data[1..7].try_into().unwrap();
+            Ok((DecodedKey::MacAddr(bytes), 7))
+        }
         type_prefix::ARRAY => {
             let (elements, consumed) = decode_array_elements(&data[1..])?;
             Ok((DecodedKey::Array(elements), 1 + consumed))
+        }
+        type_prefix::TUPLE => {
+            let (elements, consumed) = decode_array_elements(&data[1..])?;
+            Ok((DecodedKey::Tuple(elements), 1 + consumed))
+        }
+        type_prefix::RANGE => {
+            ensure!(data.len() >= 2, "truncated range");
+            let flags = data[1];
+            let lower_empty = (flags & 0x01) != 0;
+            let upper_empty = (flags & 0x02) != 0;
+            let lower_inclusive = (flags & 0x04) != 0;
+            let upper_inclusive = (flags & 0x08) != 0;
+            let mut offset = 2;
+            let lower = if lower_empty {
+                None
+            } else {
+                let (val, consumed) = decode_key(&data[offset..])?;
+                offset += consumed;
+                Some(Box::new(val))
+            };
+            let upper = if upper_empty {
+                None
+            } else {
+                let (val, consumed) = decode_key(&data[offset..])?;
+                offset += consumed;
+                Some(Box::new(val))
+            };
+            Ok((
+                DecodedKey::Range {
+                    lower,
+                    upper,
+                    lower_inclusive,
+                    upper_inclusive,
+                },
+                offset,
+            ))
         }
         type_prefix::ENUM => {
             ensure!(data.len() >= 9, "truncated enum");
@@ -476,6 +693,38 @@ pub fn decode_key(data: &[u8]) -> Result<(DecodedKey, usize)> {
             let type_id = u32::from_be_bytes(data[1..5].try_into().unwrap());
             let (fields, consumed) = decode_composite_fields(&data[5..])?;
             Ok((DecodedKey::Composite { type_id, fields }, 5 + consumed))
+        }
+        type_prefix::DOMAIN => {
+            ensure!(data.len() >= 5, "truncated domain");
+            let type_id = u32::from_be_bytes(data[1..5].try_into().unwrap());
+            let (value, consumed) = decode_key(&data[5..])?;
+            Ok((
+                DecodedKey::Domain {
+                    type_id,
+                    value: Box::new(value),
+                },
+                5 + consumed,
+            ))
+        }
+        type_prefix::VECTOR => {
+            ensure!(data.len() >= 5, "truncated vector");
+            let dim_count = u32::from_be_bytes(data[1..5].try_into().unwrap()) as usize;
+            ensure!(
+                data.len() >= 5 + dim_count * 4,
+                "truncated vector dimensions"
+            );
+            let mut dimensions = Vec::with_capacity(dim_count);
+            for i in 0..dim_count {
+                let start = 5 + i * 4;
+                let encoded = u32::from_be_bytes(data[start..start + 4].try_into().unwrap());
+                let bits = if encoded & (1u32 << 31) != 0 {
+                    encoded ^ (1u32 << 31)
+                } else {
+                    !encoded
+                };
+                dimensions.push(f32::from_bits(bits));
+            }
+            Ok((DecodedKey::Vector(dimensions), 5 + dim_count * 4))
         }
         type_prefix::JSON_NULL
         | type_prefix::JSON_FALSE
@@ -881,6 +1130,186 @@ mod tests {
             }
             _ => panic!("expected composite"),
         }
+    }
+
+    #[test]
+    fn encode_time_roundtrip() {
+        for &micros in &[0_i64, 3600_000_000, -3600_000_000] {
+            let mut buf = Vec::new();
+            encode_time(micros, &mut buf);
+            assert_eq!(buf[0], type_prefix::TIME);
+            let (decoded, consumed) = decode_key(&buf).unwrap();
+            assert_eq!(decoded, DecodedKey::Time(micros));
+            assert_eq!(consumed, 9);
+        }
+    }
+
+    #[test]
+    fn encode_timestamptz_roundtrip() {
+        let mut buf = Vec::new();
+        encode_timestamptz(1_000_000_000, 60, &mut buf);
+        assert_eq!(buf[0], type_prefix::TIMESTAMPTZ);
+        let (decoded, consumed) = decode_key(&buf).unwrap();
+        assert_eq!(
+            decoded,
+            DecodedKey::TimestampTz {
+                micros: 1_000_000_000,
+                tz_offset_mins: 60
+            }
+        );
+        assert_eq!(consumed, 11);
+    }
+
+    #[test]
+    fn encode_interval_roundtrip() {
+        let mut buf = Vec::new();
+        encode_interval(12, 30, 3600_000_000, &mut buf);
+        assert_eq!(buf[0], type_prefix::INTERVAL);
+        let (decoded, consumed) = decode_key(&buf).unwrap();
+        assert_eq!(
+            decoded,
+            DecodedKey::Interval {
+                months: 12,
+                days: 30,
+                micros: 3600_000_000
+            }
+        );
+        assert_eq!(consumed, 17);
+    }
+
+    #[test]
+    fn encode_inet_ipv4_roundtrip() {
+        let addr = [192, 168, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        let mut buf = Vec::new();
+        encode_inet(false, &addr, 24, &mut buf);
+        assert_eq!(buf[0], type_prefix::INET);
+        let (decoded, consumed) = decode_key(&buf).unwrap();
+        match decoded {
+            DecodedKey::Inet {
+                is_ipv6,
+                addr: decoded_addr,
+                prefix_len,
+            } => {
+                assert!(!is_ipv6);
+                assert_eq!(decoded_addr, &addr[..4]);
+                assert_eq!(prefix_len, 24);
+            }
+            _ => panic!("expected inet"),
+        }
+        assert_eq!(consumed, 7);
+    }
+
+    #[test]
+    fn encode_inet_ipv6_roundtrip() {
+        let addr = [
+            0x20, 0x01, 0x0d, 0xb8, 0x85, 0xa3, 0x00, 0x00, 0x00, 0x00, 0x8a, 0x2e, 0x03, 0x70,
+            0x73, 0x34,
+        ];
+        let mut buf = Vec::new();
+        encode_inet(true, &addr, 64, &mut buf);
+        let (decoded, consumed) = decode_key(&buf).unwrap();
+        match decoded {
+            DecodedKey::Inet {
+                is_ipv6,
+                addr: decoded_addr,
+                prefix_len,
+            } => {
+                assert!(is_ipv6);
+                assert_eq!(decoded_addr, &addr[..16]);
+                assert_eq!(prefix_len, 64);
+            }
+            _ => panic!("expected inet"),
+        }
+        assert_eq!(consumed, 19);
+    }
+
+    #[test]
+    fn encode_macaddr_roundtrip() {
+        let addr: [u8; 6] = [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF];
+        let mut buf = Vec::new();
+        encode_macaddr(&addr, &mut buf);
+        assert_eq!(buf[0], type_prefix::MACADDR);
+        let (decoded, consumed) = decode_key(&buf).unwrap();
+        assert_eq!(decoded, DecodedKey::MacAddr(addr));
+        assert_eq!(consumed, 7);
+    }
+
+    #[test]
+    fn encode_tuple_roundtrip() {
+        let elements = [1_i64, 2, 3];
+        let mut buf = Vec::new();
+        encode_tuple(&elements, &mut buf, |n, b| encode_int(*n, b));
+        assert_eq!(buf[0], type_prefix::TUPLE);
+        let (decoded, _) = decode_key(&buf).unwrap();
+        match decoded {
+            DecodedKey::Tuple(elems) => {
+                assert_eq!(elems.len(), 3);
+                assert_eq!(elems[0], DecodedKey::Int(1));
+            }
+            _ => panic!("expected tuple"),
+        }
+    }
+
+    #[test]
+    fn encode_range_roundtrip() {
+        let lower = 10_i64;
+        let upper = 20_i64;
+        let mut buf = Vec::new();
+        encode_range(Some(&lower), Some(&upper), true, false, &mut buf, |n, b| {
+            encode_int(*n, b)
+        });
+        assert_eq!(buf[0], type_prefix::RANGE);
+        let (decoded, _) = decode_key(&buf).unwrap();
+        match decoded {
+            DecodedKey::Range {
+                lower,
+                upper,
+                lower_inclusive,
+                upper_inclusive,
+            } => {
+                assert!(lower_inclusive);
+                assert!(!upper_inclusive);
+                assert_eq!(*lower.unwrap(), DecodedKey::Int(10));
+                assert_eq!(*upper.unwrap(), DecodedKey::Int(20));
+            }
+            _ => panic!("expected range"),
+        }
+    }
+
+    #[test]
+    fn encode_domain_roundtrip() {
+        let value = 42_i64;
+        let mut buf = Vec::new();
+        encode_domain(100, &value, &mut buf, |n, b| encode_int(*n, b));
+        assert_eq!(buf[0], type_prefix::DOMAIN);
+        let (decoded, _) = decode_key(&buf).unwrap();
+        match decoded {
+            DecodedKey::Domain { type_id, value } => {
+                assert_eq!(type_id, 100);
+                assert_eq!(*value, DecodedKey::Int(42));
+            }
+            _ => panic!("expected domain"),
+        }
+    }
+
+    #[test]
+    fn encode_vector_roundtrip() {
+        let dims = [1.0_f32, 2.5, -3.0, 0.0];
+        let mut buf = Vec::new();
+        encode_vector(&dims, &mut buf);
+        assert_eq!(buf[0], type_prefix::VECTOR);
+        let (decoded, consumed) = decode_key(&buf).unwrap();
+        match decoded {
+            DecodedKey::Vector(decoded_dims) => {
+                assert_eq!(decoded_dims.len(), 4);
+                assert_eq!(decoded_dims[0], 1.0);
+                assert_eq!(decoded_dims[1], 2.5);
+                assert_eq!(decoded_dims[2], -3.0);
+                assert_eq!(decoded_dims[3], 0.0);
+            }
+            _ => panic!("expected vector"),
+        }
+        assert_eq!(consumed, 5 + 4 * 4);
     }
 
     #[test]
