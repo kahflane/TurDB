@@ -244,6 +244,25 @@ impl MmapStorage {
     pub fn file_size(&self) -> u64 {
         self.page_count as u64 * PAGE_SIZE as u64
     }
+
+    pub fn prefetch_pages(&self, start_page: u32, count: u32) {
+        if start_page >= self.page_count {
+            return;
+        }
+
+        let end_page = (start_page + count).min(self.page_count);
+        let start_offset = start_page as usize * PAGE_SIZE;
+        let len = (end_page - start_page) as usize * PAGE_SIZE;
+
+        #[cfg(unix)]
+        unsafe {
+            libc::madvise(
+                self.mmap.as_ptr().add(start_offset) as *mut libc::c_void,
+                len,
+                libc::MADV_WILLNEED,
+            );
+        }
+    }
 }
 
 #[cfg(test)]
