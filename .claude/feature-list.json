@@ -440,7 +440,7 @@
         },
         {
           "task": "Implement encode_float() with sign bit manipulation",
-          "done": false
+          "done": true
         },
         {
           "task": "Implement encode_text() with null terminator",
