@@ -303,45 +303,45 @@
     {
       "title": "Storage - Multi-File Manager",
       "description": "MySQL-style file-per-table architecture",
-      "isCompleted": false,
+      "isCompleted": true,
       "priority": 5,
       "phase": 1,
       "tasks": [
         {
           "task": "Define FileManager struct with base_path and table files map",
-          "done": false
+          "done": true
         },
         {
           "task": "Define TableFiles struct (data, indexes HashMap)",
-          "done": false
+          "done": true
         },
         {
           "task": "Implement create_schema() to create schema directory",
-          "done": false
+          "done": true
         },
         {
           "task": "Implement create_table() to create .tbd file",
-          "done": false
+          "done": true
         },
         {
           "task": "Implement drop_table() to remove table files",
-          "done": false
+          "done": true
         },
         {
           "task": "Implement table_data() returning MmapStorage reference",
-          "done": false
+          "done": true
         },
         {
           "task": "Implement table_index() returning index MmapStorage",
-          "done": false
+          "done": true
         },
         {
           "task": "Handle max open files limit (LRU close inactive)",
-          "done": false
+          "done": true
         },
         {
           "task": "Write turdb.meta global metadata file",
-          "done": false
+          "done": true
         }
       ]
     },
