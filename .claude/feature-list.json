@@ -431,76 +431,104 @@
       "phase": 2,
       "tasks": [
         {
-          "task": "Define TypePrefix constants module (NULL=0x01, FALSE=0x02, TRUE=0x03, numbers 0x10-0x19, TEXT=0x20, BLOB=0x21, date/time 0x30-0x34, UUID=0x40, JSON 0x50-0x56, composite 0x60-0x65, VECTOR=0x70, CUSTOM_START=0x80, MAX_KEY=0xFF)",
-          "done": false
+          "task": "Implement encode_null() as 0x01",
+          "done": true
         },
         {
-          "task": "Implement encode_null() with TypePrefix::NULL (0x01)",
-          "done": false
+          "task": "Implement encode_bool() with FALSE (0x02) and TRUE (0x03)",
+          "done": true
         },
         {
-          "task": "Implement encode_bool() with TypePrefix::FALSE (0x02) and TRUE (0x03)",
-          "done": false
+          "task": "Implement encode_int() with XOR flip and big-endian",
+          "done": true
         },
         {
-          "task": "Implement encode_int() with sign-split (NEG_INT=0x12, ZERO=0x14, POS_INT=0x16) and big-endian bytes",
-          "done": false
+          "task": "Implement encode_float() with sign bit manipulation",
+          "done": true
         },
         {
-          "task": "Implement encode_float() with IEEE bit manipulation (NEG_INFINITY=0x10, NEG_FLOAT=0x13, ZERO=0x14, POS_FLOAT=0x15, POS_INFINITY=0x18, NAN=0x19)",
-          "done": false
+          "task": "Implement encode_text() with null terminator",
+          "done": true
         },
         {
-          "task": "Implement encode_text() with escaped null-termination (escape 0x00 as 0x00FF, 0xFF as 0xFF00, double-null terminator)",
-          "done": false
+          "task": "Implement encode_blob() with length prefix or null terminator",
+          "done": true
         },
         {
-          "task": "Implement encode_blob() with same escaping scheme as text",
-          "done": false
+          "task": "Implement encode_date() with signed i32 XOR encoding",
+          "done": true
         },
         {
-          "task": "Implement encode_date() with signed XOR flip (days since epoch)",
-          "done": false
+          "task": "Implement encode_time() with signed i64 microseconds XOR encoding",
+          "done": true
         },
         {
-          "task": "Implement encode_timestamp() with signed XOR flip (micros since epoch)",
-          "done": false
+          "task": "Implement encode_timestamp() with signed i64 XOR encoding",
+          "done": true
         },
         {
-          "task": "Implement encode_uuid() (16 bytes, already big-endian by spec)",
-          "done": false
+          "task": "Implement encode_timestamptz() with timestamp + timezone offset",
+          "done": true
         },
         {
-          "task": "Implement encode_json() with recursive encoding (JSON_NULL through JSON_OBJECT prefixes, sorted object keys)",
-          "done": false
+          "task": "Implement encode_interval() with months, days, microseconds",
+          "done": true
         },
         {
-          "task": "Implement encode_array() with element separator (0x01) and terminator (0x00)",
-          "done": false
+          "task": "Implement encode_uuid() with 16-byte fixed encoding",
+          "done": true
         },
         {
-          "task": "Implement encode_enum() with type_id and variant_ordinal",
-          "done": false
+          "task": "Implement encode_inet() for IPv4/IPv6 addresses",
+          "done": true
         },
         {
-          "task": "Implement encode_composite() with type_id and field separators",
-          "done": false
+          "task": "Implement encode_macaddr() with 6-byte MAC address",
+          "done": true
         },
         {
-          "task": "Implement encode_value() dispatcher for all Value types",
-          "done": false
+          "task": "Implement encode_json() for all JSON types",
+          "done": true
         },
         {
-          "task": "Implement decode functions for each type (decode_int, decode_float, decode_text, etc.)",
-          "done": false
+          "task": "Implement encode_array() with element separators",
+          "done": true
         },
         {
-          "task": "Verify byte ordering preserves sort order for all types with property tests",
-          "done": false
+          "task": "Implement encode_tuple() with element separators",
+          "done": true
         },
         {
-          "task": "Test multi-column key encoding with mixed types",
-          "done": false
+          "task": "Implement encode_range() with bounds and flags",
+          "done": true
+        },
+        {
+          "task": "Implement encode_enum() with type_id and ordinal",
+          "done": true
+        },
+        {
+          "task": "Implement encode_composite() with type_id and fields",
+          "done": true
+        },
+        {
+          "task": "Implement encode_domain() with type_id and value",
+          "done": true
+        },
+        {
+          "task": "Implement encode_vector() for float32 embeddings",
+          "done": true
+        },
+        {
+          "task": "Implement encode_value() dispatcher",
+          "done": true
+        },
+        {
+          "task": "Implement decode functions for each type",
+          "done": true
+        },
+        {
+          "task": "Verify byte ordering preserves sort order",
+          "done": true
         }
       ]
     },
