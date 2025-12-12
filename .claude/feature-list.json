@@ -269,7 +269,7 @@
     {
       "title": "Storage - Freelist Management",
       "description": "Track and allocate free pages",
-      "isCompleted": false,
+      "isCompleted": true,
       "priority": 4,
       "phase": 1,
       "tasks": [
@@ -295,7 +295,7 @@
         },
         {
           "task": "Handle trunk page overflow (create new trunk)",
-          "done": false
+          "done": true
         }
       ]
     },
