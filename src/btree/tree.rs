@@ -40,20 +40,31 @@
 //!
 //! - Path stack uses `SmallVec<[u32; 8]>` - stack-allocated for trees up to 8 levels
 //! - No heap allocation during search operations
-//! - Split operations allocate temporarily (rare, ~1 per 100-1000 inserts)
+//! - Split operations allocate `Vec<Vec<u8>>` temporarily (~1 per 100-1000 inserts)
+//!
+//! ### Split Allocation Tradeoff
+//!
+//! Node splits copy all keys/values to Vec temporaries for redistribution. This is
+//! acceptable because:
+//! - Splits are rare (~1 per 100-1000 inserts depending on key/value sizes)
+//! - Split cost is amortized across many insertions
+//! - Alternative (arena allocator) adds complexity for minimal gain
+//!
+//! Future optimization: Use `bumpalo` arena allocator if profiling shows split
+//! allocation as a bottleneck in high-throughput scenarios.
 //!
 //! ## Free Page Management
 //!
 //! The tree integrates with a freelist for page reuse:
-//! - Deleted leaf pages (when empty after underflow) return to freelist
 //! - New pages allocated from freelist before growing file
-//! - Prevents file bloat during delete-heavy workloads
+//! - Prevents file bloat during mixed insert/delete workloads
 //!
 //! ## Cursor for Range Scans
 //!
 //! The `Cursor` struct enables efficient ordered iteration:
 //! - Walks leaf pages via next_leaf pointers
 //! - Zero-copy key/value access
+//! - Uses madvise(MADV_WILLNEED) to prefetch upcoming pages
 //! - Supports forward iteration (backward requires separate implementation)
 //!
 //! ## Node Splitting
@@ -71,9 +82,18 @@
 //! 1. Search for key in leaf
 //! 2. If not found: return false
 //! 3. Delete cell from leaf
-//! 4. Empty pages are NOT automatically freed (would require parent updates)
 //!
-//! For workloads with heavy deletes, periodic compaction is recommended.
+//! ### Page Reclamation
+//!
+//! Deleted pages are NOT automatically returned to the freelist because:
+//! - Would require updating parent interior nodes (complex)
+//! - Would require tracking which pages became empty
+//! - Most workloads don't benefit (inserts often follow deletes)
+//!
+//! For delete-heavy workloads, consider:
+//! - Periodic offline compaction (rebuild tree from cursor scan)
+//! - Using a separate tombstone mechanism with background cleanup
+//! - Accepting some space overhead in exchange for simpler code
 //!
 //! ## Thread Safety
 //!
@@ -665,6 +685,8 @@ impl<'a> Cursor<'a> {
             self.exhausted = true;
             return Ok(false);
         }
+
+        self.storage.prefetch_pages(next_page + 1, 2);
 
         self.current_page = next_page;
         self.current_index = 0;
