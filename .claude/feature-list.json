@@ -572,45 +572,45 @@
     {
       "title": "B-Tree - Cursor with Prefetching",
       "description": "Iterator cursor with madvise prefetching",
-      "isCompleted": false,
+      "isCompleted": true,
       "priority": 10,
       "phase": 2,
       "tasks": [
         {
           "task": "Define Cursor<'a> with tree reference and position",
-          "done": false
+          "done": true
         },
         {
           "task": "Implement seek() to position at key",
-          "done": false
+          "done": true
         },
         {
           "task": "Implement seek_first() to position at first key",
-          "done": false
+          "done": true
         },
         {
           "task": "Implement seek_last() to position at last key",
-          "done": false
+          "done": true
         },
         {
           "task": "Implement next() with prefetch_pages()",
-          "done": false
+          "done": true
         },
         {
           "task": "Implement prev() for reverse iteration",
-          "done": false
+          "done": true
         },
         {
           "task": "Implement prefetch_pages() using madvise MADV_WILLNEED",
-          "done": false
+          "done": true
         },
         {
           "task": "Implement key() returning Option<&[u8]> (zero-copy)",
-          "done": false
+          "done": true
         },
         {
           "task": "Implement value() returning Option<&[u8]> (zero-copy)",
-          "done": false
+          "done": true
         }
       ]
     },
