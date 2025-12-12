@@ -364,10 +364,103 @@ impl FileManager {
         table_path.exists()
     }
 
+    pub fn drop_table(&mut self, schema: &str, table: &str) -> Result<()> {
+        ensure!(
+            self.table_exists(schema, table),
+            "table '{}.{}' does not exist",
+            schema,
+            table
+        );
+
+        for index_name in self.list_indexes(schema, table)? {
+            let index_path = self.index_file_path(schema, table, &index_name);
+            fs::remove_file(&index_path).wrap_err_with(|| {
+                format!("failed to remove index file '{}'", index_path.display())
+            })?;
+        }
+
+        let table_path = self.table_file_path(schema, table);
+        fs::remove_file(&table_path)
+            .wrap_err_with(|| format!("failed to remove table file '{}'", table_path.display()))?;
+
+        Ok(())
+    }
+
+    pub fn create_index(
+        &mut self,
+        schema: &str,
+        table: &str,
+        index_name: &str,
+        index_id: u64,
+        is_unique: bool,
+    ) -> Result<()> {
+        Self::validate_name(index_name)?;
+
+        ensure!(
+            self.table_exists(schema, table),
+            "table '{}.{}' does not exist",
+            schema,
+            table
+        );
+
+        let index_path = self.index_file_path(schema, table, index_name);
+
+        ensure!(
+            !index_path.exists(),
+            "index '{}.{}.{}' already exists",
+            schema,
+            table,
+            index_name
+        );
+
+        let mut storage = MmapStorage::create(&index_path, 1)?;
+
+        let page = storage.page_mut(0)?;
+        page[..16].copy_from_slice(INDEX_MAGIC);
+        page[16..24].copy_from_slice(&index_id.to_le_bytes());
+        page[40] = if is_unique { 1 } else { 0 };
+
+        storage.sync()?;
+
+        Ok(())
+    }
+
+    pub fn index_exists(&self, schema: &str, table: &str, index_name: &str) -> bool {
+        let index_path = self.index_file_path(schema, table, index_name);
+        index_path.exists()
+    }
+
+    fn list_indexes(&self, schema: &str, table: &str) -> Result<Vec<String>> {
+        let schema_path = self.base_path.join(schema);
+        let prefix = format!("{}_{}", table, "");
+        let suffix = format!(".{}", INDEX_FILE_EXTENSION);
+
+        let mut indexes = Vec::new();
+
+        if let Ok(entries) = fs::read_dir(&schema_path) {
+            for entry in entries.flatten() {
+                if let Some(name) = entry.file_name().to_str() {
+                    if name.starts_with(&prefix) && name.ends_with(&suffix) {
+                        let index_name = &name[prefix.len()..name.len() - suffix.len()];
+                        indexes.push(index_name.to_string());
+                    }
+                }
+            }
+        }
+
+        Ok(indexes)
+    }
+
     fn table_file_path(&self, schema: &str, table: &str) -> PathBuf {
         self.base_path
             .join(schema)
             .join(format!("{}.{}", table, TABLE_FILE_EXTENSION))
+    }
+
+    fn index_file_path(&self, schema: &str, table: &str, index_name: &str) -> PathBuf {
+        self.base_path
+            .join(schema)
+            .join(format!("{}_{}.{}", table, index_name, INDEX_FILE_EXTENSION))
     }
 
     fn validate_name(name: &str) -> Result<()> {
@@ -590,5 +683,49 @@ mod tests {
 
         fm.create_table(DEFAULT_SCHEMA, "users", 1).unwrap();
         assert!(fm.table_exists(DEFAULT_SCHEMA, "users"));
+    }
+
+    #[test]
+    fn drop_table_removes_tbd_file() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("testdb");
+
+        let mut fm = FileManager::create(&db_path, DEFAULT_MAX_OPEN_FILES).unwrap();
+
+        fm.create_table(DEFAULT_SCHEMA, "users", 1).unwrap();
+        assert!(fm.table_exists(DEFAULT_SCHEMA, "users"));
+
+        fm.drop_table(DEFAULT_SCHEMA, "users").unwrap();
+        assert!(!fm.table_exists(DEFAULT_SCHEMA, "users"));
+    }
+
+    #[test]
+    fn drop_table_fails_for_nonexistent_table() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("testdb");
+
+        let mut fm = FileManager::create(&db_path, DEFAULT_MAX_OPEN_FILES).unwrap();
+
+        let result = fm.drop_table(DEFAULT_SCHEMA, "nonexistent");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn drop_table_removes_associated_indexes() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("testdb");
+
+        let mut fm = FileManager::create(&db_path, DEFAULT_MAX_OPEN_FILES).unwrap();
+
+        fm.create_table(DEFAULT_SCHEMA, "users", 1).unwrap();
+        fm.create_index(DEFAULT_SCHEMA, "users", "email_idx", 1, true)
+            .unwrap();
+
+        assert!(fm.index_exists(DEFAULT_SCHEMA, "users", "email_idx"));
+
+        fm.drop_table(DEFAULT_SCHEMA, "users").unwrap();
+
+        assert!(!fm.table_exists(DEFAULT_SCHEMA, "users"));
+        assert!(!fm.index_exists(DEFAULT_SCHEMA, "users", "email_idx"));
     }
 }
