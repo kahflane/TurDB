@@ -79,4 +79,5 @@
 //! - `sql`: Lexer, parser, planner, executor
 //! - `transaction`: MVCC and WAL
 
+pub mod btree;
 pub mod storage;
