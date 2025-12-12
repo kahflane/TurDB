@@ -1471,3 +1471,136 @@ fn decimal_negative_value() {
     assert!(decimal.is_negative());
     assert_eq!(decimal.scale(), 4);
 }
+
+#[test]
+fn array_builder_creates_int4_array() {
+    use crate::records::array::{ArrayBuilder, ArrayView};
+
+    let mut builder = ArrayBuilder::new(DataType::Int4);
+    builder.push_int4(10);
+    builder.push_int4(20);
+    builder.push_int4(30);
+
+    let data = builder.build();
+    let view = ArrayView::new(&data).unwrap();
+
+    assert_eq!(view.len(), 3);
+    assert_eq!(view.elem_type(), DataType::Int4);
+    assert_eq!(view.get_int4(0).unwrap(), 10);
+    assert_eq!(view.get_int4(1).unwrap(), 20);
+    assert_eq!(view.get_int4(2).unwrap(), 30);
+}
+
+#[test]
+fn array_view_returns_none_for_out_of_bounds() {
+    use crate::records::array::{ArrayBuilder, ArrayView};
+
+    let mut builder = ArrayBuilder::new(DataType::Int4);
+    builder.push_int4(42);
+
+    let data = builder.build();
+    let view = ArrayView::new(&data).unwrap();
+
+    assert!(view.get_int4(0).is_ok());
+    assert!(view.get_int4(1).is_err());
+}
+
+#[test]
+fn array_builder_creates_text_array() {
+    use crate::records::array::{ArrayBuilder, ArrayView};
+
+    let mut builder = ArrayBuilder::new(DataType::Text);
+    builder.push_text("hello");
+    builder.push_text("world");
+    builder.push_text("!");
+
+    let data = builder.build();
+    let view = ArrayView::new(&data).unwrap();
+
+    assert_eq!(view.len(), 3);
+    assert_eq!(view.elem_type(), DataType::Text);
+    assert_eq!(view.get_text(0).unwrap(), "hello");
+    assert_eq!(view.get_text(1).unwrap(), "world");
+    assert_eq!(view.get_text(2).unwrap(), "!");
+}
+
+#[test]
+fn array_view_empty_array() {
+    use crate::records::array::{ArrayBuilder, ArrayView};
+
+    let builder = ArrayBuilder::new(DataType::Int4);
+    let data = builder.build();
+    let view = ArrayView::new(&data).unwrap();
+
+    assert_eq!(view.len(), 0);
+    assert_eq!(view.elem_type(), DataType::Int4);
+}
+
+#[test]
+fn array_builder_handles_nulls() {
+    use crate::records::array::{ArrayBuilder, ArrayView};
+
+    let mut builder = ArrayBuilder::new(DataType::Int4);
+    builder.push_int4(10);
+    builder.push_null();
+    builder.push_int4(30);
+
+    let data = builder.build();
+    let view = ArrayView::new(&data).unwrap();
+
+    assert_eq!(view.len(), 3);
+    assert!(!view.is_null(0));
+    assert!(view.is_null(1));
+    assert!(!view.is_null(2));
+    assert_eq!(view.get_int4(0).unwrap(), 10);
+    assert_eq!(view.get_int4(2).unwrap(), 30);
+}
+
+#[test]
+fn array_view_zero_copy_text_access() {
+    use crate::records::array::{ArrayBuilder, ArrayView};
+
+    let mut builder = ArrayBuilder::new(DataType::Text);
+    builder.push_text("test_string");
+
+    let data = builder.build();
+    let view = ArrayView::new(&data).unwrap();
+
+    let text = view.get_text(0).unwrap();
+    let text_ptr = text.as_ptr();
+    let data_ptr = data.as_ptr();
+    assert!(text_ptr >= data_ptr && text_ptr < unsafe { data_ptr.add(data.len()) });
+}
+
+#[test]
+fn array_builder_float8_array() {
+    use crate::records::array::{ArrayBuilder, ArrayView};
+
+    let mut builder = ArrayBuilder::new(DataType::Float8);
+    builder.push_float8(1.5);
+    builder.push_float8(2.5);
+
+    let data = builder.build();
+    let view = ArrayView::new(&data).unwrap();
+
+    assert_eq!(view.len(), 2);
+    assert!((view.get_float8(0).unwrap() - 1.5).abs() < 0.0001);
+    assert!((view.get_float8(1).unwrap() - 2.5).abs() < 0.0001);
+}
+
+#[test]
+fn array_view_fixed_type_o1_access() {
+    use crate::records::array::{ArrayBuilder, ArrayView};
+
+    let mut builder = ArrayBuilder::new(DataType::Int8);
+    for i in 0..100 {
+        builder.push_int8(i * 1000);
+    }
+
+    let data = builder.build();
+    let view = ArrayView::new(&data).unwrap();
+
+    assert_eq!(view.get_int8(50).unwrap(), 50000);
+    assert_eq!(view.get_int8(99).unwrap(), 99000);
+    assert_eq!(view.get_int8(0).unwrap(), 0);
+}
