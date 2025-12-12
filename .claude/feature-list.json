@@ -291,7 +291,7 @@
         },
         {
           "task": "Implement sync() to persist freelist to disk",
-          "done": false
+          "done": true
         },
         {
           "task": "Handle trunk page overflow (create new trunk)",
