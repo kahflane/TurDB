@@ -183,12 +183,16 @@ pub mod jsonb {
         Object(JsonbView<'a>),
     }
 
-    #[derive(Debug, Clone, Copy)]
+    #[derive(Debug, Clone, Copy, PartialEq)]
     pub struct JsonbView<'a>(pub(crate) &'a [u8]);
 
     impl<'a> JsonbView<'a> {
         pub fn new(data: &'a [u8]) -> Result<Self> {
-            ensure!(data.len() >= 4, "jsonb data too short: {} bytes", data.len());
+            ensure!(
+                data.len() >= 4,
+                "jsonb data too short: {} bytes",
+                data.len()
+            );
             Ok(Self(data))
         }
 
@@ -230,6 +234,7 @@ pub mod jsonb {
             (entry & FLAG_IS_KEY) != 0
         }
 
+        #[allow(dead_code)]
         fn entry_is_variable(entry: u32) -> bool {
             (entry & FLAG_IS_VARIABLE) != 0
         }
@@ -2329,5 +2334,277 @@ mod tests {
                 b
             );
         }
+    }
+
+    #[test]
+    fn data_type_jsonb_is_variable() {
+        assert!(DataType::Jsonb.is_variable());
+        assert_eq!(DataType::Jsonb.fixed_size(), None);
+    }
+
+    #[test]
+    fn jsonb_builder_simple_object() {
+        let mut builder = JsonbBuilder::new_object();
+        builder.set("name", "Alice");
+        builder.set("age", 30);
+
+        let data = builder.build();
+        let view = JsonbView::new(&data).unwrap();
+
+        assert_eq!(view.root_type(), jsonb::JSONB_TYPE_OBJECT);
+        assert_eq!(view.object_len().unwrap(), 2);
+    }
+
+    #[test]
+    fn jsonb_builder_object_get_key() {
+        let mut builder = JsonbBuilder::new_object();
+        builder.set("name", "Bob");
+        builder.set("score", 95.5);
+        builder.set("active", true);
+
+        let data = builder.build();
+        let view = JsonbView::new(&data).unwrap();
+
+        let name = view.get("name").unwrap().unwrap();
+        assert_eq!(name, JsonbValue::String("Bob"));
+
+        let score = view.get("score").unwrap().unwrap();
+        if let JsonbValue::Number(n) = score {
+            assert!((n - 95.5).abs() < 0.0001);
+        } else {
+            panic!("expected number");
+        }
+
+        let active = view.get("active").unwrap().unwrap();
+        assert_eq!(active, JsonbValue::Bool(true));
+
+        assert!(view.get("missing").unwrap().is_none());
+    }
+
+    #[test]
+    fn jsonb_builder_array() {
+        let mut builder = JsonbBuilder::new_array();
+        builder.push(1);
+        builder.push(2);
+        builder.push(3);
+
+        let data = builder.build();
+        let view = JsonbView::new(&data).unwrap();
+
+        assert_eq!(view.root_type(), jsonb::JSONB_TYPE_ARRAY);
+        assert_eq!(view.array_len().unwrap(), 3);
+
+        let first = view.array_get(0).unwrap().unwrap();
+        if let JsonbValue::Number(n) = first {
+            assert!((n - 1.0).abs() < 0.0001);
+        } else {
+            panic!("expected number");
+        }
+    }
+
+    #[test]
+    fn jsonb_builder_nested_object() {
+        let mut inner = JsonbBuilder::new_object();
+        inner.set("city", "NYC");
+        inner.set("zip", "10001");
+
+        let mut outer = JsonbBuilder::new_object();
+        outer.set("name", "Charlie");
+        outer.set(
+            "address",
+            JsonbBuilderValue::Object(vec![
+                (
+                    "city".to_string(),
+                    JsonbBuilderValue::String("NYC".to_string()),
+                ),
+                (
+                    "zip".to_string(),
+                    JsonbBuilderValue::String("10001".to_string()),
+                ),
+            ]),
+        );
+
+        let data = outer.build();
+        let view = JsonbView::new(&data).unwrap();
+
+        let addr = view.get("address").unwrap().unwrap();
+        if let JsonbValue::Object(addr_view) = addr {
+            let city = addr_view.get("city").unwrap().unwrap();
+            assert_eq!(city, JsonbValue::String("NYC"));
+        } else {
+            panic!("expected object");
+        }
+    }
+
+    #[test]
+    fn jsonb_get_path() {
+        let mut outer = JsonbBuilder::new_object();
+        outer.set(
+            "user",
+            JsonbBuilderValue::Object(vec![
+                (
+                    "name".to_string(),
+                    JsonbBuilderValue::String("Dave".to_string()),
+                ),
+                (
+                    "profile".to_string(),
+                    JsonbBuilderValue::Object(vec![(
+                        "email".to_string(),
+                        JsonbBuilderValue::String("dave@example.com".to_string()),
+                    )]),
+                ),
+            ]),
+        );
+
+        let data = outer.build();
+        let view = JsonbView::new(&data).unwrap();
+
+        let email = view
+            .get_path(&["user", "profile", "email"])
+            .unwrap()
+            .unwrap();
+        assert_eq!(email, JsonbValue::String("dave@example.com"));
+
+        assert!(view.get_path(&["user", "missing"]).unwrap().is_none());
+    }
+
+    #[test]
+    fn jsonb_null_value() {
+        let mut builder = JsonbBuilder::new_object();
+        builder.set("value", JsonbBuilderValue::Null);
+
+        let data = builder.build();
+        let view = JsonbView::new(&data).unwrap();
+
+        let value = view.get("value").unwrap().unwrap();
+        assert_eq!(value, JsonbValue::Null);
+    }
+
+    #[test]
+    fn jsonb_scalar_types() {
+        let null_data = JsonbBuilder::new_null().build();
+        let null_view = JsonbView::new(&null_data).unwrap();
+        assert_eq!(null_view.as_value().unwrap(), JsonbValue::Null);
+
+        let bool_data = JsonbBuilder::new_bool(true).build();
+        let bool_view = JsonbView::new(&bool_data).unwrap();
+        assert_eq!(bool_view.as_value().unwrap(), JsonbValue::Bool(true));
+
+        let num_data = JsonbBuilder::new_number(42.5).build();
+        let num_view = JsonbView::new(&num_data).unwrap();
+        if let JsonbValue::Number(n) = num_view.as_value().unwrap() {
+            assert!((n - 42.5).abs() < 0.0001);
+        } else {
+            panic!("expected number");
+        }
+
+        let str_data = JsonbBuilder::new_string("hello").build();
+        let str_view = JsonbView::new(&str_data).unwrap();
+        assert_eq!(str_view.as_value().unwrap(), JsonbValue::String("hello"));
+    }
+
+    #[test]
+    fn jsonb_record_roundtrip() {
+        let schema = Schema::new(vec![
+            ColumnDef::new("id", DataType::Int4),
+            ColumnDef::new("data", DataType::Jsonb),
+        ]);
+
+        let mut jsonb = JsonbBuilder::new_object();
+        jsonb.set("key", "value");
+        jsonb.set("count", 42);
+
+        let mut builder = RecordBuilder::new(&schema);
+        builder.set_int4(0, 1).unwrap();
+        builder.set_jsonb(1, &jsonb).unwrap();
+
+        let record_data = builder.build().unwrap();
+        let view = RecordView::new(&record_data, &schema).unwrap();
+
+        assert_eq!(view.get_int4(0).unwrap(), 1);
+
+        let jsonb_view = view.get_jsonb(1).unwrap();
+        let key_val = jsonb_view.get("key").unwrap().unwrap();
+        assert_eq!(key_val, JsonbValue::String("value"));
+
+        let count_val = jsonb_view.get("count").unwrap().unwrap();
+        if let JsonbValue::Number(n) = count_val {
+            assert!((n - 42.0).abs() < 0.0001);
+        } else {
+            panic!("expected number");
+        }
+    }
+
+    #[test]
+    fn jsonb_opt_returns_none_for_null() {
+        let schema = Schema::new(vec![ColumnDef::new("data", DataType::Jsonb)]);
+
+        let mut builder = RecordBuilder::new(&schema);
+        builder.set_null(0);
+
+        let data = builder.build().unwrap();
+        let view = RecordView::new(&data, &schema).unwrap();
+
+        assert!(view.get_jsonb_opt(0).unwrap().is_none());
+    }
+
+    #[test]
+    fn jsonb_empty_object() {
+        let builder = JsonbBuilder::new_object();
+        let data = builder.build();
+        let view = JsonbView::new(&data).unwrap();
+
+        assert_eq!(view.object_len().unwrap(), 0);
+        assert!(view.get("any").unwrap().is_none());
+    }
+
+    #[test]
+    fn jsonb_empty_array() {
+        let builder = JsonbBuilder::new_array();
+        let data = builder.build();
+        let view = JsonbView::new(&data).unwrap();
+
+        assert_eq!(view.array_len().unwrap(), 0);
+        assert!(view.array_get(0).unwrap().is_none());
+    }
+
+    #[test]
+    fn jsonb_sorted_keys_binary_search() {
+        let mut builder = JsonbBuilder::new_object();
+        builder.set("zebra", "last");
+        builder.set("apple", "first");
+        builder.set("middle", "center");
+
+        let data = builder.build();
+        let view = JsonbView::new(&data).unwrap();
+
+        assert_eq!(
+            view.get("apple").unwrap().unwrap(),
+            JsonbValue::String("first")
+        );
+        assert_eq!(
+            view.get("middle").unwrap().unwrap(),
+            JsonbValue::String("center")
+        );
+        assert_eq!(
+            view.get("zebra").unwrap().unwrap(),
+            JsonbValue::String("last")
+        );
+    }
+
+    #[test]
+    fn jsonb_array_with_mixed_types() {
+        let mut builder = JsonbBuilder::new_array();
+        builder.push(JsonbBuilderValue::Null);
+        builder.push(true);
+        builder.push(42);
+        builder.push("text");
+
+        let data = builder.build();
+        let view = JsonbView::new(&data).unwrap();
+
+        assert_eq!(view.array_len().unwrap(), 4);
+        assert_eq!(view.array_get(0).unwrap().unwrap(), JsonbValue::Null);
+        assert_eq!(view.array_get(1).unwrap().unwrap(), JsonbValue::Bool(true));
     }
 }
