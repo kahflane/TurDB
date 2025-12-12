@@ -164,6 +164,9 @@ pub enum Keyword {
     Alter,
     Drop,
     Truncate,
+    Add,
+    Column,
+    Rename,
 
     // DML
     Select,
@@ -598,6 +601,9 @@ impl Keyword {
             Keyword::Alter => "ALTER",
             Keyword::Drop => "DROP",
             Keyword::Truncate => "TRUNCATE",
+            Keyword::Add => "ADD",
+            Keyword::Column => "COLUMN",
+            Keyword::Rename => "RENAME",
             Keyword::Select => "SELECT",
             Keyword::Insert => "INSERT",
             Keyword::Update => "UPDATE",
