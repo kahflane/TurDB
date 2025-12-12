@@ -424,38 +424,82 @@
       ]
     },
     {
-      "title": "B-Tree - Big-Endian Key Encoding",
-      "description": "Byte-comparable key encoding for memcmp",
+      "title": "B-Tree - Comprehensive Type Prefix Key Encoding",
+      "description": "Byte-comparable key encoding for memcmp supporting all SQL types including JSON, composite, enum, arrays, and custom types",
       "isCompleted": false,
       "priority": 8,
       "phase": 2,
       "tasks": [
         {
-          "task": "Implement encode_null() as 0x01",
+          "task": "Define TypePrefix constants module (NULL=0x01, FALSE=0x02, TRUE=0x03, numbers 0x10-0x19, TEXT=0x20, BLOB=0x21, date/time 0x30-0x34, UUID=0x40, JSON 0x50-0x56, composite 0x60-0x65, VECTOR=0x70, CUSTOM_START=0x80, MAX_KEY=0xFF)",
           "done": false
         },
         {
-          "task": "Implement encode_int() with XOR flip and big-endian",
+          "task": "Implement encode_null() with TypePrefix::NULL (0x01)",
           "done": false
         },
         {
-          "task": "Implement encode_float() with sign bit manipulation",
+          "task": "Implement encode_bool() with TypePrefix::FALSE (0x02) and TRUE (0x03)",
           "done": false
         },
         {
-          "task": "Implement encode_text() with null terminator",
+          "task": "Implement encode_int() with sign-split (NEG_INT=0x12, ZERO=0x14, POS_INT=0x16) and big-endian bytes",
           "done": false
         },
         {
-          "task": "Implement encode_blob() with length prefix or null terminator",
+          "task": "Implement encode_float() with IEEE bit manipulation (NEG_INFINITY=0x10, NEG_FLOAT=0x13, ZERO=0x14, POS_FLOAT=0x15, POS_INFINITY=0x18, NAN=0x19)",
           "done": false
         },
         {
-          "task": "Implement decode functions for each type",
+          "task": "Implement encode_text() with escaped null-termination (escape 0x00 as 0x00FF, 0xFF as 0xFF00, double-null terminator)",
           "done": false
         },
         {
-          "task": "Verify byte ordering preserves sort order",
+          "task": "Implement encode_blob() with same escaping scheme as text",
+          "done": false
+        },
+        {
+          "task": "Implement encode_date() with signed XOR flip (days since epoch)",
+          "done": false
+        },
+        {
+          "task": "Implement encode_timestamp() with signed XOR flip (micros since epoch)",
+          "done": false
+        },
+        {
+          "task": "Implement encode_uuid() (16 bytes, already big-endian by spec)",
+          "done": false
+        },
+        {
+          "task": "Implement encode_json() with recursive encoding (JSON_NULL through JSON_OBJECT prefixes, sorted object keys)",
+          "done": false
+        },
+        {
+          "task": "Implement encode_array() with element separator (0x01) and terminator (0x00)",
+          "done": false
+        },
+        {
+          "task": "Implement encode_enum() with type_id and variant_ordinal",
+          "done": false
+        },
+        {
+          "task": "Implement encode_composite() with type_id and field separators",
+          "done": false
+        },
+        {
+          "task": "Implement encode_value() dispatcher for all Value types",
+          "done": false
+        },
+        {
+          "task": "Implement decode functions for each type (decode_int, decode_float, decode_text, etc.)",
+          "done": false
+        },
+        {
+          "task": "Verify byte ordering preserves sort order for all types with property tests",
+          "done": false
+        },
+        {
+          "task": "Test multi-column key encoding with mixed types",
           "done": false
         }
       ]
