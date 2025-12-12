@@ -90,8 +90,13 @@
 //! LeafNode borrows from page data and is `!Send + !Sync`. Thread safety
 //! is provided by the page cache layer which controls access to page buffers.
 
+mod interior;
 mod leaf;
 
+pub use interior::{
+    separator_len, InteriorNode, InteriorNodeMut, InteriorSlot, INTERIOR_CONTENT_START,
+    INTERIOR_SLOT_SIZE,
+};
 pub use leaf::{
     extract_prefix, LeafNode, LeafNodeMut, SearchResult, Slot, LEAF_CONTENT_START,
     LEAF_HEADER_SIZE, SLOT_SIZE,
