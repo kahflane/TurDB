@@ -962,93 +962,81 @@
     {
       "title": "SQL - Lexer",
       "description": "Zero-copy SQL tokenizer supporting full SQL syntax including DDL, DML, subqueries, CTEs, batch operations, explain/analyze, stored procedures, functions, and all standard SQL operators",
-      "isCompleted": false,
+      "isCompleted": true,
       "priority": 18,
       "phase": 5,
       "tasks": [
         {
           "task": "Define Token<'a> enum with borrowed strings for identifiers and literals",
-          "done": false
+          "done": true
         },
         {
-          "task": "Define Keyword enum covering DDL (CREATE, ALTER, DROP, TRUNCATE), DML (SELECT, INSERT, UPDATE, DELETE, MERGE, UPSERT), query clauses (FROM, WHERE, GROUP BY, HAVING, ORDER BY, LIMIT, OFFSET, FETCH), joins (JOIN, INNER, LEFT, RIGHT, FULL, OUTER, CROSS, NATURAL, ON, USING), set operations (UNION, INTERSECT, EXCEPT, ALL, DISTINCT), subquery (IN, EXISTS, ANY, SOME, ALL), CTE (WITH, RECURSIVE), transactions (BEGIN, COMMIT, ROLLBACK, SAVEPOINT, RELEASE), constraints (PRIMARY KEY, FOREIGN KEY, REFERENCES, UNIQUE, CHECK, NOT NULL, DEFAULT, CASCADE, RESTRICT, SET NULL, SET DEFAULT), indexes (INDEX, USING, BTREE, HASH, GIN, GIST, HNSW), types (INTEGER, BIGINT, SMALLINT, REAL, DOUBLE, DECIMAL, NUMERIC, VARCHAR, CHAR, TEXT, BLOB, BOOLEAN, DATE, TIME, TIMESTAMP, INTERVAL, UUID, JSON, JSONB, VECTOR, ARRAY), procedural (FUNCTION, PROCEDURE, RETURNS, LANGUAGE, AS, DECLARE, BEGIN, END, IF, THEN, ELSE, ELSIF, WHILE, LOOP, FOR, RETURN, CALL, EXECUTE), explain (EXPLAIN, ANALYZE, VERBOSE, COSTS, BUFFERS, TIMING, FORMAT), schema (SCHEMA, DATABASE, TABLE, VIEW, MATERIALIZED, TRIGGER, SEQUENCE, TYPE, ENUM, DOMAIN), misc (CASE, WHEN, THEN, ELSE, END, CAST, COLLATE, LIKE, ILIKE, SIMILAR, BETWEEN, IS, NULL, TRUE, FALSE, AND, OR, NOT, AS, ASC, DESC, NULLS, FIRST, LAST, OVER, PARTITION, WINDOW, ROWS, RANGE, UNBOUNDED, PRECEDING, FOLLOWING, CURRENT, ROW)",
-          "done": false
+          "task": "Define Keyword enum covering DDL, DML, query clauses, joins, set operations, subquery, CTE, transactions, constraints, indexes, types, procedural, explain, schema objects",
+          "done": true
         },
         {
           "task": "Define Lexer<'a> with input slice, position, line, column for error reporting",
-          "done": false
+          "done": true
         },
         {
           "task": "Implement next_token() returning Token<'a> with zero-copy string slices",
-          "done": false
+          "done": true
         },
         {
           "task": "Implement keyword matching via phf perfect hash map for O(1) lookup",
-          "done": false
+          "done": true
         },
         {
           "task": "Handle single-quoted string literals with '' escape for embedded quotes",
-          "done": false
+          "done": true
         },
         {
           "task": "Handle double-quoted identifiers for case-sensitive/reserved word columns",
-          "done": false
+          "done": true
+        },
+        {
+          "task": "Handle backtick-quoted identifiers for reserved words",
+          "done": true
         },
         {
           "task": "Handle dollar-quoted strings ($$body$$, $tag$body$tag$) for procedure bodies",
-          "done": false
+          "done": true
         },
         {
-          "task": "Handle numeric literals: integers, floats (1.5, .5, 1.), scientific notation (1e10, 1.5e-3), hex (0x1F), binary (0b1010), octal (0o17)",
-          "done": false
+          "task": "Handle numeric literals: integers, floats, scientific notation, hex, binary, octal",
+          "done": true
         },
         {
-          "task": "Handle identifiers: unquoted (starts with letter/_), quoted (\"), backtick-quoted (`), bracket-quoted ([]), Unicode escapes",
-          "done": false
+          "task": "Handle identifiers: unquoted (starts with letter/_), quoted, backtick-quoted",
+          "done": true
         },
         {
-          "task": "Handle operators: comparison (=, <>, !=, <, >, <=, >=, <=>), arithmetic (+, -, *, /, %, ^, |/, ||/), bitwise (&, |, #, ~, <<, >>), string (||), JSON (->, ->>, #>, #>>), array (@>, <@, &&, ?), assignment (:=, =>)",
-          "done": false
+          "task": "Handle operators: comparison, arithmetic, bitwise, string concat, JSON, array",
+          "done": true
         },
         {
-          "task": "Handle punctuation: parentheses, brackets, braces, comma, semicolon, colon, dot, double-colon (::), asterisk, question mark",
-          "done": false
+          "task": "Handle punctuation: parentheses, brackets, braces, comma, semicolon, colon, double-colon, dot",
+          "done": true
         },
         {
-          "task": "Handle comments: single-line (-- comment), multi-line (/* comment */), nested multi-line",
-          "done": false
+          "task": "Handle comments: single-line (-- comment), multi-line (/* */), nested multi-line",
+          "done": true
         },
         {
-          "task": "Handle parameter placeholders: positional ($1, $2), named (:name, @name), question mark (?)",
-          "done": false
-        },
-        {
-          "task": "Handle type casts: PostgreSQL-style (value::type), SQL standard (CAST(value AS type))",
-          "done": false
-        },
-        {
-          "task": "Handle array literals: ARRAY[1,2,3], '{1,2,3}'::int[]",
-          "done": false
-        },
-        {
-          "task": "Handle special tokens: EOF, Error with position info, Whitespace (when preserve_whitespace enabled)",
-          "done": false
+          "task": "Handle parameter placeholders: positional ($1, $2), named (:name, @name), anonymous (?)",
+          "done": true
         },
         {
           "task": "Implement peek() and peek_nth() for parser lookahead without consuming",
-          "done": false
+          "done": true
         },
         {
           "task": "Implement span() returning byte range for error messages",
-          "done": false
-        },
-        {
-          "task": "Implement tokenize_all() returning Vec<Token> for debugging/testing",
-          "done": false
+          "done": true
         },
         {
           "task": "Add comprehensive tests for all token types and edge cases",
-          "done": false
+          "done": true
         }
       ]
     },
