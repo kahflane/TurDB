@@ -484,32 +484,215 @@ fn compute_separator(left_max: &[u8], right_min: &[u8]) -> Vec<u8> {
 }
 ```
 
-### Key Encoding: Big-Endian for memcmp
+### Key Encoding: Comprehensive Type Prefix Scheme
 
-All keys MUST be encoded in big-endian byte-comparable format:
+All keys MUST be encoded in big-endian byte-comparable format with type prefixes.
+This allows multi-column keys of any type to be compared with single `memcmp`.
+
+#### Type Prefix Constants
 
 ```rust
-fn encode_key(columns: &[Value]) -> Vec<u8> {
-    let mut buf = Vec::new();
-    for col in columns {
-        match col {
-            Value::Int(n) => {
-                buf.push(0x05);
-                buf.extend((n ^ i64::MIN).to_be_bytes());
-            }
-            Value::Text(s) => {
-                buf.push(0x06);
-                buf.extend(s.as_bytes());
-                buf.push(0x00);
-            }
-            Value::Null => buf.push(0x01),
-        }
-    }
-    buf
+pub mod TypePrefix {
+    // Special values
+    pub const NULL: u8 = 0x01;
+    pub const FALSE: u8 = 0x02;
+    pub const TRUE: u8 = 0x03;
+
+    // Numbers (ordered: negative < zero < positive)
+    pub const NEG_INFINITY: u8 = 0x10;
+    pub const NEG_BIG_INT: u8 = 0x11;   // Arbitrary precision negative
+    pub const NEG_INT: u8 = 0x12;       // i64 negative
+    pub const NEG_FLOAT: u8 = 0x13;     // f64 negative
+    pub const ZERO: u8 = 0x14;
+    pub const POS_FLOAT: u8 = 0x15;     // f64 positive
+    pub const POS_INT: u8 = 0x16;       // i64 positive
+    pub const POS_BIG_INT: u8 = 0x17;   // Arbitrary precision positive
+    pub const POS_INFINITY: u8 = 0x18;
+    pub const NAN: u8 = 0x19;           // NaN sorts after all numbers
+
+    // Strings/Binary
+    pub const TEXT: u8 = 0x20;
+    pub const BLOB: u8 = 0x21;
+
+    // Date/Time
+    pub const DATE: u8 = 0x30;
+    pub const TIME: u8 = 0x31;
+    pub const TIMESTAMP: u8 = 0x32;
+    pub const TIMESTAMPTZ: u8 = 0x33;
+    pub const INTERVAL: u8 = 0x34;
+
+    // Special types
+    pub const UUID: u8 = 0x40;
+    pub const INET: u8 = 0x41;          // IP addresses
+    pub const MACADDR: u8 = 0x42;
+
+    // JSON types (RFC 7159 ordering)
+    pub const JSON_NULL: u8 = 0x50;
+    pub const JSON_FALSE: u8 = 0x51;
+    pub const JSON_TRUE: u8 = 0x52;
+    pub const JSON_NUMBER: u8 = 0x53;
+    pub const JSON_STRING: u8 = 0x54;
+    pub const JSON_ARRAY: u8 = 0x55;
+    pub const JSON_OBJECT: u8 = 0x56;
+
+    // Composite/Custom types
+    pub const ARRAY: u8 = 0x60;         // SQL arrays
+    pub const TUPLE: u8 = 0x61;         // Row/Record types
+    pub const RANGE: u8 = 0x62;         // PostgreSQL range types
+    pub const ENUM: u8 = 0x63;          // Enum types
+    pub const COMPOSITE: u8 = 0x64;     // User-defined composite
+    pub const DOMAIN: u8 = 0x65;        // Domain types
+
+    // Vectors
+    pub const VECTOR: u8 = 0x70;
+
+    // Extension point
+    pub const CUSTOM_START: u8 = 0x80;  // 0x80-0xFE for custom types
+    pub const MAX_KEY: u8 = 0xFF;       // Sentinel for range queries
 }
 ```
 
-This allows multi-column keys to be compared with single `memcmp`.
+#### Integer Encoding (Sign-Split)
+
+```rust
+fn encode_int(n: i64, buf: &mut Vec<u8>) {
+    if n < 0 {
+        buf.push(TypePrefix::NEG_INT);
+        buf.extend((n as u64).to_be_bytes()); // Two's complement preserves order
+    } else if n == 0 {
+        buf.push(TypePrefix::ZERO);
+    } else {
+        buf.push(TypePrefix::POS_INT);
+        buf.extend((n as u64).to_be_bytes());
+    }
+}
+```
+
+#### Float Encoding (IEEE Bit Manipulation)
+
+```rust
+fn encode_float(f: f64, buf: &mut Vec<u8>) {
+    if f.is_nan() {
+        buf.push(TypePrefix::NAN);
+    } else if f == f64::NEG_INFINITY {
+        buf.push(TypePrefix::NEG_INFINITY);
+    } else if f == f64::INFINITY {
+        buf.push(TypePrefix::POS_INFINITY);
+    } else if f < 0.0 {
+        buf.push(TypePrefix::NEG_FLOAT);
+        buf.extend((!f.to_bits()).to_be_bytes()); // Invert all bits
+    } else if f == 0.0 {
+        buf.push(TypePrefix::ZERO);
+    } else {
+        buf.push(TypePrefix::POS_FLOAT);
+        buf.extend((f.to_bits() ^ (1u64 << 63)).to_be_bytes()); // Flip sign bit
+    }
+}
+```
+
+#### Text Encoding (Escaped + Null-Terminated)
+
+```rust
+fn encode_text(s: &str, buf: &mut Vec<u8>) {
+    buf.push(TypePrefix::TEXT);
+    for byte in s.as_bytes() {
+        match byte {
+            0x00 => { buf.push(0x00); buf.push(0xFF); }  // Escape null
+            0xFF => { buf.push(0xFF); buf.push(0x00); }  // Escape 0xFF
+            _ => buf.push(*byte),
+        }
+    }
+    buf.push(0x00);
+    buf.push(0x00); // Double-null terminator
+}
+```
+
+#### JSON Encoding (Recursive)
+
+```rust
+fn encode_json(json: &JsonValue, buf: &mut Vec<u8>) {
+    match json {
+        JsonValue::Null => buf.push(TypePrefix::JSON_NULL),
+        JsonValue::Bool(false) => buf.push(TypePrefix::JSON_FALSE),
+        JsonValue::Bool(true) => buf.push(TypePrefix::JSON_TRUE),
+        JsonValue::Number(n) => {
+            buf.push(TypePrefix::JSON_NUMBER);
+            encode_json_number(n, buf);
+        }
+        JsonValue::String(s) => {
+            buf.push(TypePrefix::JSON_STRING);
+            encode_text_body(s, buf);
+        }
+        JsonValue::Array(arr) => {
+            buf.push(TypePrefix::JSON_ARRAY);
+            for elem in arr { encode_json(elem, buf); buf.push(0x01); }
+            buf.push(0x00);
+        }
+        JsonValue::Object(obj) => {
+            buf.push(TypePrefix::JSON_OBJECT);
+            let mut keys: Vec<_> = obj.keys().collect();
+            keys.sort(); // Deterministic key order
+            for key in keys {
+                encode_text_body(key, buf);
+                buf.push(0x02);
+                encode_json(&obj[key], buf);
+                buf.push(0x01);
+            }
+            buf.push(0x00);
+        }
+    }
+}
+```
+
+#### Composite/Custom Types
+
+```rust
+fn encode_composite(fields: &[Value], type_id: u32, buf: &mut Vec<u8>) {
+    buf.push(TypePrefix::COMPOSITE);
+    buf.extend(type_id.to_be_bytes()); // Type OID
+    for field in fields {
+        encode_value(field, buf);
+        buf.push(0x01); // Field separator
+    }
+    buf.push(0x00); // Terminator
+}
+
+fn encode_enum(variant_ordinal: u32, type_id: u32, buf: &mut Vec<u8>) {
+    buf.push(TypePrefix::ENUM);
+    buf.extend(type_id.to_be_bytes());
+    buf.extend(variant_ordinal.to_be_bytes()); // Ordinal preserves declaration order
+}
+
+fn encode_array(elements: &[Value], buf: &mut Vec<u8>) {
+    buf.push(TypePrefix::ARRAY);
+    for elem in elements {
+        encode_value(elem, buf);
+        buf.push(0x01);
+    }
+    buf.push(0x00);
+}
+```
+
+#### Date/Time Encoding
+
+```rust
+fn encode_timestamp(micros_since_epoch: i64, buf: &mut Vec<u8>) {
+    buf.push(TypePrefix::TIMESTAMP);
+    buf.extend((micros_since_epoch ^ i64::MIN).to_be_bytes()); // XOR flip for signed
+}
+
+fn encode_uuid(uuid: &[u8; 16], buf: &mut Vec<u8>) {
+    buf.push(TypePrefix::UUID);
+    buf.extend(uuid); // Already byte-comparable
+}
+```
+
+#### Type Ordering Summary
+
+```
+NULL < FALSE < TRUE < -∞ < negative numbers < 0 < positive numbers < +∞ < NaN
+< TEXT < BLOB < DATE < TIME < TIMESTAMP < UUID < JSON_* < ARRAY < COMPOSITE < CUSTOM
+```
 
 ### Range Scans: madvise Prefetching
 
