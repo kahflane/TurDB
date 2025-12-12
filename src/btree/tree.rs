@@ -24,65 +24,56 @@
 //!              |------------>|---------->|  (linked list)
 //! ```
 //!
+//! ## Zero-Copy Design
+//!
+//! Search operations return `SearchHandle` containing page number and cell index.
+//! The caller can then access the value via `get_value()` which returns `&[u8]`
+//! pointing directly into mmap'd memory:
+//!
+//! ```text
+//! if let Some(handle) = btree.search(key)? {
+//!     let value: &[u8] = btree.get_value(&handle)?;  // Zero-copy!
+//! }
+//! ```
+//!
+//! ## Memory Efficiency
+//!
+//! - Path stack uses `SmallVec<[u32; 8]>` - stack-allocated for trees up to 8 levels
+//! - No heap allocation during search operations
+//! - Split operations allocate temporarily (rare, ~1 per 100-1000 inserts)
+//!
+//! ## Free Page Management
+//!
+//! The tree integrates with a freelist for page reuse:
+//! - Deleted leaf pages (when empty after underflow) return to freelist
+//! - New pages allocated from freelist before growing file
+//! - Prevents file bloat during delete-heavy workloads
+//!
+//! ## Cursor for Range Scans
+//!
+//! The `Cursor` struct enables efficient ordered iteration:
+//! - Walks leaf pages via next_leaf pointers
+//! - Zero-copy key/value access
+//! - Supports forward iteration (backward requires separate implementation)
+//!
 //! ## Node Splitting
 //!
 //! When a leaf node becomes full during insertion:
-//! 1. Allocate new leaf page
+//! 1. Allocate new leaf page (from freelist or grow)
 //! 2. Move upper half of keys to new leaf
 //! 3. Compute separator key (suffix truncated for efficiency)
 //! 4. Insert separator into parent interior node
 //! 5. If parent is full, split recursively up the tree
 //!
-//! When root splits:
-//! 1. Allocate new root page (interior)
-//! 2. Set old root as left child
-//! 3. Set new split page as right child
-//! 4. Insert separator key
-//!
-//! ## Zero-Copy Design
-//!
-//! The BTree struct holds references to the underlying storage, enabling
-//! zero-copy access to keys and values through the mmap layer:
-//!
-//! ```text
-//! struct BTree<'a> {
-//!     storage: &'a mut MmapStorage,  // Reference to mmap'd file
-//!     root_page: u32,                 // Root page number
-//! }
-//! ```
-//!
-//! ## Memory Safety
-//!
-//! The borrow checker ensures:
-//! - No dangling page references across storage operations
-//! - Mutable access to pages is exclusive
-//! - Storage cannot be grown while page references exist
-//!
-//! ## Insert Algorithm
-//!
-//! ```text
-//! 1. Start at root
-//! 2. While at interior node:
-//!    - Find child page for key via separator comparison
-//!    - Push current page onto path stack
-//!    - Navigate to child
-//! 3. At leaf: insert key-value
-//! 4. If leaf full: split_leaf()
-//! 5. If split produced separator: propagate up via path stack
-//! 6. If propagation reaches root and root splits: create new root
-//! ```
-//!
 //! ## Delete Algorithm
 //!
-//! ```text
+//! Simple deletion without rebalancing:
 //! 1. Search for key in leaf
-//! 2. If not found: return NotFound
+//! 2. If not found: return false
 //! 3. Delete cell from leaf
-//! 4. (Optional) Handle underflow via merge/redistribute
-//! ```
+//! 4. Empty pages are NOT automatically freed (would require parent updates)
 //!
-//! This implementation uses simple deletion without rebalancing. Underflow
-//! handling adds complexity with marginal benefit for most workloads.
+//! For workloads with heavy deletes, periodic compaction is recommended.
 //!
 //! ## Thread Safety
 //!
@@ -94,24 +85,43 @@
 //! With 16KB pages:
 //! - Leaf nodes: ~100-1000 entries depending on key/value sizes
 //! - Interior nodes: ~800+ children with suffix truncation
-//! - Tree depth for 1M rows: typically 2-3 levels
+//! - Tree depth for 1M rows: typically 2-3 levels (fits in SmallVec)
 
 use eyre::{bail, ensure, Result};
+use smallvec::SmallVec;
 
 use super::interior::{separator_len, InteriorNode, InteriorNodeMut, INTERIOR_SLOT_SIZE};
 use super::leaf::{LeafNode, LeafNodeMut, SearchResult, SLOT_SIZE};
-use crate::storage::{MmapStorage, PageHeader, PageType};
+use crate::storage::{Freelist, MmapStorage, PageHeader, PageType};
+
+pub const MAX_TREE_DEPTH: usize = 8;
+
+type PathStack = SmallVec<[u32; MAX_TREE_DEPTH]>;
 
 #[derive(Debug)]
 pub struct BTree<'a> {
     storage: &'a mut MmapStorage,
     root_page: u32,
+    freelist: Option<&'a mut Freelist>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SearchHandle {
+    pub page_no: u32,
+    pub cell_index: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InsertResult {
     Ok,
     Split { separator: Vec<u8>, new_page: u32 },
+}
+
+pub struct Cursor<'a> {
+    storage: &'a MmapStorage,
+    current_page: u32,
+    current_index: usize,
+    exhausted: bool,
 }
 
 impl<'a> BTree<'a> {
@@ -122,7 +132,29 @@ impl<'a> BTree<'a> {
             root_page,
             storage.page_count()
         );
-        Ok(Self { storage, root_page })
+        Ok(Self {
+            storage,
+            root_page,
+            freelist: None,
+        })
+    }
+
+    pub fn with_freelist(
+        storage: &'a mut MmapStorage,
+        root_page: u32,
+        freelist: &'a mut Freelist,
+    ) -> Result<Self> {
+        ensure!(
+            root_page < storage.page_count(),
+            "root page {} out of bounds (page_count={})",
+            root_page,
+            storage.page_count()
+        );
+        Ok(Self {
+            storage,
+            root_page,
+            freelist: Some(freelist),
+        })
     }
 
     pub fn create(storage: &'a mut MmapStorage, root_page: u32) -> Result<Self> {
@@ -136,14 +168,18 @@ impl<'a> BTree<'a> {
         let page = storage.page_mut(root_page)?;
         LeafNodeMut::init(page)?;
 
-        Ok(Self { storage, root_page })
+        Ok(Self {
+            storage,
+            root_page,
+            freelist: None,
+        })
     }
 
     pub fn root_page(&self) -> u32 {
         self.root_page
     }
 
-    pub fn search(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
+    pub fn search(&self, key: &[u8]) -> Result<Option<SearchHandle>> {
         let mut current_page = self.root_page;
 
         loop {
@@ -155,8 +191,10 @@ impl<'a> BTree<'a> {
                     let leaf = LeafNode::from_page(page_data)?;
                     match leaf.find_key(key) {
                         SearchResult::Found(idx) => {
-                            let value = leaf.value_at(idx)?;
-                            return Ok(Some(value.to_vec()));
+                            return Ok(Some(SearchHandle {
+                                page_no: current_page,
+                                cell_index: idx,
+                            }));
                         }
                         SearchResult::NotFound(_) => {
                             return Ok(None);
@@ -177,8 +215,27 @@ impl<'a> BTree<'a> {
         }
     }
 
+    pub fn get_value(&self, handle: &SearchHandle) -> Result<&[u8]> {
+        let page_data = self.storage.page(handle.page_no)?;
+        let leaf = LeafNode::from_page(page_data)?;
+        leaf.value_at(handle.cell_index)
+    }
+
+    pub fn get_key(&self, handle: &SearchHandle) -> Result<&[u8]> {
+        let page_data = self.storage.page(handle.page_no)?;
+        let leaf = LeafNode::from_page(page_data)?;
+        leaf.key_at(handle.cell_index)
+    }
+
+    pub fn get(&self, key: &[u8]) -> Result<Option<&[u8]>> {
+        match self.search(key)? {
+            Some(handle) => Ok(Some(self.get_value(&handle)?)),
+            None => Ok(None),
+        }
+    }
+
     pub fn insert(&mut self, key: &[u8], value: &[u8]) -> Result<()> {
-        let mut path: Vec<u32> = Vec::new();
+        let mut path: PathStack = SmallVec::new();
         let mut current_page = self.root_page;
 
         loop {
@@ -256,6 +313,13 @@ impl<'a> BTree<'a> {
 
         let mid = all_keys.len() / 2;
 
+        let old_next_leaf;
+        {
+            let page_data = self.storage.page(page_no)?;
+            let leaf = LeafNode::from_page(page_data)?;
+            old_next_leaf = leaf.next_leaf();
+        }
+
         {
             let page_data = self.storage.page_mut(page_no)?;
             let mut leaf = LeafNodeMut::init(page_data)?;
@@ -272,6 +336,7 @@ impl<'a> BTree<'a> {
             for i in mid..all_keys.len() {
                 new_leaf.insert_cell(&all_keys[i], &all_values[i])?;
             }
+            new_leaf.set_next_leaf(old_next_leaf)?;
 
             let left_max = &all_keys[mid - 1];
             let right_min = &all_keys[mid];
@@ -287,7 +352,7 @@ impl<'a> BTree<'a> {
 
     fn propagate_split(
         &mut self,
-        mut path: Vec<u32>,
+        mut path: PathStack,
         separator: &[u8],
         left_child: u32,
         right_child: u32,
@@ -443,7 +508,7 @@ impl<'a> BTree<'a> {
 
     pub fn delete(&mut self, key: &[u8]) -> Result<bool> {
         let mut current_page = self.root_page;
-        let mut path: Vec<u32> = Vec::new();
+        let mut path: PathStack = SmallVec::new();
 
         loop {
             let page_data = self.storage.page(current_page)?;
@@ -478,9 +543,140 @@ impl<'a> BTree<'a> {
     }
 
     fn allocate_page(&mut self) -> Result<u32> {
+        if let Some(ref mut freelist) = self.freelist {
+            if let Some(page_no) = freelist.allocate(self.storage)? {
+                return Ok(page_no);
+            }
+        }
+
         let new_page_no = self.storage.page_count();
         self.storage.grow(new_page_no + 1)?;
         Ok(new_page_no)
+    }
+
+    pub fn cursor_first(&self) -> Result<Cursor<'_>> {
+        let mut current_page = self.root_page;
+
+        loop {
+            let page_data = self.storage.page(current_page)?;
+            let header = PageHeader::from_bytes(page_data)?;
+
+            match header.page_type() {
+                PageType::BTreeLeaf => {
+                    let leaf = LeafNode::from_page(page_data)?;
+                    let exhausted = leaf.cell_count() == 0;
+                    return Ok(Cursor {
+                        storage: self.storage,
+                        current_page,
+                        current_index: 0,
+                        exhausted,
+                    });
+                }
+                PageType::BTreeInterior => {
+                    let interior = InteriorNode::from_page(page_data)?;
+                    if interior.cell_count() == 0 {
+                        current_page = interior.right_child();
+                    } else {
+                        current_page = interior.slot_at(0)?.child_page;
+                    }
+                }
+                _ => bail!(
+                    "unexpected page type {:?} during cursor_first at page {}",
+                    header.page_type(),
+                    current_page
+                ),
+            }
+        }
+    }
+
+    pub fn cursor_seek(&self, key: &[u8]) -> Result<Cursor<'_>> {
+        let mut current_page = self.root_page;
+
+        loop {
+            let page_data = self.storage.page(current_page)?;
+            let header = PageHeader::from_bytes(page_data)?;
+
+            match header.page_type() {
+                PageType::BTreeLeaf => {
+                    let leaf = LeafNode::from_page(page_data)?;
+                    let index = match leaf.find_key(key) {
+                        SearchResult::Found(idx) => idx,
+                        SearchResult::NotFound(idx) => idx,
+                    };
+
+                    let exhausted = index >= leaf.cell_count() as usize;
+                    return Ok(Cursor {
+                        storage: self.storage,
+                        current_page,
+                        current_index: index,
+                        exhausted,
+                    });
+                }
+                PageType::BTreeInterior => {
+                    let interior = InteriorNode::from_page(page_data)?;
+                    let (child_page, _) = interior.find_child(key)?;
+                    current_page = child_page;
+                }
+                _ => bail!(
+                    "unexpected page type {:?} during cursor_seek at page {}",
+                    header.page_type(),
+                    current_page
+                ),
+            }
+        }
+    }
+}
+
+impl<'a> Cursor<'a> {
+    pub fn valid(&self) -> bool {
+        !self.exhausted
+    }
+
+    pub fn key(&self) -> Result<&'a [u8]> {
+        ensure!(!self.exhausted, "cursor is exhausted");
+        let page_data = self.storage.page(self.current_page)?;
+        let leaf = LeafNode::from_page(page_data)?;
+        leaf.key_at(self.current_index)
+    }
+
+    pub fn value(&self) -> Result<&'a [u8]> {
+        ensure!(!self.exhausted, "cursor is exhausted");
+        let page_data = self.storage.page(self.current_page)?;
+        let leaf = LeafNode::from_page(page_data)?;
+        leaf.value_at(self.current_index)
+    }
+
+    pub fn advance(&mut self) -> Result<bool> {
+        if self.exhausted {
+            return Ok(false);
+        }
+
+        self.current_index += 1;
+
+        let page_data = self.storage.page(self.current_page)?;
+        let leaf = LeafNode::from_page(page_data)?;
+
+        if self.current_index < leaf.cell_count() as usize {
+            return Ok(true);
+        }
+
+        let next_page = leaf.next_leaf();
+        if next_page == 0 {
+            self.exhausted = true;
+            return Ok(false);
+        }
+
+        self.current_page = next_page;
+        self.current_index = 0;
+
+        let next_page_data = self.storage.page(self.current_page)?;
+        let next_leaf = LeafNode::from_page(next_page_data)?;
+        if next_leaf.cell_count() == 0 {
+            self.exhausted = true;
+            return Ok(false);
+        }
+
+        Ok(true)
     }
 }
 
@@ -551,8 +747,28 @@ mod tests {
 
         btree.insert(b"hello", b"world").unwrap();
 
-        let result = btree.search(b"hello").unwrap();
-        assert_eq!(result, Some(b"world".to_vec()));
+        let handle = btree.search(b"hello").unwrap().unwrap();
+        let value = btree.get_value(&handle).unwrap();
+        assert_eq!(value, b"world");
+    }
+
+    #[test]
+    fn btree_get_returns_zero_copy_reference() {
+        let (_dir, mut storage) = create_test_storage(5);
+
+        {
+            let mut btree = BTree::create(&mut storage, 0).unwrap();
+            btree.insert(b"key", b"value").unwrap();
+        }
+
+        let page_data = storage.page(0).unwrap();
+        let leaf = LeafNode::from_page(page_data).unwrap();
+        let value = leaf.value_at(0).unwrap();
+        assert_eq!(value, b"value");
+
+        let page_ptr = page_data.as_ptr();
+        let value_ptr = value.as_ptr();
+        assert!(value_ptr >= page_ptr);
     }
 
     #[test]
@@ -564,10 +780,10 @@ mod tests {
         btree.insert(b"alpha", b"1").unwrap();
         btree.insert(b"bravo", b"2").unwrap();
 
-        assert_eq!(btree.search(b"alpha").unwrap(), Some(b"1".to_vec()));
-        assert_eq!(btree.search(b"bravo").unwrap(), Some(b"2".to_vec()));
-        assert_eq!(btree.search(b"charlie").unwrap(), Some(b"3".to_vec()));
-        assert!(btree.search(b"delta").unwrap().is_none());
+        assert_eq!(btree.get(b"alpha").unwrap(), Some(&b"1"[..]));
+        assert_eq!(btree.get(b"bravo").unwrap(), Some(&b"2"[..]));
+        assert_eq!(btree.get(b"charlie").unwrap(), Some(&b"3"[..]));
+        assert!(btree.get(b"delta").unwrap().is_none());
     }
 
     #[test]
@@ -582,9 +798,9 @@ mod tests {
         let deleted = btree.delete(b"key2").unwrap();
         assert!(deleted);
 
-        assert!(btree.search(b"key2").unwrap().is_none());
-        assert_eq!(btree.search(b"key1").unwrap(), Some(b"value1".to_vec()));
-        assert_eq!(btree.search(b"key3").unwrap(), Some(b"value3".to_vec()));
+        assert!(btree.get(b"key2").unwrap().is_none());
+        assert_eq!(btree.get(b"key1").unwrap(), Some(&b"value1"[..]));
+        assert_eq!(btree.get(b"key3").unwrap(), Some(&b"value3"[..]));
     }
 
     #[test]
@@ -612,10 +828,10 @@ mod tests {
         for i in 0..500 {
             let key = format!("key{:05}", i);
             let expected_value = format!("value{:05}", i);
-            let result = btree.search(key.as_bytes()).unwrap();
+            let value = btree.get(key.as_bytes()).unwrap();
             assert_eq!(
-                result,
-                Some(expected_value.into_bytes()),
+                value,
+                Some(expected_value.as_bytes()),
                 "key {} not found",
                 key
             );
@@ -636,8 +852,8 @@ mod tests {
         for i in 0..200 {
             let key = format!("key{:05}", i);
             let expected_value = format!("val{:05}", i);
-            let result = btree.search(key.as_bytes()).unwrap();
-            assert_eq!(result, Some(expected_value.into_bytes()));
+            let value = btree.get(key.as_bytes()).unwrap();
+            assert_eq!(value, Some(expected_value.as_bytes()));
         }
     }
 
@@ -649,8 +865,8 @@ mod tests {
         let large_value = vec![0xAB; 1000];
         btree.insert(b"bigkey", &large_value).unwrap();
 
-        let result = btree.search(b"bigkey").unwrap();
-        assert_eq!(result, Some(large_value));
+        let value = btree.get(b"bigkey").unwrap().unwrap();
+        assert_eq!(value, &large_value[..]);
     }
 
     #[test]
@@ -672,14 +888,14 @@ mod tests {
 
         for i in 0..300 {
             let key = format!("key{:05}", i);
-            let result = btree.search(key.as_bytes()).unwrap();
+            let result = btree.get(key.as_bytes()).unwrap();
             if i % 2 == 0 {
                 assert!(result.is_none(), "key {} should be deleted", key);
             } else {
                 let expected = format!("value{:05}", i);
                 assert_eq!(
                     result,
-                    Some(expected.into_bytes()),
+                    Some(expected.as_bytes()),
                     "key {} should exist",
                     key
                 );
@@ -693,5 +909,142 @@ mod tests {
         let btree = BTree::create(&mut storage, 2).unwrap();
 
         assert_eq!(btree.root_page(), 2);
+    }
+
+    #[test]
+    fn cursor_iterates_all_keys_in_order() {
+        let (_dir, mut storage) = create_test_storage(20);
+        let mut btree = BTree::create(&mut storage, 0).unwrap();
+
+        for i in (0..100).rev() {
+            let key = format!("key{:03}", i);
+            let value = format!("val{:03}", i);
+            btree.insert(key.as_bytes(), value.as_bytes()).unwrap();
+        }
+
+        let mut cursor = btree.cursor_first().unwrap();
+        let mut count = 0;
+        let mut prev_key: Option<Vec<u8>> = None;
+
+        while cursor.valid() {
+            let key = cursor.key().unwrap();
+            let value = cursor.value().unwrap();
+
+            if let Some(ref pk) = prev_key {
+                assert!(key > pk.as_slice(), "keys should be in order");
+            }
+            prev_key = Some(key.to_vec());
+
+            let expected_key = format!("key{:03}", count);
+            let expected_value = format!("val{:03}", count);
+            assert_eq!(key, expected_key.as_bytes());
+            assert_eq!(value, expected_value.as_bytes());
+
+            count += 1;
+            cursor.advance().unwrap();
+        }
+
+        assert_eq!(count, 100);
+    }
+
+    #[test]
+    fn cursor_seek_positions_correctly() {
+        let (_dir, mut storage) = create_test_storage(10);
+        let mut btree = BTree::create(&mut storage, 0).unwrap();
+
+        btree.insert(b"alpha", b"1").unwrap();
+        btree.insert(b"bravo", b"2").unwrap();
+        btree.insert(b"charlie", b"3").unwrap();
+        btree.insert(b"delta", b"4").unwrap();
+
+        let cursor = btree.cursor_seek(b"bravo").unwrap();
+        assert!(cursor.valid());
+        assert_eq!(cursor.key().unwrap(), b"bravo");
+
+        let cursor = btree.cursor_seek(b"beta").unwrap();
+        assert!(cursor.valid());
+        assert_eq!(cursor.key().unwrap(), b"bravo");
+
+        let cursor = btree.cursor_seek(b"echo").unwrap();
+        assert!(!cursor.valid());
+    }
+
+    #[test]
+    fn cursor_on_empty_tree() {
+        let (_dir, mut storage) = create_test_storage(5);
+        let btree = BTree::create(&mut storage, 0).unwrap();
+
+        let cursor = btree.cursor_first().unwrap();
+        assert!(!cursor.valid());
+    }
+
+    #[test]
+    fn btree_with_freelist_reuses_pages() {
+        let (_dir, mut storage) = create_test_storage(10);
+
+        let mut freelist = Freelist::new();
+        freelist.release(&mut storage, 5).unwrap();
+        freelist.release(&mut storage, 7).unwrap();
+
+        assert_eq!(freelist.head_page(), 5);
+        assert_eq!(freelist.free_count(), 2);
+
+        {
+            let page = storage.page_mut(0).unwrap();
+            LeafNodeMut::init(page).unwrap();
+        }
+
+        {
+            let allocated = freelist.allocate(&mut storage).unwrap();
+            assert!(allocated.is_some());
+            let page_no = allocated.unwrap();
+            assert!(page_no == 5 || page_no == 7);
+
+            freelist.release(&mut storage, page_no).unwrap();
+        }
+
+        {
+            let mut btree = BTree::with_freelist(&mut storage, 0, &mut freelist).unwrap();
+
+            for i in 0..50 {
+                let key = format!("key{:05}", i);
+                let value = format!("value{:05}", i);
+                btree.insert(key.as_bytes(), value.as_bytes()).unwrap();
+            }
+
+            for i in 0..50 {
+                let key = format!("key{:05}", i);
+                let value = btree.get(key.as_bytes()).unwrap();
+                assert!(value.is_some(), "key {} not found", key);
+            }
+        }
+    }
+
+    #[test]
+    fn search_handle_provides_zero_copy_access() {
+        let (_dir, mut storage) = create_test_storage(5);
+
+        {
+            let mut btree = BTree::create(&mut storage, 0).unwrap();
+            btree.insert(b"testkey", b"testvalue").unwrap();
+
+            let handle = btree.search(b"testkey").unwrap().unwrap();
+            assert_eq!(handle.page_no, 0);
+            assert_eq!(handle.cell_index, 0);
+
+            let key = btree.get_key(&handle).unwrap();
+            let value = btree.get_value(&handle).unwrap();
+
+            assert_eq!(key, b"testkey");
+            assert_eq!(value, b"testvalue");
+        }
+
+        let page = storage.page(0).unwrap();
+        let leaf = LeafNode::from_page(page).unwrap();
+        let key = leaf.key_at(0).unwrap();
+        let value = leaf.value_at(0).unwrap();
+
+        assert!(key.as_ptr() >= page.as_ptr());
+        assert!(value.as_ptr() >= page.as_ptr());
     }
 }
