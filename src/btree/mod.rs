@@ -92,6 +92,7 @@
 
 mod interior;
 mod leaf;
+mod tree;
 
 pub use interior::{
     separator_len, InteriorNode, InteriorNodeMut, InteriorSlot, INTERIOR_CONTENT_START,
@@ -101,3 +102,4 @@ pub use leaf::{
     extract_prefix, LeafNode, LeafNodeMut, SearchResult, Slot, LEAF_CONTENT_START,
     LEAF_HEADER_SIZE, SLOT_SIZE,
 };
+pub use tree::{BTree, InsertResult};

@@ -535,37 +535,37 @@
     {
       "title": "B-Tree - Tree Operations",
       "description": "Insert, delete, search with node splitting",
-      "isCompleted": false,
+      "isCompleted": true,
       "priority": 9,
       "phase": 2,
       "tasks": [
         {
           "task": "Define BTree struct with root page and storage reference",
-          "done": false
+          "done": true
         },
         {
           "task": "Implement search() traversing from root to leaf",
-          "done": false
+          "done": true
         },
         {
           "task": "Implement insert() with leaf insertion",
-          "done": false
+          "done": true
         },
         {
           "task": "Implement split_leaf() when leaf is full",
-          "done": false
+          "done": true
         },
         {
           "task": "Implement split_interior() when interior is full",
-          "done": false
+          "done": true
         },
         {
           "task": "Implement delete() with cell removal",
-          "done": false
+          "done": true
         },
         {
           "task": "Handle underflow (optional: simple delete without rebalance)",
-          "done": false
+          "done": true
         }
       ]
     },
