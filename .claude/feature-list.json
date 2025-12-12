@@ -764,41 +764,41 @@
     {
       "title": "Record - Composite and Nested Types",
       "description": "Recursive record format for composite types with zero-copy nested access",
-      "isCompleted": false,
+      "isCompleted": true,
       "priority": 14,
       "phase": 3,
       "tasks": [
         {
           "task": "Define CompositeView<'a> mirroring RecordView format",
-          "done": false
+          "done": true
         },
         {
           "task": "Implement RecordView::get_composite() returning nested view",
-          "done": false
+          "done": true
         },
         {
           "task": "Implement RecordView::get_array() returning ArrayView",
-          "done": false
+          "done": true
         },
         {
           "task": "Implement RecordView::get_jsonb() returning JsonbView",
-          "done": false
+          "done": true
         },
         {
-          "task": "Implement RecordBuilder::push_composite() for nested records",
-          "done": false
+          "task": "Implement RecordBuilder::set_composite() for nested records",
+          "done": true
         },
         {
-          "task": "Implement RecordBuilder::push_array() for array values",
-          "done": false
+          "task": "Implement RecordBuilder::set_array() for array values",
+          "done": true
         },
         {
-          "task": "Implement RecordBuilder::push_jsonb() for JSONB values",
-          "done": false
+          "task": "Implement RecordBuilder::set_jsonb() for JSONB values",
+          "done": true
         },
         {
           "task": "Add depth-limited pointer safety checks (max nesting level)",
-          "done": false
+          "done": true
         }
       ]
     },
