@@ -81,4 +81,5 @@
 
 pub mod btree;
 pub mod encoding;
+pub mod sql;
 pub mod storage;

@@ -847,42 +847,82 @@
     },
     {
       "title": "SQL - Lexer",
-      "description": "Zero-copy SQL tokenizer",
-      "isCompleted": false,
+      "description": "Zero-copy SQL tokenizer supporting full SQL syntax including DDL, DML, subqueries, CTEs, batch operations, explain/analyze, stored procedures, functions, and all standard SQL operators",
+      "isCompleted": true,
       "priority": 18,
       "phase": 5,
       "tasks": [
         {
-          "task": "Define Token<'a> enum with borrowed strings",
-          "done": false
+          "task": "Define Token<'a> enum with borrowed strings for identifiers and literals",
+          "done": true
         },
         {
-          "task": "Define Keyword enum for SQL keywords",
-          "done": false
+          "task": "Define Keyword enum covering DDL, DML, query clauses, joins, set operations, subquery, CTE, transactions, constraints, indexes, types, procedural, explain, schema objects",
+          "done": true
         },
         {
-          "task": "Define Lexer<'a> with input slice and position",
-          "done": false
+          "task": "Define Lexer<'a> with input slice, position, line, column for error reporting",
+          "done": true
         },
         {
-          "task": "Implement next_token() returning Token<'a>",
-          "done": false
+          "task": "Implement next_token() returning Token<'a> with zero-copy string slices",
+          "done": true
         },
         {
-          "task": "Implement keyword matching via perfect hash or match",
-          "done": false
+          "task": "Implement keyword matching via phf perfect hash map for O(1) lookup",
+          "done": true
         },
         {
-          "task": "Handle string literals with escape sequences",
-          "done": false
+          "task": "Handle single-quoted string literals with '' escape for embedded quotes",
+          "done": true
         },
         {
-          "task": "Handle numeric literals (int, float, hex)",
-          "done": false
+          "task": "Handle double-quoted identifiers for case-sensitive/reserved word columns",
+          "done": true
         },
         {
-          "task": "Handle identifiers (including quoted)",
-          "done": false
+          "task": "Handle backtick-quoted identifiers for reserved words",
+          "done": true
+        },
+        {
+          "task": "Handle dollar-quoted strings ($$body$$, $tag$body$tag$) for procedure bodies",
+          "done": true
+        },
+        {
+          "task": "Handle numeric literals: integers, floats, scientific notation, hex, binary, octal",
+          "done": true
+        },
+        {
+          "task": "Handle identifiers: unquoted (starts with letter/_), quoted, backtick-quoted",
+          "done": true
+        },
+        {
+          "task": "Handle operators: comparison, arithmetic, bitwise, string concat, JSON, array",
+          "done": true
+        },
+        {
+          "task": "Handle punctuation: parentheses, brackets, braces, comma, semicolon, colon, double-colon, dot",
+          "done": true
+        },
+        {
+          "task": "Handle comments: single-line (-- comment), multi-line (/* */), nested multi-line",
+          "done": true
+        },
+        {
+          "task": "Handle parameter placeholders: positional ($1, $2), named (:name, @name), anonymous (?)",
+          "done": true
+        },
+        {
+          "task": "Implement peek() and peek_nth() for parser lookahead without consuming",
+          "done": true
+        },
+        {
+          "task": "Implement span() returning byte range for error messages",
+          "done": true
+        },
+        {
+          "task": "Add comprehensive tests for all token types and edge cases",
+          "done": true
         }
       ]
     },
