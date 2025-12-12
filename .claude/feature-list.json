@@ -393,33 +393,33 @@
     {
       "title": "B-Tree - Interior Node with Suffix Truncation",
       "description": "Interior nodes with minimal separator keys",
-      "isCompleted": false,
+      "isCompleted": true,
       "priority": 7,
       "phase": 2,
       "tasks": [
         {
           "task": "Define InteriorPageHeader struct",
-          "done": false
+          "done": true
         },
         {
           "task": "Define InteriorNode<'a> borrowing from page",
-          "done": false
+          "done": true
         },
         {
           "task": "Implement compute_separator() for suffix truncation",
-          "done": false
+          "done": true
         },
         {
           "task": "Implement find_child() returning child page number",
-          "done": false
+          "done": true
         },
         {
           "task": "Implement insert_separator() after split",
-          "done": false
+          "done": true
         },
         {
           "task": "Store right_child in header",
-          "done": false
+          "done": true
         }
       ]
     },
