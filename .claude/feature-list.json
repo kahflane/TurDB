@@ -435,6 +435,10 @@
           "done": true
         },
         {
+          "task": "Implement encode_bool() with FALSE (0x02) and TRUE (0x03)",
+          "done": true
+        },
+        {
           "task": "Implement encode_int() with XOR flip and big-endian",
           "done": true
         },
@@ -448,6 +452,38 @@
         },
         {
           "task": "Implement encode_blob() with length prefix or null terminator",
+          "done": true
+        },
+        {
+          "task": "Implement encode_date() with signed i32 XOR encoding",
+          "done": true
+        },
+        {
+          "task": "Implement encode_timestamp() with signed i64 XOR encoding",
+          "done": true
+        },
+        {
+          "task": "Implement encode_uuid() with 16-byte fixed encoding",
+          "done": true
+        },
+        {
+          "task": "Implement encode_json() for all JSON types",
+          "done": true
+        },
+        {
+          "task": "Implement encode_array() with element separators",
+          "done": true
+        },
+        {
+          "task": "Implement encode_enum() with type_id and ordinal",
+          "done": true
+        },
+        {
+          "task": "Implement encode_composite() with type_id and fields",
+          "done": true
+        },
+        {
+          "task": "Implement encode_value() dispatcher",
           "done": true
         },
         {
