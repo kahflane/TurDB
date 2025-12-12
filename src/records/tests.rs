@@ -1604,3 +1604,197 @@ fn array_view_fixed_type_o1_access() {
     assert_eq!(view.get_int8(99).unwrap(), 99000);
     assert_eq!(view.get_int8(0).unwrap(), 0);
 }
+
+#[test]
+fn data_type_composite_is_variable() {
+    assert!(DataType::Composite.is_variable());
+    assert_eq!(DataType::Composite.fixed_size(), None);
+}
+
+#[test]
+fn composite_view_basic_field_access() {
+    use crate::records::composite::CompositeView;
+
+    let inner_schema = Schema::new(vec![
+        ColumnDef::new("street", DataType::Text),
+        ColumnDef::new("city", DataType::Text),
+        ColumnDef::new("zip", DataType::Int4),
+    ]);
+
+    let mut inner_builder = RecordBuilder::new(&inner_schema);
+    inner_builder.set_text(0, "123 Main St").unwrap();
+    inner_builder.set_text(1, "Springfield").unwrap();
+    inner_builder.set_int4(2, 12345).unwrap();
+    let inner_data = inner_builder.build().unwrap();
+
+    let view = CompositeView::new(&inner_data, 3).unwrap();
+
+    assert_eq!(view.field_count(), 3);
+    assert!(!view.is_null(0));
+    assert!(!view.is_null(1));
+    assert!(!view.is_null(2));
+}
+
+#[test]
+fn composite_view_get_field_returns_data_payload() {
+    use crate::records::composite::CompositeView;
+
+    let inner_schema = Schema::new(vec![
+        ColumnDef::new("id", DataType::Int4),
+        ColumnDef::new("value", DataType::Int8),
+    ]);
+
+    let mut inner_builder = RecordBuilder::new(&inner_schema);
+    inner_builder.set_int4(0, 42).unwrap();
+    inner_builder.set_int8(1, 123456789).unwrap();
+    let inner_data = inner_builder.build().unwrap();
+
+    let view = CompositeView::new(&inner_data, 2).unwrap();
+
+    let payload = view.get_field(0).unwrap();
+    assert!(payload.len() >= 12);
+
+    let val0 = i32::from_le_bytes(payload[0..4].try_into().unwrap());
+    assert_eq!(val0, 42);
+
+    let val1 = i64::from_le_bytes(payload[4..12].try_into().unwrap());
+    assert_eq!(val1, 123456789);
+}
+
+#[test]
+fn composite_view_handles_null_fields() {
+    use crate::records::composite::CompositeView;
+
+    let inner_schema = Schema::new(vec![
+        ColumnDef::new("a", DataType::Int4),
+        ColumnDef::new("b", DataType::Int4),
+    ]);
+
+    let mut inner_builder = RecordBuilder::new(&inner_schema);
+    inner_builder.set_int4(0, 100).unwrap();
+    inner_builder.set_null(1);
+    let inner_data = inner_builder.build().unwrap();
+
+    let view = CompositeView::new(&inner_data, 2).unwrap();
+
+    assert!(!view.is_null(0));
+    assert!(view.is_null(1));
+}
+
+#[test]
+fn composite_view_rejects_empty_data() {
+    use crate::records::composite::CompositeView;
+
+    let result = CompositeView::new(&[], 2);
+    assert!(result.is_err());
+}
+
+#[test]
+fn record_builder_set_composite_roundtrip() {
+    let inner_schema = Schema::new(vec![
+        ColumnDef::new("x", DataType::Int4),
+        ColumnDef::new("y", DataType::Int4),
+    ]);
+
+    let mut inner_builder = RecordBuilder::new(&inner_schema);
+    inner_builder.set_int4(0, 10).unwrap();
+    inner_builder.set_int4(1, 20).unwrap();
+    let inner_data = inner_builder.build().unwrap();
+
+    let outer_schema = Schema::new(vec![
+        ColumnDef::new("id", DataType::Int4),
+        ColumnDef::new("point", DataType::Composite),
+    ]);
+
+    let mut outer_builder = RecordBuilder::new(&outer_schema);
+    outer_builder.set_int4(0, 1).unwrap();
+    outer_builder.set_composite(1, &inner_data).unwrap();
+
+    let outer_data = outer_builder.build().unwrap();
+    let outer_view = RecordView::new(&outer_data, &outer_schema).unwrap();
+
+    assert_eq!(outer_view.get_int4(0).unwrap(), 1);
+
+    let composite = outer_view.get_composite(1, 2).unwrap();
+    assert_eq!(composite.field_count(), 2);
+}
+
+#[test]
+fn record_view_get_array_returns_array_view() {
+    use crate::records::array::ArrayBuilder;
+
+    let mut arr_builder = ArrayBuilder::new(DataType::Int4);
+    arr_builder.push_int4(1);
+    arr_builder.push_int4(2);
+    arr_builder.push_int4(3);
+    let arr_data = arr_builder.build();
+
+    let schema = Schema::new(vec![
+        ColumnDef::new("id", DataType::Int4),
+        ColumnDef::new("numbers", DataType::Array),
+    ]);
+
+    let mut builder = RecordBuilder::new(&schema);
+    builder.set_int4(0, 42).unwrap();
+    builder.set_array(1, &arr_data).unwrap();
+
+    let data = builder.build().unwrap();
+    let view = RecordView::new(&data, &schema).unwrap();
+
+    assert_eq!(view.get_int4(0).unwrap(), 42);
+
+    let arr = view.get_array(1).unwrap();
+    assert_eq!(arr.len(), 3);
+    assert_eq!(arr.get_int4(0).unwrap(), 1);
+    assert_eq!(arr.get_int4(1).unwrap(), 2);
+    assert_eq!(arr.get_int4(2).unwrap(), 3);
+}
+
+#[test]
+fn nested_composite_within_composite() {
+    use crate::records::composite::CompositeView;
+
+    let address_schema = Schema::new(vec![
+        ColumnDef::new("city", DataType::Text),
+        ColumnDef::new("zip", DataType::Int4),
+    ]);
+
+    let mut addr_builder = RecordBuilder::new(&address_schema);
+    addr_builder.set_text(0, "Boston").unwrap();
+    addr_builder.set_int4(1, 02101).unwrap();
+    let addr_data = addr_builder.build().unwrap();
+
+    let person_schema = Schema::new(vec![
+        ColumnDef::new("name", DataType::Text),
+        ColumnDef::new("address", DataType::Composite),
+    ]);
+
+    let mut person_builder = RecordBuilder::new(&person_schema);
+    person_builder.set_text(0, "Alice").unwrap();
+    person_builder.set_composite(1, &addr_data).unwrap();
+    let person_data = person_builder.build().unwrap();
+
+    let person_view = CompositeView::new(&person_data, 2).unwrap();
+    assert_eq!(person_view.field_count(), 2);
+
+    let nested = person_view.get_nested_composite(1, 2).unwrap();
+    assert_eq!(nested.field_count(), 2);
+}
+
+#[test]
+fn composite_view_depth_limit_enforced() {
+    use crate::records::composite::{CompositeView, MAX_NESTING_DEPTH};
+
+    let schema = Schema::new(vec![ColumnDef::new("data", DataType::Composite)]);
+
+    let mut data = RecordBuilder::new(&schema);
+    data.set_blob(0, &[0x03, 0x00, 0x00]).unwrap();
+    let bytes = data.build().unwrap();
+
+    let view = CompositeView::new_with_depth(&bytes, 1, MAX_NESTING_DEPTH - 1).unwrap();
+    assert_eq!(view.field_count(), 1);
+
+    let result = view.get_nested_composite(0, 1);
+    assert!(result.is_err());
+    assert!(result.unwrap_err().to_string().contains("depth"));
+}
