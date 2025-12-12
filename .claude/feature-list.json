@@ -275,7 +275,7 @@
       "tasks": [
         {
           "task": "Define Freelist struct with head_page and free_count",
-          "done": false
+          "done": true
         },
         {
           "task": "Define trunk page format (next_trunk, count, page_numbers)",

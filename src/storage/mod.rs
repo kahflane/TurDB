@@ -85,10 +85,12 @@
 //! - Windows (CreateFileMapping/MapViewOfFile)
 
 mod cache;
+mod freelist;
 mod mmap;
 mod page;
 
 pub use cache::{PageCache, PageKey, PageRef};
+pub use freelist::Freelist;
 pub use mmap::MmapStorage;
 pub use page::{validate_page, PageHeader, PageType};
 
