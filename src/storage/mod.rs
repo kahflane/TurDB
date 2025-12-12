@@ -90,7 +90,7 @@ mod mmap;
 mod page;
 
 pub use cache::{PageCache, PageKey, PageRef};
-pub use freelist::Freelist;
+pub use freelist::{Freelist, TrunkHeader, TRUNK_HEADER_SIZE, TRUNK_MAX_ENTRIES};
 pub use mmap::MmapStorage;
 pub use page::{validate_page, PageHeader, PageType};
 

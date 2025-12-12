@@ -64,6 +64,103 @@
 //! Trunk page contents are read/written through the storage layer on demand,
 //! not cached in memory beyond the page cache.
 
+use eyre::{ensure, Result};
+use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
+
+use super::{PAGE_HEADER_SIZE, PAGE_SIZE};
+
+pub const TRUNK_HEADER_SIZE: usize = 8;
+pub const TRUNK_MAX_ENTRIES: usize = (PAGE_SIZE - PAGE_HEADER_SIZE - TRUNK_HEADER_SIZE) / 4;
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, FromBytes, IntoBytes, Immutable, KnownLayout)]
+pub struct TrunkHeader {
+    next_trunk: u32,
+    count: u32,
+}
+
+impl TrunkHeader {
+    pub fn new() -> Self {
+        Self {
+            next_trunk: 0,
+            count: 0,
+        }
+    }
+
+    pub fn with_next(next_trunk: u32) -> Self {
+        Self {
+            next_trunk,
+            count: 0,
+        }
+    }
+
+    pub fn from_bytes(data: &[u8]) -> Result<&Self> {
+        ensure!(
+            data.len() >= size_of::<Self>(),
+            "buffer too small for TrunkHeader: {} < {}",
+            data.len(),
+            size_of::<Self>()
+        );
+
+        Self::ref_from_bytes(&data[..size_of::<Self>()])
+            .map_err(|e| eyre::eyre!("failed to read TrunkHeader: {:?}", e))
+    }
+
+    pub fn from_bytes_mut(data: &mut [u8]) -> Result<&mut Self> {
+        ensure!(
+            data.len() >= size_of::<Self>(),
+            "buffer too small for TrunkHeader: {} < {}",
+            data.len(),
+            size_of::<Self>()
+        );
+
+        Self::mut_from_bytes(&mut data[..size_of::<Self>()])
+            .map_err(|e| eyre::eyre!("failed to read TrunkHeader: {:?}", e))
+    }
+
+    pub fn write_to(&self, data: &mut [u8]) -> Result<()> {
+        ensure!(
+            data.len() >= size_of::<Self>(),
+            "buffer too small for TrunkHeader: {} < {}",
+            data.len(),
+            size_of::<Self>()
+        );
+
+        data[..size_of::<Self>()].copy_from_slice(self.as_bytes());
+        Ok(())
+    }
+
+    pub fn next_trunk(&self) -> u32 {
+        self.next_trunk
+    }
+
+    pub fn set_next_trunk(&mut self, page_no: u32) {
+        self.next_trunk = page_no;
+    }
+
+    pub fn count(&self) -> u32 {
+        self.count
+    }
+
+    pub fn set_count(&mut self, count: u32) {
+        self.count = count;
+    }
+
+    pub fn is_full(&self) -> bool {
+        self.count as usize >= TRUNK_MAX_ENTRIES
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.count == 0
+    }
+}
+
+impl Default for TrunkHeader {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[derive(Debug)]
 pub struct Freelist {
     head_page: u32,
@@ -111,6 +208,99 @@ impl Default for Freelist {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use crate::storage::{PAGE_HEADER_SIZE, PAGE_SIZE};
+
+    #[test]
+    fn trunk_header_size_is_8_bytes() {
+        assert_eq!(size_of::<TrunkHeader>(), 8);
+    }
+
+    #[test]
+    fn trunk_header_new_creates_empty_trunk() {
+        let trunk = TrunkHeader::new();
+
+        assert_eq!(trunk.next_trunk(), 0);
+        assert_eq!(trunk.count(), 0);
+    }
+
+    #[test]
+    fn trunk_header_with_next_sets_next_trunk() {
+        let trunk = TrunkHeader::with_next(42);
+
+        assert_eq!(trunk.next_trunk(), 42);
+        assert_eq!(trunk.count(), 0);
+    }
+
+    #[test]
+    fn trunk_header_set_next_trunk_updates_value() {
+        let mut trunk = TrunkHeader::new();
+
+        trunk.set_next_trunk(123);
+
+        assert_eq!(trunk.next_trunk(), 123);
+    }
+
+    #[test]
+    fn trunk_header_set_count_updates_value() {
+        let mut trunk = TrunkHeader::new();
+
+        trunk.set_count(500);
+
+        assert_eq!(trunk.count(), 500);
+    }
+
+    #[test]
+    fn trunk_header_from_bytes_zero_copy() {
+        let mut data = [0u8; 8];
+        data[0..4].copy_from_slice(&42u32.to_le_bytes());
+        data[4..8].copy_from_slice(&100u32.to_le_bytes());
+
+        let trunk = TrunkHeader::from_bytes(&data).unwrap();
+
+        assert_eq!(trunk.next_trunk(), 42);
+        assert_eq!(trunk.count(), 100);
+    }
+
+    #[test]
+    fn trunk_header_from_bytes_too_small() {
+        let data = [0u8; 4];
+        let result = TrunkHeader::from_bytes(&data);
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn trunk_header_write_to() {
+        let mut trunk = TrunkHeader::new();
+        trunk.set_next_trunk(99);
+        trunk.set_count(50);
+        let mut data = [0xFFu8; 16];
+
+        trunk.write_to(&mut data).unwrap();
+
+        assert_eq!(&data[0..4], &99u32.to_le_bytes());
+        assert_eq!(&data[4..8], &50u32.to_le_bytes());
+    }
+
+    #[test]
+    fn trunk_max_entries_calculated_correctly() {
+        let expected = (PAGE_SIZE - PAGE_HEADER_SIZE - size_of::<TrunkHeader>()) / 4;
+        assert_eq!(TRUNK_MAX_ENTRIES, expected);
+        assert_eq!(TRUNK_MAX_ENTRIES, 4090);
+    }
+
+    #[test]
+    fn trunk_header_is_full() {
+        let mut trunk = TrunkHeader::new();
+
+        assert!(!trunk.is_full());
+
+        trunk.set_count(TRUNK_MAX_ENTRIES as u32);
+
+        assert!(trunk.is_full());
+    }
+
     #[test]
     fn freelist_new_creates_empty_freelist() {
         let freelist = super::Freelist::new();
