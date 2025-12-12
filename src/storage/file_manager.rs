@@ -330,6 +330,46 @@ impl FileManager {
         schema_path.exists() && schema_path.is_dir()
     }
 
+    pub fn create_table(&mut self, schema: &str, table: &str, table_id: u64) -> Result<()> {
+        Self::validate_name(table)?;
+
+        ensure!(
+            self.schema_exists(schema),
+            "schema '{}' does not exist",
+            schema
+        );
+
+        let table_path = self.table_file_path(schema, table);
+
+        ensure!(
+            !table_path.exists(),
+            "table '{}.{}' already exists",
+            schema,
+            table
+        );
+
+        let mut storage = MmapStorage::create(&table_path, 1)?;
+
+        let page = storage.page_mut(0)?;
+        page[..16].copy_from_slice(TABLE_MAGIC);
+        page[16..24].copy_from_slice(&table_id.to_le_bytes());
+
+        storage.sync()?;
+
+        Ok(())
+    }
+
+    pub fn table_exists(&self, schema: &str, table: &str) -> bool {
+        let table_path = self.table_file_path(schema, table);
+        table_path.exists()
+    }
+
+    fn table_file_path(&self, schema: &str, table: &str) -> PathBuf {
+        self.base_path
+            .join(schema)
+            .join(format!("{}.{}", table, TABLE_FILE_EXTENSION))
+    }
+
     fn validate_name(name: &str) -> Result<()> {
         ensure!(!name.is_empty(), "name cannot be empty");
         ensure!(
@@ -481,5 +521,74 @@ mod tests {
 
         fm.create_schema("newschema").unwrap();
         assert!(fm.schema_exists("newschema"));
+    }
+
+    #[test]
+    fn create_table_creates_tbd_file() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("testdb");
+
+        let mut fm = FileManager::create(&db_path, DEFAULT_MAX_OPEN_FILES).unwrap();
+
+        fm.create_table(DEFAULT_SCHEMA, "users", 1).unwrap();
+
+        let table_path = db_path.join(DEFAULT_SCHEMA).join("users.tbd");
+        assert!(table_path.exists());
+    }
+
+    #[test]
+    fn create_table_initializes_header() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("testdb");
+
+        let mut fm = FileManager::create(&db_path, DEFAULT_MAX_OPEN_FILES).unwrap();
+
+        fm.create_table(DEFAULT_SCHEMA, "users", 42).unwrap();
+
+        let table_path = db_path.join(DEFAULT_SCHEMA).join("users.tbd");
+        let storage = MmapStorage::open(&table_path).unwrap();
+        let page = storage.page(0).unwrap();
+
+        assert_eq!(&page[..16], TABLE_MAGIC);
+
+        let table_id = u64::from_le_bytes(page[16..24].try_into().unwrap());
+        assert_eq!(table_id, 42);
+    }
+
+    #[test]
+    fn create_table_fails_for_nonexistent_schema() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("testdb");
+
+        let mut fm = FileManager::create(&db_path, DEFAULT_MAX_OPEN_FILES).unwrap();
+
+        let result = fm.create_table("nonexistent", "users", 1);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn create_table_fails_for_existing_table() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("testdb");
+
+        let mut fm = FileManager::create(&db_path, DEFAULT_MAX_OPEN_FILES).unwrap();
+
+        fm.create_table(DEFAULT_SCHEMA, "users", 1).unwrap();
+        let result = fm.create_table(DEFAULT_SCHEMA, "users", 2);
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn table_exists_returns_correct_value() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("testdb");
+
+        let mut fm = FileManager::create(&db_path, DEFAULT_MAX_OPEN_FILES).unwrap();
+
+        assert!(!fm.table_exists(DEFAULT_SCHEMA, "users"));
+
+        fm.create_table(DEFAULT_SCHEMA, "users", 1).unwrap();
+        assert!(fm.table_exists(DEFAULT_SCHEMA, "users"));
     }
 }
