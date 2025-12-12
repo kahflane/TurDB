@@ -545,7 +545,12 @@ mod tests {
             let mut buf = Vec::new();
             encode_int(val, &mut buf);
             let (decoded, _) = decode_key(&buf).unwrap();
-            assert_eq!(decoded, DecodedKey::Int(val), "roundtrip failed for {}", val);
+            assert_eq!(
+                decoded,
+                DecodedKey::Int(val),
+                "roundtrip failed for {}",
+                val
+            );
         }
     }
 
@@ -555,7 +560,12 @@ mod tests {
             let mut buf = Vec::new();
             encode_float(val, &mut buf);
             let (decoded, _) = decode_key(&buf).unwrap();
-            assert_eq!(decoded, DecodedKey::Float(val), "roundtrip failed for {}", val);
+            assert_eq!(
+                decoded,
+                DecodedKey::Float(val),
+                "roundtrip failed for {}",
+                val
+            );
         }
     }
 
@@ -596,22 +606,158 @@ mod tests {
             let mut buf = Vec::new();
             encode_text(val, &mut buf);
             let (decoded, _) = decode_key(&buf).unwrap();
-            assert_eq!(decoded, DecodedKey::Text(val.to_string()), "roundtrip failed for {:?}", val);
+            assert_eq!(
+                decoded,
+                DecodedKey::Text(val.to_string()),
+                "roundtrip failed for {:?}",
+                val
+            );
         }
     }
 
     #[test]
     fn decode_blob_roundtrip() {
-        let test_cases: &[&[u8]] = &[
-            &[],
-            b"hello",
-            &[0x00, 0xFF, 0x01],
-        ];
+        let test_cases: &[&[u8]] = &[&[], b"hello", &[0x00, 0xFF, 0x01]];
         for &val in test_cases {
             let mut buf = Vec::new();
             encode_blob(val, &mut buf);
             let (decoded, _) = decode_key(&buf).unwrap();
-            assert_eq!(decoded, DecodedKey::Blob(val.to_vec()), "roundtrip failed for {:?}", val);
+            assert_eq!(
+                decoded,
+                DecodedKey::Blob(val.to_vec()),
+                "roundtrip failed for {:?}",
+                val
+            );
+        }
+    }
+
+    #[test]
+    fn cross_type_ordering_null_first() {
+        let mut null_buf = Vec::new();
+        encode_null(&mut null_buf);
+
+        let mut int_buf = Vec::new();
+        encode_int(-1000, &mut int_buf);
+
+        let mut text_buf = Vec::new();
+        encode_text("", &mut text_buf);
+
+        assert!(null_buf < int_buf, "NULL should sort before integers");
+        assert!(int_buf < text_buf, "integers should sort before text");
+    }
+
+    #[test]
+    fn cross_type_ordering_numbers_before_strings() {
+        let mut neg_inf = Vec::new();
+        encode_float(f64::NEG_INFINITY, &mut neg_inf);
+
+        let mut neg_int = Vec::new();
+        encode_int(-100, &mut neg_int);
+
+        let mut zero = Vec::new();
+        encode_int(0, &mut zero);
+
+        let mut pos_int = Vec::new();
+        encode_int(100, &mut pos_int);
+
+        let mut pos_inf = Vec::new();
+        encode_float(f64::INFINITY, &mut pos_inf);
+
+        let mut nan = Vec::new();
+        encode_float(f64::NAN, &mut nan);
+
+        let mut text = Vec::new();
+        encode_text("a", &mut text);
+
+        assert!(neg_inf < neg_int);
+        assert!(neg_int < zero);
+        assert!(zero < pos_int);
+        assert!(pos_int < pos_inf);
+        assert!(pos_inf < nan);
+        assert!(nan < text);
+    }
+
+    #[test]
+    fn comprehensive_type_ordering() {
+        #[derive(Debug)]
+        enum TestValue {
+            Null,
+            Int(i64),
+            Float(f64),
+            Text(&'static str),
+            Blob(&'static [u8]),
+        }
+
+        let values_in_order = [
+            TestValue::Null,
+            TestValue::Float(f64::NEG_INFINITY),
+            TestValue::Int(-1000),
+            TestValue::Int(-1),
+            TestValue::Float(-0.5),
+            TestValue::Int(0),
+            TestValue::Float(0.5),
+            TestValue::Int(1),
+            TestValue::Int(1000),
+            TestValue::Float(f64::INFINITY),
+            TestValue::Float(f64::NAN),
+            TestValue::Text(""),
+            TestValue::Text("a"),
+            TestValue::Text("ab"),
+            TestValue::Text("b"),
+            TestValue::Blob(b""),
+            TestValue::Blob(b"a"),
+            TestValue::Blob(b"ab"),
+        ];
+
+        let encoded: Vec<Vec<u8>> = values_in_order
+            .iter()
+            .map(|v| {
+                let mut buf = Vec::new();
+                match v {
+                    TestValue::Null => encode_null(&mut buf),
+                    TestValue::Int(n) => encode_int(*n, &mut buf),
+                    TestValue::Float(f) => encode_float(*f, &mut buf),
+                    TestValue::Text(s) => encode_text(s, &mut buf),
+                    TestValue::Blob(b) => encode_blob(b, &mut buf),
+                }
+                buf
+            })
+            .collect();
+
+        for i in 0..encoded.len() - 1 {
+            assert!(
+                encoded[i] < encoded[i + 1],
+                "ordering failed: {:?} should be < {:?}",
+                values_in_order[i],
+                values_in_order[i + 1]
+            );
+        }
+    }
+
+    #[test]
+    fn multi_column_key_ordering() {
+        fn encode_pair(a: i64, b: &str) -> Vec<u8> {
+            let mut buf = Vec::new();
+            encode_int(a, &mut buf);
+            encode_text(b, &mut buf);
+            buf
+        }
+
+        let keys = [
+            encode_pair(-1, "z"),
+            encode_pair(0, "a"),
+            encode_pair(0, "b"),
+            encode_pair(1, "a"),
+            encode_pair(1, "z"),
+            encode_pair(100, ""),
+        ];
+
+        for i in 0..keys.len() - 1 {
+            assert!(
+                keys[i] < keys[i + 1],
+                "multi-column ordering failed at index {}",
+                i
+            );
         }
     }
 }
