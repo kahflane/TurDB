@@ -85,11 +85,17 @@
 //! - Windows (CreateFileMapping/MapViewOfFile)
 
 mod cache;
+mod file_manager;
 mod freelist;
 mod mmap;
 mod page;
 
 pub use cache::{PageCache, PageKey, PageRef};
+pub use file_manager::{
+    FileKey, FileManager, DEFAULT_MAX_OPEN_FILES, DEFAULT_SCHEMA, HNSW_FILE_EXTENSION, HNSW_MAGIC,
+    INDEX_FILE_EXTENSION, INDEX_MAGIC, META_FILE_NAME, META_MAGIC, MIN_MAX_OPEN_FILES,
+    TABLE_FILE_EXTENSION, TABLE_MAGIC,
+};
 pub use freelist::{Freelist, TrunkHeader, TRUNK_HEADER_SIZE, TRUNK_MAX_ENTRIES};
 pub use mmap::MmapStorage;
 pub use page::{validate_page, PageHeader, PageType};
