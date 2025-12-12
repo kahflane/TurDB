@@ -198,6 +198,48 @@ impl Freelist {
         self.head_page = head_page;
         self.free_count = free_count;
     }
+
+    pub fn allocate(&mut self, storage: &mut super::MmapStorage) -> Result<Option<u32>> {
+        if self.is_empty() {
+            return Ok(None);
+        }
+
+        let page_data = storage.page_mut(self.head_page)?;
+        let trunk_offset = PAGE_HEADER_SIZE;
+
+        let (count, next_trunk) = {
+            let trunk = TrunkHeader::from_bytes(&page_data[trunk_offset..])?;
+            (trunk.count(), trunk.next_trunk())
+        };
+
+        if count == 0 {
+            if next_trunk == 0 {
+                self.head_page = 0;
+                self.free_count = 0;
+                return Ok(None);
+            }
+            self.head_page = next_trunk;
+            return self.allocate(storage);
+        }
+
+        let entry_index = (count - 1) as usize;
+        let entry_offset = PAGE_HEADER_SIZE + TRUNK_HEADER_SIZE + entry_index * 4;
+        let page_no = u32::from_le_bytes(
+            page_data[entry_offset..entry_offset + 4]
+                .try_into()
+                .unwrap(),
+        );
+
+        let trunk = TrunkHeader::from_bytes_mut(&mut page_data[trunk_offset..])?;
+        trunk.set_count(count - 1);
+        self.free_count -= 1;
+
+        if count - 1 == 0 {
+            self.head_page = next_trunk;
+        }
+
+        Ok(Some(page_no))
+    }
 }
 
 impl Default for Freelist {
@@ -339,5 +381,102 @@ mod tests {
 
         assert_eq!(freelist.head_page(), 5);
         assert_eq!(freelist.free_count(), 50);
+    }
+
+    #[test]
+    fn freelist_allocate_returns_none_when_empty() {
+        let mut freelist = Freelist::new();
+        let mut storage = create_test_storage(10);
+
+        let result = freelist.allocate(&mut storage).unwrap();
+
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn freelist_allocate_returns_page_from_trunk() {
+        let mut storage = create_test_storage(10);
+        let trunk_page = 1;
+        setup_trunk_page(&mut storage, trunk_page, 0, &[5, 6, 7]);
+        let mut freelist = Freelist::with_head(trunk_page, 3);
+
+        let page = freelist.allocate(&mut storage).unwrap();
+
+        assert_eq!(page, Some(7));
+        assert_eq!(freelist.free_count(), 2);
+    }
+
+    #[test]
+    fn freelist_allocate_decrements_trunk_count() {
+        let mut storage = create_test_storage(10);
+        let trunk_page = 1;
+        setup_trunk_page(&mut storage, trunk_page, 0, &[10, 20, 30]);
+        let mut freelist = Freelist::with_head(trunk_page, 3);
+
+        freelist.allocate(&mut storage).unwrap();
+
+        let page_data = storage.page(trunk_page).unwrap();
+        let trunk = TrunkHeader::from_bytes(&page_data[PAGE_HEADER_SIZE..]).unwrap();
+        assert_eq!(trunk.count(), 2);
+    }
+
+    #[test]
+    fn freelist_allocate_moves_to_next_trunk_when_empty() {
+        let mut storage = create_test_storage(10);
+        setup_trunk_page(&mut storage, 1, 2, &[100]);
+        setup_trunk_page(&mut storage, 2, 0, &[200, 201, 202]);
+        let mut freelist = Freelist::with_head(1, 4);
+
+        let page1 = freelist.allocate(&mut storage).unwrap();
+        assert_eq!(page1, Some(100));
+        assert_eq!(freelist.head_page(), 2);
+        assert_eq!(freelist.free_count(), 3);
+    }
+
+    #[test]
+    fn freelist_allocate_multiple_pages() {
+        let mut storage = create_test_storage(10);
+        setup_trunk_page(&mut storage, 1, 0, &[5, 6, 7]);
+        let mut freelist = Freelist::with_head(1, 3);
+
+        let p1 = freelist.allocate(&mut storage).unwrap();
+        let p2 = freelist.allocate(&mut storage).unwrap();
+        let p3 = freelist.allocate(&mut storage).unwrap();
+        let p4 = freelist.allocate(&mut storage).unwrap();
+
+        assert_eq!(p1, Some(7));
+        assert_eq!(p2, Some(6));
+        assert_eq!(p3, Some(5));
+        assert_eq!(p4, None);
+        assert_eq!(freelist.free_count(), 0);
+    }
+
+    fn create_test_storage(page_count: u32) -> crate::storage::MmapStorage {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.keep().join("test.db");
+        crate::storage::MmapStorage::create(&path, page_count).unwrap()
+    }
+
+    fn setup_trunk_page(
+        storage: &mut crate::storage::MmapStorage,
+        page_no: u32,
+        next_trunk: u32,
+        page_numbers: &[u32],
+    ) {
+        let page = storage.page_mut(page_no).unwrap();
+
+        let header = crate::storage::PageHeader::new(crate::storage::PageType::FreeList);
+        header.write_to(page).unwrap();
+
+        let mut trunk = TrunkHeader::new();
+        trunk.set_next_trunk(next_trunk);
+        trunk.set_count(page_numbers.len() as u32);
+        trunk.write_to(&mut page[PAGE_HEADER_SIZE..]).unwrap();
+
+        let entries_offset = PAGE_HEADER_SIZE + TRUNK_HEADER_SIZE;
+        for (i, &pn) in page_numbers.iter().enumerate() {
+            let offset = entries_offset + i * 4;
+            page[offset..offset + 4].copy_from_slice(&pn.to_le_bytes());
+        }
     }
 }

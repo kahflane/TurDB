@@ -283,7 +283,7 @@
         },
         {
           "task": "Implement allocate() to get free page",
-          "done": false
+          "done": true
         },
         {
           "task": "Implement release() to return page to freelist",
