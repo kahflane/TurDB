@@ -617,106 +617,106 @@
     {
       "title": "Record - O(1) Column Access Format",
       "description": "TurDB record format with O(1) column lookup, null bitmap, offset table for variable columns, and schema-dependent type storage",
-      "isCompleted": false,
+      "isCompleted": true,
       "priority": 11,
       "phase": 3,
       "tasks": [
         {
           "task": "Define RecordView<'a> struct borrowing from page buffer with schema reference",
-          "done": false
+          "done": true
         },
         {
           "task": "Implement record header parsing (header_len u16, null bitmap, offset table)",
-          "done": false
+          "done": true
         },
         {
           "task": "Implement is_null(col_idx) using null bitmap bit manipulation",
-          "done": false
+          "done": true
         },
         {
           "task": "Implement get_fixed_offset() calculating position from schema fixed-width sizes",
-          "done": false
+          "done": true
         },
         {
           "task": "Implement get_var_bounds() reading offset table for variable columns",
-          "done": false
+          "done": true
         },
         {
           "task": "Implement get_int2/int4/int8() for fixed-width integers",
-          "done": false
+          "done": true
         },
         {
           "task": "Implement get_float4/float8() for fixed-width floats",
-          "done": false
+          "done": true
         },
         {
           "task": "Implement get_text() returning &str (zero-copy from mmap)",
-          "done": false
+          "done": true
         },
         {
           "task": "Implement get_blob() returning &[u8] (zero-copy from mmap)",
-          "done": false
+          "done": true
         },
         {
           "task": "Implement get_timestamp/date/time() for date-time types",
-          "done": false
+          "done": true
         },
         {
           "task": "Implement get_uuid() returning &[u8; 16]",
-          "done": false
+          "done": true
         },
         {
           "task": "Add schema evolution support (missing columns return NULL or default)",
-          "done": false
+          "done": true
         }
       ]
     },
     {
       "title": "Record - Builder with Buffer Reuse",
       "description": "Record builder with null bitmap, offset table for variable columns, and schema-aware serialization",
-      "isCompleted": false,
+      "isCompleted": true,
       "priority": 12,
       "phase": 3,
       "tasks": [
         {
           "task": "Define RecordBuilder with schema, null_bitmap, offsets vec, and data buffer",
-          "done": false
+          "done": true
         },
         {
           "task": "Implement new(schema) pre-allocating buffers based on column count",
-          "done": false
+          "done": true
         },
         {
-          "task": "Implement push_null(col_idx) setting bit in null bitmap",
-          "done": false
+          "task": "Implement set_null(col_idx) setting bit in null bitmap",
+          "done": true
         },
         {
-          "task": "Implement push_int2/int4/int8() appending to data buffer",
-          "done": false
+          "task": "Implement set_int2/int4/int8() appending to data buffer",
+          "done": true
         },
         {
-          "task": "Implement push_float4/float8() appending to data buffer",
-          "done": false
+          "task": "Implement set_float4/float8() appending to data buffer",
+          "done": true
         },
         {
-          "task": "Implement push_text() recording offset and appending bytes",
-          "done": false
+          "task": "Implement set_text() recording offset and appending bytes",
+          "done": true
         },
         {
-          "task": "Implement push_blob() recording offset and appending bytes",
-          "done": false
+          "task": "Implement set_blob() recording offset and appending bytes",
+          "done": true
         },
         {
-          "task": "Implement push_timestamp/date/time() for date-time types",
-          "done": false
+          "task": "Implement set_timestamp/date/time() for date-time types",
+          "done": true
         },
         {
-          "task": "Implement finish() assembling header_len + null_bitmap + offsets + data",
-          "done": false
+          "task": "Implement build() assembling header_len + null_bitmap + offsets + data",
+          "done": true
         },
         {
           "task": "Implement reset() clearing buffers without deallocation",
-          "done": false
+          "done": true
         }
       ]
     },
