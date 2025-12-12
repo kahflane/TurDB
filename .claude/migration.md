@@ -757,90 +757,392 @@ impl<'a> Cursor<'a> {
 
 ## Phase 3: Record Serialization (Week 7)
 
-### 3.1 Record Format
+### 3.1 TurDB Record Format (O(1) Column Access)
 
-**Go Source**: `pkg/record/record.go`
+**Design Goals**:
+- O(1) column lookup (not SQLite's O(N) sequential parsing)
+- Zero-copy access for variable-length data
+- Support 30+ PostgreSQL types
+- Schema-dependent (types defined in catalog, not per-row)
 
-**Format** (SQLite-compatible):
+**Why NOT SQLite Serial Types**:
+SQLite's record format requires sequential parsing to find the Nth column.
+For 30+ types and "ultrafast" access, we need O(1) column lookup.
+
+### Record Binary Layout
+
 ```
-[header_size: varint][type0: varint][type1: varint]...[data0][data1]...
++------------------+------------------+------------------+------------------+
+| Header Length    | Null Bitmap      | Offset Table     | Data Payload     |
+| (u16)            | [u8; (N+7)/8]    | [u16; M]         | [u8; ...]        |
++------------------+------------------+------------------+------------------+
 ```
 
-**Serial Types**:
-| Type | Description |
-|------|-------------|
-| 0 | NULL |
-| 1 | 8-bit signed integer |
-| 2 | 16-bit signed integer (BE) |
-| 3 | 24-bit signed integer (BE) |
-| 4 | 32-bit signed integer (BE) |
-| 5 | 48-bit signed integer (BE) |
-| 6 | 64-bit signed integer (BE) |
-| 7 | 64-bit IEEE float (BE) |
-| 8 | Integer 0 |
-| 9 | Integer 1 |
-| ≥12 even | BLOB of (N-12)/2 bytes |
-| ≥13 odd | TEXT of (N-13)/2 bytes |
+| Component | Type | Description |
+|-----------|------|-------------|
+| **Header Length** | `u16` | Total size of metadata (allows skipping to data) |
+| **Null Bitmap** | `[u8; (N+7)/8]` | 1 bit per column. `1` = NULL, `0` = data exists |
+| **Offset Table** | `[u16; M]` | Offsets for variable-length columns only |
+| **Data Payload** | `[u8; ...]` | Concatenated fixed-width and variable-width values |
 
-### 3.2 Zero-Copy Record Access
+**Key Design Decisions**:
+1. **u16 Offsets**: Pages are 16KB, so u16 is sufficient (saves 50% vs u32)
+2. **Null Bitmap First**: Enables fast NULL checks from CPU cache
+3. **Split Fixed/Variable**: Fixed columns don't need offset table entries
+4. **Schema-Dependent**: Types come from catalog, not stored per-row
+
+### 3.2 Type Storage Classes
+
+The schema defines column types. The record format categorizes them into storage classes:
+
+| Class | Examples | Storage Logic |
+|-------|----------|---------------|
+| **Inline** | `bool`, `null` | Stored only in Null Bitmap (or Value Bitmap) |
+| **Fixed** | `int4`, `float8`, `uuid`, `macaddr`, `timestamp` | Direct bytes in Data Payload, no offset needed |
+| **Variable** | `text`, `bytea`, `jsonb`, `vector` | Offset in table → Raw bytes in Payload |
+| **Complex** | `array`, `composite`, `range` | Recursively encoded using same format |
+
+**Fixed-Width Type Sizes**:
+```rust
+pub fn fixed_size(data_type: &DataType) -> Option<usize> {
+    match data_type {
+        DataType::Boolean => Some(1),
+        DataType::Int2 => Some(2),
+        DataType::Int4 => Some(4),
+        DataType::Int8 => Some(8),
+        DataType::Float4 => Some(4),
+        DataType::Float8 => Some(8),
+        DataType::Date => Some(4),      // days since epoch
+        DataType::Time => Some(8),      // microseconds
+        DataType::Timestamp => Some(8), // microseconds since epoch
+        DataType::TimestampTz => Some(12), // timestamp + tz offset
+        DataType::Uuid => Some(16),
+        DataType::MacAddr => Some(6),
+        DataType::Inet4 => Some(4),
+        DataType::Inet6 => Some(16),
+        _ => None, // Variable-length
+    }
+}
+```
+
+### 3.3 Zero-Copy Record Access
 
 ```rust
 // src/record.rs
 
-pub struct Record<'a> {
+pub struct RecordView<'a> {
     data: &'a [u8],
-    header_size: usize,
-    column_types: SmallVec<[u32; 16]>,
-    column_offsets: SmallVec<[usize; 16]>,
+    schema: &'a Schema,
 }
 
-impl<'a> Record<'a> {
-    pub fn parse(data: &'a [u8]) -> Result<Self>
+impl<'a> RecordView<'a> {
+    pub fn from_bytes(data: &'a [u8], schema: &'a Schema) -> Result<Self> {
+        Ok(Self { data, schema })
+    }
 
-    pub fn column_count(&self) -> usize
+    fn header_len(&self) -> u16 {
+        u16::from_le_bytes([self.data[0], self.data[1]])
+    }
 
-    pub fn is_null(&self, col: usize) -> bool
+    fn null_bitmap(&self) -> &[u8] {
+        let bitmap_size = (self.schema.column_count() + 7) / 8;
+        &self.data[2..2 + bitmap_size]
+    }
 
-    pub fn get_int(&self, col: usize) -> Result<i64>
+    pub fn is_null(&self, col_idx: usize) -> bool {
+        let byte_idx = col_idx / 8;
+        let bit_idx = col_idx % 8;
+        (self.null_bitmap()[byte_idx] & (1 << bit_idx)) != 0
+    }
 
-    pub fn get_float(&self, col: usize) -> Result<f64>
+    pub fn get_text(&self, col_idx: usize) -> Option<&'a str> {
+        if self.is_null(col_idx) { return None; }
+        let (start, end) = self.get_var_bounds(col_idx);
+        Some(std::str::from_utf8(&self.data[start..end]).unwrap())
+    }
 
-    pub fn get_text(&self, col: usize) -> Result<&'a str>
+    pub fn get_blob(&self, col_idx: usize) -> Option<&'a [u8]> {
+        if self.is_null(col_idx) { return None; }
+        let (start, end) = self.get_var_bounds(col_idx);
+        Some(&self.data[start..end])
+    }
 
-    pub fn get_blob(&self, col: usize) -> Result<&'a [u8]>
+    pub fn get_int4(&self, col_idx: usize) -> Option<i32> {
+        if self.is_null(col_idx) { return None; }
+        let offset = self.get_fixed_offset(col_idx);
+        Some(i32::from_le_bytes(self.data[offset..offset+4].try_into().unwrap()))
+    }
+
+    pub fn get_timestamp(&self, col_idx: usize) -> Option<i64> {
+        if self.is_null(col_idx) { return None; }
+        let offset = self.get_fixed_offset(col_idx);
+        Some(i64::from_le_bytes(self.data[offset..offset+8].try_into().unwrap()))
+    }
+
+    fn get_fixed_offset(&self, col_idx: usize) -> usize {
+        let header_len = self.header_len() as usize;
+        let mut offset = header_len;
+        for i in 0..col_idx {
+            if !self.is_null(i) {
+                if let Some(size) = self.schema.fixed_size(i) {
+                    offset += size;
+                }
+            }
+        }
+        offset
+    }
+
+    fn get_var_bounds(&self, col_idx: usize) -> (usize, usize) {
+        let var_idx = self.schema.var_column_index(col_idx);
+        let offset_table_start = 2 + (self.schema.column_count() + 7) / 8;
+        let start_offset = u16::from_le_bytes([
+            self.data[offset_table_start + var_idx * 2],
+            self.data[offset_table_start + var_idx * 2 + 1],
+        ]) as usize;
+        let end_offset = u16::from_le_bytes([
+            self.data[offset_table_start + (var_idx + 1) * 2],
+            self.data[offset_table_start + (var_idx + 1) * 2 + 1],
+        ]) as usize;
+        (start_offset, end_offset)
+    }
 }
 ```
 
-**Key Design**:
-- `Record` borrows from page buffer
-- Text/blob access returns slices, not copies
-- Column offsets computed once on parse
+### 3.4 Array Binary Format (O(1) Element Access)
 
-### 3.3 Record Builder
+For homogeneous arrays, we use a jump table for O(1) element access:
+
+```
++----------+----------+----------+----------+------------------+----------+
+| Total    | NDims    | ElemType | Count    | Offsets          | Data     |
+| Size(u32)| (u16)    | (u16)    | (u32)    | [u16; Count]     | [u8; ...] |
++----------+----------+----------+----------+------------------+----------+
+```
+
+**Optimization**: If `ElemType` is fixed-width, omit the Offsets table entirely.
+Element `i` position = `12 + (i × elem_size)`.
+
+```rust
+pub struct ArrayView<'a> {
+    data: &'a [u8],
+}
+
+impl<'a> ArrayView<'a> {
+    pub fn len(&self) -> u32 {
+        u32::from_le_bytes(self.data[8..12].try_into().unwrap())
+    }
+
+    pub fn elem_type(&self) -> u16 {
+        u16::from_le_bytes(self.data[6..8].try_into().unwrap())
+    }
+
+    pub fn get_element(&self, idx: usize) -> &'a [u8] {
+        if self.is_fixed_width() {
+            let elem_size = self.fixed_elem_size();
+            let start = 12 + idx * elem_size;
+            &self.data[start..start + elem_size]
+        } else {
+            let offset_start = 12 + idx * 2;
+            let start = u16::from_le_bytes([
+                self.data[offset_start],
+                self.data[offset_start + 1],
+            ]) as usize;
+            let end = u16::from_le_bytes([
+                self.data[offset_start + 2],
+                self.data[offset_start + 3],
+            ]) as usize;
+            &self.data[start..end]
+        }
+    }
+}
+```
+
+### 3.5 JSONB Binary Format (O(log n) Key Lookup)
+
+Decomposed binary format with sorted keys for binary search:
+
+```
++----------+------------------+------------------+
+| Header   | Entries Table    | Data             |
+| (u32)    | [Entry; N]       | [u8; ...]        |
++----------+------------------+------------------+
+
+Entry (4 bytes):
+  Bit 31: Is_Key (1 = key string, 0 = value)
+  Bit 30: Is_Variable (1 = variable length)
+  Bits 29-0: Offset from Data section start
+```
+
+```rust
+pub struct JsonbView<'a>(&'a [u8]);
+
+impl<'a> JsonbView<'a> {
+    pub fn get_key(&self, key: &str) -> Option<JsonbValue<'a>> {
+        let count = self.entry_count();
+        let mut low = 0;
+        let mut high = count - 1;
+
+        while low <= high {
+            let mid = (low + high) / 2;
+            let current_key = self.read_key_at(mid);
+            match current_key.cmp(key) {
+                Ordering::Equal => return Some(self.read_value_at(mid)),
+                Ordering::Less => low = mid + 1,
+                Ordering::Greater => high = mid - 1,
+            }
+        }
+        None
+    }
+}
+```
+
+### 3.6 Composite Type Format (Nested Records)
+
+Composite values use the same record format recursively:
+
+```
++------------------+------------------+------------------+------------------+
+| Internal Length  | Field Count      | Null Bitmap      | Offset Table     | Data
+| (u16)            | (u8)             | [u8; ...]        | [u16; M]         | [u8; ...]
++------------------+------------------+------------------+------------------+
+```
+
+Zero-copy nested access:
+```rust
+let address_bytes = row.get_composite(2)?;  // Slice into mmap
+let address_view = RecordView::new(address_bytes, &address_schema);
+let city = address_view.get_text(1);  // Still points into original mmap
+```
+
+### 3.7 Record Builder
 
 ```rust
 pub struct RecordBuilder {
-    buffer: Vec<u8>,
     header: Vec<u8>,
+    null_bitmap: Vec<u8>,
+    offsets: Vec<u16>,
     data: Vec<u8>,
+    schema: Schema,
 }
 
 impl RecordBuilder {
-    pub fn new() -> Self
-    pub fn push_null(&mut self)
-    pub fn push_int(&mut self, val: i64)
-    pub fn push_float(&mut self, val: f64)
-    pub fn push_text(&mut self, val: &str)
-    pub fn push_blob(&mut self, val: &[u8])
-    pub fn finish(&mut self) -> &[u8]
-    pub fn reset(&mut self)
+    pub fn new(schema: Schema) -> Self {
+        let bitmap_size = (schema.column_count() + 7) / 8;
+        Self {
+            header: Vec::with_capacity(64),
+            null_bitmap: vec![0; bitmap_size],
+            offsets: Vec::with_capacity(schema.var_column_count()),
+            data: Vec::with_capacity(256),
+            schema,
+        }
+    }
+
+    pub fn push_null(&mut self, col_idx: usize) {
+        let byte_idx = col_idx / 8;
+        let bit_idx = col_idx % 8;
+        self.null_bitmap[byte_idx] |= 1 << bit_idx;
+    }
+
+    pub fn push_int4(&mut self, val: i32) {
+        self.data.extend_from_slice(&val.to_le_bytes());
+    }
+
+    pub fn push_text(&mut self, val: &str) {
+        self.offsets.push(self.data.len() as u16);
+        self.data.extend_from_slice(val.as_bytes());
+    }
+
+    pub fn finish(&mut self) -> &[u8] {
+        self.header.clear();
+        let header_len = 2 + self.null_bitmap.len() + self.offsets.len() * 2;
+        self.header.extend_from_slice(&(header_len as u16).to_le_bytes());
+        self.header.extend_from_slice(&self.null_bitmap);
+        for &offset in &self.offsets {
+            self.header.extend_from_slice(&offset.to_le_bytes());
+        }
+        self.header.extend_from_slice(&self.data);
+        &self.header
+    }
+
+    pub fn reset(&mut self) {
+        self.null_bitmap.fill(0);
+        self.offsets.clear();
+        self.data.clear();
+    }
 }
 ```
 
-**Buffer Reuse**:
-- `RecordBuilder` pre-allocates buffers
-- `reset()` clears without deallocating
-- Same builder used for all inserts in a transaction
+### 3.8 Schema Evolution Support
+
+To support `ALTER TABLE ... ADD COLUMN` without rewriting rows:
+
+1. New columns added to end of schema
+2. `Header Length` tells reader how many columns this row has
+3. If `requested_col_idx > record.column_count`, treat as NULL or use schema default
+
+### 3.9 Memory Footprint
+
+| Row Type | Header + Bitmap | Offset Table | Data | Total |
+|----------|-----------------|--------------|------|-------|
+| Small (8 cols, all fixed) | 3 bytes | 0 bytes | 32 bytes | ~35 bytes |
+| Wide (64 cols, mixed) | 10 bytes | 128 bytes | 512 bytes | ~650 bytes |
+
+With 1MB RAM, metadata and active views for **thousands of records** can be held simultaneously since actual data stays in OS Page Cache (mmap).
+
+### 3.10 Varint Encoding (for lengths only)
+
+Varint is used only for encoding lengths in cells, NOT for type codes:
+
+```rust
+// src/encoding/varint.rs
+
+pub fn encode_varint(value: u64, buf: &mut [u8]) -> usize {
+    if value <= 240 {
+        buf[0] = value as u8;
+        1
+    } else if value <= 2287 {
+        buf[0] = (241 + (value - 241) / 256) as u8;
+        buf[1] = ((value - 241) % 256) as u8;
+        2
+    } else if value <= 67823 {
+        buf[0] = 249;
+        buf[1] = ((value - 2288) / 256) as u8;
+        buf[2] = ((value - 2288) % 256) as u8;
+        3
+    } else if value <= 0xFFFFFFFF {
+        buf[0] = 251;
+        buf[1..5].copy_from_slice(&(value as u32).to_be_bytes());
+        5
+    } else {
+        buf[0] = 255;
+        buf[1..9].copy_from_slice(&value.to_be_bytes());
+        9
+    }
+}
+
+pub fn decode_varint(buf: &[u8]) -> (u64, usize) {
+    let first = buf[0] as u64;
+    if first <= 240 {
+        (first, 1)
+    } else if first <= 248 {
+        (241 + (first - 241) * 256 + buf[1] as u64, 2)
+    } else if first == 249 {
+        (2288 + (buf[1] as u64) * 256 + buf[2] as u64, 3)
+    } else if first == 251 {
+        (u32::from_be_bytes([buf[1], buf[2], buf[3], buf[4]]) as u64, 5)
+    } else {
+        (u64::from_be_bytes([buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7], buf[8]]), 9)
+    }
+}
+
+pub fn varint_len(value: u64) -> usize {
+    if value <= 240 { 1 }
+    else if value <= 2287 { 2 }
+    else if value <= 67823 { 3 }
+    else if value <= 0xFFFFFFFF { 5 }
+    else { 9 }
+}
+```
 
 ## Phase 4: Schema and Catalog (Weeks 8-9)
 
