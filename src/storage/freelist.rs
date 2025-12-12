@@ -240,6 +240,53 @@ impl Freelist {
 
         Ok(Some(page_no))
     }
+
+    pub fn release(&mut self, storage: &mut super::MmapStorage, page_no: u32) -> Result<()> {
+        if self.head_page == 0 {
+            self.initialize_trunk(storage, page_no)?;
+            return Ok(());
+        }
+
+        let page_data = storage.page_mut(self.head_page)?;
+        let trunk_offset = PAGE_HEADER_SIZE;
+
+        let (count, is_full) = {
+            let trunk = TrunkHeader::from_bytes(&page_data[trunk_offset..])?;
+            (trunk.count(), trunk.is_full())
+        };
+
+        if is_full {
+            eyre::bail!(
+                "trunk page {} is full, cannot release page {} (need overflow handling)",
+                self.head_page,
+                page_no
+            );
+        }
+
+        let entry_offset = PAGE_HEADER_SIZE + TRUNK_HEADER_SIZE + count as usize * 4;
+        page_data[entry_offset..entry_offset + 4].copy_from_slice(&page_no.to_le_bytes());
+
+        let trunk = TrunkHeader::from_bytes_mut(&mut page_data[trunk_offset..])?;
+        trunk.set_count(count + 1);
+        self.free_count += 1;
+
+        Ok(())
+    }
+
+    fn initialize_trunk(&mut self, storage: &mut super::MmapStorage, page_no: u32) -> Result<()> {
+        let page_data = storage.page_mut(page_no)?;
+
+        let header = super::PageHeader::new(super::PageType::FreeList);
+        header.write_to(page_data)?;
+
+        let trunk = TrunkHeader::new();
+        trunk.write_to(&mut page_data[PAGE_HEADER_SIZE..])?;
+
+        self.head_page = page_no;
+        self.free_count = 1;
+
+        Ok(())
+    }
 }
 
 impl Default for Freelist {
@@ -478,5 +525,59 @@ mod tests {
             let offset = entries_offset + i * 4;
             page[offset..offset + 4].copy_from_slice(&pn.to_le_bytes());
         }
+    }
+
+    #[test]
+    fn freelist_release_to_existing_trunk() {
+        let mut storage = create_test_storage(10);
+        let trunk_page = 1;
+        setup_trunk_page(&mut storage, trunk_page, 0, &[5, 6]);
+        let mut freelist = Freelist::with_head(trunk_page, 2);
+
+        freelist.release(&mut storage, 99).unwrap();
+
+        assert_eq!(freelist.free_count(), 3);
+        let page_data = storage.page(trunk_page).unwrap();
+        let trunk = TrunkHeader::from_bytes(&page_data[PAGE_HEADER_SIZE..]).unwrap();
+        assert_eq!(trunk.count(), 3);
+
+        let entry_offset = PAGE_HEADER_SIZE + TRUNK_HEADER_SIZE + 2 * 4;
+        let stored_page = u32::from_le_bytes(
+            page_data[entry_offset..entry_offset + 4]
+                .try_into()
+                .unwrap(),
+        );
+        assert_eq!(stored_page, 99);
+    }
+
+    #[test]
+    fn freelist_release_to_empty_freelist_creates_trunk() {
+        let mut storage = create_test_storage(10);
+        let mut freelist = Freelist::new();
+
+        freelist.release(&mut storage, 5).unwrap();
+
+        assert_eq!(freelist.free_count(), 1);
+        assert_eq!(freelist.head_page(), 5);
+    }
+
+    #[test]
+    fn freelist_release_then_allocate_roundtrip() {
+        let mut storage = create_test_storage(10);
+        let trunk_page = 1;
+        setup_trunk_page(&mut storage, trunk_page, 0, &[]);
+        let mut freelist = Freelist::with_head(trunk_page, 0);
+
+        freelist.release(&mut storage, 50).unwrap();
+        freelist.release(&mut storage, 51).unwrap();
+        freelist.release(&mut storage, 52).unwrap();
+
+        let p1 = freelist.allocate(&mut storage).unwrap();
+        let p2 = freelist.allocate(&mut storage).unwrap();
+        let p3 = freelist.allocate(&mut storage).unwrap();
+
+        assert_eq!(p1, Some(52));
+        assert_eq!(p2, Some(51));
+        assert_eq!(p3, Some(50));
     }
 }
