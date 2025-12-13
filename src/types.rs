@@ -118,6 +118,7 @@
 //! are tied to page lifetime). This enables safe sharing across threads for
 //! query results.
 
+use eyre::{bail, Result};
 use std::borrow::Cow;
 
 /// Runtime value representation for SQL values.
@@ -192,6 +193,64 @@ impl DataType {
             | DataType::Inet
             | DataType::MacAddr => TypeAffinity::Numeric,
             DataType::Array(_) => TypeAffinity::Blob,
+        }
+    }
+}
+
+impl<'a> Value<'a> {
+    /// Coerces this value to the target type affinity.
+    pub fn coerce_to_affinity(&self, target: TypeAffinity) -> Result<Value<'a>> {
+        match self {
+            Value::Null => Ok(Value::Null),
+            Value::Int(i) => match target {
+                TypeAffinity::Integer | TypeAffinity::Numeric => Ok(Value::Int(*i)),
+                TypeAffinity::Real => Ok(Value::Float(*i as f64)),
+                TypeAffinity::Text => Ok(Value::Text(Cow::Owned(i.to_string()))),
+                TypeAffinity::Blob => Ok(Value::Blob(Cow::Owned(i.to_le_bytes().to_vec()))),
+            },
+            Value::Float(f) => match target {
+                TypeAffinity::Real | TypeAffinity::Numeric => Ok(Value::Float(*f)),
+                TypeAffinity::Integer => Ok(Value::Int(*f as i64)),
+                TypeAffinity::Text => Ok(Value::Text(Cow::Owned(f.to_string()))),
+                TypeAffinity::Blob => Ok(Value::Blob(Cow::Owned(f.to_le_bytes().to_vec()))),
+            },
+            Value::Text(s) => match target {
+                TypeAffinity::Text => Ok(Value::Text(s.clone())),
+                TypeAffinity::Integer => {
+                    let parsed = s
+                        .trim()
+                        .parse::<i64>()
+                        .map_err(|e| eyre::eyre!("cannot coerce text '{}' to integer: {}", s, e))?;
+                    Ok(Value::Int(parsed))
+                }
+                TypeAffinity::Real | TypeAffinity::Numeric => {
+                    let parsed = s
+                        .trim()
+                        .parse::<f64>()
+                        .map_err(|e| eyre::eyre!("cannot coerce text '{}' to real: {}", s, e))?;
+                    Ok(Value::Float(parsed))
+                }
+                TypeAffinity::Blob => Ok(Value::Blob(Cow::Owned(s.as_bytes().to_vec()))),
+            },
+            Value::Blob(b) => match target {
+                TypeAffinity::Blob => Ok(Value::Blob(b.clone())),
+                TypeAffinity::Text => {
+                    let s = std::str::from_utf8(b)
+                        .map_err(|e| eyre::eyre!("cannot coerce blob to text: {}", e))?;
+                    Ok(Value::Text(Cow::Owned(s.to_string())))
+                }
+                _ => bail!(
+                    "cannot coerce blob to affinity {:?}",
+                    target
+                ),
+            },
+            Value::Vector(v) => match target {
+                TypeAffinity::Blob => Ok(Value::Vector(v.clone())),
+                _ => bail!(
+                    "cannot coerce vector to affinity {:?}",
+                    target
+                ),
+            },
         }
     }
 }
@@ -287,5 +346,78 @@ mod tests {
         assert_eq!(DataType::Blob.affinity(), TypeAffinity::Blob);
         assert_eq!(DataType::Bytea.affinity(), TypeAffinity::Blob);
         assert_eq!(DataType::Vector(128).affinity(), TypeAffinity::Blob);
+    }
+
+    #[test]
+    fn test_coerce_null_to_any_affinity() {
+        let null = Value::Null;
+        assert_eq!(
+            null.coerce_to_affinity(TypeAffinity::Integer).unwrap(),
+            Value::Null
+        );
+        assert_eq!(
+            null.coerce_to_affinity(TypeAffinity::Real).unwrap(),
+            Value::Null
+        );
+        assert_eq!(
+            null.coerce_to_affinity(TypeAffinity::Text).unwrap(),
+            Value::Null
+        );
+        assert_eq!(
+            null.coerce_to_affinity(TypeAffinity::Blob).unwrap(),
+            Value::Null
+        );
+    }
+
+    #[test]
+    fn test_coerce_int_to_real() {
+        let int_val = Value::Int(42);
+        let result = int_val.coerce_to_affinity(TypeAffinity::Real).unwrap();
+        assert_eq!(result, Value::Float(42.0));
+    }
+
+    #[test]
+    fn test_coerce_int_to_text() {
+        let int_val = Value::Int(123);
+        let result = int_val.coerce_to_affinity(TypeAffinity::Text).unwrap();
+        assert_eq!(result, Value::Text(Cow::Owned("123".to_string())));
+    }
+
+    #[test]
+    fn test_coerce_float_to_text() {
+        let float_val = Value::Float(3.14159);
+        let result = float_val.coerce_to_affinity(TypeAffinity::Text).unwrap();
+        match result {
+            Value::Text(s) => assert!(s.starts_with("3.14")),
+            _ => panic!("Expected Text variant"),
+        }
+    }
+
+    #[test]
+    fn test_coerce_text_to_int() {
+        let text_val = Value::Text(Cow::Borrowed("42"));
+        let result = text_val.coerce_to_affinity(TypeAffinity::Integer).unwrap();
+        assert_eq!(result, Value::Int(42));
+    }
+
+    #[test]
+    fn test_coerce_text_to_real() {
+        let text_val = Value::Text(Cow::Borrowed("3.14"));
+        let result = text_val.coerce_to_affinity(TypeAffinity::Real).unwrap();
+        assert!((result == Value::Float(3.14)) || matches!(result, Value::Float(f) if (f - 3.14).abs() < 0.001));
+    }
+
+    #[test]
+    fn test_coerce_invalid_text_to_int_fails() {
+        let text_val = Value::Text(Cow::Borrowed("not a number"));
+        let result = text_val.coerce_to_affinity(TypeAffinity::Integer);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_coerce_same_affinity_noop() {
+        let int_val = Value::Int(42);
+        let result = int_val.coerce_to_affinity(TypeAffinity::Integer).unwrap();
+        assert_eq!(result, Value::Int(42));
     }
 }
