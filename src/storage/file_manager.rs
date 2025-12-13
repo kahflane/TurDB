@@ -83,8 +83,8 @@
 //! // Create a schema
 //! fm.create_schema("analytics")?;
 //!
-//! // Create a table
-//! fm.create_table("analytics", "events", 1)?;
+//! // Create a table (schema, table_name, table_id, column_count)
+//! fm.create_table("analytics", "events", 1, 3)?;
 //!
 //! // Access table data
 //! let storage = fm.table_data("analytics", "events")?;
@@ -117,10 +117,11 @@ pub const INDEX_FILE_EXTENSION: &str = "idx";
 pub const HNSW_FILE_EXTENSION: &str = "hnsw";
 pub const META_FILE_NAME: &str = "turdb.meta";
 
-pub const TABLE_MAGIC: &[u8; 16] = b"TurDB Table\x00\x00\x00\x00\x00";
-pub const INDEX_MAGIC: &[u8; 16] = b"TurDB Index\x00\x00\x00\x00\x00";
 pub const HNSW_MAGIC: &[u8; 16] = b"TurDB HNSW\x00\x00\x00\x00\x00\x00";
-pub const META_MAGIC: &[u8; 16] = b"TurDB Rust v1\x00\x00\x00";
+
+#[cfg(test)]
+pub use super::headers::{INDEX_MAGIC, TABLE_MAGIC};
+pub use super::headers::META_MAGIC;
 
 pub const DEFAULT_SCHEMA: &str = "root";
 
@@ -286,7 +287,7 @@ impl FileManager {
             "invalid database: magic bytes mismatch"
         );
 
-        let version = u32::from_le_bytes(page[16..20].try_into().unwrap()); // INVARIANT: slice is exactly 4 bytes
+        let version = u32::from_le_bytes(page[16..20].try_into().unwrap());
         ensure!(version == 1, "unsupported database version: {}", version);
 
         Ok(Self {
@@ -390,7 +391,16 @@ impl FileManager {
         schema_path.exists() && schema_path.is_dir()
     }
 
-    pub fn create_table(&mut self, schema: &str, table: &str, table_id: u64) -> Result<()> {
+    pub fn create_table(
+        &mut self,
+        schema: &str,
+        table: &str,
+        table_id: u64,
+        column_count: u32,
+    ) -> Result<()> {
+        use super::headers::TableFileHeader;
+        use zerocopy::IntoBytes;
+
         Self::validate_name(table)?;
 
         ensure!(
@@ -410,9 +420,9 @@ impl FileManager {
 
         let mut storage = MmapStorage::create(&table_path, 1)?;
 
+        let header = TableFileHeader::new(table_id, 0, 1, column_count, 0, 0);
         let page = storage.page_mut(0)?;
-        page[..16].copy_from_slice(TABLE_MAGIC);
-        page[16..24].copy_from_slice(&table_id.to_le_bytes());
+        page[..128].copy_from_slice(header.as_bytes());
 
         storage.sync()?;
 
@@ -446,14 +456,20 @@ impl FileManager {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn create_index(
         &mut self,
         schema: &str,
         table: &str,
         index_name: &str,
         index_id: u64,
+        table_id: u64,
+        key_column_count: u32,
         is_unique: bool,
     ) -> Result<()> {
+        use super::headers::{IndexFileHeader, INDEX_TYPE_BTREE};
+        use zerocopy::IntoBytes;
+
         Self::validate_name(index_name)?;
 
         ensure!(
@@ -475,10 +491,10 @@ impl FileManager {
 
         let mut storage = MmapStorage::create(&index_path, 1)?;
 
+        let header =
+            IndexFileHeader::new(index_id, table_id, 1, key_column_count, is_unique, INDEX_TYPE_BTREE);
         let page = storage.page_mut(0)?;
-        page[..16].copy_from_slice(INDEX_MAGIC);
-        page[16..24].copy_from_slice(&index_id.to_le_bytes());
-        page[40] = if is_unique { 1 } else { 0 };
+        page[..128].copy_from_slice(header.as_bytes());
 
         storage.sync()?;
 
@@ -509,7 +525,7 @@ impl FileManager {
             self.open_files.insert(key.clone(), storage);
         }
 
-        Ok(self.open_files.get(&key).unwrap()) // INVARIANT: key just inserted above if not present
+        Ok(self.open_files.get(&key).unwrap())
     }
 
     pub fn table_data_mut(&mut self, schema: &str, table: &str) -> Result<&mut MmapStorage> {
@@ -531,7 +547,7 @@ impl FileManager {
             self.open_files.insert(key.clone(), storage);
         }
 
-        Ok(self.open_files.get_mut(&key).unwrap()) // INVARIANT: key just inserted above if not present
+        Ok(self.open_files.get_mut(&key).unwrap())
     }
 
     pub fn index_data(
@@ -560,7 +576,7 @@ impl FileManager {
             self.open_files.insert(key.clone(), storage);
         }
 
-        Ok(self.open_files.get(&key).unwrap()) // INVARIANT: key just inserted above if not present
+        Ok(self.open_files.get(&key).unwrap())
     }
 
     pub fn index_data_mut(
@@ -589,7 +605,7 @@ impl FileManager {
             self.open_files.insert(key.clone(), storage);
         }
 
-        Ok(self.open_files.get_mut(&key).unwrap()) // INVARIANT: key just inserted above if not present
+        Ok(self.open_files.get_mut(&key).unwrap())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -671,7 +687,7 @@ impl FileManager {
             self.open_files.insert(key.clone(), storage);
         }
 
-        Ok(self.open_files.get(&key).unwrap()) // INVARIANT: key just inserted above if not present
+        Ok(self.open_files.get(&key).unwrap())
     }
 
     pub fn hnsw_data_mut(
@@ -700,7 +716,7 @@ impl FileManager {
             self.open_files.insert(key.clone(), storage);
         }
 
-        Ok(self.open_files.get_mut(&key).unwrap()) // INVARIANT: key just inserted above if not present
+        Ok(self.open_files.get_mut(&key).unwrap())
     }
 
     fn hnsw_file_path(&self, schema: &str, table: &str, index_name: &str) -> PathBuf {
@@ -902,7 +918,7 @@ mod tests {
 
         let mut fm = FileManager::create(&db_path, DEFAULT_MAX_OPEN_FILES).unwrap();
 
-        fm.create_table(DEFAULT_SCHEMA, "users", 1).unwrap();
+        fm.create_table(DEFAULT_SCHEMA, "users", 1, 3).unwrap();
 
         let table_path = db_path.join(DEFAULT_SCHEMA).join("users.tbd");
         assert!(table_path.exists());
@@ -915,7 +931,7 @@ mod tests {
 
         let mut fm = FileManager::create(&db_path, DEFAULT_MAX_OPEN_FILES).unwrap();
 
-        fm.create_table(DEFAULT_SCHEMA, "users", 42).unwrap();
+        fm.create_table(DEFAULT_SCHEMA, "users", 42, 5).unwrap();
 
         let table_path = db_path.join(DEFAULT_SCHEMA).join("users.tbd");
         let storage = MmapStorage::open(&table_path).unwrap();
@@ -934,7 +950,7 @@ mod tests {
 
         let mut fm = FileManager::create(&db_path, DEFAULT_MAX_OPEN_FILES).unwrap();
 
-        let result = fm.create_table("nonexistent", "users", 1);
+        let result = fm.create_table("nonexistent", "users", 1, 3);
         assert!(result.is_err());
     }
 
@@ -945,8 +961,8 @@ mod tests {
 
         let mut fm = FileManager::create(&db_path, DEFAULT_MAX_OPEN_FILES).unwrap();
 
-        fm.create_table(DEFAULT_SCHEMA, "users", 1).unwrap();
-        let result = fm.create_table(DEFAULT_SCHEMA, "users", 2);
+        fm.create_table(DEFAULT_SCHEMA, "users", 1, 3).unwrap();
+        let result = fm.create_table(DEFAULT_SCHEMA, "users", 2, 3);
 
         assert!(result.is_err());
     }
@@ -960,7 +976,7 @@ mod tests {
 
         assert!(!fm.table_exists(DEFAULT_SCHEMA, "users"));
 
-        fm.create_table(DEFAULT_SCHEMA, "users", 1).unwrap();
+        fm.create_table(DEFAULT_SCHEMA, "users", 1, 3).unwrap();
         assert!(fm.table_exists(DEFAULT_SCHEMA, "users"));
     }
 
@@ -971,7 +987,7 @@ mod tests {
 
         let mut fm = FileManager::create(&db_path, DEFAULT_MAX_OPEN_FILES).unwrap();
 
-        fm.create_table(DEFAULT_SCHEMA, "users", 1).unwrap();
+        fm.create_table(DEFAULT_SCHEMA, "users", 1, 3).unwrap();
         assert!(fm.table_exists(DEFAULT_SCHEMA, "users"));
 
         fm.drop_table(DEFAULT_SCHEMA, "users").unwrap();
@@ -996,8 +1012,8 @@ mod tests {
 
         let mut fm = FileManager::create(&db_path, DEFAULT_MAX_OPEN_FILES).unwrap();
 
-        fm.create_table(DEFAULT_SCHEMA, "users", 1).unwrap();
-        fm.create_index(DEFAULT_SCHEMA, "users", "email_idx", 1, true)
+        fm.create_table(DEFAULT_SCHEMA, "users", 1, 3).unwrap();
+        fm.create_index(DEFAULT_SCHEMA, "users", "email_idx", 1, 1, 1, true)
             .unwrap();
 
         assert!(fm.index_exists(DEFAULT_SCHEMA, "users", "email_idx"));
@@ -1015,7 +1031,7 @@ mod tests {
 
         let mut fm = FileManager::create(&db_path, DEFAULT_MAX_OPEN_FILES).unwrap();
 
-        fm.create_table(DEFAULT_SCHEMA, "users", 42).unwrap();
+        fm.create_table(DEFAULT_SCHEMA, "users", 42, 5).unwrap();
 
         let storage = fm.table_data(DEFAULT_SCHEMA, "users").unwrap();
 
@@ -1032,7 +1048,7 @@ mod tests {
 
         let mut fm = FileManager::create(&db_path, DEFAULT_MAX_OPEN_FILES).unwrap();
 
-        fm.create_table(DEFAULT_SCHEMA, "users", 1).unwrap();
+        fm.create_table(DEFAULT_SCHEMA, "users", 1, 3).unwrap();
 
         let _storage1 = fm.table_data(DEFAULT_SCHEMA, "users").unwrap();
 
@@ -1061,8 +1077,8 @@ mod tests {
 
         let mut fm = FileManager::create(&db_path, DEFAULT_MAX_OPEN_FILES).unwrap();
 
-        fm.create_table(DEFAULT_SCHEMA, "users", 1).unwrap();
-        fm.create_index(DEFAULT_SCHEMA, "users", "email_idx", 99, true)
+        fm.create_table(DEFAULT_SCHEMA, "users", 1, 3).unwrap();
+        fm.create_index(DEFAULT_SCHEMA, "users", "email_idx", 99, 1, 1, true)
             .unwrap();
 
         let storage = fm.index_data(DEFAULT_SCHEMA, "users", "email_idx").unwrap();
@@ -1081,7 +1097,7 @@ mod tests {
         let mut fm = FileManager::create(&db_path, MIN_MAX_OPEN_FILES).unwrap();
 
         for i in 0..MIN_MAX_OPEN_FILES + 2 {
-            fm.create_table(DEFAULT_SCHEMA, &format!("table_{}", i), i as u64)
+            fm.create_table(DEFAULT_SCHEMA, &format!("table_{}", i), i as u64, 3)
                 .unwrap();
         }
 
@@ -1101,7 +1117,7 @@ mod tests {
         let mut fm = FileManager::create(&db_path, MIN_MAX_OPEN_FILES).unwrap();
 
         for i in 0..MIN_MAX_OPEN_FILES + 2 {
-            fm.create_table(DEFAULT_SCHEMA, &format!("table_{}", i), i as u64)
+            fm.create_table(DEFAULT_SCHEMA, &format!("table_{}", i), i as u64, 3)
                 .unwrap();
         }
 
@@ -1126,7 +1142,7 @@ mod tests {
 
         let mut fm = FileManager::create(&db_path, DEFAULT_MAX_OPEN_FILES).unwrap();
 
-        fm.create_table(DEFAULT_SCHEMA, "users", 1).unwrap();
+        fm.create_table(DEFAULT_SCHEMA, "users", 1, 3).unwrap();
 
         {
             let storage = fm.table_data_mut(DEFAULT_SCHEMA, "users").unwrap();
@@ -1167,7 +1183,7 @@ mod tests {
 
         {
             let mut fm = FileManager::create(&db_path, DEFAULT_MAX_OPEN_FILES).unwrap();
-            fm.create_table(DEFAULT_SCHEMA, "users", 42).unwrap();
+            fm.create_table(DEFAULT_SCHEMA, "users", 42, 5).unwrap();
             fm.sync_all().unwrap();
         }
 
@@ -1215,7 +1231,7 @@ mod tests {
 
         let mut fm = FileManager::create(&db_path, DEFAULT_MAX_OPEN_FILES).unwrap();
 
-        fm.create_table(DEFAULT_SCHEMA, "vectors", 1).unwrap();
+        fm.create_table(DEFAULT_SCHEMA, "vectors", 1, 2).unwrap();
         fm.create_hnsw_index(DEFAULT_SCHEMA, "vectors", "vec_idx", 1, 128, 16, 200)
             .unwrap();
 
@@ -1230,7 +1246,7 @@ mod tests {
 
         let mut fm = FileManager::create(&db_path, DEFAULT_MAX_OPEN_FILES).unwrap();
 
-        fm.create_table(DEFAULT_SCHEMA, "vectors", 1).unwrap();
+        fm.create_table(DEFAULT_SCHEMA, "vectors", 1, 2).unwrap();
 
         assert!(!fm.hnsw_exists(DEFAULT_SCHEMA, "vectors", "vec_idx"));
 
@@ -1247,7 +1263,7 @@ mod tests {
 
         let mut fm = FileManager::create(&db_path, DEFAULT_MAX_OPEN_FILES).unwrap();
 
-        fm.create_table(DEFAULT_SCHEMA, "vectors", 1).unwrap();
+        fm.create_table(DEFAULT_SCHEMA, "vectors", 1, 2).unwrap();
         fm.create_hnsw_index(DEFAULT_SCHEMA, "vectors", "vec_idx", 1, 128, 16, 200)
             .unwrap();
 
@@ -1263,7 +1279,7 @@ mod tests {
 
         let mut fm = FileManager::create(&db_path, DEFAULT_MAX_OPEN_FILES).unwrap();
 
-        fm.create_table(DEFAULT_SCHEMA, "vectors", 1).unwrap();
+        fm.create_table(DEFAULT_SCHEMA, "vectors", 1, 2).unwrap();
         fm.create_hnsw_index(DEFAULT_SCHEMA, "vectors", "vec_idx", 1, 128, 16, 200)
             .unwrap();
 
@@ -1287,7 +1303,7 @@ mod tests {
 
         let mut fm = FileManager::create(&db_path, DEFAULT_MAX_OPEN_FILES).unwrap();
 
-        fm.create_table(DEFAULT_SCHEMA, "vectors", 1).unwrap();
+        fm.create_table(DEFAULT_SCHEMA, "vectors", 1, 2).unwrap();
         fm.create_hnsw_index(DEFAULT_SCHEMA, "vectors", "vec_idx", 42, 256, 32, 100)
             .unwrap();
 

@@ -129,15 +129,15 @@ use smallvec::SmallVec;
 use super::interior::{separator_len, InteriorNode, InteriorNodeMut, INTERIOR_SLOT_SIZE};
 use super::leaf::{LeafNode, LeafNodeMut, SearchResult, SLOT_SIZE};
 use crate::encoding::varint::varint_len;
-use crate::storage::{Freelist, MmapStorage, PageHeader, PageType};
+use crate::storage::{Freelist, MmapStorage, PageHeader, PageType, Storage};
 
 pub const MAX_TREE_DEPTH: usize = 8;
 
 type PathStack = SmallVec<[u32; MAX_TREE_DEPTH]>;
 
 #[derive(Debug)]
-pub struct BTree<'a> {
-    storage: &'a mut MmapStorage,
+pub struct BTree<'a, S: Storage> {
+    storage: &'a mut S,
     root_page: u32,
     freelist: Option<&'a mut Freelist>,
 }
@@ -154,8 +154,8 @@ pub enum InsertResult {
     Split { separator: Vec<u8>, new_page: u32 },
 }
 
-pub struct Cursor<'a> {
-    storage: &'a MmapStorage,
+pub struct Cursor<'a, S: Storage + ?Sized> {
+    storage: &'a S,
     root_page: u32,
     current_page: u32,
     current_index: usize,
@@ -178,7 +178,7 @@ impl<'a> BTreeReader<'a> {
         Ok(Self { storage, root_page })
     }
 
-    pub fn cursor_first(&self) -> Result<Cursor<'a>> {
+    pub fn cursor_first(&self) -> Result<Cursor<'a, MmapStorage>> {
         let mut current_page = self.root_page;
 
         loop {
@@ -215,8 +215,8 @@ impl<'a> BTreeReader<'a> {
     }
 }
 
-impl<'a> BTree<'a> {
-    pub fn new(storage: &'a mut MmapStorage, root_page: u32) -> Result<Self> {
+impl<'a, S: Storage> BTree<'a, S> {
+    pub fn new(storage: &'a mut S, root_page: u32) -> Result<Self> {
         ensure!(
             root_page < storage.page_count(),
             "root page {} out of bounds (page_count={})",
@@ -231,7 +231,7 @@ impl<'a> BTree<'a> {
     }
 
     pub fn with_freelist(
-        storage: &'a mut MmapStorage,
+        storage: &'a mut S,
         root_page: u32,
         freelist: &'a mut Freelist,
     ) -> Result<Self> {
@@ -248,7 +248,7 @@ impl<'a> BTree<'a> {
         })
     }
 
-    pub fn create(storage: &'a mut MmapStorage, root_page: u32) -> Result<Self> {
+    pub fn create(storage: &'a mut S, root_page: u32) -> Result<Self> {
         ensure!(
             root_page < storage.page_count(),
             "root page {} out of bounds (page_count={})",
@@ -647,7 +647,7 @@ impl<'a> BTree<'a> {
         Ok(new_page_no)
     }
 
-    pub fn cursor_first(&self) -> Result<Cursor<'_>> {
+    pub fn cursor_first(&self) -> Result<Cursor<'_, S>> {
         let mut current_page = self.root_page;
 
         loop {
@@ -683,7 +683,7 @@ impl<'a> BTree<'a> {
         }
     }
 
-    pub fn cursor_seek(&self, key: &[u8]) -> Result<Cursor<'_>> {
+    pub fn cursor_seek(&self, key: &[u8]) -> Result<Cursor<'_, S>> {
         let mut current_page = self.root_page;
 
         loop {
@@ -721,7 +721,7 @@ impl<'a> BTree<'a> {
         }
     }
 
-    pub fn cursor_last(&self) -> Result<Cursor<'_>> {
+    pub fn cursor_last(&self) -> Result<Cursor<'_, S>> {
         let mut current_page = self.root_page;
 
         loop {
@@ -763,7 +763,7 @@ impl<'a> BTree<'a> {
     }
 }
 
-impl<'a> Cursor<'a> {
+impl<'a, S: Storage + ?Sized> Cursor<'a, S> {
     pub fn valid(&self) -> bool {
         !self.exhausted
     }

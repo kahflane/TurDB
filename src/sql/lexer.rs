@@ -485,6 +485,7 @@ static KEYWORDS: phf::Map<&'static str, Keyword> = phf_map! {
     "UNKNOWN" => Keyword::Unknown,
     "UNNEST" => Keyword::Unnest,
     "YEAR" => Keyword::Year,
+    "PRAGMA" => Keyword::Pragma,
 };
 
 pub struct Lexer<'a> {

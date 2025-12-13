@@ -92,10 +92,11 @@ use crate::schema::{Catalog, ColumnDef as SchemaColumnDef};
 use crate::sql::executor::{ExecutionContext, Executor, ExecutorBuilder, StreamingBTreeSource};
 use crate::sql::planner::Planner;
 use crate::sql::Parser;
-use crate::storage::{FileManager, Wal};
+use crate::storage::{FileManager, Wal, WalStorage};
 use crate::types::Value;
 use bumpalo::Bump;
 use eyre::{bail, ensure, Result, WrapErr};
+use hashbrown::HashSet;
 use parking_lot::{Mutex, RwLock};
 use std::path::{Path, PathBuf};
 
@@ -186,6 +187,7 @@ pub enum ExecuteResult {
     Update { rows_affected: usize },
     Delete { rows_affected: usize },
     Select { rows: Vec<Row> },
+    Pragma { name: String, value: Option<String> },
 }
 
 #[derive(Debug, Clone)]
@@ -207,7 +209,11 @@ pub struct Database {
     wal: Mutex<Option<Wal>>,
     wal_dir: PathBuf,
     next_row_id: std::sync::atomic::AtomicU64,
+    next_table_id: std::sync::atomic::AtomicU64,
+    next_index_id: std::sync::atomic::AtomicU64,
     closed: std::sync::atomic::AtomicBool,
+    wal_enabled: std::sync::atomic::AtomicBool,
+    dirty_pages: Mutex<HashSet<u32>>,
 }
 
 impl Database {
@@ -216,33 +222,27 @@ impl Database {
     }
 
     pub fn open_with_recovery<P: AsRef<Path>>(path: P) -> Result<(Self, RecoveryInfo)> {
-        use std::sync::atomic::{AtomicBool, AtomicU64};
+        use crate::storage::{MetaFileHeader, FILE_HEADER_SIZE};
         use std::fs::File;
         use std::io::Read;
+        use std::sync::atomic::{AtomicBool, AtomicU64};
 
         let path = path.as_ref().to_path_buf();
 
         let meta_path = path.join("turdb.meta");
-        ensure!(
-            meta_path.exists(),
-            "database not found at {:?}",
-            path
-        );
+        ensure!(meta_path.exists(), "database not found at {:?}", path);
 
-        let mut header = [0u8; 32];
+        let mut header_bytes = [0u8; FILE_HEADER_SIZE];
         File::open(&meta_path)
             .wrap_err_with(|| format!("failed to open metadata file at {:?}", meta_path))?
-            .read_exact(&mut header)
+            .read_exact(&mut header_bytes)
             .wrap_err("failed to read database header")?;
 
-        const MAGIC: &[u8; 16] = b"TurDB Rust v1\x00\x00\x00";
-        ensure!(
-            &header[..16] == MAGIC,
-            "invalid database: magic bytes mismatch"
-        );
+        let header = MetaFileHeader::from_bytes(&header_bytes)
+            .wrap_err("failed to parse database metadata header")?;
 
-        let version = u32::from_le_bytes(header[16..20].try_into().unwrap());
-        ensure!(version == 1, "unsupported database version: {}", version);
+        let next_table_id = header.next_table_id();
+        let next_index_id = header.next_index_id();
 
         let wal_dir = path.join("wal");
 
@@ -266,7 +266,11 @@ impl Database {
             wal: Mutex::new(None),
             wal_dir,
             next_row_id: AtomicU64::new(1),
+            next_table_id: AtomicU64::new(next_table_id),
+            next_index_id: AtomicU64::new(next_index_id),
             closed: AtomicBool::new(false),
+            wal_enabled: AtomicBool::new(false),
+            dirty_pages: Mutex::new(HashSet::new()),
         };
 
         let recovery_info = RecoveryInfo {
@@ -278,9 +282,11 @@ impl Database {
     }
 
     pub fn create<P: AsRef<Path>>(path: P) -> Result<Self> {
-        use std::sync::atomic::{AtomicBool, AtomicU64};
+        use crate::storage::{MetaFileHeader, PAGE_SIZE};
         use std::fs::File;
         use std::io::Write;
+        use std::sync::atomic::{AtomicBool, AtomicU64};
+        use zerocopy::IntoBytes;
 
         let path = path.as_ref().to_path_buf();
 
@@ -293,11 +299,9 @@ impl Database {
         })?;
 
         let meta_path = path.join("turdb.meta");
-        const PAGE_SIZE: usize = 16384;
         let mut page = vec![0u8; PAGE_SIZE];
-        page[..16].copy_from_slice(b"TurDB Rust v1\x00\x00\x00");
-        page[16..20].copy_from_slice(&1u32.to_le_bytes());
-        page[20..24].copy_from_slice(&(PAGE_SIZE as u32).to_le_bytes());
+        let header = MetaFileHeader::new();
+        page[..128].copy_from_slice(header.as_bytes());
 
         let mut file = File::create(&meta_path)
             .wrap_err_with(|| format!("failed to create metadata file at {:?}", meta_path))?;
@@ -313,7 +317,11 @@ impl Database {
             wal: Mutex::new(None),
             wal_dir,
             next_row_id: AtomicU64::new(1),
+            next_table_id: AtomicU64::new(1),
+            next_index_id: AtomicU64::new(1),
             closed: AtomicBool::new(false),
+            wal_enabled: AtomicBool::new(false),
+            dirty_pages: Mutex::new(HashSet::new()),
         })
     }
 
@@ -386,6 +394,52 @@ impl Database {
         Ok(())
     }
 
+    fn save_meta(&self) -> Result<()> {
+        use crate::storage::{MetaFileHeader, PAGE_SIZE};
+        use std::fs::OpenOptions;
+        use std::io::{Read, Seek, SeekFrom, Write};
+        use std::sync::atomic::Ordering;
+        use zerocopy::IntoBytes;
+
+        let meta_path = self.path.join("turdb.meta");
+
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&meta_path)
+            .wrap_err_with(|| format!("failed to open metadata file at {:?}", meta_path))?;
+
+        let mut page = vec![0u8; PAGE_SIZE];
+        file.read_exact(&mut page)
+            .wrap_err("failed to read metadata page")?;
+
+        let header = MetaFileHeader::from_bytes(&page)?;
+        let mut new_header = *header;
+        new_header.set_next_table_id(self.next_table_id.load(Ordering::Acquire));
+        new_header.set_next_index_id(self.next_index_id.load(Ordering::Acquire));
+
+        page[..128].copy_from_slice(new_header.as_bytes());
+
+        file.seek(SeekFrom::Start(0))
+            .wrap_err("failed to seek to start of metadata file")?;
+        file.write_all(&page)
+            .wrap_err("failed to write metadata header")?;
+        file.sync_all()
+            .wrap_err("failed to sync metadata file")?;
+
+        Ok(())
+    }
+
+    fn allocate_table_id(&self) -> u64 {
+        use std::sync::atomic::Ordering;
+        self.next_table_id.fetch_add(1, Ordering::AcqRel)
+    }
+
+    fn allocate_index_id(&self) -> u64 {
+        use std::sync::atomic::Ordering;
+        self.next_index_id.fetch_add(1, Ordering::AcqRel)
+    }
+
     pub fn query(&self, sql: &str) -> Result<Vec<Row>> {
         self.ensure_catalog()?;
         self.ensure_file_manager()?;
@@ -425,8 +479,8 @@ impl Database {
             op: &'a crate::sql::planner::PhysicalOperator<'a>,
             table_def: &crate::schema::TableDef,
         ) -> Option<Vec<usize>> {
-            use crate::sql::planner::PhysicalOperator;
             use crate::sql::ast::Expr;
+            use crate::sql::planner::PhysicalOperator;
 
             match op {
                 PhysicalOperator::ProjectExec(project) => {
@@ -533,6 +587,7 @@ impl Database {
                     _ => bail!("unsupported DROP statement type: {:?}", drop.object_type),
                 }
             }
+            Statement::Pragma(pragma) => self.execute_pragma(pragma),
             _ => bail!("unsupported statement type"),
         }
     }
@@ -574,19 +629,22 @@ impl Database {
             })
             .collect();
 
-        let table_id = catalog.create_table(schema_name, table_name, columns)?;
+        let column_count = columns.len() as u32;
+        let table_id = self.allocate_table_id();
+        catalog.create_table_with_id(schema_name, table_name, columns, table_id)?;
 
         drop(catalog_guard);
 
         let mut file_manager_guard = self.file_manager.write();
         let file_manager = file_manager_guard.as_mut().unwrap();
-        file_manager.create_table(schema_name, table_name, table_id)?;
+        file_manager.create_table(schema_name, table_name, table_id, column_count)?;
 
         let storage = file_manager.table_data_mut(schema_name, table_name)?;
         storage.grow(2)?;
         crate::btree::BTree::create(storage, 1)?;
 
         self.save_catalog()?;
+        self.save_meta()?;
 
         Ok(ExecuteResult::CreateTable { created: true })
     }
@@ -644,6 +702,7 @@ impl Database {
                 }
             })
             .collect();
+        let key_column_count = columns.len() as u32;
 
         let index_def = crate::schema::table::IndexDef::new(
             index_name.to_string(),
@@ -667,11 +726,22 @@ impl Database {
 
         drop(catalog_guard);
 
+        let index_id = self.allocate_index_id();
+
         let mut file_manager_guard = self.file_manager.write();
         let file_manager = file_manager_guard.as_mut().unwrap();
-        file_manager.create_index(schema_name, table_name, index_name, table_id, create.unique)?;
+        file_manager.create_index(
+            schema_name,
+            table_name,
+            index_name,
+            index_id,
+            table_id,
+            key_column_count,
+            create.unique,
+        )?;
 
         self.save_catalog()?;
+        self.save_meta()?;
 
         Ok(ExecuteResult::CreateIndex { created: true })
     }
@@ -684,9 +754,15 @@ impl Database {
         use crate::btree::BTree;
         use crate::records::types::ColumnDef as RecordColumnDef;
         use crate::records::{RecordBuilder, Schema};
+        use std::sync::atomic::Ordering;
 
         self.ensure_catalog()?;
         self.ensure_file_manager()?;
+
+        let wal_enabled = self.wal_enabled.load(Ordering::Acquire);
+        if wal_enabled {
+            self.ensure_wal()?;
+        }
 
         let catalog_guard = self.catalog.read();
         let catalog = catalog_guard.as_ref().unwrap();
@@ -715,32 +791,63 @@ impl Database {
         };
 
         let root_page = 1u32;
-        let mut btree = BTree::new(storage, root_page)?;
         let mut rows_affected = 0;
 
-        for row_values in rows.iter() {
-            let mut builder = RecordBuilder::new(&schema);
+        if wal_enabled {
+            let mut wal_storage = WalStorage::new(storage, &self.dirty_pages);
+            let mut btree = BTree::new(&mut wal_storage, root_page)?;
 
-            for (idx, expr) in row_values.iter().enumerate() {
-                let value = Self::eval_literal(expr)?;
-                match value {
-                    OwnedValue::Null => builder.set_null(idx),
-                    OwnedValue::Int(i) => builder.set_int8(idx, i)?,
-                    OwnedValue::Float(f) => builder.set_float8(idx, f)?,
-                    OwnedValue::Text(s) => builder.set_text(idx, &s)?,
-                    OwnedValue::Blob(b) => builder.set_blob(idx, &b)?,
-                    OwnedValue::Vector(_) => bail!("vector insert not yet supported"),
+            for row_values in rows.iter() {
+                let mut builder = RecordBuilder::new(&schema);
+
+                for (idx, expr) in row_values.iter().enumerate() {
+                    let value = Self::eval_literal(expr)?;
+                    match value {
+                        OwnedValue::Null => builder.set_null(idx),
+                        OwnedValue::Int(i) => builder.set_int8(idx, i)?,
+                        OwnedValue::Float(f) => builder.set_float8(idx, f)?,
+                        OwnedValue::Text(s) => builder.set_text(idx, &s)?,
+                        OwnedValue::Blob(b) => builder.set_blob(idx, &b)?,
+                        OwnedValue::Vector(_) => bail!("vector insert not yet supported"),
+                    }
                 }
+
+                let record_data = builder.build()?;
+
+                let row_id = self
+                    .next_row_id
+                    .fetch_add(1, Ordering::Relaxed);
+                let key = Self::generate_row_key(row_id);
+                btree.insert(&key, &record_data)?;
+                rows_affected += 1;
             }
+        } else {
+            let mut btree = BTree::new(storage, root_page)?;
 
-            let record_data = builder.build()?;
+            for row_values in rows.iter() {
+                let mut builder = RecordBuilder::new(&schema);
 
-            let row_id = self
-                .next_row_id
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            let key = Self::generate_row_key(row_id);
-            btree.insert(&key, &record_data)?;
-            rows_affected += 1;
+                for (idx, expr) in row_values.iter().enumerate() {
+                    let value = Self::eval_literal(expr)?;
+                    match value {
+                        OwnedValue::Null => builder.set_null(idx),
+                        OwnedValue::Int(i) => builder.set_int8(idx, i)?,
+                        OwnedValue::Float(f) => builder.set_float8(idx, f)?,
+                        OwnedValue::Text(s) => builder.set_text(idx, &s)?,
+                        OwnedValue::Blob(b) => builder.set_blob(idx, &b)?,
+                        OwnedValue::Vector(_) => bail!("vector insert not yet supported"),
+                    }
+                }
+
+                let record_data = builder.build()?;
+
+                let row_id = self
+                    .next_row_id
+                    .fetch_add(1, Ordering::Relaxed);
+                let key = Self::generate_row_key(row_id);
+                btree.insert(&key, &record_data)?;
+                rows_affected += 1;
+            }
         }
 
         Ok(ExecuteResult::Insert { rows_affected })
@@ -783,6 +890,39 @@ impl Database {
         self.save_catalog()?;
 
         Ok(ExecuteResult::DropTable { dropped: true })
+    }
+
+    fn execute_pragma(
+        &self,
+        pragma: &crate::sql::ast::PragmaStmt<'_>,
+    ) -> Result<ExecuteResult> {
+        use std::sync::atomic::Ordering;
+
+        let name = pragma.name.to_uppercase();
+        let value = pragma.value.map(|v| v.to_uppercase());
+
+        match name.as_str() {
+            "WAL" => {
+                if let Some(ref val) = value {
+                    match val.as_str() {
+                        "ON" | "TRUE" | "1" => {
+                            self.wal_enabled.store(true, Ordering::Release);
+                            self.ensure_wal()?;
+                        }
+                        "OFF" | "FALSE" | "0" => {
+                            self.wal_enabled.store(false, Ordering::Release);
+                        }
+                        _ => bail!("invalid PRAGMA WAL value: {}", val),
+                    }
+                }
+                let current = self.wal_enabled.load(Ordering::Acquire);
+                Ok(ExecuteResult::Pragma {
+                    name: name.clone(),
+                    value: Some(if current { "ON".to_string() } else { "OFF".to_string() }),
+                })
+            }
+            _ => bail!("unknown PRAGMA: {}", name),
+        }
     }
 
     fn convert_data_type(sql_type: &crate::sql::ast::DataType) -> crate::records::types::DataType {
@@ -843,35 +983,68 @@ impl Database {
     }
 
     pub fn checkpoint(&self) -> Result<CheckpointInfo> {
+        self.checkpoint_table("root", "users")
+    }
+
+    pub fn checkpoint_table(&self, schema_name: &str, table_name: &str) -> Result<CheckpointInfo> {
         use std::sync::atomic::Ordering;
 
         if self.closed.load(Ordering::Acquire) {
             bail!("database is closed");
         }
 
+        let dirty_count = self.dirty_pages.lock().len();
+        if dirty_count == 0 {
+            return Ok(CheckpointInfo {
+                frames_checkpointed: 0,
+                wal_truncated: false,
+            });
+        }
+
+        self.ensure_file_manager()?;
+
         let mut wal_guard = self.wal.lock();
         let wal = match wal_guard.as_mut() {
             Some(w) => w,
             None => {
+                self.dirty_pages.lock().clear();
                 return Ok(CheckpointInfo {
                     frames_checkpointed: 0,
                     wal_truncated: false,
-                })
+                });
             }
         };
 
-        self.ensure_file_manager()?;
-
-        let frames_checkpointed = {
-            let mut file_manager_guard = self.file_manager.write();
-            let file_manager = file_manager_guard.as_mut().unwrap();
-            let meta_storage = file_manager.meta_storage_mut();
-            wal.checkpoint(meta_storage)?
+        let mut file_manager_guard = self.file_manager.write();
+        let file_manager = match file_manager_guard.as_mut() {
+            Some(fm) => fm,
+            None => {
+                self.dirty_pages.lock().clear();
+                return Ok(CheckpointInfo {
+                    frames_checkpointed: 0,
+                    wal_truncated: false,
+                });
+            }
         };
 
+        let frames_written = if let Ok(storage) = file_manager.table_data(schema_name, table_name) {
+            WalStorage::flush_wal(&self.dirty_pages, storage, wal)
+                .wrap_err("failed to flush dirty pages to WAL")?
+        } else {
+            self.dirty_pages.lock().clear();
+            0
+        };
+
+        let current_offset = wal.current_offset();
+        let had_frames = current_offset > 0;
+
+        if had_frames {
+            wal.truncate()?;
+        }
+
         Ok(CheckpointInfo {
-            frames_checkpointed,
-            wal_truncated: frames_checkpointed > 0,
+            frames_checkpointed: frames_written,
+            wal_truncated: had_frames,
         })
     }
 
@@ -1042,14 +1215,20 @@ mod tests {
         let db = Database::create(&db_path).unwrap();
 
         let wal_dir = db_path.join("wal");
-        assert!(!wal_dir.exists(), "WAL directory should NOT exist before first write");
+        assert!(
+            !wal_dir.exists(),
+            "WAL directory should NOT exist before first write"
+        );
 
         db.execute("CREATE TABLE test (id INT)").unwrap();
         db.execute("INSERT INTO test VALUES (1)").unwrap();
 
         db.ensure_wal().unwrap();
 
-        assert!(wal_dir.exists(), "WAL directory should exist after ensure_wal");
+        assert!(
+            wal_dir.exists(),
+            "WAL directory should exist after ensure_wal"
+        );
         assert!(wal_dir.is_dir(), "WAL should be a directory");
     }
 
@@ -1066,7 +1245,10 @@ mod tests {
         let db = Database::open(&db_path).unwrap();
 
         let wal_dir = db_path.join("wal");
-        assert!(!wal_dir.exists(), "WAL directory should NOT exist immediately after open");
+        assert!(
+            !wal_dir.exists(),
+            "WAL directory should NOT exist immediately after open"
+        );
 
         db.checkpoint().unwrap();
     }

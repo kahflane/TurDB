@@ -2719,6 +2719,10 @@ impl<'a> Parser<'a> {
                 let revoke = self.parse_revoke_stmt()?;
                 Ok(Statement::Revoke(self.arena.alloc(revoke)))
             }
+            Token::Keyword(Keyword::Pragma) => {
+                let pragma = self.parse_pragma()?;
+                Ok(Statement::Pragma(self.arena.alloc(pragma)))
+            }
             _ => bail!("unexpected token {:?} at start of statement", self.current),
         }
     }
@@ -5235,6 +5239,20 @@ impl<'a> Parser<'a> {
                 all: false,
             })
         }
+    }
+
+    fn parse_pragma(&mut self) -> Result<PragmaStmt<'a>> {
+        self.expect_keyword(Keyword::Pragma)?;
+
+        let name = self.expect_ident()?;
+
+        let value = if self.consume_token(&Token::Eq) {
+            Some(self.expect_ident()?)
+        } else {
+            None
+        };
+
+        Ok(PragmaStmt { name, value })
     }
 
     fn parse_grant(&mut self) -> Result<GrantStmt<'a>> {
