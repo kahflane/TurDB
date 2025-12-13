@@ -86,9 +86,11 @@
 
 pub mod record_header;
 pub mod transaction;
+pub mod version;
 
 pub use record_header::RecordHeader;
 pub use transaction::{Transaction, TransactionManager, TxnId, TxnState, MAX_CONCURRENT_TXNS};
+pub use version::{VersionChainReader, VersionChainWriter, VisibilityResult, WriteCheckResult};
 
 #[cfg(test)]
 mod tests {
