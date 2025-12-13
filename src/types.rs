@@ -120,6 +120,7 @@
 
 use eyre::{bail, Result};
 use std::borrow::Cow;
+use std::cmp::Ordering;
 
 /// Runtime value representation for SQL values.
 #[derive(Debug, Clone, PartialEq)]
@@ -214,24 +215,24 @@ impl<'a> Value<'a> {
                 TypeAffinity::Text => Ok(Value::Text(Cow::Owned(f.to_string()))),
                 TypeAffinity::Blob => Ok(Value::Blob(Cow::Owned(f.to_le_bytes().to_vec()))),
             },
-            Value::Text(s) => match target {
-                TypeAffinity::Text => Ok(Value::Text(s.clone())),
-                TypeAffinity::Integer => {
-                    let parsed = s
-                        .trim()
-                        .parse::<i64>()
-                        .map_err(|e| eyre::eyre!("cannot coerce text '{}' to integer: {}", s, e))?;
-                    Ok(Value::Int(parsed))
+            Value::Text(s) => {
+                match target {
+                    TypeAffinity::Text => Ok(Value::Text(s.clone())),
+                    TypeAffinity::Integer => {
+                        let parsed = s.trim().parse::<i64>().map_err(|e| {
+                            eyre::eyre!("cannot coerce text '{}' to integer: {}", s, e)
+                        })?;
+                        Ok(Value::Int(parsed))
+                    }
+                    TypeAffinity::Real | TypeAffinity::Numeric => {
+                        let parsed = s.trim().parse::<f64>().map_err(|e| {
+                            eyre::eyre!("cannot coerce text '{}' to real: {}", s, e)
+                        })?;
+                        Ok(Value::Float(parsed))
+                    }
+                    TypeAffinity::Blob => Ok(Value::Blob(Cow::Owned(s.as_bytes().to_vec()))),
                 }
-                TypeAffinity::Real | TypeAffinity::Numeric => {
-                    let parsed = s
-                        .trim()
-                        .parse::<f64>()
-                        .map_err(|e| eyre::eyre!("cannot coerce text '{}' to real: {}", s, e))?;
-                    Ok(Value::Float(parsed))
-                }
-                TypeAffinity::Blob => Ok(Value::Blob(Cow::Owned(s.as_bytes().to_vec()))),
-            },
+            }
             Value::Blob(b) => match target {
                 TypeAffinity::Blob => Ok(Value::Blob(b.clone())),
                 TypeAffinity::Text => {
@@ -239,18 +240,78 @@ impl<'a> Value<'a> {
                         .map_err(|e| eyre::eyre!("cannot coerce blob to text: {}", e))?;
                     Ok(Value::Text(Cow::Owned(s.to_string())))
                 }
-                _ => bail!(
-                    "cannot coerce blob to affinity {:?}",
-                    target
-                ),
+                _ => bail!("cannot coerce blob to affinity {:?}", target),
             },
             Value::Vector(v) => match target {
                 TypeAffinity::Blob => Ok(Value::Vector(v.clone())),
-                _ => bail!(
-                    "cannot coerce vector to affinity {:?}",
-                    target
-                ),
+                _ => bail!("cannot coerce vector to affinity {:?}", target),
             },
+        }
+    }
+
+    /// Compares two values with SQL NULL semantics.
+    /// Returns None if either value is NULL (SQL UNKNOWN).
+    pub fn compare(&self, other: &Value) -> Option<Ordering> {
+        match (self, other) {
+            (Value::Null, _) | (_, Value::Null) => None,
+
+            (Value::Int(a), Value::Int(b)) => Some(a.cmp(b)),
+            (Value::Float(a), Value::Float(b)) => {
+                if a.is_nan() || b.is_nan() {
+                    None
+                } else {
+                    a.partial_cmp(b)
+                }
+            }
+
+            (Value::Int(i), Value::Float(f)) => {
+                let i_as_float = *i as f64;
+                if f.is_nan() {
+                    None
+                } else {
+                    i_as_float.partial_cmp(f)
+                }
+            }
+
+            (Value::Float(f), Value::Int(i)) => {
+                let i_as_float = *i as f64;
+                if f.is_nan() {
+                    None
+                } else {
+                    f.partial_cmp(&i_as_float)
+                }
+            }
+
+            (Value::Text(a), Value::Text(b)) => Some(a.cmp(b)),
+            (Value::Blob(a), Value::Blob(b)) => Some(a.cmp(b)),
+            (Value::Vector(a), Value::Vector(b)) => {
+                for (x, y) in a.iter().zip(b.iter()) {
+                    if x.is_nan() || y.is_nan() {
+                        return None;
+                    }
+                    match x.partial_cmp(y) {
+                        Some(Ordering::Equal) => continue,
+                        other => return other,
+                    }
+                }
+                Some(a.len().cmp(&b.len()))
+            }
+
+            (Value::Int(_) | Value::Float(_), Value::Text(_))
+            | (Value::Int(_) | Value::Float(_), Value::Blob(_))
+            | (Value::Int(_) | Value::Float(_), Value::Vector(_)) => Some(Ordering::Less),
+
+            (Value::Text(_), Value::Int(_) | Value::Float(_)) => Some(Ordering::Greater),
+            (Value::Text(_), Value::Blob(_) | Value::Vector(_)) => Some(Ordering::Less),
+
+            (Value::Blob(_) | Value::Vector(_), Value::Int(_) | Value::Float(_)) => {
+                Some(Ordering::Greater)
+            }
+            (Value::Blob(_), Value::Text(_)) => Some(Ordering::Greater),
+            (Value::Vector(_), Value::Text(_)) => Some(Ordering::Greater),
+
+            (Value::Blob(_), Value::Vector(_)) => Some(Ordering::Less),
+            (Value::Vector(_), Value::Blob(_)) => Some(Ordering::Greater),
         }
     }
 }
@@ -263,7 +324,7 @@ mod tests {
     fn test_value_variants_exist() {
         let _null = Value::Null;
         let _int = Value::Int(42);
-        let _float = Value::Float(2.71828);
+        let _float = Value::Float(2.5);
         let _text = Value::Text(Cow::Borrowed("hello"));
         let _blob = Value::Blob(Cow::Borrowed(b"data"));
         let _vector = Value::Vector(Cow::Borrowed(&[1.0, 2.0, 3.0]));
@@ -385,10 +446,10 @@ mod tests {
 
     #[test]
     fn test_coerce_float_to_text() {
-        let float_val = Value::Float(3.14159);
+        let float_val = Value::Float(2.5);
         let result = float_val.coerce_to_affinity(TypeAffinity::Text).unwrap();
         match result {
-            Value::Text(s) => assert!(s.starts_with("3.14")),
+            Value::Text(s) => assert!(s.starts_with("2.5")),
             _ => panic!("Expected Text variant"),
         }
     }
@@ -402,9 +463,9 @@ mod tests {
 
     #[test]
     fn test_coerce_text_to_real() {
-        let text_val = Value::Text(Cow::Borrowed("3.14"));
+        let text_val = Value::Text(Cow::Borrowed("2.5"));
         let result = text_val.coerce_to_affinity(TypeAffinity::Real).unwrap();
-        assert!((result == Value::Float(3.14)) || matches!(result, Value::Float(f) if (f - 3.14).abs() < 0.001));
+        assert_eq!(result, Value::Float(2.5));
     }
 
     #[test]
@@ -419,5 +480,78 @@ mod tests {
         let int_val = Value::Int(42);
         let result = int_val.coerce_to_affinity(TypeAffinity::Integer).unwrap();
         assert_eq!(result, Value::Int(42));
+    }
+
+    #[test]
+    fn test_compare_null_returns_none() {
+        let null = Value::Null;
+        let int_val = Value::Int(42);
+        assert_eq!(null.compare(&int_val), None);
+        assert_eq!(int_val.compare(&null), None);
+        assert_eq!(null.compare(&null), None);
+    }
+
+    #[test]
+    fn test_compare_int_values() {
+        let v1 = Value::Int(10);
+        let v2 = Value::Int(20);
+        let v3 = Value::Int(10);
+
+        assert_eq!(v1.compare(&v2), Some(Ordering::Less));
+        assert_eq!(v2.compare(&v1), Some(Ordering::Greater));
+        assert_eq!(v1.compare(&v3), Some(Ordering::Equal));
+    }
+
+    #[test]
+    fn test_compare_float_values() {
+        let v1 = Value::Float(1.5);
+        let v2 = Value::Float(2.5);
+        let v3 = Value::Float(1.5);
+
+        assert_eq!(v1.compare(&v2), Some(Ordering::Less));
+        assert_eq!(v2.compare(&v1), Some(Ordering::Greater));
+        assert_eq!(v1.compare(&v3), Some(Ordering::Equal));
+    }
+
+    #[test]
+    fn test_compare_int_and_float() {
+        let int_val = Value::Int(42);
+        let float_val = Value::Float(42.5);
+        let float_equal = Value::Float(42.0);
+
+        assert_eq!(int_val.compare(&float_val), Some(Ordering::Less));
+        assert_eq!(float_val.compare(&int_val), Some(Ordering::Greater));
+        assert_eq!(int_val.compare(&float_equal), Some(Ordering::Equal));
+    }
+
+    #[test]
+    fn test_compare_text_values() {
+        let v1 = Value::Text(Cow::Borrowed("apple"));
+        let v2 = Value::Text(Cow::Borrowed("banana"));
+        let v3 = Value::Text(Cow::Borrowed("apple"));
+
+        assert_eq!(v1.compare(&v2), Some(Ordering::Less));
+        assert_eq!(v2.compare(&v1), Some(Ordering::Greater));
+        assert_eq!(v1.compare(&v3), Some(Ordering::Equal));
+    }
+
+    #[test]
+    fn test_compare_blob_values() {
+        let v1 = Value::Blob(Cow::Borrowed(b"abc"));
+        let v2 = Value::Blob(Cow::Borrowed(b"def"));
+        let v3 = Value::Blob(Cow::Borrowed(b"abc"));
+
+        assert_eq!(v1.compare(&v2), Some(Ordering::Less));
+        assert_eq!(v2.compare(&v1), Some(Ordering::Greater));
+        assert_eq!(v1.compare(&v3), Some(Ordering::Equal));
+    }
+
+    #[test]
+    fn test_compare_different_types() {
+        let int_val = Value::Int(42);
+        let text_val = Value::Text(Cow::Borrowed("hello"));
+
+        assert_eq!(int_val.compare(&text_val), Some(Ordering::Less));
+        assert_eq!(text_val.compare(&int_val), Some(Ordering::Greater));
     }
 }
