@@ -1,12 +1,207 @@
 //! # Table Definition Module
 //!
-//! Provides structures for defining tables, columns, indexes, and constraints.
+//! This module provides the core schema definition types for TurDB tables,
+//! columns, indexes, and constraints. These types represent the metadata
+//! that describes the structure of database objects.
+//!
+//! ## Overview
+//!
+//! The schema system supports:
+//! - **Tables**: Named collections of columns with optional primary keys and indexes
+//! - **Columns**: Typed fields with optional constraints and default values
+//! - **Indexes**: B-tree or HNSW indexes on one or more columns
+//! - **Constraints**: NOT NULL, PRIMARY KEY, UNIQUE, FOREIGN KEY, CHECK
+//!
+//! ## Type System
+//!
+//! Column types are defined in `records::types::DataType` and include:
+//! - Fixed-width: bool, int2, int4, int8, float4, float8, date, time, timestamp, uuid
+//! - Variable-width: text, blob, vector, jsonb
+//!
+//! ## Table Definition Example
+//!
+//! ```rust,ignore
+//! use turdb::schema::{TableDef, ColumnDef, IndexDef, Constraint, IndexType};
+//! use turdb::records::types::DataType;
+//!
+//! let columns = vec![
+//!     ColumnDef::new("id", DataType::Int8)
+//!         .with_constraint(Constraint::PrimaryKey),
+//!     ColumnDef::new("email", DataType::Text)
+//!         .with_constraint(Constraint::NotNull)
+//!         .with_constraint(Constraint::Unique),
+//!     ColumnDef::new("created_at", DataType::Timestamp)
+//!         .with_default("CURRENT_TIMESTAMP"),
+//! ];
+//!
+//! let table = TableDef::new(1, "users", columns)
+//!     .with_primary_key(vec!["id"])
+//!     .with_index(IndexDef::new("idx_email", vec!["email"], true, IndexType::BTree));
+//! ```
+//!
+//! ## Index Types
+//!
+//! TurDB supports two index types:
+//! - **BTree**: Traditional B+tree for range queries and exact matches
+//! - **Hnsw**: Hierarchical Navigable Small World graph for vector similarity search
+//!
+//! ## Constraints
+//!
+//! | Constraint | Description |
+//! |------------|-------------|
+//! | NotNull | Column cannot contain NULL values |
+//! | PrimaryKey | Column is part of the primary key |
+//! | Unique | Column values must be unique |
+//! | ForeignKey | References a column in another table |
+//! | Check | Custom expression that must evaluate to true |
+//!
+//! ## Memory Layout
+//!
+//! Schema definitions are stored in memory as Rust structs during runtime.
+//! For persistence, they are serialized to the turdb.meta file using a
+//! compact binary format (see schema::persistence module).
+//!
+//! ## Thread Safety
+//!
+//! Schema types are Clone but not Sync. The Catalog wraps schemas in
+//! appropriate locks for concurrent access.
+
+use crate::records::types::DataType;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IndexType {
+    BTree,
+    Hnsw,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum Constraint {
+    NotNull,
+    PrimaryKey,
+    Unique,
+    ForeignKey { table: String, column: String },
+    Check(String),
+}
+
+#[derive(Debug, Clone)]
+pub struct ColumnDef {
+    name: String,
+    data_type: DataType,
+    constraints: Vec<Constraint>,
+    default_value: Option<String>,
+}
+
+impl ColumnDef {
+    pub fn new(name: impl Into<String>, data_type: DataType) -> Self {
+        Self {
+            name: name.into(),
+            data_type,
+            constraints: Vec::new(),
+            default_value: None,
+        }
+    }
+
+    pub fn with_constraint(mut self, constraint: Constraint) -> Self {
+        self.constraints.push(constraint);
+        self
+    }
+
+    pub fn with_default(mut self, default: impl Into<String>) -> Self {
+        self.default_value = Some(default.into());
+        self
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub fn data_type(&self) -> DataType {
+        self.data_type
+    }
+
+    pub fn constraints(&self) -> &[Constraint] {
+        &self.constraints
+    }
+
+    pub fn has_constraint(&self, constraint: &Constraint) -> bool {
+        self.constraints.iter().any(|c| {
+            std::mem::discriminant(c) == std::mem::discriminant(constraint)
+                && match (c, constraint) {
+                    (Constraint::NotNull, Constraint::NotNull) => true,
+                    (Constraint::PrimaryKey, Constraint::PrimaryKey) => true,
+                    (Constraint::Unique, Constraint::Unique) => true,
+                    (
+                        Constraint::ForeignKey {
+                            table: t1,
+                            column: c1,
+                        },
+                        Constraint::ForeignKey {
+                            table: t2,
+                            column: c2,
+                        },
+                    ) => t1 == t2 && c1 == c2,
+                    (Constraint::Check(e1), Constraint::Check(e2)) => e1 == e2,
+                    _ => false,
+                }
+        })
+    }
+
+    pub fn default_value(&self) -> Option<&str> {
+        self.default_value.as_deref()
+    }
+
+    pub fn is_nullable(&self) -> bool {
+        !self.has_constraint(&Constraint::NotNull)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct IndexDef {
+    name: String,
+    columns: Vec<String>,
+    is_unique: bool,
+    index_type: IndexType,
+}
+
+impl IndexDef {
+    pub fn new(
+        name: impl Into<String>,
+        columns: Vec<impl Into<String>>,
+        is_unique: bool,
+        index_type: IndexType,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            columns: columns.into_iter().map(|c| c.into()).collect(),
+            is_unique,
+            index_type,
+        }
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub fn columns(&self) -> &[String] {
+        &self.columns
+    }
+
+    pub fn is_unique(&self) -> bool {
+        self.is_unique
+    }
+
+    pub fn index_type(&self) -> IndexType {
+        self.index_type
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct TableDef {
     id: u64,
     name: String,
     columns: Vec<ColumnDef>,
+    primary_key: Option<Vec<String>>,
+    indexes: Vec<IndexDef>,
 }
 
 impl TableDef {
@@ -15,7 +210,19 @@ impl TableDef {
             id,
             name: name.into(),
             columns,
+            primary_key: None,
+            indexes: Vec::new(),
         }
+    }
+
+    pub fn with_primary_key(mut self, columns: Vec<impl Into<String>>) -> Self {
+        self.primary_key = Some(columns.into_iter().map(|c| c.into()).collect());
+        self
+    }
+
+    pub fn with_index(mut self, index: IndexDef) -> Self {
+        self.indexes.push(index);
+        self
     }
 
     pub fn id(&self) -> u64 {
@@ -29,41 +236,20 @@ impl TableDef {
     pub fn columns(&self) -> &[ColumnDef] {
         &self.columns
     }
-}
 
-#[derive(Debug, Clone)]
-pub struct ColumnDef {
-    name: String,
-}
-
-impl ColumnDef {
-    pub fn new(name: impl Into<String>) -> Self {
-        Self { name: name.into() }
+    pub fn primary_key(&self) -> Option<&[String]> {
+        self.primary_key.as_deref()
     }
 
-    pub fn name(&self) -> &str {
-        &self.name
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct IndexDef {
-    name: String,
-}
-
-impl IndexDef {
-    pub fn new(name: impl Into<String>) -> Self {
-        Self { name: name.into() }
+    pub fn indexes(&self) -> &[IndexDef] {
+        &self.indexes
     }
 
-    pub fn name(&self) -> &str {
-        &self.name
+    pub fn get_column(&self, name: &str) -> Option<&ColumnDef> {
+        self.columns.iter().find(|c| c.name() == name)
     }
-}
 
-#[derive(Debug, Clone)]
-pub enum Constraint {
-    NotNull,
-    PrimaryKey,
-    Unique,
+    pub fn column_index(&self, name: &str) -> Option<usize> {
+        self.columns.iter().position(|c| c.name() == name)
+    }
 }

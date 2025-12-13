@@ -2,8 +2,8 @@
 //!
 //! The catalog manages all schemas within a database.
 
-use super::table::TableDef;
-use super::{Schema, SchemaId};
+use super::table::{ColumnDef, TableDef};
+use super::{Schema, SchemaId, TableId};
 use eyre::{ensure, Result};
 use std::collections::HashMap;
 
@@ -12,6 +12,7 @@ pub struct Catalog {
     schemas: HashMap<String, Schema>,
     default_schema: String,
     next_schema_id: SchemaId,
+    next_table_id: TableId,
 }
 
 impl Catalog {
@@ -20,6 +21,7 @@ impl Catalog {
             schemas: HashMap::new(),
             default_schema: "root".to_string(),
             next_schema_id: 1,
+            next_table_id: 1,
         };
 
         catalog
@@ -116,6 +118,74 @@ impl Catalog {
 
     pub fn schemas(&self) -> &HashMap<String, Schema> {
         &self.schemas
+    }
+
+    pub fn create_table(
+        &mut self,
+        schema_name: &str,
+        table_name: &str,
+        columns: Vec<ColumnDef>,
+    ) -> Result<TableId> {
+        let schema_name = if schema_name.is_empty() {
+            &self.default_schema
+        } else {
+            schema_name
+        };
+
+        let schema = self
+            .schemas
+            .get_mut(schema_name)
+            .ok_or_else(|| eyre::eyre!("schema '{}' not found", schema_name))?;
+
+        ensure!(
+            !schema.table_exists(table_name),
+            "table '{}' already exists in schema '{}'",
+            table_name,
+            schema_name
+        );
+
+        let table_id = self.next_table_id;
+        self.next_table_id += 1;
+
+        let table = TableDef::new(table_id, table_name, columns);
+        schema.add_table(table);
+
+        Ok(table_id)
+    }
+
+    pub fn drop_table(&mut self, schema_name: &str, table_name: &str) -> Result<()> {
+        let schema_name = if schema_name.is_empty() {
+            &self.default_schema
+        } else {
+            schema_name
+        };
+
+        let schema = self
+            .schemas
+            .get_mut(schema_name)
+            .ok_or_else(|| eyre::eyre!("schema '{}' not found", schema_name))?;
+
+        ensure!(
+            schema.table_exists(table_name),
+            "table '{}' not found in schema '{}'",
+            table_name,
+            schema_name
+        );
+
+        schema.remove_table(table_name);
+        Ok(())
+    }
+
+    pub fn get_table(&self, schema_name: &str, table_name: &str) -> Option<&TableDef> {
+        let schema_name = if schema_name.is_empty() {
+            &self.default_schema
+        } else {
+            schema_name
+        };
+
+        self.schemas
+            .get(schema_name)
+            .and_then(|s| s.get_table(table_name))
     }
 }
 

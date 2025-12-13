@@ -867,37 +867,37 @@
     {
       "title": "Schema - Table Definition",
       "description": "Table and column definitions with constraints",
-      "isCompleted": false,
+      "isCompleted": true,
       "priority": 17,
       "phase": 4,
       "tasks": [
         {
           "task": "Define ColumnDef struct with name, data_type, constraints",
-          "done": false
+          "done": true
         },
         {
           "task": "Define TableDef struct with columns, primary_key, indexes",
-          "done": false
+          "done": true
         },
         {
           "task": "Define IndexDef struct with columns, unique flag, index type",
-          "done": false
+          "done": true
         },
         {
           "task": "Define Constraint enum (NotNull, PrimaryKey, Unique, ForeignKey, Check)",
-          "done": false
+          "done": true
         },
         {
           "task": "Implement create_table() adding to schema",
-          "done": false
+          "done": true
         },
         {
           "task": "Implement drop_table() removing from schema",
-          "done": false
+          "done": true
         },
         {
           "task": "Implement get_table() returning &TableDef",
-          "done": false
+          "done": true
         }
       ]
     },
