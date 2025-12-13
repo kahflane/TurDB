@@ -94,7 +94,7 @@
 //! - Achieved through arena allocation and heuristic optimization
 
 use crate::records::types::DataType;
-use crate::schema::Catalog;
+use crate::schema::{Catalog, TableDef};
 use crate::sql::ast::{Expr, JoinType, Statement};
 use bumpalo::Bump;
 use eyre::{bail, Result};
@@ -265,6 +265,7 @@ pub struct PhysicalTableScan<'a> {
     pub table: &'a str,
     pub alias: Option<&'a str>,
     pub post_scan_filter: Option<&'a Expr<'a>>,
+    pub table_def: Option<&'a TableDef>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -718,13 +719,17 @@ impl<'a> Planner<'a> {
     fn compute_output_schema(&self, op: &'a PhysicalOperator<'a>) -> Result<OutputSchema<'a>> {
         match op {
             PhysicalOperator::TableScan(scan) => {
-                let table_name = if let Some(schema) = scan.schema {
-                    self.arena.alloc_str(&format!("{}.{}", schema, scan.table))
+                let table_def = if let Some(td) = scan.table_def {
+                    td
                 } else {
-                    scan.table
+                    let table_name = if let Some(schema) = scan.schema {
+                        self.arena.alloc_str(&format!("{}.{}", schema, scan.table))
+                    } else {
+                        scan.table
+                    };
+                    self.catalog.resolve_table(table_name)?
                 };
 
-                let table_def = self.catalog.resolve_table(table_name)?;
                 let mut columns = bumpalo::collections::Vec::new_in(self.arena);
 
                 for col in table_def.columns() {
@@ -952,11 +957,19 @@ impl<'a> Planner<'a> {
     ) -> Result<&'a PhysicalOperator<'a>> {
         match op {
             LogicalOperator::Scan(scan) => {
+                let table_name = if let Some(schema) = scan.schema {
+                    self.arena.alloc_str(&format!("{}.{}", schema, scan.table))
+                } else {
+                    scan.table
+                };
+                let table_def = self.catalog.resolve_table(table_name).ok();
+
                 let physical = self.arena.alloc(PhysicalOperator::TableScan(PhysicalTableScan {
                     schema: scan.schema,
                     table: scan.table,
                     alias: scan.alias,
                     post_scan_filter: None,
+                    table_def,
                 }));
                 Ok(physical)
             }
@@ -1797,6 +1810,7 @@ mod tests {
             table: "users",
             alias: None,
             post_scan_filter: Some(filter),
+            table_def: None,
         };
 
         assert_eq!(scan.schema, Some("root"));
@@ -1840,6 +1854,7 @@ mod tests {
             table: "t",
             alias: None,
             post_scan_filter: None,
+            table_def: None,
         };
         let table_scan_op = bump.alloc(PhysicalOperator::TableScan(table_scan));
         assert!(matches!(table_scan_op, PhysicalOperator::TableScan(_)));
@@ -1873,6 +1888,7 @@ mod tests {
             table: "orders",
             alias: None,
             post_scan_filter: None,
+            table_def: None,
         }));
 
         let right_scan = bump.alloc(PhysicalOperator::TableScan(PhysicalTableScan {
@@ -1880,6 +1896,7 @@ mod tests {
             table: "customers",
             alias: None,
             post_scan_filter: None,
+            table_def: None,
         }));
 
         let join = PhysicalGraceHashJoin {
@@ -1929,6 +1946,7 @@ mod tests {
             table: "users",
             alias: None,
             post_scan_filter: None,
+            table_def: None,
         }));
 
         let node = PlanNode::Physical(scan);
@@ -4112,5 +4130,49 @@ mod tests {
 
         let active_col = schema.get_column("active").expect("active column should exist");
         assert_eq!(active_col.data_type, DataType::Bool);
+    }
+
+    #[test]
+    fn test_physical_table_scan_has_table_def_reference() {
+        use crate::sql::ast::{Distinct, FromClause, SelectColumn, SelectStmt, TableRef};
+
+        let arena = Bump::new();
+        let catalog = create_test_catalog();
+        let planner = Planner::new(&catalog, &arena);
+
+        let select = arena.alloc(SelectStmt {
+            with: None,
+            distinct: Distinct::All,
+            columns: arena.alloc_slice_copy(&[SelectColumn::AllColumns]),
+            from: Some(arena.alloc(FromClause::Table(TableRef {
+                schema: None,
+                name: "users",
+                alias: None,
+            }))),
+            where_clause: None,
+            group_by: &[],
+            having: None,
+            order_by: &[],
+            limit: None,
+            offset: None,
+            set_op: None,
+            for_clause: None,
+        });
+
+        let logical = planner.plan_select(select).unwrap();
+        let physical = planner.optimize_to_physical(&logical).unwrap();
+
+        if let PhysicalOperator::ProjectExec(project) = physical.root {
+            if let PhysicalOperator::TableScan(scan) = project.input {
+                assert!(scan.table_def.is_some());
+                let table_def = scan.table_def.unwrap();
+                assert_eq!(table_def.name(), "users");
+                assert_eq!(table_def.columns().len(), 4);
+            } else {
+                panic!("Expected TableScan under ProjectExec");
+            }
+        } else {
+            panic!("Expected ProjectExec at root");
+        }
     }
 }

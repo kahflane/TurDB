@@ -83,7 +83,7 @@ pub enum Constraint {
     Check(String),
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ColumnDef {
     name: String,
     data_type: DataType,
@@ -155,7 +155,7 @@ impl ColumnDef {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct IndexDef {
     name: String,
     columns: Vec<String>,
@@ -195,7 +195,7 @@ impl IndexDef {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct TableDef {
     id: u64,
     name: String,
