@@ -764,6 +764,10 @@ impl<'a> Cursor<'a> {
         Ok(true)
     }
 
+    /// Moves the cursor to the previous key. Returns false if exhausted.
+    ///
+    /// **Performance:** O(1) within a page, O(log N) when crossing page boundaries
+    /// (requires tree re-traversal). Prefer forward iteration for large scans.
     pub fn prev(&mut self) -> Result<bool> {
         if self.exhausted {
             return Ok(false);
