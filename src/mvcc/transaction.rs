@@ -121,3 +121,52 @@ impl Default for TransactionManager {
         Self::new()
     }
 }
+
+pub type TableId = u32;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WriteKey {
+    pub table_id: TableId,
+    pub key: Vec<u8>,
+}
+
+pub struct Transaction<'a> {
+    id: TxnId,
+    slot_idx: usize,
+    state: TxnState,
+    write_set: smallvec::SmallVec<[WriteKey; 16]>,
+    #[allow(dead_code)]
+    manager: &'a TransactionManager,
+}
+
+impl<'a> Transaction<'a> {
+    pub fn new(manager: &'a TransactionManager, id: TxnId, slot_idx: usize) -> Self {
+        Self {
+            id,
+            slot_idx,
+            state: TxnState::Active,
+            write_set: smallvec::SmallVec::new(),
+            manager,
+        }
+    }
+
+    pub fn id(&self) -> TxnId {
+        self.id
+    }
+
+    pub fn slot_idx(&self) -> usize {
+        self.slot_idx
+    }
+
+    pub fn state(&self) -> TxnState {
+        self.state
+    }
+
+    pub fn write_set(&self) -> &[WriteKey] {
+        &self.write_set
+    }
+
+    pub fn add_to_write_set(&mut self, table_id: TableId, key: Vec<u8>) {
+        self.write_set.push(WriteKey { table_id, key });
+    }
+}

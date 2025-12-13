@@ -86,7 +86,7 @@
 
 pub mod transaction;
 
-pub use transaction::{TransactionManager, TxnId, TxnState, MAX_CONCURRENT_TXNS};
+pub use transaction::{Transaction, TransactionManager, TxnId, TxnState, MAX_CONCURRENT_TXNS};
 
 #[cfg(test)]
 mod tests {
@@ -154,5 +154,35 @@ mod tests {
             mgr1.global_ts.load(Ordering::SeqCst),
             mgr2.global_ts.load(Ordering::SeqCst)
         );
+    }
+
+    #[test]
+    fn transaction_has_id_and_slot_idx() {
+        let mgr = TransactionManager::new();
+        let txn = Transaction::new(&mgr, 42, 5);
+        assert_eq!(txn.id(), 42);
+        assert_eq!(txn.slot_idx(), 5);
+    }
+
+    #[test]
+    fn transaction_initial_state_is_active() {
+        let mgr = TransactionManager::new();
+        let txn = Transaction::new(&mgr, 1, 0);
+        assert!(matches!(txn.state(), TxnState::Active));
+    }
+
+    #[test]
+    fn transaction_write_set_starts_empty() {
+        let mgr = TransactionManager::new();
+        let txn = Transaction::new(&mgr, 1, 0);
+        assert!(txn.write_set().is_empty());
+    }
+
+    #[test]
+    fn transaction_can_add_to_write_set() {
+        let mgr = TransactionManager::new();
+        let mut txn = Transaction::new(&mgr, 1, 0);
+        txn.add_to_write_set(100, vec![1, 2, 3]);
+        assert_eq!(txn.write_set().len(), 1);
     }
 }
