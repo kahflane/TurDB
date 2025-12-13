@@ -130,6 +130,16 @@ impl TransactionManager {
             MAX_CONCURRENT_TXNS
         )
     }
+
+    pub fn commit_txn(&self, slot_idx: usize) -> TxnId {
+        let commit_ts = self.global_ts.fetch_add(1, Ordering::SeqCst);
+        self.active_slots[slot_idx].store(0, Ordering::SeqCst);
+        commit_ts
+    }
+
+    pub fn abort_txn(&self, slot_idx: usize) {
+        self.active_slots[slot_idx].store(0, Ordering::SeqCst);
+    }
 }
 
 impl Default for TransactionManager {
@@ -151,8 +161,8 @@ pub struct Transaction<'a> {
     slot_idx: usize,
     state: TxnState,
     write_set: smallvec::SmallVec<[WriteKey; 16]>,
-    #[allow(dead_code)]
     manager: &'a TransactionManager,
+    committed: bool,
 }
 
 impl<'a> Transaction<'a> {
@@ -163,6 +173,7 @@ impl<'a> Transaction<'a> {
             state: TxnState::Active,
             write_set: smallvec::SmallVec::new(),
             manager,
+            committed: false,
         }
     }
 
@@ -184,5 +195,25 @@ impl<'a> Transaction<'a> {
 
     pub fn add_to_write_set(&mut self, table_id: TableId, key: Vec<u8>) {
         self.write_set.push(WriteKey { table_id, key });
+    }
+
+    pub fn commit(mut self) -> TxnId {
+        self.state = TxnState::Committed;
+        self.committed = true;
+        self.manager.commit_txn(self.slot_idx)
+    }
+
+    pub fn rollback(mut self) {
+        self.state = TxnState::Aborted;
+        self.committed = true;
+        self.manager.abort_txn(self.slot_idx);
+    }
+}
+
+impl<'a> Drop for Transaction<'a> {
+    fn drop(&mut self) {
+        if !self.committed {
+            self.manager.abort_txn(self.slot_idx);
+        }
     }
 }
