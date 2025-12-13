@@ -1,0 +1,123 @@
+//! # Transaction Management
+//!
+//! This module provides the core transaction primitives for TurDB's MVCC
+//! implementation. The design follows a Single-Writer / Multi-Reader model
+//! with row-level locking stored directly in record headers.
+//!
+//! ## Transaction Identifiers
+//!
+//! Transaction IDs (`TxnId`) are 64-bit monotonically increasing integers
+//! allocated from a global atomic counter. This provides:
+//! - Unique identification for each transaction
+//! - Natural ordering for visibility checks
+//! - Effectively unlimited transaction space (centuries at 100K/sec)
+//!
+//! Special values:
+//! - `TxnId = 0`: Reserved for "always visible" bootstrapped data
+//! - `TxnId = u64::MAX`: Sentinel value (never used for real transactions)
+//!
+//! ## Transaction States
+//!
+//! ```text
+//! ┌─────────┐     commit()     ┌───────────┐
+//! │ Active  │ ───────────────> │ Committed │
+//! └─────────┘                  └───────────┘
+//!      │
+//!      │ rollback()
+//!      v
+//! ┌─────────┐
+//! │ Aborted │
+//! └─────────┘
+//! ```
+//!
+//! ## Memory Layout
+//!
+//! The TransactionManager uses a fixed-size slot array to track active
+//! transactions, avoiding any dynamic allocation:
+//!
+//! ```text
+//! TransactionManager {
+//!     global_ts: AtomicU64,           // 8 bytes
+//!     active_slots: [AtomicU64; 64],  // 512 bytes
+//!     slot_lock: Mutex<()>,           // ~40 bytes (parking_lot)
+//! }
+//! Total: ~560 bytes
+//! ```
+//!
+//! ## Concurrency Model
+//!
+//! - `global_ts`: Lock-free increment via `fetch_add`
+//! - `active_slots`: Lock-free reads, mutex-protected slot allocation
+//! - Watermark calculation: Lock-free iteration over slots
+//!
+//! ## Slot Array Design
+//!
+//! Each slot holds the start timestamp of an active transaction:
+//! - Value 0: Slot is empty (available)
+//! - Value > 0: Start timestamp of active transaction
+//!
+//! Maximum concurrent transactions: 64 (hard limit for 1MB budget)
+//! Memory overhead: 64 * 8 bytes = 512 bytes
+//!
+//! ## Watermark Calculation
+//!
+//! The global watermark is the minimum of:
+//! - Current global timestamp
+//! - All non-zero values in active_slots
+//!
+//! Any version with txn_id < watermark is safe for garbage collection.
+//!
+//! ## Write Set Tracking
+//!
+//! Transactions track modified keys using `SmallVec<[(TableId, Key); 16]>`:
+//! - 90% of embedded transactions touch <16 rows
+//! - Stack-allocated for small transactions
+//! - Spills to heap only for large transactions
+//!
+//! ## Safety Invariants
+//!
+//! 1. A transaction ID is never reused
+//! 2. Slots are released on commit/rollback (enforced via Drop)
+//! 3. Watermark is always <= global_ts
+//! 4. Only one transaction can hold a given slot
+
+pub type TxnId = u64;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TxnState {
+    #[default]
+    Active,
+    Committed,
+    Aborted,
+}
+
+use parking_lot::Mutex;
+use std::sync::atomic::AtomicU64;
+
+pub const MAX_CONCURRENT_TXNS: usize = 64;
+
+#[allow(dead_code)]
+pub struct TransactionManager {
+    pub(crate) global_ts: AtomicU64,
+    pub(crate) active_slots: [AtomicU64; MAX_CONCURRENT_TXNS],
+    pub(crate) slot_lock: Mutex<()>,
+}
+
+impl TransactionManager {
+    #[allow(clippy::declare_interior_mutable_const)]
+    pub fn new() -> Self {
+        const INIT: AtomicU64 = AtomicU64::new(0);
+        Self {
+            global_ts: AtomicU64::new(1),
+            #[allow(clippy::borrow_interior_mutable_const)]
+            active_slots: [INIT; MAX_CONCURRENT_TXNS],
+            slot_lock: Mutex::new(()),
+        }
+    }
+}
+
+impl Default for TransactionManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
