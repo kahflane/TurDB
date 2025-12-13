@@ -89,6 +89,7 @@ mod file_manager;
 mod freelist;
 mod mmap;
 mod page;
+mod wal;
 
 pub use cache::{PageCache, PageKey, PageRef};
 pub use file_manager::{
@@ -99,6 +100,7 @@ pub use file_manager::{
 pub use freelist::{Freelist, TrunkHeader, TRUNK_HEADER_SIZE, TRUNK_MAX_ENTRIES};
 pub use mmap::MmapStorage;
 pub use page::{validate_page, PageHeader, PageType};
+pub use wal::{Wal, WalFrameHeader, WalSegment};
 
 pub const PAGE_SIZE: usize = 16384;
 pub const PAGE_HEADER_SIZE: usize = 16;
