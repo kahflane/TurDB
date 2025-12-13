@@ -146,10 +146,7 @@ impl MvccTable {
         Ok(mvcc_value.header.is_visible_to(read_ts))
     }
 
-    pub fn get_visible(
-        raw_value: &[u8],
-        read_ts: TxnId,
-    ) -> Result<Option<&[u8]>> {
+    pub fn get_visible(raw_value: &[u8], read_ts: TxnId) -> Result<Option<&[u8]>> {
         let reader = VersionChainReader::new(raw_value, read_ts);
 
         match reader.visibility() {
@@ -176,7 +173,11 @@ impl MvccTable {
         }
     }
 
-    pub fn can_write(raw_value: &[u8], writer_txn_id: TxnId, writer_read_ts: TxnId) -> Result<WriteCheckResult> {
+    pub fn can_write(
+        raw_value: &[u8],
+        writer_txn_id: TxnId,
+        writer_read_ts: TxnId,
+    ) -> Result<WriteCheckResult> {
         let mvcc_value = Self::parse_value(raw_value)?;
         Ok(mvcc_value.header.can_write(writer_txn_id, writer_read_ts))
     }
@@ -247,11 +248,7 @@ impl MvccTable {
         Ok(())
     }
 
-    pub fn create_undo_record(
-        &self,
-        key: &[u8],
-        raw_value: &[u8],
-    ) -> Result<UndoRecord> {
+    pub fn create_undo_record(&self, key: &[u8], raw_value: &[u8]) -> Result<UndoRecord> {
         let mvcc_value = Self::parse_value(raw_value)?;
         Ok(UndoRecord::new(
             self.table_id,
@@ -470,7 +467,9 @@ mod tests {
         let txn_id = txn.id();
 
         let value = MvccTable::prepare_insert_value(txn_id, b"test_data");
-        assert!(MvccTable::get_visible(&value, txn_id + 10).unwrap().is_none());
+        assert!(MvccTable::get_visible(&value, txn_id + 10)
+            .unwrap()
+            .is_none());
 
         let commit_ts = txn.commit();
 
@@ -506,7 +505,9 @@ mod tests {
 
         assert!(MvccTable::get_visible(&v1, reader_ts).unwrap().is_some());
         assert!(MvccTable::get_visible(&v2, reader_ts).unwrap().is_none());
-        assert!(MvccTable::get_visible(&v2, commit_ts2 + 1).unwrap().is_some());
+        assert!(MvccTable::get_visible(&v2, commit_ts2 + 1)
+            .unwrap()
+            .is_some());
     }
 
     #[test]
@@ -563,11 +564,15 @@ mod tests {
         let delete_commit = deleter.commit();
         MvccTable::finalize_commit_value(&mut deleted, delete_commit).unwrap();
 
-        assert!(MvccTable::get_visible(&value, old_read_ts).unwrap().is_some());
+        assert!(MvccTable::get_visible(&value, old_read_ts)
+            .unwrap()
+            .is_some());
 
         let new_reader = manager.begin_txn().unwrap();
         let new_read_ts = new_reader.id();
-        assert!(MvccTable::get_visible(&deleted, new_read_ts).unwrap().is_none());
+        assert!(MvccTable::get_visible(&deleted, new_read_ts)
+            .unwrap()
+            .is_none());
     }
 
     #[test]
@@ -596,9 +601,10 @@ mod tests {
         v1_header.set_locked(false);
         let v1_user_data = b"v1";
 
-        let load_undo = |_page: u64, _offset: u16| -> Result<Option<(RecordHeader, &[u8])>, eyre::Report> {
-            Ok(Some((v1_header, v1_user_data.as_slice())))
-        };
+        let load_undo =
+            |_page: u64, _offset: u16| -> Result<Option<(RecordHeader, &[u8])>, eyre::Report> {
+                Ok(Some((v1_header, v1_user_data.as_slice())))
+            };
 
         let result = MvccTable::get_visible_with_undo(&v2_committed, 150, load_undo).unwrap();
         assert_eq!(result, Some(b"v1".as_slice()));
@@ -646,7 +652,8 @@ mod tests {
             }));
         }
 
-        let results: Vec<(u64, u64, Vec<u8>)> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        let results: Vec<(u64, u64, Vec<u8>)> =
+            handles.into_iter().map(|h| h.join().unwrap()).collect();
 
         let txn_ids: Vec<_> = results.iter().map(|(id, _, _)| *id).collect();
         let mut unique_ids = txn_ids.clone();
@@ -689,7 +696,9 @@ mod tests {
         let reader = manager.begin_txn().unwrap();
         let reader_ts = reader.id();
 
-        assert!(MvccTable::get_visible(&locked_value, reader_ts).unwrap().is_none());
+        assert!(MvccTable::get_visible(&locked_value, reader_ts)
+            .unwrap()
+            .is_none());
 
         let own_read = MvccTable::get_visible(&locked_value, writer_id).unwrap();
         assert!(own_read.is_none());
