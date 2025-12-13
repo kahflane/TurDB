@@ -910,11 +910,11 @@
       "tasks": [
         {
           "task": "Define catalog page format in metadata file",
-          "done": false
+          "done": true
         },
         {
           "task": "Implement serialize_catalog() to bytes",
-          "done": false
+          "done": true
         },
         {
           "task": "Implement deserialize_catalog() from bytes",
