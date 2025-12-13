@@ -561,7 +561,7 @@ where
                 }
             }
 
-            let left_row = self.current_left_row.as_ref().unwrap();
+            let left_row = self.current_left_row.as_ref().unwrap(); // INVARIANT: is_none check above sets to Some
 
             while self.right_index < self.right_rows.len() {
                 let right_row = &self.right_rows[self.right_index];
@@ -1769,7 +1769,7 @@ impl<'a, S: RowSource> Executor<'a> for DynamicExecutor<'a, S> {
                         }
                     }
 
-                    let left_row = state.current_left_row.as_ref().unwrap();
+                    let left_row = state.current_left_row.as_ref().unwrap(); // INVARIANT: is_none check above sets to Some
                     let left_col_count = left_row.len();
 
                     while state.right_index < state.right_rows.len() {
