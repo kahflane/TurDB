@@ -805,29 +805,29 @@
     {
       "title": "Encoding - Varint for Lengths",
       "description": "Variable-length integer encoding for record lengths and cell sizes (NOT for type codes)",
-      "isCompleted": false,
+      "isCompleted": true,
       "priority": 15,
       "phase": 3,
       "tasks": [
         {
           "task": "Implement encode_varint(value, buf) writing 1-9 bytes",
-          "done": false
+          "done": true
         },
         {
           "task": "Implement decode_varint(buf) returning (value, bytes_read)",
-          "done": false
+          "done": true
         },
         {
           "task": "Implement varint_len(value) returning encoded length without encoding",
-          "done": false
+          "done": true
         },
         {
           "task": "Move existing varint_size() from tree.rs to encoding/varint.rs",
-          "done": false
+          "done": true
         },
         {
           "task": "Add roundtrip tests for boundary values (240, 2287, 67823, u32::MAX, u64::MAX)",
-          "done": false
+          "done": true
         }
       ]
     },

@@ -135,6 +135,7 @@
 use eyre::{bail, ensure, Result};
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
+use crate::encoding::varint::{decode_varint, encode_varint, varint_len};
 use crate::storage::{PageHeader, PageType, PAGE_HEADER_SIZE, PAGE_SIZE};
 
 pub const SLOT_SIZE: usize = 8;
@@ -447,8 +448,8 @@ impl<'a> LeafNodeMut<'a> {
     }
 
     pub fn insert_cell(&mut self, key: &[u8], value: &[u8]) -> Result<()> {
-        let varint_len = varint_size(value.len() as u64);
-        let cell_size = key.len() + varint_len + value.len();
+        let value_len_size = varint_len(value.len() as u64);
+        let cell_size = key.len() + value_len_size + value.len();
         let space_needed = cell_size + SLOT_SIZE;
 
         ensure!(
@@ -471,7 +472,7 @@ impl<'a> LeafNodeMut<'a> {
         self.data[offset..offset + key.len()].copy_from_slice(key);
         offset += key.len();
 
-        offset += encode_varint(&mut self.data[offset..], value.len() as u64);
+        offset += encode_varint(value.len() as u64, &mut self.data[offset..]);
 
         self.data[offset..offset + value.len()].copy_from_slice(value);
 
@@ -586,92 +587,6 @@ impl<'a> LeafNodeMut<'a> {
 
     pub fn as_ref(&self) -> LeafNode<'_> {
         LeafNode { data: self.data }
-    }
-}
-
-fn varint_size(value: u64) -> usize {
-    if value <= 240 {
-        1
-    } else if value <= 2287 {
-        2
-    } else if value <= 67823 {
-        3
-    } else if value <= 0xFF_FFFF {
-        4
-    } else if value <= 0xFFFF_FFFF {
-        5
-    } else {
-        9
-    }
-}
-
-fn encode_varint(buf: &mut [u8], value: u64) -> usize {
-    if value <= 240 {
-        buf[0] = value as u8;
-        1
-    } else if value <= 2287 {
-        let v = value - 240;
-        buf[0] = ((v >> 8) + 241) as u8;
-        buf[1] = (v & 0xFF) as u8;
-        2
-    } else if value <= 67823 {
-        let v = value - 2288;
-        buf[0] = 249;
-        buf[1] = (v >> 8) as u8;
-        buf[2] = (v & 0xFF) as u8;
-        3
-    } else if value <= 0xFF_FFFF {
-        buf[0] = 250;
-        buf[1] = (value >> 16) as u8;
-        buf[2] = (value >> 8) as u8;
-        buf[3] = value as u8;
-        4
-    } else if value <= 0xFFFF_FFFF {
-        buf[0] = 251;
-        buf[1] = (value >> 24) as u8;
-        buf[2] = (value >> 16) as u8;
-        buf[3] = (value >> 8) as u8;
-        buf[4] = value as u8;
-        5
-    } else {
-        buf[0] = 255;
-        buf[1..9].copy_from_slice(&value.to_be_bytes());
-        9
-    }
-}
-
-fn decode_varint(buf: &[u8]) -> Result<(u64, usize)> {
-    ensure!(!buf.is_empty(), "empty buffer for varint decode");
-
-    let first = buf[0];
-
-    if first <= 240 {
-        Ok((first as u64, 1))
-    } else if first <= 248 {
-        ensure!(buf.len() >= 2, "truncated 2-byte varint");
-        let value = 240 + ((first as u64 - 241) << 8) + buf[1] as u64;
-        Ok((value, 2))
-    } else if first == 249 {
-        ensure!(buf.len() >= 3, "truncated 3-byte varint");
-        let value = 2288 + ((buf[1] as u64) << 8) + buf[2] as u64;
-        Ok((value, 3))
-    } else if first == 250 {
-        ensure!(buf.len() >= 4, "truncated 4-byte varint");
-        let value = ((buf[1] as u64) << 16) + ((buf[2] as u64) << 8) + buf[3] as u64;
-        Ok((value, 4))
-    } else if first == 251 {
-        ensure!(buf.len() >= 5, "truncated 5-byte varint");
-        let value = ((buf[1] as u64) << 24)
-            + ((buf[2] as u64) << 16)
-            + ((buf[3] as u64) << 8)
-            + buf[4] as u64;
-        Ok((value, 5))
-    } else if first == 255 {
-        ensure!(buf.len() >= 9, "truncated 9-byte varint");
-        let value = u64::from_be_bytes(buf[1..9].try_into().unwrap());
-        Ok((value, 9))
-    } else {
-        bail!("invalid varint marker: {}", first)
     }
 }
 
@@ -918,32 +833,6 @@ mod tests {
         for i in 0..100 {
             let expected_key = format!("key{:03}", i);
             assert_eq!(node.key_at(i).unwrap(), expected_key.as_bytes());
-        }
-    }
-
-    #[test]
-    fn varint_encode_decode_roundtrip() {
-        let test_values = [
-            0,
-            1,
-            240,
-            241,
-            2287,
-            2288,
-            67823,
-            67824,
-            0xFFFFFF,
-            0xFFFFFFFF,
-            u64::MAX,
-        ];
-
-        for &value in &test_values {
-            let mut buf = [0u8; 9];
-            let encoded_len = encode_varint(&mut buf, value);
-            let (decoded, decoded_len) = decode_varint(&buf).unwrap();
-
-            assert_eq!(encoded_len, decoded_len, "length mismatch for {}", value);
-            assert_eq!(value, decoded, "value mismatch for {}", value);
         }
     }
 
