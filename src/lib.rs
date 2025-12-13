@@ -80,6 +80,7 @@
 //! - `transaction`: MVCC and WAL
 
 pub mod btree;
+pub mod database;
 pub mod encoding;
 pub mod hnsw;
 pub mod mvcc;
@@ -88,3 +89,5 @@ pub mod schema;
 pub mod sql;
 pub mod storage;
 pub mod types;
+
+pub use database::{Database, ExecuteResult, OwnedValue, Row};

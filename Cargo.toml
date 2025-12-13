@@ -22,6 +22,7 @@ libc = "0.2"
 [dev-dependencies]
 tempfile = "3.10"
 criterion = { version = "0.5", features = ["html_reports"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
 
 [[bench]]
 name = "btree"
@@ -33,6 +34,10 @@ harness = false
 
 [[bench]]
 name = "records"
+harness = false
+
+[[bench]]
+name = "database"
 harness = false
 
 [profile.release]
