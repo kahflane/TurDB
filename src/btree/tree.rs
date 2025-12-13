@@ -475,7 +475,7 @@ impl<'a> BTree<'a> {
 
             for i in 0..count {
                 all_separators.push(arena.alloc_slice_copy(interior.key_at(i)?));
-                all_children.push(interior.slot_at(i)?.child_page);
+                all_children.push(interior.slot_at(i)?.child_page());
             }
             old_right_child = interior.right_child();
         }
@@ -618,7 +618,7 @@ impl<'a> BTree<'a> {
                     if interior.cell_count() == 0 {
                         current_page = interior.right_child();
                     } else {
-                        current_page = interior.slot_at(0)?.child_page;
+                        current_page = interior.slot_at(0)?.child_page();
                     }
                 }
                 _ => bail!(
@@ -824,11 +824,11 @@ impl<'a> Cursor<'a> {
                 let interior = InteriorNode::from_page(page_data)?;
 
                 let prev_child = if child_idx == 1 {
-                    interior.slot_at(0)?.child_page
+                    interior.slot_at(0)?.child_page()
                 } else if child_idx > 1 {
                     let target_idx = child_idx - 1;
                     if target_idx < interior.cell_count() as usize {
-                        interior.slot_at(target_idx)?.child_page
+                        interior.slot_at(target_idx)?.child_page()
                     } else {
                         interior.right_child()
                     }

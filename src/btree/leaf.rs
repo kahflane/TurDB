@@ -133,7 +133,10 @@
 //! sharded RwLocks).
 
 use eyre::{bail, ensure, Result};
-use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
+use zerocopy::{
+    byteorder::{LittleEndian, U16},
+    FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned,
+};
 
 use crate::encoding::varint::{decode_varint, encode_varint, varint_len};
 use crate::storage::{PageHeader, PageType, PAGE_HEADER_SIZE, PAGE_SIZE};
@@ -143,24 +146,38 @@ pub const LEAF_HEADER_SIZE: usize = 8;
 pub const LEAF_CONTENT_START: usize = PAGE_HEADER_SIZE + LEAF_HEADER_SIZE;
 
 #[repr(C)]
-#[derive(Debug, Clone, Copy, FromBytes, IntoBytes, Immutable, KnownLayout, PartialEq, Eq)]
+#[derive(
+    Debug, Clone, Copy, FromBytes, IntoBytes, Immutable, KnownLayout, Unaligned, PartialEq, Eq,
+)]
 pub struct Slot {
     pub prefix: [u8; 4],
-    pub offset: u16,
-    pub key_len: u16,
+    pub offset: U16<LittleEndian>,
+    pub key_len: U16<LittleEndian>,
 }
 
 impl Slot {
     pub fn new(key: &[u8], offset: u16) -> Self {
         Self {
             prefix: extract_prefix(key),
-            offset,
-            key_len: key.len() as u16,
+            offset: U16::new(offset),
+            key_len: U16::new(key.len() as u16),
         }
     }
 
     pub fn prefix_as_u32(&self) -> u32 {
         u32::from_be_bytes(self.prefix)
+    }
+
+    pub fn offset(&self) -> u16 {
+        self.offset.get()
+    }
+
+    pub fn key_len(&self) -> u16 {
+        self.key_len.get()
+    }
+
+    pub fn set_offset(&mut self, offset: u16) {
+        self.offset.set(offset);
     }
 }
 
@@ -231,8 +248,8 @@ impl<'a> LeafNode<'a> {
 
     pub fn key_at(&self, index: usize) -> Result<&'a [u8]> {
         let slot = self.slot_at(index)?;
-        let cell_offset = slot.offset as usize;
-        let key_len = slot.key_len as usize;
+        let cell_offset = slot.offset() as usize;
+        let key_len = slot.key_len() as usize;
 
         ensure!(
             cell_offset + key_len <= PAGE_SIZE,
@@ -246,8 +263,8 @@ impl<'a> LeafNode<'a> {
 
     pub fn value_at(&self, index: usize) -> Result<&'a [u8]> {
         let slot = self.slot_at(index)?;
-        let cell_offset = slot.offset as usize;
-        let key_len = slot.key_len as usize;
+        let cell_offset = slot.offset() as usize;
+        let key_len = slot.key_len() as usize;
         let value_start = cell_offset + key_len;
 
         ensure!(
@@ -384,8 +401,8 @@ impl<'a> LeafNodeMut<'a> {
 
     pub fn key_at(&self, index: usize) -> Result<&[u8]> {
         let slot = self.slot_at(index)?;
-        let cell_offset = slot.offset as usize;
-        let key_len = slot.key_len as usize;
+        let cell_offset = slot.offset() as usize;
+        let key_len = slot.key_len() as usize;
 
         ensure!(
             cell_offset + key_len <= PAGE_SIZE,
@@ -397,8 +414,8 @@ impl<'a> LeafNodeMut<'a> {
 
     pub fn value_at(&self, index: usize) -> Result<&[u8]> {
         let slot = self.slot_at(index)?;
-        let cell_offset = slot.offset as usize;
-        let key_len = slot.key_len as usize;
+        let cell_offset = slot.offset() as usize;
+        let key_len = slot.key_len() as usize;
         let value_start = cell_offset + key_len;
 
         ensure!(value_start < PAGE_SIZE, "value_len offset beyond page");
@@ -506,8 +523,8 @@ impl<'a> LeafNodeMut<'a> {
         );
 
         let slot = self.slot_at(index)?;
-        let cell_offset = slot.offset as usize;
-        let key_len = slot.key_len as usize;
+        let cell_offset = slot.offset() as usize;
+        let key_len = slot.key_len() as usize;
         let value_start = cell_offset + key_len;
         let (value_len, varint_size) = decode_varint(&self.data[value_start..])?;
         let cell_size = key_len + varint_size + value_len as usize;
@@ -552,8 +569,8 @@ impl<'a> LeafNodeMut<'a> {
 
         for i in 0..cell_count {
             let slot = *self.slot_at(i)?;
-            let cell_offset = slot.offset as usize;
-            let key_len = slot.key_len as usize;
+            let cell_offset = slot.offset() as usize;
+            let key_len = slot.key_len() as usize;
             let value_start = cell_offset + key_len;
             let (value_len, varint_size) = decode_varint(&self.data[value_start..])?;
             let cell_end = value_start + varint_size + value_len as usize;
@@ -567,7 +584,7 @@ impl<'a> LeafNodeMut<'a> {
             new_free_end -= cell_data.len();
             self.data[new_free_end..new_free_end + cell_data.len()].copy_from_slice(&cell_data);
 
-            slot.offset = new_free_end as u16;
+            slot.set_offset(new_free_end as u16);
             let slot_offset = self.slot_offset(i);
             self.data[slot_offset..slot_offset + SLOT_SIZE].copy_from_slice(slot.as_bytes());
         }
@@ -608,8 +625,8 @@ mod tests {
         let slot = Slot::new(b"hello", 100);
 
         assert_eq!(slot.prefix, [b'h', b'e', b'l', b'l']);
-        assert_eq!(slot.offset, 100);
-        assert_eq!(slot.key_len, 5);
+        assert_eq!(slot.offset(), 100);
+        assert_eq!(slot.key_len(), 5);
     }
 
     #[test]
@@ -617,7 +634,7 @@ mod tests {
         let slot = Slot::new(b"ab", 200);
 
         assert_eq!(slot.prefix, [b'a', b'b', 0, 0]);
-        assert_eq!(slot.key_len, 2);
+        assert_eq!(slot.key_len(), 2);
     }
 
     #[test]

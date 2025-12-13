@@ -99,7 +99,10 @@
 //! (typically via PageCache's sharded RwLocks).
 
 use eyre::{bail, ensure, Result};
-use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
+use zerocopy::{
+    byteorder::{LittleEndian, U16, U32},
+    FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned,
+};
 
 use crate::btree::extract_prefix;
 use crate::storage::{PageHeader, PageType, PAGE_HEADER_SIZE, PAGE_SIZE};
@@ -108,26 +111,40 @@ pub const INTERIOR_SLOT_SIZE: usize = 12;
 pub const INTERIOR_CONTENT_START: usize = PAGE_HEADER_SIZE;
 
 #[repr(C)]
-#[derive(Debug, Clone, Copy, FromBytes, IntoBytes, Immutable, KnownLayout, PartialEq, Eq)]
+#[derive(
+    Debug, Clone, Copy, FromBytes, IntoBytes, Immutable, KnownLayout, Unaligned, PartialEq, Eq,
+)]
 pub struct InteriorSlot {
     pub prefix: [u8; 4],
-    pub child_page: u32,
-    pub offset: u16,
-    pub key_len: u16,
+    pub child_page: U32<LittleEndian>,
+    pub offset: U16<LittleEndian>,
+    pub key_len: U16<LittleEndian>,
 }
 
 impl InteriorSlot {
     pub fn new(key: &[u8], child_page: u32, offset: u16) -> Self {
         Self {
             prefix: extract_prefix(key),
-            child_page,
-            offset,
-            key_len: key.len() as u16,
+            child_page: U32::new(child_page),
+            offset: U16::new(offset),
+            key_len: U16::new(key.len() as u16),
         }
     }
 
     pub fn prefix_as_u32(&self) -> u32 {
         u32::from_be_bytes(self.prefix)
+    }
+
+    pub fn child_page(&self) -> u32 {
+        self.child_page.get()
+    }
+
+    pub fn offset(&self) -> u16 {
+        self.offset.get()
+    }
+
+    pub fn key_len(&self) -> u16 {
+        self.key_len.get()
     }
 }
 
@@ -194,8 +211,8 @@ impl<'a> InteriorNode<'a> {
 
     pub fn key_at(&self, index: usize) -> Result<&'a [u8]> {
         let slot = self.slot_at(index)?;
-        let cell_offset = slot.offset as usize;
-        let key_len = slot.key_len as usize;
+        let cell_offset = slot.offset() as usize;
+        let key_len = slot.key_len() as usize;
 
         ensure!(
             cell_offset + key_len <= PAGE_SIZE,
@@ -216,12 +233,12 @@ impl<'a> InteriorNode<'a> {
             let slot_prefix = slot.prefix_as_u32();
 
             if key_prefix < slot_prefix {
-                return Ok((slot.child_page, Some(i)));
+                return Ok((slot.child_page(), Some(i)));
             }
             if key_prefix == slot_prefix {
                 let separator = self.key_at(i)?;
                 if key < separator {
-                    return Ok((slot.child_page, Some(i)));
+                    return Ok((slot.child_page(), Some(i)));
                 }
             }
         }
@@ -307,8 +324,8 @@ impl<'a> InteriorNodeMut<'a> {
 
     pub fn key_at(&self, index: usize) -> Result<&[u8]> {
         let slot = self.slot_at(index)?;
-        let cell_offset = slot.offset as usize;
-        let key_len = slot.key_len as usize;
+        let cell_offset = slot.offset() as usize;
+        let key_len = slot.key_len() as usize;
 
         ensure!(
             cell_offset + key_len <= PAGE_SIZE,
@@ -327,12 +344,12 @@ impl<'a> InteriorNodeMut<'a> {
             let slot_prefix = slot.prefix_as_u32();
 
             if key_prefix < slot_prefix {
-                return Ok((slot.child_page, Some(i)));
+                return Ok((slot.child_page(), Some(i)));
             }
             if key_prefix == slot_prefix {
                 let separator = self.key_at(i)?;
                 if key < separator {
-                    return Ok((slot.child_page, Some(i)));
+                    return Ok((slot.child_page(), Some(i)));
                 }
             }
         }
@@ -427,9 +444,9 @@ mod tests {
         let slot = InteriorSlot::new(b"hello", 42, 100);
 
         assert_eq!(slot.prefix, [b'h', b'e', b'l', b'l']);
-        assert_eq!(slot.child_page, 42);
-        assert_eq!(slot.offset, 100);
-        assert_eq!(slot.key_len, 5);
+        assert_eq!(slot.child_page(), 42);
+        assert_eq!(slot.offset(), 100);
+        assert_eq!(slot.key_len(), 5);
     }
 
     #[test]
@@ -437,7 +454,7 @@ mod tests {
         let slot = InteriorSlot::new(b"ab", 10, 200);
 
         assert_eq!(slot.prefix, [b'a', b'b', 0, 0]);
-        assert_eq!(slot.key_len, 2);
+        assert_eq!(slot.key_len(), 2);
     }
 
     #[test]
@@ -485,7 +502,7 @@ mod tests {
 
         assert_eq!(node.cell_count(), 1);
         assert_eq!(node.key_at(0).unwrap(), b"middle");
-        assert_eq!(node.slot_at(0).unwrap().child_page, 50);
+        assert_eq!(node.slot_at(0).unwrap().child_page(), 50);
         assert_eq!(node.right_child(), 100);
     }
 
@@ -503,9 +520,9 @@ mod tests {
         assert_eq!(node.key_at(1).unwrap(), b"bravo");
         assert_eq!(node.key_at(2).unwrap(), b"charlie");
 
-        assert_eq!(node.slot_at(0).unwrap().child_page, 10);
-        assert_eq!(node.slot_at(1).unwrap().child_page, 20);
-        assert_eq!(node.slot_at(2).unwrap().child_page, 30);
+        assert_eq!(node.slot_at(0).unwrap().child_page(), 10);
+        assert_eq!(node.slot_at(1).unwrap().child_page(), 20);
+        assert_eq!(node.slot_at(2).unwrap().child_page(), 30);
     }
 
     #[test]
@@ -636,7 +653,7 @@ mod tests {
         for i in 0..100 {
             let expected_key = format!("key{:03}", i);
             assert_eq!(node.key_at(i).unwrap(), expected_key.as_bytes());
-            assert_eq!(node.slot_at(i).unwrap().child_page, i as u32);
+            assert_eq!(node.slot_at(i).unwrap().child_page(), i as u32);
         }
     }
 
