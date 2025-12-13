@@ -472,6 +472,8 @@ impl<'a> Planner<'a> {
 
         match from {
             FromClause::Table(table_ref) => {
+                self.validate_table_exists(table_ref.schema, table_ref.name)?;
+
                 let scan = self.arena.alloc(LogicalOperator::Scan(LogicalScan {
                     schema: table_ref.schema,
                     table: table_ref.name,
@@ -605,7 +607,21 @@ impl<'a> Planner<'a> {
         }
     }
 
+    fn validate_table_exists(&self, schema: Option<&str>, table: &str) -> Result<()> {
+        let table_name = if let Some(s) = schema {
+            format!("{}.{}", s, table)
+        } else {
+            table.to_string()
+        };
+
+        self.catalog
+            .resolve_table(&table_name)
+            .map(|_| ())
+    }
+
     fn plan_insert(&self, insert: &crate::sql::ast::InsertStmt<'a>) -> Result<LogicalPlan<'a>> {
+        self.validate_table_exists(insert.table.schema, insert.table.name)?;
+
         let source = match insert.source {
             crate::sql::ast::InsertSource::Values(rows) => InsertSource::Values(rows),
             crate::sql::ast::InsertSource::Select(select) => {
@@ -626,6 +642,8 @@ impl<'a> Planner<'a> {
     }
 
     fn plan_update(&self, update: &crate::sql::ast::UpdateStmt<'a>) -> Result<LogicalPlan<'a>> {
+        self.validate_table_exists(update.table.schema, update.table.name)?;
+
         let mut assignments = bumpalo::collections::Vec::new_in(self.arena);
         for assign in update.assignments {
             assignments.push(UpdateAssignment {
@@ -645,6 +663,8 @@ impl<'a> Planner<'a> {
     }
 
     fn plan_delete(&self, delete: &crate::sql::ast::DeleteStmt<'a>) -> Result<LogicalPlan<'a>> {
+        self.validate_table_exists(delete.table.schema, delete.table.name)?;
+
         let delete_op = self.arena.alloc(LogicalOperator::Delete(LogicalDelete {
             schema: delete.table.schema,
             table: delete.table.name,
@@ -1376,6 +1396,39 @@ mod tests {
     use super::*;
     use bumpalo::Bump;
 
+    fn create_test_catalog() -> Catalog {
+        use crate::records::types::DataType;
+        use crate::schema::ColumnDef;
+
+        let mut catalog = Catalog::new();
+
+        let users_columns = vec![
+            ColumnDef::new("id", DataType::Int8),
+            ColumnDef::new("name", DataType::Text),
+            ColumnDef::new("email", DataType::Text),
+            ColumnDef::new("active", DataType::Bool),
+        ];
+        catalog.create_table("root", "users", users_columns).unwrap();
+
+        let orders_columns = vec![
+            ColumnDef::new("id", DataType::Int8),
+            ColumnDef::new("user_id", DataType::Int8),
+            ColumnDef::new("product_id", DataType::Int8),
+            ColumnDef::new("quantity", DataType::Int4),
+            ColumnDef::new("total", DataType::Float8),
+        ];
+        catalog.create_table("root", "orders", orders_columns).unwrap();
+
+        let products_columns = vec![
+            ColumnDef::new("id", DataType::Int8),
+            ColumnDef::new("name", DataType::Text),
+            ColumnDef::new("price", DataType::Float8),
+        ];
+        catalog.create_table("root", "products", products_columns).unwrap();
+
+        catalog
+    }
+
     #[test]
     fn logical_scan_has_table_and_schema() {
         let scan = LogicalScan {
@@ -1663,7 +1716,7 @@ mod tests {
         use crate::sql::ast::{Distinct, FromClause, SelectColumn, SelectStmt, TableRef};
 
         let arena = Bump::new();
-        let catalog = Catalog::new();
+        let catalog = create_test_catalog();
         let planner = Planner::new(&catalog, &arena);
 
         let table_ref = TableRef {
@@ -1708,7 +1761,7 @@ mod tests {
         use crate::sql::ast::{Distinct, FromClause, Literal, SelectColumn, SelectStmt, TableRef};
 
         let arena = Bump::new();
-        let catalog = Catalog::new();
+        let catalog = create_test_catalog();
         let planner = Planner::new(&catalog, &arena);
 
         let table_ref = TableRef {
@@ -1749,7 +1802,7 @@ mod tests {
         use crate::sql::ast::{Distinct, FromClause, Literal, SelectColumn, SelectStmt, TableRef};
 
         let arena = Bump::new();
-        let catalog = Catalog::new();
+        let catalog = create_test_catalog();
         let planner = Planner::new(&catalog, &arena);
 
         let table_ref = TableRef {
@@ -1795,7 +1848,7 @@ mod tests {
         };
 
         let arena = Bump::new();
-        let catalog = Catalog::new();
+        let catalog = create_test_catalog();
         let planner = Planner::new(&catalog, &arena);
 
         let left_table = TableRef {
@@ -1807,7 +1860,7 @@ mod tests {
 
         let right_table = TableRef {
             schema: None,
-            name: "customers",
+            name: "users",
             alias: None,
         };
         let right_from = arena.alloc(FromClause::Table(right_table));
@@ -1854,7 +1907,7 @@ mod tests {
         use crate::sql::ast::{InsertStmt, Literal, TableRef};
 
         let arena = Bump::new();
-        let catalog = Catalog::new();
+        let catalog = create_test_catalog();
         let planner = Planner::new(&catalog, &arena);
 
         let val1 = arena.alloc(Expr::Literal(Literal::Integer("1")));
@@ -1894,7 +1947,7 @@ mod tests {
         use crate::sql::ast::{InsertStmt, Literal, TableRef};
 
         let arena = Bump::new();
-        let catalog = Catalog::new();
+        let catalog = create_test_catalog();
         let planner = Planner::new(&catalog, &arena);
 
         let val1 = arena.alloc(Expr::Literal(Literal::Integer("1")));
@@ -1904,7 +1957,7 @@ mod tests {
 
         let insert = arena.alloc(InsertStmt {
             table: TableRef {
-                schema: Some("public"),
+                schema: Some("root"),
                 name: "users",
                 alias: None,
             },
@@ -1921,7 +1974,7 @@ mod tests {
         let plan = result.unwrap();
         if let LogicalOperator::Insert(insert_op) = plan.root {
             assert_eq!(insert_op.table, "users");
-            assert_eq!(insert_op.schema, Some("public"));
+            assert_eq!(insert_op.schema, Some("root"));
             assert_eq!(insert_op.columns, Some(&["id"][..]));
         }
     }
@@ -1931,7 +1984,7 @@ mod tests {
         use crate::sql::ast::{InsertStmt, TableRef};
 
         let arena = Bump::new();
-        let catalog = Catalog::new();
+        let catalog = create_test_catalog();
         let planner = Planner::new(&catalog, &arena);
 
         let insert = arena.alloc(InsertStmt {
@@ -1961,12 +2014,12 @@ mod tests {
         use crate::sql::ast::{Distinct, FromClause, InsertStmt, SelectColumn, SelectStmt, TableRef};
 
         let arena = Bump::new();
-        let catalog = Catalog::new();
+        let catalog = create_test_catalog();
         let planner = Planner::new(&catalog, &arena);
 
         let table_ref = TableRef {
             schema: None,
-            name: "source_table",
+            name: "users",
             alias: None,
         };
         let from = arena.alloc(FromClause::Table(table_ref));
@@ -1989,7 +2042,7 @@ mod tests {
         let insert = arena.alloc(InsertStmt {
             table: TableRef {
                 schema: None,
-                name: "target_table",
+                name: "orders",
                 alias: None,
             },
             columns: None,
@@ -2004,7 +2057,7 @@ mod tests {
 
         let plan = result.unwrap();
         if let LogicalOperator::Insert(insert_op) = plan.root {
-            assert_eq!(insert_op.table, "target_table");
+            assert_eq!(insert_op.table, "orders");
             assert!(matches!(insert_op.source, InsertSource::Select(_)));
         }
     }
@@ -2014,7 +2067,7 @@ mod tests {
         use crate::sql::ast::{Assignment, ColumnRef, Literal, TableRef, UpdateStmt};
 
         let arena = Bump::new();
-        let catalog = Catalog::new();
+        let catalog = create_test_catalog();
         let planner = Planner::new(&catalog, &arena);
 
         let value = arena.alloc(Expr::Literal(Literal::Integer("42")));
@@ -2060,7 +2113,7 @@ mod tests {
         use crate::sql::ast::{Assignment, ColumnRef, Literal, TableRef, UpdateStmt};
 
         let arena = Bump::new();
-        let catalog = Catalog::new();
+        let catalog = create_test_catalog();
         let planner = Planner::new(&catalog, &arena);
 
         let value = arena.alloc(Expr::Literal(Literal::String("inactive")));
@@ -2077,7 +2130,7 @@ mod tests {
 
         let update = arena.alloc(UpdateStmt {
             table: TableRef {
-                schema: Some("public"),
+                schema: Some("root"),
                 name: "users",
                 alias: None,
             },
@@ -2094,7 +2147,7 @@ mod tests {
         let plan = result.unwrap();
         if let LogicalOperator::Update(update_op) = plan.root {
             assert_eq!(update_op.table, "users");
-            assert_eq!(update_op.schema, Some("public"));
+            assert_eq!(update_op.schema, Some("root"));
             assert!(update_op.filter.is_some());
         }
     }
@@ -2104,7 +2157,7 @@ mod tests {
         use crate::sql::ast::{Assignment, ColumnRef, Literal, TableRef, UpdateStmt};
 
         let arena = Bump::new();
-        let catalog = Catalog::new();
+        let catalog = create_test_catalog();
         let planner = Planner::new(&catalog, &arena);
 
         let val1 = arena.alloc(Expr::Literal(Literal::String("John")));
@@ -2157,7 +2210,7 @@ mod tests {
         use crate::sql::ast::{DeleteStmt, TableRef};
 
         let arena = Bump::new();
-        let catalog = Catalog::new();
+        let catalog = create_test_catalog();
         let planner = Planner::new(&catalog, &arena);
 
         let delete = arena.alloc(DeleteStmt {
@@ -2190,14 +2243,14 @@ mod tests {
         use crate::sql::ast::{DeleteStmt, Literal, TableRef};
 
         let arena = Bump::new();
-        let catalog = Catalog::new();
+        let catalog = create_test_catalog();
         let planner = Planner::new(&catalog, &arena);
 
         let where_clause = arena.alloc(Expr::Literal(Literal::Boolean(true)));
 
         let delete = arena.alloc(DeleteStmt {
             table: TableRef {
-                schema: Some("public"),
+                schema: Some("root"),
                 name: "users",
                 alias: None,
             },
@@ -2213,7 +2266,7 @@ mod tests {
         let plan = result.unwrap();
         if let LogicalOperator::Delete(delete_op) = plan.root {
             assert_eq!(delete_op.table, "users");
-            assert_eq!(delete_op.schema, Some("public"));
+            assert_eq!(delete_op.schema, Some("root"));
             assert!(delete_op.filter.is_some());
         }
     }
@@ -3550,5 +3603,153 @@ mod tests {
         let index_columns = vec!["id".to_string()];
         let residual = planner.compute_residual_filter(predicate, &index_columns);
         assert!(residual.is_some());
+    }
+
+    #[test]
+    fn validate_table_exists_in_from_clause() {
+        use crate::records::types::DataType;
+        use crate::schema::ColumnDef;
+        use crate::sql::ast::{Distinct, FromClause, SelectColumn, SelectStmt, TableRef};
+
+        let arena = Bump::new();
+        let mut catalog = Catalog::new();
+
+        let columns = vec![
+            ColumnDef::new("id", DataType::Int8),
+            ColumnDef::new("name", DataType::Text),
+        ];
+        catalog.create_table("root", "users", columns).unwrap();
+
+        let planner = Planner::new(&catalog, &arena);
+
+        let select = arena.alloc(SelectStmt {
+            with: None,
+            distinct: Distinct::All,
+            columns: arena.alloc_slice_copy(&[SelectColumn::AllColumns]),
+            from: Some(arena.alloc(FromClause::Table(TableRef {
+                schema: None,
+                name: "users",
+                alias: None,
+            }))),
+            where_clause: None,
+            group_by: &[],
+            having: None,
+            order_by: &[],
+            limit: None,
+            offset: None,
+            set_op: None,
+            for_clause: None,
+        });
+
+        let result = planner.plan_select(select);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn validate_table_not_found_error() {
+        use crate::sql::ast::{Distinct, FromClause, SelectColumn, SelectStmt, TableRef};
+
+        let arena = Bump::new();
+        let catalog = Catalog::new();
+        let planner = Planner::new(&catalog, &arena);
+
+        let select = arena.alloc(SelectStmt {
+            with: None,
+            distinct: Distinct::All,
+            columns: arena.alloc_slice_copy(&[SelectColumn::AllColumns]),
+            from: Some(arena.alloc(FromClause::Table(TableRef {
+                schema: None,
+                name: "nonexistent_table",
+                alias: None,
+            }))),
+            where_clause: None,
+            group_by: &[],
+            having: None,
+            order_by: &[],
+            limit: None,
+            offset: None,
+            set_op: None,
+            for_clause: None,
+        });
+
+        let result = planner.plan_select(select);
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(err_msg.contains("not found") || err_msg.contains("does not exist"));
+    }
+
+    #[test]
+    fn validate_table_in_qualified_name() {
+        use crate::records::types::DataType;
+        use crate::schema::ColumnDef;
+        use crate::sql::ast::{Distinct, FromClause, SelectColumn, SelectStmt, TableRef};
+
+        let arena = Bump::new();
+        let mut catalog = Catalog::new();
+
+        catalog.create_schema("analytics").unwrap();
+        let schema = catalog.get_schema_mut("analytics").unwrap();
+        schema.add_table(crate::schema::TableDef::new(
+            1,
+            "events",
+            vec![ColumnDef::new("id", DataType::Int8)],
+        ));
+
+        let planner = Planner::new(&catalog, &arena);
+
+        let select = arena.alloc(SelectStmt {
+            with: None,
+            distinct: Distinct::All,
+            columns: arena.alloc_slice_copy(&[SelectColumn::AllColumns]),
+            from: Some(arena.alloc(FromClause::Table(TableRef {
+                schema: Some("analytics"),
+                name: "events",
+                alias: None,
+            }))),
+            where_clause: None,
+            group_by: &[],
+            having: None,
+            order_by: &[],
+            limit: None,
+            offset: None,
+            set_op: None,
+            for_clause: None,
+        });
+
+        let result = planner.plan_select(select);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn validate_schema_not_found_error() {
+        use crate::sql::ast::{Distinct, FromClause, SelectColumn, SelectStmt, TableRef};
+
+        let arena = Bump::new();
+        let catalog = Catalog::new();
+        let planner = Planner::new(&catalog, &arena);
+
+        let select = arena.alloc(SelectStmt {
+            with: None,
+            distinct: Distinct::All,
+            columns: arena.alloc_slice_copy(&[SelectColumn::AllColumns]),
+            from: Some(arena.alloc(FromClause::Table(TableRef {
+                schema: Some("nonexistent_schema"),
+                name: "table",
+                alias: None,
+            }))),
+            where_clause: None,
+            group_by: &[],
+            having: None,
+            order_by: &[],
+            limit: None,
+            offset: None,
+            set_op: None,
+            for_clause: None,
+        });
+
+        let result = planner.plan_select(select);
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(err_msg.contains("not found") || err_msg.contains("schema"));
     }
 }
