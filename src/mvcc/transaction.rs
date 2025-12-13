@@ -91,8 +91,9 @@ pub enum TxnState {
     Aborted,
 }
 
+use eyre::{bail, Result};
 use parking_lot::Mutex;
-use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 pub const MAX_CONCURRENT_TXNS: usize = 64;
 
@@ -113,6 +114,21 @@ impl TransactionManager {
             active_slots: [INIT; MAX_CONCURRENT_TXNS],
             slot_lock: Mutex::new(()),
         }
+    }
+
+    pub fn begin_txn(&self) -> Result<Transaction<'_>> {
+        let _guard = self.slot_lock.lock();
+        let start_ts = self.global_ts.fetch_add(1, Ordering::SeqCst);
+        for (idx, slot) in self.active_slots.iter().enumerate() {
+            if slot.load(Ordering::Relaxed) == 0 {
+                slot.store(start_ts, Ordering::SeqCst);
+                return Ok(Transaction::new(self, start_ts, idx));
+            }
+        }
+        bail!(
+            "too many concurrent transactions (max {})",
+            MAX_CONCURRENT_TXNS
+        )
     }
 }
 
