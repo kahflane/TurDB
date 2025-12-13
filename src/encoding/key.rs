@@ -45,6 +45,22 @@
 //! - Negative floats: invert all bits (!bits)
 //! - Positive floats: flip sign bit (bits ^ (1 << 63))
 //!
+//! ### Zero Canonicalization
+//!
+//! Both integer 0 and floating-point 0.0 encode to the same representation:
+//! the single-byte `ZERO` prefix (0x14). This is intentional for sort order
+//! consistency. However, decoding always returns `DecodedKey::Int(0)`:
+//!
+//! ```text
+//! encode_int(0)   → [0x14]
+//! encode_float(0.0) → [0x14]
+//! decode([0x14])    → DecodedKey::Int(0)  // Type information lost
+//! ```
+//!
+//! This means type information is lost for zero values during round-trip
+//! encoding/decoding. Applications requiring precise type preservation
+//! for zero should handle this case explicitly.
+//!
 //! ## Text Encoding Strategy
 //!
 //! Text values use escape encoding to handle embedded null bytes:
