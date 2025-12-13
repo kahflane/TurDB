@@ -159,7 +159,6 @@ pub enum Parameter<'a> {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Keyword {
-    // DDL
     Create,
     Alter,
     Drop,
@@ -167,16 +166,12 @@ pub enum Keyword {
     Add,
     Column,
     Rename,
-
-    // DML
     Select,
     Insert,
     Update,
     Delete,
     Merge,
     Upsert,
-
-    // Query clauses
     From,
     Where,
     Group,
@@ -187,8 +182,6 @@ pub enum Keyword {
     Fetch,
     By,
     As,
-
-    // Joins
     Join,
     Inner,
     Left,
@@ -199,32 +192,22 @@ pub enum Keyword {
     Natural,
     On,
     Using,
-
-    // Set operations
     Union,
     Intersect,
     Except,
     All,
     Distinct,
-
-    // Subquery keywords
     In,
     Exists,
     Any,
     Some,
-
-    // CTE
     With,
     Recursive,
-
-    // Transaction
     Begin,
     Commit,
     Rollback,
     Savepoint,
     Release,
-
-    // Constraints
     Primary,
     Foreign,
     Key,
@@ -237,16 +220,12 @@ pub enum Keyword {
     Cascade,
     Restrict,
     Set,
-
-    // Index
     Index,
     Btree,
     Hash,
     Gin,
     Gist,
     Hnsw,
-
-    // Types
     Integer,
     Int,
     Bigint,
@@ -272,8 +251,6 @@ pub enum Keyword {
     Jsonb,
     Vector,
     Array,
-
-    // Procedural
     Function,
     Procedure,
     Returns,
@@ -290,8 +267,6 @@ pub enum Keyword {
     Return,
     Call,
     Execute,
-
-    // Explain/Analyze
     Explain,
     Analyze,
     Verbose,
@@ -299,8 +274,6 @@ pub enum Keyword {
     Buffers,
     Timing,
     Format,
-
-    // Schema objects
     Schema,
     Database,
     Table,
@@ -311,8 +284,6 @@ pub enum Keyword {
     Type,
     Enum,
     Domain,
-
-    // Misc
     Case,
     When,
     Cast,
