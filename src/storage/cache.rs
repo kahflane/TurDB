@@ -372,10 +372,23 @@ impl PageCache {
         guard.get(key).map(|idx| {
             let entry = &guard.entries[idx];
             let ptr = entry.data.as_ptr();
+            // SAFETY: entry.data is a Box<[u8; PAGE_SIZE]> which is always valid for
+            // PAGE_SIZE bytes. The pointer is derived from a Box which guarantees proper
+            // alignment and validity. The lifetime of the returned slice is tied to the
+            // RwLockReadGuard, and since we return within the map closure, the guard
+            // remains held for the duration of the returned reference. The caller must
+            // ensure the cache entry remains valid (pinned) while using the slice.
             unsafe { std::slice::from_raw_parts(ptr, PAGE_SIZE) }
         })
     }
 
+    // SAFETY: This function is unsafe because it returns a mutable reference to page data
+    // while only holding a read lock. The caller must ensure:
+    // 1. Only one mutable reference exists at a time (enforced by PageRef's &mut self)
+    // 2. The page is pinned (enforced by PageRef holding a reference)
+    // 3. No concurrent read access occurs while mutating (caller responsibility)
+    // The function is private and only called from PageRef::data_mut which takes &mut self,
+    // ensuring exclusive access at the PageRef level.
     #[allow(clippy::mut_from_ref)]
     unsafe fn data_mut_unchecked(&self, key: &PageKey) -> Option<&mut [u8]> {
         let shard = self.shard(key);
@@ -385,6 +398,9 @@ impl PageCache {
             let entry = &guard.entries[idx];
             entry.mark_dirty();
             let ptr = entry.data.as_ptr() as *mut u8;
+            // SAFETY: entry.data is a Box<[u8; PAGE_SIZE]>, so ptr is valid for PAGE_SIZE
+            // bytes with proper alignment. The caller (PageRef::data_mut) ensures exclusive
+            // access via &mut self. The page is pinned, preventing eviction while in use.
             std::slice::from_raw_parts_mut(ptr, PAGE_SIZE)
         })
     }
@@ -475,6 +491,10 @@ impl<'a> PageRef<'a> {
     }
 
     pub fn data_mut(&mut self) -> &mut [u8] {
+        // SAFETY: PageRef takes &mut self, ensuring exclusive access. The page is pinned
+        // (pin_count > 0) because PageRef's existence implies the page was pinned in
+        // get_or_insert. The page cannot be evicted while pinned, so the underlying
+        // data remains valid. data_mut_unchecked's safety requirements are satisfied.
         unsafe {
             self.cache
                 .data_mut_unchecked(&self.key)

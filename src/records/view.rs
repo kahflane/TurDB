@@ -235,6 +235,12 @@ impl<'a> RecordView<'a> {
                 col_idx
             ));
         }
+        // SAFETY: This is safe because:
+        // 1. We verified float_bytes.as_ptr() is 4-byte aligned above (returns Err if not)
+        // 2. float_bytes.len() >= len * 4, so we have enough bytes for `len` f32 values
+        // 3. float_bytes is a valid slice into self.data, which is valid for 'a lifetime
+        // 4. f32 has no invalid bit patterns - all 32-bit patterns are valid floats
+        // 5. The returned slice lifetime is tied to self, which borrows the underlying data
         let floats = unsafe { std::slice::from_raw_parts(float_bytes.as_ptr() as *const f32, len) };
         Ok(floats)
     }
