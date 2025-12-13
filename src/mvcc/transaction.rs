@@ -160,6 +160,7 @@ impl Default for TransactionManager {
 }
 
 pub type TableId = u32;
+pub type PageId = u64;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WriteKey {
@@ -167,11 +168,23 @@ pub struct WriteKey {
     pub key: Vec<u8>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WriteEntry {
+    pub table_id: TableId,
+    pub key: Vec<u8>,
+    pub page_id: PageId,
+    pub offset: u16,
+    pub undo_page_id: Option<PageId>,
+    pub undo_offset: Option<u16>,
+    pub is_insert: bool,
+}
+
 pub struct Transaction<'a> {
     id: TxnId,
     slot_idx: usize,
     state: TxnState,
     write_set: smallvec::SmallVec<[WriteKey; 16]>,
+    write_entries: smallvec::SmallVec<[WriteEntry; 16]>,
     manager: &'a TransactionManager,
     committed: bool,
 }
@@ -183,6 +196,7 @@ impl<'a> Transaction<'a> {
             slot_idx,
             state: TxnState::Active,
             write_set: smallvec::SmallVec::new(),
+            write_entries: smallvec::SmallVec::new(),
             manager,
             committed: false,
         }
@@ -204,8 +218,16 @@ impl<'a> Transaction<'a> {
         &self.write_set
     }
 
+    pub fn write_entries(&self) -> &[WriteEntry] {
+        &self.write_entries
+    }
+
     pub fn add_to_write_set(&mut self, table_id: TableId, key: Vec<u8>) {
         self.write_set.push(WriteKey { table_id, key });
+    }
+
+    pub fn add_write_entry(&mut self, entry: WriteEntry) {
+        self.write_entries.push(entry);
     }
 
     pub fn commit(mut self) -> TxnId {
@@ -214,10 +236,39 @@ impl<'a> Transaction<'a> {
         self.manager.commit_txn(self.slot_idx)
     }
 
+    pub fn commit_with_finalize<F, E>(mut self, mut finalize: F) -> Result<TxnId, E>
+    where
+        F: FnMut(&WriteEntry, TxnId) -> Result<(), E>,
+    {
+        let commit_ts = self.manager.commit_txn(self.slot_idx);
+
+        for entry in &self.write_entries {
+            finalize(entry, commit_ts)?;
+        }
+
+        self.state = TxnState::Committed;
+        self.committed = true;
+        Ok(commit_ts)
+    }
+
     pub fn rollback(mut self) {
         self.state = TxnState::Aborted;
         self.committed = true;
         self.manager.abort_txn(self.slot_idx);
+    }
+
+    pub fn rollback_with_undo<F, E>(mut self, mut undo: F) -> Result<(), E>
+    where
+        F: FnMut(&WriteEntry) -> Result<(), E>,
+    {
+        for entry in self.write_entries.iter().rev() {
+            undo(entry)?;
+        }
+
+        self.state = TxnState::Aborted;
+        self.committed = true;
+        self.manager.abort_txn(self.slot_idx);
+        Ok(())
     }
 }
 
