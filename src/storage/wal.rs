@@ -146,7 +146,8 @@ use eyre::{Result, WrapErr, ensure, bail};
 use std::fs::{File, OpenOptions, create_dir_all};
 use std::path::{Path, PathBuf};
 use std::io::{Write, Read, Seek, SeekFrom};
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RwLock};
+use hashbrown::HashMap;
 
 use super::PAGE_SIZE;
 
@@ -154,6 +155,7 @@ pub struct Wal {
     #[allow(dead_code)]
     dir: PathBuf,
     current_segment: Mutex<WalSegment>,
+    page_index: RwLock<HashMap<u32, u64>>,
 }
 
 impl Wal {
@@ -167,6 +169,7 @@ impl Wal {
         Ok(Self {
             dir: dir.to_path_buf(),
             current_segment: Mutex::new(segment),
+            page_index: RwLock::new(HashMap::new()),
         })
     }
 
@@ -184,9 +187,27 @@ impl Wal {
             WalSegment::create(&segment_path, 1)?
         };
 
+        let mut page_index = HashMap::new();
+
+        if segment_path.exists() {
+            let mut scan_segment = WalSegment::open(&segment_path, 1)?;
+            let mut offset = 0u64;
+
+            loop {
+                match scan_segment.read_frame() {
+                    Ok((header, _)) => {
+                        page_index.insert(header.page_no, offset);
+                        offset += (WAL_FRAME_HEADER_SIZE + PAGE_SIZE) as u64;
+                    }
+                    Err(_) => break,
+                }
+            }
+        }
+
         Ok(Self {
             dir: dir.to_path_buf(),
             current_segment: Mutex::new(segment),
+            page_index: RwLock::new(page_index),
         })
     }
 
@@ -239,11 +260,37 @@ impl Wal {
 
         segment.offset = 0;
 
+        drop(segment);
+
+        let mut index = self.page_index.write();
+        index.clear();
+
         Ok(())
     }
 
     pub fn needs_checkpoint(&self, threshold_bytes: u64) -> bool {
         self.current_offset() >= threshold_bytes
+    }
+
+    pub fn read_page(&self, page_no: u32) -> Result<Option<Vec<u8>>> {
+        let index = self.page_index.read();
+        let offset = match index.get(&page_no) {
+            Some(&offset) => offset,
+            None => return Ok(None),
+        };
+        drop(index);
+
+        let segment_path = self.dir.join("wal.000001");
+        let mut segment = WalSegment::open(&segment_path, 1)?;
+
+        segment.file
+            .seek(SeekFrom::Start(offset))
+            .wrap_err_with(|| format!("failed to seek to offset {} in WAL", offset))?;
+
+        let (_, page_data) = segment.read_frame()
+            .wrap_err_with(|| format!("failed to read frame at offset {} for page {}", offset, page_no))?;
+
+        Ok(Some(page_data))
     }
 
     pub fn write_frame(&mut self, header: &WalFrameHeader, page_data: &[u8]) -> Result<()> {
@@ -258,8 +305,20 @@ impl Wal {
         let mut header_with_checksum = *header;
         header_with_checksum.checksum = checksum;
 
+        let current_offset = {
+            let segment = self.current_segment.lock();
+            segment.offset()
+        };
+
         let mut segment = self.current_segment.lock();
-        segment.write_frame(&header_with_checksum, page_data)
+        segment.write_frame(&header_with_checksum, page_data)?;
+
+        drop(segment);
+
+        let mut index = self.page_index.write();
+        index.insert(header.page_no, current_offset);
+
+        Ok(())
     }
 
     pub fn current_offset(&self) -> u64 {
@@ -880,6 +939,118 @@ mod tests {
 
         assert!(wal.needs_checkpoint(frame_size - 1));
         assert!(!wal.needs_checkpoint(frame_size + 1));
+
+        std::fs::remove_dir_all(&temp_dir).ok();
+    }
+
+    #[test]
+    fn read_page_returns_none_when_page_not_in_wal() {
+        let temp_dir = std::env::temp_dir().join("turdb_test_read_page_none");
+        let wal_dir = temp_dir.join("wal");
+
+        if temp_dir.exists() {
+            std::fs::remove_dir_all(&temp_dir).ok();
+        }
+
+        let wal = Wal::create(&wal_dir).expect("should create WAL");
+
+        let page = wal.read_page(42).expect("should read page");
+        assert!(page.is_none());
+
+        std::fs::remove_dir_all(&temp_dir).ok();
+    }
+
+    #[test]
+    fn read_page_returns_latest_page_data() {
+        use super::super::PAGE_SIZE;
+
+        let temp_dir = std::env::temp_dir().join("turdb_test_read_page_latest");
+        let wal_dir = temp_dir.join("wal");
+
+        if temp_dir.exists() {
+            std::fs::remove_dir_all(&temp_dir).ok();
+        }
+
+        let mut wal = Wal::create(&wal_dir).expect("should create WAL");
+
+        let page_data = vec![123u8; PAGE_SIZE];
+        let header = WalFrameHeader::new(5, 10, 1, 2, 0);
+        wal.write_frame(&header, &page_data).expect("should write frame");
+
+        let read_data = wal.read_page(5).expect("should read page");
+        assert!(read_data.is_some());
+
+        let read_data = read_data.unwrap();
+        assert_eq!(read_data.len(), PAGE_SIZE);
+        assert_eq!(read_data[0], 123);
+        assert_eq!(read_data[PAGE_SIZE - 1], 123);
+
+        std::fs::remove_dir_all(&temp_dir).ok();
+    }
+
+    #[test]
+    fn read_page_returns_latest_version_of_page() {
+        use super::super::PAGE_SIZE;
+
+        let temp_dir = std::env::temp_dir().join("turdb_test_read_page_latest_version");
+        let wal_dir = temp_dir.join("wal");
+
+        if temp_dir.exists() {
+            std::fs::remove_dir_all(&temp_dir).ok();
+        }
+
+        let mut wal = Wal::create(&wal_dir).expect("should create WAL");
+
+        let page_data_1 = vec![10u8; PAGE_SIZE];
+        let header_1 = WalFrameHeader::new(3, 10, 1, 2, 0);
+        wal.write_frame(&header_1, &page_data_1).expect("should write frame 1");
+
+        let page_data_2 = vec![20u8; PAGE_SIZE];
+        let header_2 = WalFrameHeader::new(3, 10, 1, 2, 0);
+        wal.write_frame(&header_2, &page_data_2).expect("should write frame 2");
+
+        let page_data_3 = vec![30u8; PAGE_SIZE];
+        let header_3 = WalFrameHeader::new(3, 10, 1, 2, 0);
+        wal.write_frame(&header_3, &page_data_3).expect("should write frame 3");
+
+        let read_data = wal.read_page(3).expect("should read page");
+        assert!(read_data.is_some());
+
+        let read_data = read_data.unwrap();
+        assert_eq!(read_data[0], 30);
+        assert_eq!(read_data[PAGE_SIZE - 1], 30);
+
+        std::fs::remove_dir_all(&temp_dir).ok();
+    }
+
+    #[test]
+    fn read_page_after_checkpoint_returns_none() {
+        use super::super::{PAGE_SIZE, MmapStorage};
+
+        let temp_dir = std::env::temp_dir().join("turdb_test_read_page_after_checkpoint");
+        let db_path = temp_dir.join("test.db");
+        let wal_dir = temp_dir.join("wal");
+
+        if temp_dir.exists() {
+            std::fs::remove_dir_all(&temp_dir).ok();
+        }
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        let mut storage = MmapStorage::create(&db_path, 10).expect("should create storage");
+
+        let mut wal = Wal::create(&wal_dir).expect("should create WAL");
+
+        let page_data = vec![77u8; PAGE_SIZE];
+        let header = WalFrameHeader::new(2, 10, 1, 2, 0);
+        wal.write_frame(&header, &page_data).expect("should write frame");
+
+        let read_before = wal.read_page(2).expect("should read page");
+        assert!(read_before.is_some());
+
+        wal.checkpoint(&mut storage).expect("should checkpoint");
+
+        let read_after = wal.read_page(2).expect("should read page");
+        assert!(read_after.is_none());
 
         std::fs::remove_dir_all(&temp_dir).ok();
     }
