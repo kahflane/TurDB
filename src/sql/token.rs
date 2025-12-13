@@ -119,6 +119,8 @@ pub enum Token<'a> {
     Gt,
     GtEq,
     Spaceship,
+    LtMinusGt,
+    LtHashGt,
 
     Arrow,
     DoubleArrow,
@@ -1027,6 +1029,8 @@ impl<'a> fmt::Display for Token<'a> {
             Token::Gt => write!(f, ">"),
             Token::GtEq => write!(f, ">="),
             Token::Spaceship => write!(f, "<=>"),
+            Token::LtMinusGt => write!(f, "<->"),
+            Token::LtHashGt => write!(f, "<#>"),
             Token::Arrow => write!(f, "->"),
             Token::DoubleArrow => write!(f, "->>"),
             Token::HashArrow => write!(f, "#>"),

@@ -2263,6 +2263,174 @@ mod tests {
             panic!("Expected Revoke statement");
         }
     }
+
+    #[test]
+    fn parse_vector_column_type() {
+        let arena = Bump::new();
+        let mut parser = Parser::new(
+            "CREATE TABLE embeddings (id INTEGER, embedding VECTOR(128))",
+            &arena,
+        );
+        let stmt = parser.parse_statement().unwrap();
+        if let Statement::CreateTable(ct) = stmt {
+            assert_eq!(ct.name, "embeddings");
+            assert_eq!(ct.columns.len(), 2);
+            assert!(matches!(ct.columns[1].data_type, DataType::Vector(Some(128))));
+        } else {
+            panic!("Expected CreateTable statement");
+        }
+    }
+
+    #[test]
+    fn parse_vector_column_without_dimension() {
+        let arena = Bump::new();
+        let mut parser = Parser::new(
+            "CREATE TABLE embeddings (id INTEGER, embedding VECTOR)",
+            &arena,
+        );
+        let stmt = parser.parse_statement().unwrap();
+        if let Statement::CreateTable(ct) = stmt {
+            assert!(matches!(ct.columns[1].data_type, DataType::Vector(None)));
+        } else {
+            panic!("Expected CreateTable statement");
+        }
+    }
+
+    #[test]
+    fn parse_direct_array_literal() {
+        let arena = Bump::new();
+        let mut parser = Parser::new("SELECT [1.0, 2.0, 3.0]", &arena);
+        let stmt = parser.parse_statement().unwrap();
+        if let Statement::Select(select) = stmt {
+            assert_eq!(select.columns.len(), 1);
+            if let SelectColumn::Expr { expr, .. } = &select.columns[0] {
+                assert!(matches!(expr, Expr::Array(_)));
+            } else {
+                panic!("Expected Expr column");
+            }
+        } else {
+            panic!("Expected Select statement");
+        }
+    }
+
+    #[test]
+    fn parse_empty_array_literal() {
+        let arena = Bump::new();
+        let mut parser = Parser::new("SELECT []", &arena);
+        let stmt = parser.parse_statement().unwrap();
+        if let Statement::Select(select) = stmt {
+            if let SelectColumn::Expr { expr, .. } = &select.columns[0] {
+                if let Expr::Array(elements) = expr {
+                    assert!(elements.is_empty());
+                } else {
+                    panic!("Expected Array");
+                }
+            } else {
+                panic!("Expected Expr column");
+            }
+        } else {
+            panic!("Expected Select statement");
+        }
+    }
+
+    #[test]
+    fn parse_l2_distance_operator() {
+        let arena = Bump::new();
+        let mut parser = Parser::new("SELECT embedding <-> [1.0, 2.0] FROM vectors", &arena);
+        let stmt = parser.parse_statement().unwrap();
+        if let Statement::Select(select) = stmt {
+            if let SelectColumn::Expr { expr, .. } = &select.columns[0] {
+                if let Expr::BinaryOp { op, .. } = expr {
+                    assert_eq!(op, &BinaryOperator::VectorL2Distance);
+                } else {
+                    panic!("Expected BinaryOp");
+                }
+            } else {
+                panic!("Expected Expr column");
+            }
+        } else {
+            panic!("Expected Select statement");
+        }
+    }
+
+    #[test]
+    fn parse_inner_product_operator() {
+        let arena = Bump::new();
+        let mut parser = Parser::new("SELECT embedding <#> [1.0, 2.0] FROM vectors", &arena);
+        let stmt = parser.parse_statement().unwrap();
+        if let Statement::Select(select) = stmt {
+            if let SelectColumn::Expr { expr, .. } = &select.columns[0] {
+                if let Expr::BinaryOp { op, .. } = expr {
+                    assert_eq!(op, &BinaryOperator::VectorInnerProduct);
+                } else {
+                    panic!("Expected BinaryOp");
+                }
+            } else {
+                panic!("Expected Expr column");
+            }
+        } else {
+            panic!("Expected Select statement");
+        }
+    }
+
+    #[test]
+    fn parse_cosine_distance_operator() {
+        let arena = Bump::new();
+        let mut parser = Parser::new("SELECT embedding <=> [1.0, 2.0] FROM vectors", &arena);
+        let stmt = parser.parse_statement().unwrap();
+        if let Statement::Select(select) = stmt {
+            if let SelectColumn::Expr { expr, .. } = &select.columns[0] {
+                if let Expr::BinaryOp { op, .. } = expr {
+                    assert_eq!(op, &BinaryOperator::VectorCosineDistance);
+                } else {
+                    panic!("Expected BinaryOp");
+                }
+            } else {
+                panic!("Expected Expr column");
+            }
+        } else {
+            panic!("Expected Select statement");
+        }
+    }
+
+    #[test]
+    fn parse_create_hnsw_index() {
+        let arena = Bump::new();
+        let mut parser = Parser::new(
+            "CREATE INDEX idx_embedding ON documents USING HNSW (embedding)",
+            &arena,
+        );
+        let stmt = parser.parse_statement().unwrap();
+        if let Statement::CreateIndex(ci) = stmt {
+            assert_eq!(ci.name, "idx_embedding");
+            assert_eq!(ci.table.name, "documents");
+            assert_eq!(ci.index_type, Some(IndexType::Hnsw));
+            assert_eq!(ci.columns.len(), 1);
+        } else {
+            panic!("Expected CreateIndex statement");
+        }
+    }
+
+    #[test]
+    fn parse_order_by_distance() {
+        let arena = Bump::new();
+        let mut parser = Parser::new(
+            "SELECT * FROM vectors ORDER BY embedding <-> [1.0, 2.0] LIMIT 10",
+            &arena,
+        );
+        let stmt = parser.parse_statement().unwrap();
+        if let Statement::Select(select) = stmt {
+            assert!(!select.order_by.is_empty());
+            assert_eq!(select.order_by.len(), 1);
+            if let Expr::BinaryOp { op, .. } = select.order_by[0].expr {
+                assert_eq!(op, &BinaryOperator::VectorL2Distance);
+            } else {
+                panic!("Expected BinaryOp in ORDER BY");
+            }
+        } else {
+            panic!("Expected Select statement");
+        }
+    }
 }
 
 pub struct Parser<'a> {
@@ -3030,6 +3198,9 @@ impl<'a> Parser<'a> {
                 Token::AtGt => Some((BinaryOperator::JsonContains, 6, 7)),
                 Token::LtAt => Some((BinaryOperator::JsonContainedBy, 6, 7)),
                 Token::DoubleAmpersand => Some((BinaryOperator::ArrayOverlaps, 6, 7)),
+                Token::LtMinusGt => Some((BinaryOperator::VectorL2Distance, 6, 7)),
+                Token::LtHashGt => Some((BinaryOperator::VectorInnerProduct, 6, 7)),
+                Token::Spaceship => Some((BinaryOperator::VectorCosineDistance, 6, 7)),
                 _ => None,
             };
 
@@ -3297,6 +3468,17 @@ impl<'a> Parser<'a> {
                         self.expect_token(&Token::RParen)?;
                         Ok(expr)
                     }
+                }
+            }
+            Token::LBracket => {
+                self.advance();
+                if self.check_token(&Token::RBracket) {
+                    self.advance();
+                    Ok(Expr::Array(&[]))
+                } else {
+                    let exprs = self.parse_expr_list()?;
+                    self.expect_token(&Token::RBracket)?;
+                    Ok(Expr::Array(exprs))
                 }
             }
             Token::Keyword(Keyword::Case) => self.parse_case(),
