@@ -732,6 +732,89 @@ impl<'a> Planner<'a> {
             }
         })
     }
+
+    pub fn estimate_cardinality(&self, op: &LogicalOperator<'a>) -> u64 {
+        const DEFAULT_TABLE_CARDINALITY: u64 = 1000;
+        const FILTER_SELECTIVITY: f64 = 0.1;
+        const JOIN_SELECTIVITY: f64 = 0.1;
+
+        match op {
+            LogicalOperator::Scan(_) => DEFAULT_TABLE_CARDINALITY,
+            LogicalOperator::Filter(filter) => {
+                let input_card = self.estimate_cardinality(filter.input);
+                ((input_card as f64) * FILTER_SELECTIVITY).max(1.0) as u64
+            }
+            LogicalOperator::Project(project) => self.estimate_cardinality(project.input),
+            LogicalOperator::Aggregate(agg) => {
+                let input_card = self.estimate_cardinality(agg.input);
+                if agg.group_by.is_empty() {
+                    1
+                } else {
+                    (input_card / 10).max(1)
+                }
+            }
+            LogicalOperator::Join(join) => {
+                let left_card = self.estimate_cardinality(join.left);
+                let right_card = self.estimate_cardinality(join.right);
+                if join.condition.is_some() {
+                    ((left_card as f64 * right_card as f64 * JOIN_SELECTIVITY) as u64).max(1)
+                } else {
+                    left_card * right_card
+                }
+            }
+            LogicalOperator::Sort(sort) => self.estimate_cardinality(sort.input),
+            LogicalOperator::Limit(limit) => {
+                let input_card = self.estimate_cardinality(limit.input);
+                match (limit.limit, limit.offset) {
+                    (Some(l), Some(o)) => input_card.saturating_sub(o).min(l),
+                    (Some(l), None) => input_card.min(l),
+                    (None, Some(o)) => input_card.saturating_sub(o),
+                    (None, None) => input_card,
+                }
+            }
+            LogicalOperator::Values(values) => values.rows.len() as u64,
+            LogicalOperator::Insert(_) => 0,
+            LogicalOperator::Update(_) => 0,
+            LogicalOperator::Delete(_) => 0,
+        }
+    }
+
+    pub fn extract_join_tables(&self, op: &'a LogicalOperator<'a>) -> Vec<&'a LogicalOperator<'a>> {
+        let mut tables = Vec::new();
+        self.collect_join_tables(op, &mut tables);
+        tables
+    }
+
+    fn collect_join_tables(
+        &self,
+        op: &'a LogicalOperator<'a>,
+        tables: &mut Vec<&'a LogicalOperator<'a>>,
+    ) {
+        match op {
+            LogicalOperator::Join(join) => {
+                self.collect_join_tables(join.left, tables);
+                self.collect_join_tables(join.right, tables);
+            }
+            LogicalOperator::Scan(_) => {
+                tables.push(op);
+            }
+            LogicalOperator::Filter(filter) => {
+                self.collect_join_tables(filter.input, tables);
+            }
+            _ => {
+                tables.push(op);
+            }
+        }
+    }
+
+    pub fn order_tables_by_cardinality(
+        &self,
+        tables_with_card: Vec<(&'a LogicalOperator<'a>, u64)>,
+    ) -> Vec<&'a LogicalOperator<'a>> {
+        let mut sorted = tables_with_card;
+        sorted.sort_by_key(|(_, card)| *card);
+        sorted.into_iter().map(|(op, _)| op).collect()
+    }
 }
 
 #[cfg(test)]
@@ -1733,5 +1816,151 @@ mod tests {
 
         assert!(best.is_some());
         assert_eq!(best.unwrap().name(), "idx_id_status");
+    }
+
+    #[test]
+    fn estimate_scan_cardinality() {
+        let arena = Bump::new();
+        let catalog = Catalog::new();
+        let planner = Planner::new(&catalog, &arena);
+
+        let scan = arena.alloc(LogicalOperator::Scan(LogicalScan {
+            schema: None,
+            table: "users",
+            alias: None,
+        }));
+
+        let est = planner.estimate_cardinality(scan);
+        assert!(est > 0);
+    }
+
+    #[test]
+    fn estimate_filter_reduces_cardinality() {
+        let arena = Bump::new();
+        let catalog = Catalog::new();
+        let planner = Planner::new(&catalog, &arena);
+
+        let scan = arena.alloc(LogicalOperator::Scan(LogicalScan {
+            schema: None,
+            table: "users",
+            alias: None,
+        }));
+
+        let predicate = arena.alloc(Expr::Literal(crate::sql::ast::Literal::Boolean(true)));
+        let filter = arena.alloc(LogicalOperator::Filter(LogicalFilter {
+            input: scan,
+            predicate,
+        }));
+
+        let scan_est = planner.estimate_cardinality(scan);
+        let filter_est = planner.estimate_cardinality(filter);
+        assert!(filter_est <= scan_est);
+    }
+
+    #[test]
+    fn estimate_join_multiplies_cardinalities() {
+        let arena = Bump::new();
+        let catalog = Catalog::new();
+        let planner = Planner::new(&catalog, &arena);
+
+        let left = arena.alloc(LogicalOperator::Scan(LogicalScan {
+            schema: None,
+            table: "orders",
+            alias: None,
+        }));
+        let right = arena.alloc(LogicalOperator::Scan(LogicalScan {
+            schema: None,
+            table: "customers",
+            alias: None,
+        }));
+
+        let join = arena.alloc(LogicalOperator::Join(LogicalJoin {
+            left,
+            right,
+            join_type: JoinType::Inner,
+            condition: None,
+        }));
+
+        let join_est = planner.estimate_cardinality(join);
+        assert!(join_est > 0);
+    }
+
+    #[test]
+    fn extract_join_tables() {
+        let arena = Bump::new();
+        let catalog = Catalog::new();
+        let planner = Planner::new(&catalog, &arena);
+
+        let t1 = arena.alloc(LogicalOperator::Scan(LogicalScan {
+            schema: None,
+            table: "orders",
+            alias: None,
+        }));
+        let t2 = arena.alloc(LogicalOperator::Scan(LogicalScan {
+            schema: None,
+            table: "customers",
+            alias: None,
+        }));
+        let t3 = arena.alloc(LogicalOperator::Scan(LogicalScan {
+            schema: None,
+            table: "products",
+            alias: None,
+        }));
+
+        let join1 = arena.alloc(LogicalOperator::Join(LogicalJoin {
+            left: t1,
+            right: t2,
+            join_type: JoinType::Inner,
+            condition: None,
+        }));
+        let join2 = arena.alloc(LogicalOperator::Join(LogicalJoin {
+            left: join1,
+            right: t3,
+            join_type: JoinType::Inner,
+            condition: None,
+        }));
+
+        let tables = planner.extract_join_tables(join2);
+        assert_eq!(tables.len(), 3);
+    }
+
+    #[test]
+    fn reorder_joins_smallest_first() {
+        let arena = Bump::new();
+        let catalog = Catalog::new();
+        let planner = Planner::new(&catalog, &arena);
+
+        let scans: Vec<(&LogicalOperator, u64)> = vec![
+            (
+                arena.alloc(LogicalOperator::Scan(LogicalScan {
+                    schema: None,
+                    table: "large_table",
+                    alias: None,
+                })) as &LogicalOperator,
+                1000,
+            ),
+            (
+                arena.alloc(LogicalOperator::Scan(LogicalScan {
+                    schema: None,
+                    table: "small_table",
+                    alias: None,
+                })) as &LogicalOperator,
+                10,
+            ),
+            (
+                arena.alloc(LogicalOperator::Scan(LogicalScan {
+                    schema: None,
+                    table: "medium_table",
+                    alias: None,
+                })) as &LogicalOperator,
+                100,
+            ),
+        ];
+
+        let ordered = planner.order_tables_by_cardinality(scans);
+        assert_eq!(ordered.len(), 3);
+        if let LogicalOperator::Scan(s) = ordered[0] {
+            assert_eq!(s.table, "small_table");
+        }
     }
 }
