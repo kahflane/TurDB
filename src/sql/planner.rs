@@ -978,6 +978,162 @@ impl<'a> Planner<'a> {
         sorted.sort_by_key(|(_, card)| *card);
         sorted.into_iter().map(|(op, _)| op).collect()
     }
+
+    pub fn extract_scan_bounds_for_column(
+        &self,
+        predicate: &'a Expr<'a>,
+        target_column: &str,
+    ) -> ColumnScanBounds<'a> {
+        let mut bounds = ColumnScanBounds {
+            lower: None,
+            upper: None,
+            point_value: None,
+        };
+
+        self.collect_bounds_from_expr(predicate, target_column, &mut bounds);
+        bounds
+    }
+
+    fn collect_bounds_from_expr(
+        &self,
+        expr: &'a Expr<'a>,
+        target_column: &str,
+        bounds: &mut ColumnScanBounds<'a>,
+    ) {
+        use crate::sql::ast::BinaryOperator;
+
+        match expr {
+            Expr::BinaryOp { left, op, right } => {
+                match op {
+                    BinaryOperator::And => {
+                        self.collect_bounds_from_expr(left, target_column, bounds);
+                        self.collect_bounds_from_expr(right, target_column, bounds);
+                    }
+                    BinaryOperator::Eq => {
+                        if self.expr_references_column(left, target_column) {
+                            bounds.point_value = Some(ColumnBound {
+                                value: right,
+                                inclusive: true,
+                            });
+                        } else if self.expr_references_column(right, target_column) {
+                            bounds.point_value = Some(ColumnBound {
+                                value: left,
+                                inclusive: true,
+                            });
+                        }
+                    }
+                    BinaryOperator::Lt => {
+                        if self.expr_references_column(left, target_column) {
+                            bounds.upper = Some(ColumnBound {
+                                value: right,
+                                inclusive: false,
+                            });
+                        } else if self.expr_references_column(right, target_column) {
+                            bounds.lower = Some(ColumnBound {
+                                value: left,
+                                inclusive: false,
+                            });
+                        }
+                    }
+                    BinaryOperator::LtEq => {
+                        if self.expr_references_column(left, target_column) {
+                            bounds.upper = Some(ColumnBound {
+                                value: right,
+                                inclusive: true,
+                            });
+                        } else if self.expr_references_column(right, target_column) {
+                            bounds.lower = Some(ColumnBound {
+                                value: left,
+                                inclusive: true,
+                            });
+                        }
+                    }
+                    BinaryOperator::Gt => {
+                        if self.expr_references_column(left, target_column) {
+                            bounds.lower = Some(ColumnBound {
+                                value: right,
+                                inclusive: false,
+                            });
+                        } else if self.expr_references_column(right, target_column) {
+                            bounds.upper = Some(ColumnBound {
+                                value: left,
+                                inclusive: false,
+                            });
+                        }
+                    }
+                    BinaryOperator::GtEq => {
+                        if self.expr_references_column(left, target_column) {
+                            bounds.lower = Some(ColumnBound {
+                                value: right,
+                                inclusive: true,
+                            });
+                        } else if self.expr_references_column(right, target_column) {
+                            bounds.upper = Some(ColumnBound {
+                                value: left,
+                                inclusive: true,
+                            });
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            Expr::Between {
+                expr: between_expr,
+                negated,
+                low,
+                high,
+            } => {
+                if !negated && self.expr_references_column(between_expr, target_column) {
+                    bounds.lower = Some(ColumnBound {
+                        value: low,
+                        inclusive: true,
+                    });
+                    bounds.upper = Some(ColumnBound {
+                        value: high,
+                        inclusive: true,
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn expr_references_column(&self, expr: &Expr<'a>, target_column: &str) -> bool {
+        match expr {
+            Expr::Column(col_ref) => col_ref.column.eq_ignore_ascii_case(target_column),
+            _ => false,
+        }
+    }
+
+    pub fn bounds_to_scan_type(&self, bounds: &ColumnScanBounds<'a>) -> ScanBoundType {
+        if bounds.point_value.is_some() {
+            ScanBoundType::Point
+        } else if bounds.lower.is_some() || bounds.upper.is_some() {
+            ScanBoundType::Range
+        } else {
+            ScanBoundType::Full
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ColumnBound<'a> {
+    pub value: &'a Expr<'a>,
+    pub inclusive: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct ColumnScanBounds<'a> {
+    pub lower: Option<ColumnBound<'a>>,
+    pub upper: Option<ColumnBound<'a>>,
+    pub point_value: Option<ColumnBound<'a>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScanBoundType {
+    Point,
+    Range,
+    Full,
 }
 
 #[cfg(test)]
@@ -2626,5 +2782,196 @@ mod tests {
         assert_eq!(aggregates[2].function, AggregateFunction::Avg);
         assert_eq!(aggregates[3].function, AggregateFunction::Min);
         assert_eq!(aggregates[4].function, AggregateFunction::Max);
+    }
+
+    #[test]
+    fn extract_scan_bounds_equality() {
+        use crate::sql::ast::{BinaryOperator, ColumnRef, Literal};
+
+        let arena = Bump::new();
+        let catalog = Catalog::new();
+        let planner = Planner::new(&catalog, &arena);
+
+        let col = arena.alloc(Expr::Column(ColumnRef {
+            schema: None,
+            table: None,
+            column: "id",
+        }));
+        let val = arena.alloc(Expr::Literal(Literal::Integer("42")));
+        let predicate = arena.alloc(Expr::BinaryOp {
+            left: col,
+            op: BinaryOperator::Eq,
+            right: val,
+        });
+
+        let bounds = planner.extract_scan_bounds_for_column(predicate, "id");
+
+        assert!(bounds.point_value.is_some());
+        assert!(bounds.lower.is_none());
+        assert!(bounds.upper.is_none());
+        assert_eq!(planner.bounds_to_scan_type(&bounds), ScanBoundType::Point);
+    }
+
+    #[test]
+    fn extract_scan_bounds_greater_than() {
+        use crate::sql::ast::{BinaryOperator, ColumnRef, Literal};
+
+        let arena = Bump::new();
+        let catalog = Catalog::new();
+        let planner = Planner::new(&catalog, &arena);
+
+        let col = arena.alloc(Expr::Column(ColumnRef {
+            schema: None,
+            table: None,
+            column: "age",
+        }));
+        let val = arena.alloc(Expr::Literal(Literal::Integer("18")));
+        let predicate = arena.alloc(Expr::BinaryOp {
+            left: col,
+            op: BinaryOperator::Gt,
+            right: val,
+        });
+
+        let bounds = planner.extract_scan_bounds_for_column(predicate, "age");
+
+        assert!(bounds.lower.is_some());
+        assert!(!bounds.lower.unwrap().inclusive);
+        assert!(bounds.upper.is_none());
+        assert!(bounds.point_value.is_none());
+        assert_eq!(planner.bounds_to_scan_type(&bounds), ScanBoundType::Range);
+    }
+
+    #[test]
+    fn extract_scan_bounds_less_than_or_equal() {
+        use crate::sql::ast::{BinaryOperator, ColumnRef, Literal};
+
+        let arena = Bump::new();
+        let catalog = Catalog::new();
+        let planner = Planner::new(&catalog, &arena);
+
+        let col = arena.alloc(Expr::Column(ColumnRef {
+            schema: None,
+            table: None,
+            column: "price",
+        }));
+        let val = arena.alloc(Expr::Literal(Literal::Float("100.00")));
+        let predicate = arena.alloc(Expr::BinaryOp {
+            left: col,
+            op: BinaryOperator::LtEq,
+            right: val,
+        });
+
+        let bounds = planner.extract_scan_bounds_for_column(predicate, "price");
+
+        assert!(bounds.upper.is_some());
+        assert!(bounds.upper.unwrap().inclusive);
+        assert!(bounds.lower.is_none());
+        assert_eq!(planner.bounds_to_scan_type(&bounds), ScanBoundType::Range);
+    }
+
+    #[test]
+    fn extract_scan_bounds_between() {
+        use crate::sql::ast::{ColumnRef, Literal};
+
+        let arena = Bump::new();
+        let catalog = Catalog::new();
+        let planner = Planner::new(&catalog, &arena);
+
+        let col = arena.alloc(Expr::Column(ColumnRef {
+            schema: None,
+            table: None,
+            column: "score",
+        }));
+        let low = arena.alloc(Expr::Literal(Literal::Integer("60")));
+        let high = arena.alloc(Expr::Literal(Literal::Integer("100")));
+        let predicate = arena.alloc(Expr::Between {
+            expr: col,
+            negated: false,
+            low,
+            high,
+        });
+
+        let bounds = planner.extract_scan_bounds_for_column(predicate, "score");
+
+        assert!(bounds.lower.is_some());
+        assert!(bounds.upper.is_some());
+        assert!(bounds.lower.unwrap().inclusive);
+        assert!(bounds.upper.unwrap().inclusive);
+        assert_eq!(planner.bounds_to_scan_type(&bounds), ScanBoundType::Range);
+    }
+
+    #[test]
+    fn extract_scan_bounds_combined_and() {
+        use crate::sql::ast::{BinaryOperator, ColumnRef, Literal};
+
+        let arena = Bump::new();
+        let catalog = Catalog::new();
+        let planner = Planner::new(&catalog, &arena);
+
+        let col1 = arena.alloc(Expr::Column(ColumnRef {
+            schema: None,
+            table: None,
+            column: "age",
+        }));
+        let val1 = arena.alloc(Expr::Literal(Literal::Integer("18")));
+        let cond1 = arena.alloc(Expr::BinaryOp {
+            left: col1,
+            op: BinaryOperator::GtEq,
+            right: val1,
+        });
+
+        let col2 = arena.alloc(Expr::Column(ColumnRef {
+            schema: None,
+            table: None,
+            column: "age",
+        }));
+        let val2 = arena.alloc(Expr::Literal(Literal::Integer("65")));
+        let cond2 = arena.alloc(Expr::BinaryOp {
+            left: col2,
+            op: BinaryOperator::Lt,
+            right: val2,
+        });
+
+        let predicate = arena.alloc(Expr::BinaryOp {
+            left: cond1,
+            op: BinaryOperator::And,
+            right: cond2,
+        });
+
+        let bounds = planner.extract_scan_bounds_for_column(predicate, "age");
+
+        assert!(bounds.lower.is_some());
+        assert!(bounds.upper.is_some());
+        assert!(bounds.lower.unwrap().inclusive);
+        assert!(!bounds.upper.unwrap().inclusive);
+        assert_eq!(planner.bounds_to_scan_type(&bounds), ScanBoundType::Range);
+    }
+
+    #[test]
+    fn extract_scan_bounds_no_applicable_predicate() {
+        use crate::sql::ast::{BinaryOperator, ColumnRef, Literal};
+
+        let arena = Bump::new();
+        let catalog = Catalog::new();
+        let planner = Planner::new(&catalog, &arena);
+
+        let col = arena.alloc(Expr::Column(ColumnRef {
+            schema: None,
+            table: None,
+            column: "name",
+        }));
+        let val = arena.alloc(Expr::Literal(Literal::String("John")));
+        let predicate = arena.alloc(Expr::BinaryOp {
+            left: col,
+            op: BinaryOperator::Eq,
+            right: val,
+        });
+
+        let bounds = planner.extract_scan_bounds_for_column(predicate, "id");
+
+        assert!(bounds.lower.is_none());
+        assert!(bounds.upper.is_none());
+        assert!(bounds.point_value.is_none());
+        assert_eq!(planner.bounds_to_scan_type(&bounds), ScanBoundType::Full);
     }
 }
