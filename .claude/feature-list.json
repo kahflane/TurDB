@@ -1596,11 +1596,11 @@
         },
         {
           "task": "Implement read_frame() with checksum validation",
-          "done": false
+          "done": true
         },
         {
           "task": "Implement sync() for durability",
-          "done": false
+          "done": true
         }
       ]
     },

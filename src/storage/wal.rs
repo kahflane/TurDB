@@ -94,8 +94,11 @@
 //! For safety, we sync after each frame write by default.
 
 use zerocopy::{IntoBytes, FromBytes, Immutable};
+use crc::{Crc, CRC_64_ECMA_182};
 
 pub const WAL_FRAME_HEADER_SIZE: usize = 32;
+
+const CRC64: Crc<u64> = Crc::<u64>::new(&CRC_64_ECMA_182);
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, IntoBytes, FromBytes, Immutable)]
@@ -121,10 +124,28 @@ impl WalFrameHeader {
     }
 }
 
-use eyre::{Result, WrapErr, ensure};
+pub fn compute_checksum(header: &WalFrameHeader, page_data: &[u8]) -> u64 {
+    let mut digest = CRC64.digest();
+
+    digest.update(&header.page_no.to_le_bytes());
+    digest.update(&header.db_size.to_le_bytes());
+    digest.update(&header.salt1.to_le_bytes());
+    digest.update(&header.salt2.to_le_bytes());
+
+    digest.update(page_data);
+
+    digest.finalize()
+}
+
+pub fn validate_checksum(header: &WalFrameHeader, page_data: &[u8]) -> bool {
+    let computed = compute_checksum(header, page_data);
+    computed == header.checksum
+}
+
+use eyre::{Result, WrapErr, ensure, bail};
 use std::fs::{File, OpenOptions, create_dir_all};
 use std::path::{Path, PathBuf};
-use std::io::Write;
+use std::io::{Write, Read, Seek, SeekFrom};
 use parking_lot::Mutex;
 
 use super::PAGE_SIZE;
@@ -157,8 +178,12 @@ impl Wal {
             page_data.len()
         );
 
+        let checksum = compute_checksum(header, page_data);
+        let mut header_with_checksum = *header;
+        header_with_checksum.checksum = checksum;
+
         let mut segment = self.current_segment.lock();
-        segment.write_frame(header, page_data)
+        segment.write_frame(&header_with_checksum, page_data)
     }
 
     pub fn current_offset(&self) -> u64 {
@@ -190,6 +215,23 @@ impl WalSegment {
         })
     }
 
+    pub fn open(path: &Path, sequence: u64) -> Result<Self> {
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .wrap_err_with(|| format!("failed to open WAL segment at {:?}", path))?;
+
+        file.seek(SeekFrom::Start(0))
+            .wrap_err("failed to seek to start of WAL segment")?;
+
+        Ok(Self {
+            file,
+            sequence,
+            offset: 0,
+        })
+    }
+
     pub fn sequence(&self) -> u64 {
         self.sequence
     }
@@ -208,9 +250,36 @@ impl WalSegment {
             .write_all(page_data)
             .wrap_err("failed to write WAL frame page data")?;
 
+        self.file
+            .sync_all()
+            .wrap_err("failed to sync WAL frame to disk")?;
+
         self.offset += (WAL_FRAME_HEADER_SIZE + PAGE_SIZE) as u64;
 
         Ok(())
+    }
+
+    pub fn read_frame(&mut self) -> Result<(WalFrameHeader, Vec<u8>)> {
+        let mut header_bytes = vec![0u8; WAL_FRAME_HEADER_SIZE];
+        self.file
+            .read_exact(&mut header_bytes)
+            .wrap_err("failed to read WAL frame header")?;
+
+        let header = WalFrameHeader::read_from_bytes(&header_bytes)
+            .map_err(|e| eyre::eyre!("invalid WAL frame header: {:?}", e))?;
+
+        let mut page_data = vec![0u8; PAGE_SIZE];
+        self.file
+            .read_exact(&mut page_data)
+            .wrap_err("failed to read WAL frame page data")?;
+
+        if !validate_checksum(&header, &page_data) {
+            bail!("WAL frame checksum validation failed");
+        }
+
+        self.offset += (WAL_FRAME_HEADER_SIZE + PAGE_SIZE) as u64;
+
+        Ok((header, page_data))
     }
 }
 
@@ -358,6 +427,180 @@ mod tests {
 
         let expected_offset = WAL_FRAME_HEADER_SIZE + PAGE_SIZE;
         assert_eq!(wal.current_offset(), expected_offset as u64);
+
+        std::fs::remove_dir_all(&temp_dir).ok();
+    }
+
+    #[test]
+    fn compute_checksum_for_frame() {
+        use super::super::PAGE_SIZE;
+
+        let page_data = vec![42u8; PAGE_SIZE];
+        let mut header = WalFrameHeader::new(5, 10, 0x12345678, 0x9ABCDEF0, 0);
+
+        let checksum = compute_checksum(&header, &page_data);
+
+        assert_ne!(checksum, 0, "checksum should not be zero");
+
+        header.checksum = checksum;
+    }
+
+    #[test]
+    fn same_data_produces_same_checksum() {
+        use super::super::PAGE_SIZE;
+
+        let page_data = vec![123u8; PAGE_SIZE];
+        let header = WalFrameHeader::new(1, 1, 100, 200, 0);
+
+        let checksum1 = compute_checksum(&header, &page_data);
+        let checksum2 = compute_checksum(&header, &page_data);
+
+        assert_eq!(checksum1, checksum2);
+    }
+
+    #[test]
+    fn different_data_produces_different_checksum() {
+        use super::super::PAGE_SIZE;
+
+        let page_data1 = vec![1u8; PAGE_SIZE];
+        let page_data2 = vec![2u8; PAGE_SIZE];
+        let header = WalFrameHeader::new(1, 1, 100, 200, 0);
+
+        let checksum1 = compute_checksum(&header, &page_data1);
+        let checksum2 = compute_checksum(&header, &page_data2);
+
+        assert_ne!(checksum1, checksum2);
+    }
+
+    #[test]
+    fn validate_checksum_accepts_valid_frame() {
+        use super::super::PAGE_SIZE;
+
+        let page_data = vec![55u8; PAGE_SIZE];
+        let mut header = WalFrameHeader::new(3, 7, 0xAABBCCDD, 0x11223344, 0);
+
+        let checksum = compute_checksum(&header, &page_data);
+        header.checksum = checksum;
+
+        assert!(validate_checksum(&header, &page_data));
+    }
+
+    #[test]
+    fn validate_checksum_rejects_corrupted_frame() {
+        use super::super::PAGE_SIZE;
+
+        let page_data = vec![77u8; PAGE_SIZE];
+        let mut header = WalFrameHeader::new(8, 15, 0xDEADBEEF, 0xCAFEBABE, 0);
+
+        let checksum = compute_checksum(&header, &page_data);
+        header.checksum = checksum + 1;
+
+        assert!(!validate_checksum(&header, &page_data));
+    }
+
+    #[test]
+    fn validate_checksum_rejects_corrupted_data() {
+        use super::super::PAGE_SIZE;
+
+        let mut page_data = vec![88u8; PAGE_SIZE];
+        let mut header = WalFrameHeader::new(10, 20, 0x11111111, 0x22222222, 0);
+
+        let checksum = compute_checksum(&header, &page_data);
+        header.checksum = checksum;
+
+        page_data[100] = 99;
+
+        assert!(!validate_checksum(&header, &page_data));
+    }
+
+    #[test]
+    fn read_frame_roundtrip() {
+        use super::super::PAGE_SIZE;
+        use std::io::{Seek, SeekFrom};
+
+        let temp_dir = std::env::temp_dir().join("turdb_test_read_frame");
+        let wal_dir = temp_dir.join("wal");
+
+        if wal_dir.exists() {
+            std::fs::remove_dir_all(&wal_dir).ok();
+        }
+
+        let mut wal = Wal::create(&wal_dir).expect("should create WAL");
+
+        let page_data = vec![42u8; PAGE_SIZE];
+        let header = WalFrameHeader::new(5, 10, 0x12345678, 0x9ABCDEF0, 0);
+
+        wal.write_frame(&header, &page_data).expect("should write frame");
+
+        let segment_path = wal_dir.join("wal.000001");
+        let mut segment = WalSegment::open(&segment_path, 1).expect("should open segment");
+
+        let (read_header, read_data) = segment.read_frame().expect("should read frame");
+
+        assert_eq!(read_header.page_no, header.page_no);
+        assert_eq!(read_header.db_size, header.db_size);
+        assert_eq!(read_header.salt1, header.salt1);
+        assert_eq!(read_header.salt2, header.salt2);
+        assert_eq!(read_data, page_data);
+
+        std::fs::remove_dir_all(&temp_dir).ok();
+    }
+
+    #[test]
+    fn read_frame_validates_checksum() {
+        use super::super::PAGE_SIZE;
+
+        let temp_dir = std::env::temp_dir().join("turdb_test_read_frame_checksum");
+        let wal_dir = temp_dir.join("wal");
+
+        if wal_dir.exists() {
+            std::fs::remove_dir_all(&wal_dir).ok();
+        }
+
+        let mut wal = Wal::create(&wal_dir).expect("should create WAL");
+
+        let page_data = vec![99u8; PAGE_SIZE];
+        let header = WalFrameHeader::new(1, 1, 100, 200, 0);
+
+        wal.write_frame(&header, &page_data).expect("should write frame");
+
+        let segment_path = wal_dir.join("wal.000001");
+        let mut segment = WalSegment::open(&segment_path, 1).expect("should open segment");
+
+        let (read_header, read_data) = segment.read_frame().expect("should read frame");
+
+        assert!(validate_checksum(&read_header, &read_data));
+
+        std::fs::remove_dir_all(&temp_dir).ok();
+    }
+
+    #[test]
+    fn read_frame_multiple_frames() {
+        use super::super::PAGE_SIZE;
+
+        let temp_dir = std::env::temp_dir().join("turdb_test_read_multiple_frames");
+        let wal_dir = temp_dir.join("wal");
+
+        if wal_dir.exists() {
+            std::fs::remove_dir_all(&wal_dir).ok();
+        }
+
+        let mut wal = Wal::create(&wal_dir).expect("should create WAL");
+
+        for i in 0..3 {
+            let page_data = vec![i as u8; PAGE_SIZE];
+            let header = WalFrameHeader::new(i as u32, (i + 1) as u32, 0, 0, 0);
+            wal.write_frame(&header, &page_data).expect("should write frame");
+        }
+
+        let segment_path = wal_dir.join("wal.000001");
+        let mut segment = WalSegment::open(&segment_path, 1).expect("should open segment");
+
+        for expected_i in 0..3 {
+            let (header, data) = segment.read_frame().expect("should read frame");
+            assert_eq!(header.page_no, expected_i as u32);
+            assert_eq!(data[0], expected_i as u8);
+        }
 
         std::fs::remove_dir_all(&temp_dir).ok();
     }
