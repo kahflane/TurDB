@@ -126,6 +126,7 @@ use smallvec::SmallVec;
 
 use super::interior::{separator_len, InteriorNode, InteriorNodeMut, INTERIOR_SLOT_SIZE};
 use super::leaf::{LeafNode, LeafNodeMut, SearchResult, SLOT_SIZE};
+use crate::encoding::varint::varint_len;
 use crate::storage::{Freelist, MmapStorage, PageHeader, PageType};
 
 pub const MAX_TREE_DEPTH: usize = 8;
@@ -310,8 +311,8 @@ impl<'a> BTree<'a> {
         let page_data = self.storage.page_mut(page_no)?;
         let mut leaf = LeafNodeMut::from_page(page_data)?;
 
-        let varint_len = varint_size(value.len() as u64);
-        let cell_size = key.len() + varint_len + value.len();
+        let value_len_size = varint_len(value.len() as u64);
+        let cell_size = key.len() + value_len_size + value.len();
         let space_needed = cell_size + SLOT_SIZE;
 
         if leaf.free_space() as usize >= space_needed {
@@ -859,22 +860,6 @@ impl<'a> Cursor<'a> {
                 ),
             }
         }
-    }
-}
-
-fn varint_size(value: u64) -> usize {
-    if value <= 240 {
-        1
-    } else if value <= 2287 {
-        2
-    } else if value <= 67823 {
-        3
-    } else if value <= 0xFF_FFFF {
-        4
-    } else if value <= 0xFFFF_FFFF {
-        5
-    } else {
-        9
     }
 }
 
