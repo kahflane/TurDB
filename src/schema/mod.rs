@@ -95,6 +95,7 @@
 //! ```
 
 pub mod catalog;
+pub mod persistence;
 pub mod table;
 
 pub use catalog::Catalog;
