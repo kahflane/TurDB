@@ -40,18 +40,18 @@
 //!
 //! - Path stack uses `SmallVec<[u32; 8]>` - stack-allocated for trees up to 8 levels
 //! - No heap allocation during search operations
-//! - Split operations allocate `Vec<Vec<u8>>` temporarily (~1 per 100-1000 inserts)
+//! - Split operations use per-operation `bumpalo` arena allocators
 //!
-//! ### Split Allocation Tradeoff
+//! ### Arena-Based Split Operations
 //!
-//! Node splits copy all keys/values to Vec temporaries for redistribution. This is
-//! acceptable because:
-//! - Splits are rare (~1 per 100-1000 inserts depending on key/value sizes)
-//! - Split cost is amortized across many insertions
-//! - Alternative (arena allocator) adds complexity for minimal gain
+//! Node splits use ephemeral `bumpalo::Bump` arenas for temporary key/value storage
+//! during redistribution. This design:
+//! - Avoids heap fragmentation from many small allocations
+//! - Deallocates all temporary storage in O(1) when arena is dropped
+//! - Keeps the memory locality of temporary data high (single allocation block)
 //!
-//! Future optimization: Use `bumpalo` arena allocator if profiling shows split
-//! allocation as a bottleneck in high-throughput scenarios.
+//! The arena is created at split start and dropped at function end. Only the
+//! separator key (which must outlive the split) uses heap allocation.
 //!
 //! ## Free Page Management
 //!
@@ -121,6 +121,8 @@
 //! - Interior nodes: ~800+ children with suffix truncation
 //! - Tree depth for 1M rows: typically 2-3 levels (fits in SmallVec)
 
+use bumpalo::collections::Vec as BumpVec;
+use bumpalo::Bump;
 use eyre::{bail, ensure, Result};
 use smallvec::SmallVec;
 
@@ -324,10 +326,11 @@ impl<'a> BTree<'a> {
     }
 
     fn split_leaf(&mut self, page_no: u32, key: &[u8], value: &[u8]) -> Result<InsertResult> {
+        let arena = Bump::new();
         let new_page_no = self.allocate_page()?;
 
-        let mut all_keys: Vec<Vec<u8>> = Vec::new();
-        let mut all_values: Vec<Vec<u8>> = Vec::new();
+        let mut all_keys: BumpVec<&[u8]> = BumpVec::new_in(&arena);
+        let mut all_values: BumpVec<&[u8]> = BumpVec::new_in(&arena);
 
         {
             let page_data = self.storage.page(page_no)?;
@@ -335,17 +338,17 @@ impl<'a> BTree<'a> {
             let count = leaf.cell_count() as usize;
 
             for i in 0..count {
-                all_keys.push(leaf.key_at(i)?.to_vec());
-                all_values.push(leaf.value_at(i)?.to_vec());
+                all_keys.push(arena.alloc_slice_copy(leaf.key_at(i)?));
+                all_values.push(arena.alloc_slice_copy(leaf.value_at(i)?));
             }
         }
 
         let insert_pos = all_keys
             .iter()
-            .position(|k| k.as_slice() > key)
+            .position(|k| *k > key)
             .unwrap_or(all_keys.len());
-        all_keys.insert(insert_pos, key.to_vec());
-        all_values.insert(insert_pos, value.to_vec());
+        all_keys.insert(insert_pos, arena.alloc_slice_copy(key));
+        all_values.insert(insert_pos, arena.alloc_slice_copy(value));
 
         let mid = all_keys.len() / 2;
 
@@ -360,7 +363,7 @@ impl<'a> BTree<'a> {
             let page_data = self.storage.page_mut(page_no)?;
             let mut leaf = LeafNodeMut::init(page_data)?;
             for i in 0..mid {
-                leaf.insert_cell(&all_keys[i], &all_values[i])?;
+                leaf.insert_cell(all_keys[i], all_values[i])?;
             }
             leaf.set_next_leaf(new_page_no)?;
         }
@@ -370,12 +373,12 @@ impl<'a> BTree<'a> {
             let page_data = self.storage.page_mut(new_page_no)?;
             let mut new_leaf = LeafNodeMut::init(page_data)?;
             for i in mid..all_keys.len() {
-                new_leaf.insert_cell(&all_keys[i], &all_values[i])?;
+                new_leaf.insert_cell(all_keys[i], all_values[i])?;
             }
             new_leaf.set_next_leaf(old_next_leaf)?;
 
-            let left_max = &all_keys[mid - 1];
-            let right_min = &all_keys[mid];
+            let left_max = all_keys[mid - 1];
+            let right_min = all_keys[mid];
             let sep_len = separator_len(left_max, right_min);
             separator_key = right_min[..sep_len].to_vec();
         }
@@ -458,10 +461,11 @@ impl<'a> BTree<'a> {
         new_separator: &[u8],
         new_right_child: u32,
     ) -> Result<InsertResult> {
+        let arena = Bump::new();
         let new_page_no = self.allocate_page()?;
 
-        let mut all_separators: Vec<Vec<u8>> = Vec::new();
-        let mut all_children: Vec<u32> = Vec::new();
+        let mut all_separators: BumpVec<&[u8]> = BumpVec::new_in(&arena);
+        let mut all_children: BumpVec<u32> = BumpVec::new_in(&arena);
         let old_right_child: u32;
 
         {
@@ -470,7 +474,7 @@ impl<'a> BTree<'a> {
             let count = interior.cell_count() as usize;
 
             for i in 0..count {
-                all_separators.push(interior.key_at(i)?.to_vec());
+                all_separators.push(arena.alloc_slice_copy(interior.key_at(i)?));
                 all_children.push(interior.slot_at(i)?.child_page);
             }
             old_right_child = interior.right_child();
@@ -478,10 +482,10 @@ impl<'a> BTree<'a> {
 
         let insert_pos = all_separators
             .iter()
-            .position(|s| s.as_slice() > new_separator)
+            .position(|s| *s > new_separator)
             .unwrap_or(all_separators.len());
 
-        all_separators.insert(insert_pos, new_separator.to_vec());
+        all_separators.insert(insert_pos, arena.alloc_slice_copy(new_separator));
 
         if insert_pos == all_children.len() {
             all_children.push(old_right_child);
@@ -490,7 +494,7 @@ impl<'a> BTree<'a> {
         }
 
         let mid = all_separators.len() / 2;
-        let promoted_separator = all_separators[mid].clone();
+        let promoted_separator = all_separators[mid].to_vec();
 
         {
             let page_data = self.storage.page_mut(page_no)?;
@@ -499,7 +503,7 @@ impl<'a> BTree<'a> {
 
             for i in 0..mid {
                 interior.insert_separator(
-                    &all_separators[i],
+                    all_separators[i],
                     if i == 0 { first_child } else { all_children[i] },
                 )?;
             }
@@ -515,7 +519,7 @@ impl<'a> BTree<'a> {
             let mut new_interior = InteriorNodeMut::init(page_data, last_child)?;
 
             for i in (mid + 1)..all_separators.len() {
-                new_interior.insert_separator(&all_separators[i], all_children[i])?;
+                new_interior.insert_separator(all_separators[i], all_children[i])?;
             }
         }
 
