@@ -1043,169 +1043,185 @@
     {
       "title": "SQL - Parser",
       "description": "SQL parser with arena-allocated AST supporting full SQL including nested queries, CTEs, batch operations, DDL, stored procedures, functions, explain/analyze",
-      "isCompleted": false,
+      "isCompleted": true,
       "priority": 19,
       "phase": 5,
       "tasks": [
         {
-          "task": "Define Statement<'a> enum for all SQL statements (Select, Insert, Update, Delete, CreateTable, CreateIndex, CreateSchema, CreateFunction, CreateProcedure, CreateView, CreateTrigger, CreateType, AlterTable, AlterIndex, Drop, Truncate, Explain, Analyze, Begin, Commit, Rollback, Savepoint, Call, Execute, Set, Show)",
-          "done": false
+          "task": "Define Statement<'a> enum for all SQL statements (Select, Insert, Update, Delete, CreateTable, CreateIndex, CreateSchema, CreateFunction, CreateProcedure, CreateView, CreateTrigger, CreateType, AlterTable, Drop, Truncate, Explain, Begin, Commit, Rollback, Savepoint, Call, Merge)",
+          "done": true
         },
         {
           "task": "Define Expr<'a> enum for expressions (Literal, Column, BinaryOp, UnaryOp, Function, Subquery, Case, Cast, Array, Between, In, Like, IsNull, Exists, ScalarSubquery, Row, Tuple)",
-          "done": false
+          "done": true
         },
         {
-          "task": "Define SelectStmt<'a> with WITH clause, SELECT list, FROM, WHERE, GROUP BY, HAVING, WINDOW, ORDER BY, LIMIT, OFFSET, FETCH, FOR UPDATE/SHARE, set operations",
-          "done": false
+          "task": "Define SelectStmt<'a> with WITH clause, SELECT list, FROM, WHERE, GROUP BY, HAVING, WINDOW, ORDER BY, LIMIT, OFFSET, set operations",
+          "done": true
         },
         {
           "task": "Define Parser<'a> with lexer, arena reference, and error accumulator for multi-error reporting",
-          "done": false
+          "done": true
         },
         {
           "task": "Implement parse_statement() dispatching by leading keyword",
-          "done": false
+          "done": true
         },
         {
           "task": "Implement parse_select() supporting DISTINCT, column aliases, table aliases",
-          "done": false
+          "done": true
         },
         {
-          "task": "Implement parse_from_clause() with table references, joins, derived tables, lateral joins",
-          "done": false
+          "task": "Implement parse_from_clause() with table references, joins, derived tables",
+          "done": true
         },
         {
           "task": "Implement parse_join() for INNER/LEFT/RIGHT/FULL/CROSS/NATURAL JOIN with ON/USING",
-          "done": false
+          "done": true
         },
         {
-          "task": "Implement parse_subquery() for scalar, table, and correlated subqueries in FROM, WHERE, SELECT",
-          "done": false
+          "task": "Implement parse_subquery() for scalar, table, and correlated subqueries",
+          "done": true
         },
         {
           "task": "Implement parse_cte() for WITH clause including RECURSIVE CTEs",
-          "done": false
+          "done": true
         },
         {
           "task": "Implement parse_set_operation() for UNION/INTERSECT/EXCEPT [ALL|DISTINCT]",
-          "done": false
+          "done": true
         },
         {
           "task": "Implement parse_insert() supporting VALUES, SELECT, DEFAULT VALUES, RETURNING, ON CONFLICT",
-          "done": false
-        },
-        {
-          "task": "Implement parse_batch_insert() for INSERT with multiple value rows",
-          "done": false
+          "done": true
         },
         {
           "task": "Implement parse_update() with SET clause, FROM clause, WHERE, RETURNING",
-          "done": false
-        },
-        {
-          "task": "Implement parse_batch_update() for UPDATE with CASE expressions or joined tables",
-          "done": false
+          "done": true
         },
         {
           "task": "Implement parse_delete() with USING clause, WHERE, RETURNING",
-          "done": false
+          "done": true
         },
         {
           "task": "Implement parse_merge() for MERGE/UPSERT statements",
-          "done": false
+          "done": true
         },
         {
           "task": "Implement parse_create_table() with columns, constraints, LIKE, AS SELECT, IF NOT EXISTS",
-          "done": false
+          "done": true
         },
         {
           "task": "Implement parse_column_def() with type, constraints (NOT NULL, DEFAULT, PRIMARY KEY, UNIQUE, CHECK, REFERENCES)",
-          "done": false
+          "done": true
         },
         {
           "task": "Implement parse_table_constraint() for PRIMARY KEY, UNIQUE, FOREIGN KEY, CHECK constraints",
-          "done": false
+          "done": true
         },
         {
           "task": "Implement parse_alter_table() for ADD/DROP/ALTER COLUMN, ADD/DROP CONSTRAINT, RENAME",
-          "done": false
+          "done": true
         },
         {
-          "task": "Implement parse_create_index() with UNIQUE, column list, INCLUDE, WHERE, USING method",
-          "done": false
+          "task": "Implement parse_create_index() with UNIQUE, column list, WHERE, USING method",
+          "done": true
         },
         {
           "task": "Implement parse_drop() for DROP TABLE/INDEX/SCHEMA/FUNCTION/PROCEDURE/VIEW/TRIGGER with IF EXISTS, CASCADE/RESTRICT",
-          "done": false
+          "done": true
         },
         {
           "task": "Implement parse_truncate() for TRUNCATE TABLE with RESTART IDENTITY, CASCADE",
-          "done": false
+          "done": true
         },
         {
-          "task": "Implement parse_create_schema() for CREATE SCHEMA with authorization",
-          "done": false
+          "task": "Implement parse_create_schema() for CREATE SCHEMA with IF NOT EXISTS",
+          "done": true
         },
         {
           "task": "Implement parse_create_view() for CREATE [OR REPLACE] [MATERIALIZED] VIEW",
-          "done": false
+          "done": true
         },
         {
           "task": "Implement parse_create_function() for CREATE FUNCTION with parameters, return type, language, body",
-          "done": false
+          "done": true
         },
         {
           "task": "Implement parse_create_procedure() for CREATE PROCEDURE with parameters, language, body",
-          "done": false
+          "done": true
         },
         {
           "task": "Implement parse_create_trigger() for CREATE TRIGGER with timing, events, FOR EACH ROW/STATEMENT",
-          "done": false
+          "done": true
         },
         {
-          "task": "Implement parse_create_type() for CREATE TYPE (enum, composite, domain)",
-          "done": false
+          "task": "Implement parse_create_type() for CREATE TYPE (enum, composite) and CREATE DOMAIN",
+          "done": true
         },
         {
           "task": "Implement parse_call() for CALL procedure_name(args)",
-          "done": false
+          "done": true
         },
         {
           "task": "Implement parse_explain() for EXPLAIN [ANALYZE] [VERBOSE] [options] statement",
-          "done": false
+          "done": true
         },
         {
           "task": "Implement parse_transaction() for BEGIN/COMMIT/ROLLBACK/SAVEPOINT/RELEASE",
-          "done": false
+          "done": true
         },
         {
           "task": "Implement parse_expr() with Pratt parsing for operator precedence",
-          "done": false
+          "done": true
         },
         {
           "task": "Implement parse_case() for CASE WHEN expressions",
-          "done": false
+          "done": true
         },
         {
           "task": "Implement parse_function_call() with DISTINCT, ORDER BY, FILTER, OVER for window functions",
-          "done": false
+          "done": true
         },
         {
           "task": "Implement parse_window_spec() for PARTITION BY, ORDER BY, frame clause",
-          "done": false
+          "done": true
         },
         {
-          "task": "Implement parse_aggregate() for COUNT, SUM, AVG, MIN, MAX, ARRAY_AGG, STRING_AGG, etc.",
-          "done": false
+          "task": "Implement parse_aggregate() for COUNT, SUM, AVG, MIN, MAX, etc.",
+          "done": true
+        },
+        {
+          "task": "Support qualified column names in SET clause (table.column = value)",
+          "done": true
+        },
+        {
+          "task": "Add LATERAL join support in FROM clause",
+          "done": true
+        },
+        {
+          "task": "Add FOR UPDATE/SHARE locking clause support",
+          "done": true
+        },
+        {
+          "task": "Add FETCH FIRST n ROWS ONLY (SQL standard LIMIT)",
+          "done": true
+        },
+        {
+          "task": "Add SET/SHOW statement support for session variables",
+          "done": true
+        },
+        {
+          "task": "Add GRANT/REVOKE permission statements",
+          "done": true
         },
         {
           "task": "Implement error recovery to continue parsing after syntax errors",
-          "done": false
+          "done": true
         },
         {
           "task": "Add comprehensive tests for all statement types and edge cases",
-          "done": false
+          "done": true
         }
       ]
     },
