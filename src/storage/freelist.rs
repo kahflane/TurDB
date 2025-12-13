@@ -223,11 +223,22 @@ impl Freelist {
         }
 
         let entry_index = (count - 1) as usize;
-        let entry_offset = PAGE_HEADER_SIZE + TRUNK_HEADER_SIZE + entry_index * 4;
+        let entries_size = entry_index
+            .checked_mul(4)
+            .ok_or_else(|| eyre::eyre!("trunk entry index overflow: {}", entry_index))?;
+        let entry_offset = (PAGE_HEADER_SIZE + TRUNK_HEADER_SIZE)
+            .checked_add(entries_size)
+            .ok_or_else(|| eyre::eyre!("entry offset overflow"))?;
+        ensure!(
+            entry_offset + 4 <= PAGE_SIZE,
+            "trunk entry at offset {} exceeds page size {}",
+            entry_offset,
+            PAGE_SIZE
+        );
         let page_no = u32::from_le_bytes(
             page_data[entry_offset..entry_offset + 4]
                 .try_into()
-                .unwrap(),
+                .map_err(|_| eyre::eyre!("failed to read page number from freelist"))?,
         );
 
         let trunk = TrunkHeader::from_bytes_mut(&mut page_data[trunk_offset..])?;
@@ -266,7 +277,18 @@ impl Freelist {
             trunk.count()
         };
 
-        let entry_offset = PAGE_HEADER_SIZE + TRUNK_HEADER_SIZE + count as usize * 4;
+        let entries_size = (count as usize)
+            .checked_mul(4)
+            .ok_or_else(|| eyre::eyre!("trunk count overflow: {}", count))?;
+        let entry_offset = (PAGE_HEADER_SIZE + TRUNK_HEADER_SIZE)
+            .checked_add(entries_size)
+            .ok_or_else(|| eyre::eyre!("entry offset overflow"))?;
+        ensure!(
+            entry_offset + 4 <= PAGE_SIZE,
+            "trunk entry at offset {} exceeds page size {}",
+            entry_offset,
+            PAGE_SIZE
+        );
         page_data[entry_offset..entry_offset + 4].copy_from_slice(&page_no.to_le_bytes());
 
         let trunk = TrunkHeader::from_bytes_mut(&mut page_data[trunk_offset..])?;
