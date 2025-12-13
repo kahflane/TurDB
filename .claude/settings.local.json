@@ -22,7 +22,9 @@
       "Bash(MIRIFLAGS=\"-Zmiri-disable-isolation\" cargo +nightly miri test:*)",
       "Bash(./scripts/lint-inline-comments.sh:*)",
       "Bash(./scripts/lint-unwrap-panic.sh:*)",
-      "Bash(cargo bench:*)"
+      "Bash(cargo bench:*)",
+      "Bash(wc:*)",
+      "Bash(grep:*)"
     ]
   }
 }

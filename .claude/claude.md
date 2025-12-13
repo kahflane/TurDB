@@ -113,7 +113,7 @@ Regular Page (1+):          Page 0 (file header):
 
 ### 4. Memory Budget: 1MB Minimum
 
-The database MUST be able to start and perform basic operations with only 1MB RAM:
+The database MUST be able to start and perform basic operations with only 1MB RAM but it can grow more if needed:
 - Page cache: 32 pages minimum (512KB)
 - Fixed overhead: Maximum 256KB
 - Working memory: Maximum 256KB
