@@ -166,6 +166,20 @@ impl NodeId {
     pub const fn is_none(&self) -> bool {
         self.page_no == u32::MAX && self.slot_index == u16::MAX
     }
+
+    pub fn write_to(&self, buf: &mut [u8]) {
+        buf[0..4].copy_from_slice(&self.page_no.to_le_bytes());
+        buf[4..6].copy_from_slice(&self.slot_index.to_le_bytes());
+    }
+
+    pub fn read_from(buf: &[u8]) -> Self {
+        let page_no = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
+        let slot_index = u16::from_le_bytes([buf[4], buf[5]]);
+        Self {
+            page_no,
+            slot_index,
+        }
+    }
 }
 
 impl Default for NodeId {
@@ -262,6 +276,105 @@ impl HnswNode {
                 level_vec.push(neighbor);
             }
         }
+    }
+
+    pub fn serialized_size(&self) -> usize {
+        let mut size = 8 + 1 + 1;
+        size += (self.l0_count as usize) * 6;
+        for level_neighbors in &self.higher_levels {
+            size += 1;
+            size += level_neighbors.len() * 6;
+        }
+        size
+    }
+
+    pub fn write_to(&self, buf: &mut [u8]) -> usize {
+        let mut offset = 0;
+        buf[offset..offset + 8].copy_from_slice(&self.row_id.to_le_bytes());
+        offset += 8;
+        buf[offset] = self.max_level;
+        offset += 1;
+        buf[offset] = self.l0_count;
+        offset += 1;
+
+        for i in 0..self.l0_count as usize {
+            self.l0_neighbors[i].write_to(&mut buf[offset..offset + 6]);
+            offset += 6;
+        }
+
+        for level_neighbors in &self.higher_levels {
+            buf[offset] = level_neighbors.len() as u8;
+            offset += 1;
+            for neighbor in level_neighbors {
+                neighbor.write_to(&mut buf[offset..offset + 6]);
+                offset += 6;
+            }
+        }
+
+        offset
+    }
+
+    pub fn read_from(buf: &[u8]) -> eyre::Result<Self> {
+        use eyre::ensure;
+
+        ensure!(buf.len() >= 10, "buffer too small for HnswNode header");
+
+        let row_id = u64::from_le_bytes([
+            buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7],
+        ]);
+        let max_level = buf[8];
+        let l0_count = buf[9];
+
+        ensure!(
+            l0_count as usize <= MAX_LEVEL0_NEIGHBORS,
+            "l0_count {} exceeds maximum {}",
+            l0_count,
+            MAX_LEVEL0_NEIGHBORS
+        );
+
+        let mut offset = 10;
+        let mut l0_neighbors = [NodeId::none(); MAX_LEVEL0_NEIGHBORS];
+        for (i, neighbor) in l0_neighbors.iter_mut().enumerate().take(l0_count as usize) {
+            ensure!(
+                offset + 6 <= buf.len(),
+                "buffer too small for L0 neighbor {}",
+                i
+            );
+            *neighbor = NodeId::read_from(&buf[offset..offset + 6]);
+            offset += 6;
+        }
+
+        let mut higher_levels = Vec::with_capacity(max_level as usize);
+        for level in 0..max_level {
+            ensure!(
+                offset < buf.len(),
+                "buffer too small for level {} count",
+                level + 1
+            );
+            let level_count = buf[offset] as usize;
+            offset += 1;
+
+            let mut level_neighbors = Vec::with_capacity(level_count);
+            for i in 0..level_count {
+                ensure!(
+                    offset + 6 <= buf.len(),
+                    "buffer too small for level {} neighbor {}",
+                    level + 1,
+                    i
+                );
+                level_neighbors.push(NodeId::read_from(&buf[offset..offset + 6]));
+                offset += 6;
+            }
+            higher_levels.push(level_neighbors);
+        }
+
+        Ok(Self {
+            row_id,
+            max_level,
+            l0_count,
+            l0_neighbors,
+            higher_levels,
+        })
     }
 }
 
@@ -507,5 +620,63 @@ mod tests {
 
         assert_eq!(f32_ref.dimension(), 3);
         assert_eq!(sq8_ref.dimension(), 5);
+    }
+
+    #[test]
+    fn node_id_serialization_roundtrip() {
+        let node_id = NodeId::new(12345, 678);
+        let mut buf = [0u8; 6];
+
+        node_id.write_to(&mut buf);
+        let decoded = NodeId::read_from(&buf);
+
+        assert_eq!(decoded.page_no(), 12345);
+        assert_eq!(decoded.slot_index(), 678);
+    }
+
+    #[test]
+    fn hnsw_node_serialization_roundtrip_level0_only() {
+        let mut node = HnswNode::new(999, 0);
+        node.add_level0_neighbor(NodeId::new(1, 0));
+        node.add_level0_neighbor(NodeId::new(2, 1));
+
+        let mut buf = vec![0u8; 1024];
+        let written = node.write_to(&mut buf);
+
+        let decoded = HnswNode::read_from(&buf[..written]).unwrap();
+
+        assert_eq!(decoded.row_id(), 999);
+        assert_eq!(decoded.max_level(), 0);
+        assert_eq!(decoded.level0_neighbor_count(), 2);
+        assert_eq!(decoded.level0_neighbors()[0], NodeId::new(1, 0));
+        assert_eq!(decoded.level0_neighbors()[1], NodeId::new(2, 1));
+    }
+
+    #[test]
+    fn hnsw_node_serialization_roundtrip_with_higher_levels() {
+        let mut node = HnswNode::new(12345, 2);
+        node.add_level0_neighbor(NodeId::new(10, 0));
+        node.add_neighbor_at_level(1, NodeId::new(20, 1));
+        node.add_neighbor_at_level(2, NodeId::new(30, 2));
+
+        let mut buf = vec![0u8; 1024];
+        let written = node.write_to(&mut buf);
+
+        let decoded = HnswNode::read_from(&buf[..written]).unwrap();
+
+        assert_eq!(decoded.row_id(), 12345);
+        assert_eq!(decoded.max_level(), 2);
+        assert_eq!(decoded.level0_neighbor_count(), 1);
+        assert_eq!(decoded.level0_neighbors()[0], NodeId::new(10, 0));
+        assert_eq!(decoded.neighbors_at_level(1).len(), 1);
+        assert_eq!(decoded.neighbors_at_level(1)[0], NodeId::new(20, 1));
+        assert_eq!(decoded.neighbors_at_level(2).len(), 1);
+        assert_eq!(decoded.neighbors_at_level(2)[0], NodeId::new(30, 2));
+    }
+
+    #[test]
+    fn hnsw_node_serialized_size() {
+        let node = HnswNode::new(100, 0);
+        assert!(node.serialized_size() >= 10);
     }
 }
