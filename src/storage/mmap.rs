@@ -141,6 +141,12 @@ impl MmapStorage {
 
         let page_count = (file_size / PAGE_SIZE as u64) as u32;
 
+        // SAFETY: MmapMut::map_mut is unsafe because memory-mapped files can be
+        // modified externally, leading to undefined behavior. This is safe because:
+        // 1. The file is opened with exclusive write access (read+write mode)
+        // 2. Database files are not meant to be modified by external processes
+        // 3. The mmap lifetime is tied to MmapStorage, preventing use-after-unmap
+        // 4. All access goes through page()/page_mut() which bounds-check page_no
         let mmap = unsafe {
             MmapMut::map_mut(&file)
                 .wrap_err_with(|| format!("failed to memory-map '{}'", path.display()))?
@@ -174,6 +180,12 @@ impl MmapStorage {
         file.set_len(file_size)
             .wrap_err_with(|| format!("failed to set file size to {} bytes", file_size))?;
 
+        // SAFETY: MmapMut::map_mut is unsafe because memory-mapped files can be
+        // modified externally. This is safe because:
+        // 1. We just created this file with exclusive access (truncate=true)
+        // 2. The file size is set to a valid multiple of PAGE_SIZE
+        // 3. The mmap lifetime is tied to MmapStorage, preventing use-after-unmap
+        // 4. All access goes through page()/page_mut() which bounds-check page_no
         let mmap = unsafe {
             MmapMut::map_mut(&file)
                 .wrap_err_with(|| format!("failed to memory-map '{}'", path.display()))?
@@ -225,6 +237,12 @@ impl MmapStorage {
             .set_len(new_size)
             .wrap_err_with(|| format!("failed to extend file to {} bytes", new_size))?;
 
+        // SAFETY: MmapMut::map_mut is unsafe because the old mmap becomes invalid.
+        // This is safe because:
+        // 1. grow() requires &mut self, so no page references can exist (borrow checker)
+        // 2. We flushed the old mmap above, ensuring data is written to disk
+        // 3. The file was extended to new_size before remapping
+        // 4. The old mmap is dropped when we assign the new one
         self.mmap =
             unsafe { MmapMut::map_mut(&self.file).wrap_err("failed to remap file after grow")? };
 
@@ -255,6 +273,13 @@ impl MmapStorage {
         let len = (end_page - start_page) as usize * PAGE_SIZE;
 
         #[cfg(unix)]
+        // SAFETY: madvise with MADV_WILLNEED is a hint to the kernel and does not
+        // cause undefined behavior even if the memory region is invalid. However,
+        // this is safe because:
+        // 1. start_page was bounds-checked above (start_page >= self.page_count returns early)
+        // 2. end_page is clamped to self.page_count, so we never exceed the mmap bounds
+        // 3. start_offset + len is at most self.page_count * PAGE_SIZE = file_size
+        // 4. The mmap is valid for the entire file size
         unsafe {
             libc::madvise(
                 self.mmap.as_ptr().add(start_offset) as *mut libc::c_void,
