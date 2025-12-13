@@ -227,4 +227,64 @@ mod tests {
         }
         assert!(mgr.begin_txn().is_err());
     }
+
+    #[test]
+    fn commit_releases_slot() {
+        let mgr = TransactionManager::new();
+        let txn = mgr.begin_txn().unwrap();
+        let slot_idx = txn.slot_idx();
+        let commit_ts = txn.commit();
+        assert!(commit_ts > 0);
+        assert_eq!(mgr.active_slots[slot_idx].load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn commit_returns_commit_timestamp() {
+        let mgr = TransactionManager::new();
+        let txn1 = mgr.begin_txn().unwrap();
+        let txn2 = mgr.begin_txn().unwrap();
+        let commit_ts1 = txn1.commit();
+        let commit_ts2 = txn2.commit();
+        assert!(commit_ts2 > commit_ts1);
+    }
+
+    #[test]
+    fn rollback_releases_slot() {
+        let mgr = TransactionManager::new();
+        let txn = mgr.begin_txn().unwrap();
+        let slot_idx = txn.slot_idx();
+        txn.rollback();
+        assert_eq!(mgr.active_slots[slot_idx].load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn slot_can_be_reused_after_commit() {
+        let mgr = TransactionManager::new();
+        let txn1 = mgr.begin_txn().unwrap();
+        let slot1 = txn1.slot_idx();
+        txn1.commit();
+        let txn2 = mgr.begin_txn().unwrap();
+        assert_eq!(txn2.slot_idx(), slot1);
+    }
+
+    #[test]
+    fn slot_can_be_reused_after_rollback() {
+        let mgr = TransactionManager::new();
+        let txn1 = mgr.begin_txn().unwrap();
+        let slot1 = txn1.slot_idx();
+        txn1.rollback();
+        let txn2 = mgr.begin_txn().unwrap();
+        assert_eq!(txn2.slot_idx(), slot1);
+    }
+
+    #[test]
+    fn drop_without_commit_releases_slot() {
+        let mgr = TransactionManager::new();
+        let slot_idx;
+        {
+            let txn = mgr.begin_txn().unwrap();
+            slot_idx = txn.slot_idx();
+        }
+        assert_eq!(mgr.active_slots[slot_idx].load(Ordering::SeqCst), 0);
+    }
 }
