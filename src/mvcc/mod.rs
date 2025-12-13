@@ -85,6 +85,7 @@
 //! memory from mmap. This avoids UB on architectures requiring alignment.
 
 pub mod record_header;
+pub mod table;
 pub mod transaction;
 pub mod undo_page;
 pub mod version;
@@ -95,6 +96,7 @@ pub use transaction::{
     MAX_CONCURRENT_TXNS,
 };
 pub use undo_page::{UndoHeader, UndoPageReader, UndoPageWriter, UndoRecord};
+pub use table::{MvccTable, MvccValue};
 pub use version::{
     VersionChainReader, VersionChainWriter, VisibilityResult, VisibleVersion, WriteCheckResult,
 };
