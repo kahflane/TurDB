@@ -286,7 +286,7 @@ impl FileManager {
             "invalid database: magic bytes mismatch"
         );
 
-        let version = u32::from_le_bytes(page[16..20].try_into().unwrap());
+        let version = u32::from_le_bytes(page[16..20].try_into().unwrap()); // INVARIANT: slice is exactly 4 bytes
         ensure!(version == 1, "unsupported database version: {}", version);
 
         Ok(Self {
@@ -509,7 +509,7 @@ impl FileManager {
             self.open_files.insert(key.clone(), storage);
         }
 
-        Ok(self.open_files.get(&key).unwrap())
+        Ok(self.open_files.get(&key).unwrap()) // INVARIANT: key just inserted above if not present
     }
 
     pub fn table_data_mut(&mut self, schema: &str, table: &str) -> Result<&mut MmapStorage> {
@@ -531,7 +531,7 @@ impl FileManager {
             self.open_files.insert(key.clone(), storage);
         }
 
-        Ok(self.open_files.get_mut(&key).unwrap())
+        Ok(self.open_files.get_mut(&key).unwrap()) // INVARIANT: key just inserted above if not present
     }
 
     pub fn index_data(
@@ -560,7 +560,7 @@ impl FileManager {
             self.open_files.insert(key.clone(), storage);
         }
 
-        Ok(self.open_files.get(&key).unwrap())
+        Ok(self.open_files.get(&key).unwrap()) // INVARIANT: key just inserted above if not present
     }
 
     pub fn index_data_mut(
@@ -589,7 +589,7 @@ impl FileManager {
             self.open_files.insert(key.clone(), storage);
         }
 
-        Ok(self.open_files.get_mut(&key).unwrap())
+        Ok(self.open_files.get_mut(&key).unwrap()) // INVARIANT: key just inserted above if not present
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -671,7 +671,7 @@ impl FileManager {
             self.open_files.insert(key.clone(), storage);
         }
 
-        Ok(self.open_files.get(&key).unwrap())
+        Ok(self.open_files.get(&key).unwrap()) // INVARIANT: key just inserted above if not present
     }
 
     pub fn hnsw_data_mut(
@@ -700,7 +700,7 @@ impl FileManager {
             self.open_files.insert(key.clone(), storage);
         }
 
-        Ok(self.open_files.get_mut(&key).unwrap())
+        Ok(self.open_files.get_mut(&key).unwrap()) // INVARIANT: key just inserted above if not present
     }
 
     fn hnsw_file_path(&self, schema: &str, table: &str, index_name: &str) -> PathBuf {

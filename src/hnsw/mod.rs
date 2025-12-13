@@ -774,7 +774,7 @@ impl PersistentHnswIndex {
             return Ok(node_id);
         }
 
-        let entry_point = self.index.entry_point().unwrap();
+        let entry_point = self.index.entry_point().unwrap(); // INVARIANT: is_some checked above
         let entry_vector = self.get_vector_for_node(entry_point)?;
         let entry_distance = distance::euclidean_squared_scalar(vector, &entry_vector);
 

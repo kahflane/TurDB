@@ -178,7 +178,7 @@ pub fn decode_varint(buf: &[u8]) -> Result<(u64, usize)> {
         Ok((value, 5))
     } else if first == 255 {
         ensure!(buf.len() >= 9, "truncated 9-byte varint");
-        let value = u64::from_be_bytes(buf[1..9].try_into().unwrap());
+        let value = u64::from_be_bytes(buf[1..9].try_into().unwrap()); // INVARIANT: length validated by ensure above
         Ok((value, 9))
     } else {
         bail!("invalid varint marker: {}", first)

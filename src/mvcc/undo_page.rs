@@ -100,10 +100,10 @@ impl UndoHeader {
 
     pub fn from_bytes(data: &[u8]) -> Self {
         debug_assert!(data.len() >= UNDO_HEADER_SIZE);
-        let next_page = u32::from_le_bytes(data[0..4].try_into().unwrap());
-        let entry_count = u16::from_le_bytes(data[4..6].try_into().unwrap());
-        let free_offset = u16::from_le_bytes(data[6..8].try_into().unwrap());
-        let min_txn_id = u64::from_le_bytes(data[8..16].try_into().unwrap());
+        let next_page = u32::from_le_bytes(data[0..4].try_into().unwrap()); // INVARIANT: length asserted above
+        let entry_count = u16::from_le_bytes(data[4..6].try_into().unwrap()); // INVARIANT: length asserted above
+        let free_offset = u16::from_le_bytes(data[6..8].try_into().unwrap()); // INVARIANT: length asserted above
+        let min_txn_id = u64::from_le_bytes(data[8..16].try_into().unwrap()); // INVARIANT: length asserted above
         Self {
             next_page,
             entry_count,
@@ -168,7 +168,7 @@ impl UndoRecord {
             UNDO_RECORD_HEADER_SIZE
         );
 
-        let entry_size = u16::from_le_bytes(data[0..2].try_into().unwrap());
+        let entry_size = u16::from_le_bytes(data[0..2].try_into().unwrap()); // INVARIANT: length validated by ensure above
         ensure!(
             data.len() >= entry_size as usize,
             "undo record truncated: {} < {}",
@@ -176,12 +176,12 @@ impl UndoRecord {
             entry_size
         );
 
-        let table_id = u32::from_le_bytes(data[2..6].try_into().unwrap());
+        let table_id = u32::from_le_bytes(data[2..6].try_into().unwrap()); // INVARIANT: length validated by ensure above
         let record_header = RecordHeader::from_bytes(&data[6..6 + RecordHeader::SIZE]);
         let key_len = u16::from_le_bytes(
             data[6 + RecordHeader::SIZE..6 + RecordHeader::SIZE + 2]
                 .try_into()
-                .unwrap(),
+                .unwrap(), // INVARIANT: length validated by ensure above (UNDO_RECORD_HEADER_SIZE includes this)
         );
 
         let key_start = UNDO_RECORD_HEADER_SIZE;

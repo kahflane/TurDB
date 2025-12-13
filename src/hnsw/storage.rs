@@ -504,7 +504,7 @@ impl<'a> HnswPageRef<'a> {
     fn hnsw_header(&self) -> &HnswPageHeader {
         let offset = size_of::<PageHeader>();
         HnswPageHeader::ref_from_bytes(&self.data[offset..offset + size_of::<HnswPageHeader>()])
-            .unwrap()
+            .unwrap() // INVARIANT: page size and alignment validated in from_bytes constructor
     }
 
     pub fn slot_count(&self) -> u16 {
@@ -583,7 +583,7 @@ impl<'a> HnswPage<'a> {
     fn hnsw_header(&self) -> &HnswPageHeader {
         let offset = size_of::<PageHeader>();
         HnswPageHeader::ref_from_bytes(&self.data[offset..offset + size_of::<HnswPageHeader>()])
-            .unwrap()
+            .unwrap() // INVARIANT: page size and alignment validated in from_bytes/init constructor
     }
 
     fn hnsw_header_mut(&mut self) -> &mut HnswPageHeader {
@@ -591,7 +591,7 @@ impl<'a> HnswPage<'a> {
         HnswPageHeader::mut_from_bytes(
             &mut self.data[offset..offset + size_of::<HnswPageHeader>()],
         )
-        .unwrap()
+        .unwrap() // INVARIANT: page size and alignment validated in from_bytes/init constructor
     }
 
     pub fn slot_count(&self) -> u16 {

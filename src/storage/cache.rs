@@ -487,7 +487,7 @@ impl<'a> PageRef<'a> {
     }
 
     pub fn data(&self) -> &[u8] {
-        self.cache.data(&self.key).expect("page not in cache")
+        self.cache.data(&self.key).expect("page not in cache") // INVARIANT: PageRef can only exist if page is pinned in cache
     }
 
     pub fn data_mut(&mut self) -> &mut [u8] {
@@ -498,7 +498,7 @@ impl<'a> PageRef<'a> {
         unsafe {
             self.cache
                 .data_mut_unchecked(&self.key)
-                .expect("page not in cache")
+                .expect("page not in cache") // INVARIANT: PageRef can only exist if page is pinned in cache
         }
     }
 

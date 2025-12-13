@@ -544,26 +544,26 @@ pub fn decode_key(data: &[u8]) -> Result<(DecodedKey, usize)> {
         type_prefix::ZERO => Ok((DecodedKey::Int(0), 1)),
         type_prefix::NEG_INT => {
             ensure!(data.len() >= 9, "truncated negative integer");
-            let bytes: [u8; 8] = data[1..9].try_into().unwrap();
+            let bytes: [u8; 8] = data[1..9].try_into().unwrap(); // INVARIANT: length validated by ensure above
             let val = i64::from_be_bytes(bytes);
             Ok((DecodedKey::Int(val), 9))
         }
         type_prefix::POS_INT => {
             ensure!(data.len() >= 9, "truncated positive integer");
-            let bytes: [u8; 8] = data[1..9].try_into().unwrap();
+            let bytes: [u8; 8] = data[1..9].try_into().unwrap(); // INVARIANT: length validated by ensure above
             let val = u64::from_be_bytes(bytes) as i64;
             Ok((DecodedKey::Int(val), 9))
         }
         type_prefix::NEG_FLOAT => {
             ensure!(data.len() >= 9, "truncated negative float");
-            let bytes: [u8; 8] = data[1..9].try_into().unwrap();
+            let bytes: [u8; 8] = data[1..9].try_into().unwrap(); // INVARIANT: length validated by ensure above
             let bits = !u64::from_be_bytes(bytes);
             let val = f64::from_bits(bits);
             Ok((DecodedKey::Float(val), 9))
         }
         type_prefix::POS_FLOAT => {
             ensure!(data.len() >= 9, "truncated positive float");
-            let bytes: [u8; 8] = data[1..9].try_into().unwrap();
+            let bytes: [u8; 8] = data[1..9].try_into().unwrap(); // INVARIANT: length validated by ensure above
             let bits = u64::from_be_bytes(bytes) ^ (1u64 << 63);
             let val = f64::from_bits(bits);
             Ok((DecodedKey::Float(val), 9))
@@ -580,29 +580,29 @@ pub fn decode_key(data: &[u8]) -> Result<(DecodedKey, usize)> {
         }
         type_prefix::DATE => {
             ensure!(data.len() >= 5, "truncated date");
-            let bytes: [u8; 4] = data[1..5].try_into().unwrap();
+            let bytes: [u8; 4] = data[1..5].try_into().unwrap(); // INVARIANT: length validated by ensure above
             let encoded = u32::from_be_bytes(bytes);
             let days = (encoded ^ (1u32 << 31)) as i32;
             Ok((DecodedKey::Date(days), 5))
         }
         type_prefix::TIME => {
             ensure!(data.len() >= 9, "truncated time");
-            let bytes: [u8; 8] = data[1..9].try_into().unwrap();
+            let bytes: [u8; 8] = data[1..9].try_into().unwrap(); // INVARIANT: length validated by ensure above
             let encoded = u64::from_be_bytes(bytes);
             let micros = (encoded ^ (1u64 << 63)) as i64;
             Ok((DecodedKey::Time(micros), 9))
         }
         type_prefix::TIMESTAMP => {
             ensure!(data.len() >= 9, "truncated timestamp");
-            let bytes: [u8; 8] = data[1..9].try_into().unwrap();
+            let bytes: [u8; 8] = data[1..9].try_into().unwrap(); // INVARIANT: length validated by ensure above
             let encoded = u64::from_be_bytes(bytes);
             let micros = (encoded ^ (1u64 << 63)) as i64;
             Ok((DecodedKey::Timestamp(micros), 9))
         }
         type_prefix::TIMESTAMPTZ => {
             ensure!(data.len() >= 11, "truncated timestamptz");
-            let ts_bytes: [u8; 8] = data[1..9].try_into().unwrap();
-            let tz_bytes: [u8; 2] = data[9..11].try_into().unwrap();
+            let ts_bytes: [u8; 8] = data[1..9].try_into().unwrap(); // INVARIANT: length validated by ensure above
+            let tz_bytes: [u8; 2] = data[9..11].try_into().unwrap(); // INVARIANT: length validated by ensure above
             let encoded_ts = u64::from_be_bytes(ts_bytes);
             let encoded_tz = u16::from_be_bytes(tz_bytes);
             let micros = (encoded_ts ^ (1u64 << 63)) as i64;
@@ -617,9 +617,9 @@ pub fn decode_key(data: &[u8]) -> Result<(DecodedKey, usize)> {
         }
         type_prefix::INTERVAL => {
             ensure!(data.len() >= 17, "truncated interval");
-            let m_bytes: [u8; 4] = data[1..5].try_into().unwrap();
-            let d_bytes: [u8; 4] = data[5..9].try_into().unwrap();
-            let u_bytes: [u8; 8] = data[9..17].try_into().unwrap();
+            let m_bytes: [u8; 4] = data[1..5].try_into().unwrap(); // INVARIANT: length validated by ensure above
+            let d_bytes: [u8; 4] = data[5..9].try_into().unwrap(); // INVARIANT: length validated by ensure above
+            let u_bytes: [u8; 8] = data[9..17].try_into().unwrap(); // INVARIANT: length validated by ensure above
             let months = (u32::from_be_bytes(m_bytes) ^ (1u32 << 31)) as i32;
             let days = (u32::from_be_bytes(d_bytes) ^ (1u32 << 31)) as i32;
             let micros = (u64::from_be_bytes(u_bytes) ^ (1u64 << 63)) as i64;
@@ -634,7 +634,7 @@ pub fn decode_key(data: &[u8]) -> Result<(DecodedKey, usize)> {
         }
         type_prefix::UUID => {
             ensure!(data.len() >= 17, "truncated uuid");
-            let bytes: [u8; 16] = data[1..17].try_into().unwrap();
+            let bytes: [u8; 16] = data[1..17].try_into().unwrap(); // INVARIANT: length validated by ensure above
             Ok((DecodedKey::Uuid(bytes), 17))
         }
         type_prefix::INET => {
@@ -655,7 +655,7 @@ pub fn decode_key(data: &[u8]) -> Result<(DecodedKey, usize)> {
         }
         type_prefix::MACADDR => {
             ensure!(data.len() >= 7, "truncated macaddr");
-            let bytes: [u8; 6] = data[1..7].try_into().unwrap();
+            let bytes: [u8; 6] = data[1..7].try_into().unwrap(); // INVARIANT: length validated by ensure above
             Ok((DecodedKey::MacAddr(bytes), 7))
         }
         type_prefix::ARRAY => {
@@ -700,19 +700,19 @@ pub fn decode_key(data: &[u8]) -> Result<(DecodedKey, usize)> {
         }
         type_prefix::ENUM => {
             ensure!(data.len() >= 9, "truncated enum");
-            let type_id = u32::from_be_bytes(data[1..5].try_into().unwrap());
-            let ordinal = u32::from_be_bytes(data[5..9].try_into().unwrap());
+            let type_id = u32::from_be_bytes(data[1..5].try_into().unwrap()); // INVARIANT: length validated by ensure above
+            let ordinal = u32::from_be_bytes(data[5..9].try_into().unwrap()); // INVARIANT: length validated by ensure above
             Ok((DecodedKey::Enum { type_id, ordinal }, 9))
         }
         type_prefix::COMPOSITE => {
             ensure!(data.len() >= 5, "truncated composite");
-            let type_id = u32::from_be_bytes(data[1..5].try_into().unwrap());
+            let type_id = u32::from_be_bytes(data[1..5].try_into().unwrap()); // INVARIANT: length validated by ensure above
             let (fields, consumed) = decode_composite_fields(&data[5..])?;
             Ok((DecodedKey::Composite { type_id, fields }, 5 + consumed))
         }
         type_prefix::DOMAIN => {
             ensure!(data.len() >= 5, "truncated domain");
-            let type_id = u32::from_be_bytes(data[1..5].try_into().unwrap());
+            let type_id = u32::from_be_bytes(data[1..5].try_into().unwrap()); // INVARIANT: length validated by ensure above
             let (value, consumed) = decode_key(&data[5..])?;
             Ok((
                 DecodedKey::Domain {
@@ -724,7 +724,7 @@ pub fn decode_key(data: &[u8]) -> Result<(DecodedKey, usize)> {
         }
         type_prefix::VECTOR => {
             ensure!(data.len() >= 5, "truncated vector");
-            let dim_count = u32::from_be_bytes(data[1..5].try_into().unwrap()) as usize;
+            let dim_count = u32::from_be_bytes(data[1..5].try_into().unwrap()) as usize; // INVARIANT: length validated by ensure above
             ensure!(
                 data.len() >= 5 + dim_count * 4,
                 "truncated vector dimensions"
@@ -732,7 +732,7 @@ pub fn decode_key(data: &[u8]) -> Result<(DecodedKey, usize)> {
             let mut dimensions = Vec::with_capacity(dim_count);
             for i in 0..dim_count {
                 let start = 5 + i * 4;
-                let encoded = u32::from_be_bytes(data[start..start + 4].try_into().unwrap());
+                let encoded = u32::from_be_bytes(data[start..start + 4].try_into().unwrap()); // INVARIANT: length validated by ensure above
                 let bits = if encoded & (1u32 << 31) != 0 {
                     encoded ^ (1u32 << 31)
                 } else {
@@ -845,7 +845,7 @@ fn decode_json(data: &[u8]) -> Result<(DecodedJson, usize)> {
         type_prefix::JSON_TRUE => Ok((DecodedJson::Bool(true), 1)),
         type_prefix::JSON_NUMBER => {
             ensure!(data.len() >= 9, "truncated json number");
-            let bytes: [u8; 8] = data[1..9].try_into().unwrap();
+            let bytes: [u8; 8] = data[1..9].try_into().unwrap(); // INVARIANT: length validated by ensure above
             let encoded = u64::from_be_bytes(bytes);
             let bits = if encoded & (1u64 << 63) != 0 {
                 encoded ^ (1u64 << 63)

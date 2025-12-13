@@ -95,8 +95,8 @@ impl RecordHeader {
     pub fn from_bytes(slice: &[u8]) -> Self {
         debug_assert!(slice.len() >= Self::SIZE);
         let flags = slice[0];
-        let txn_id = u64::from_be_bytes(slice[1..9].try_into().unwrap());
-        let prev_version = u64::from_be_bytes(slice[9..17].try_into().unwrap());
+        let txn_id = u64::from_be_bytes(slice[1..9].try_into().unwrap()); // INVARIANT: length asserted above
+        let prev_version = u64::from_be_bytes(slice[9..17].try_into().unwrap()); // INVARIANT: length asserted above
         Self {
             flags,
             txn_id,

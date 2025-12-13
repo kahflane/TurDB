@@ -221,12 +221,12 @@ impl<'a> LeafNode<'a> {
     }
 
     pub fn cell_count(&self) -> u16 {
-        let header = PageHeader::from_bytes(self.data).unwrap();
+        let header = PageHeader::from_bytes(self.data).unwrap(); // INVARIANT: page validated in from_page constructor
         header.cell_count()
     }
 
     pub fn free_space(&self) -> u16 {
-        let header = PageHeader::from_bytes(self.data).unwrap();
+        let header = PageHeader::from_bytes(self.data).unwrap(); // INVARIANT: page validated in from_page constructor
         header.free_space()
     }
 
@@ -318,7 +318,7 @@ impl<'a> LeafNode<'a> {
     }
 
     pub fn next_leaf(&self) -> u32 {
-        let header = PageHeader::from_bytes(self.data).unwrap();
+        let header = PageHeader::from_bytes(self.data).unwrap(); // INVARIANT: page validated in from_page constructor
         header.next_leaf()
     }
 }
@@ -360,17 +360,17 @@ impl<'a> LeafNodeMut<'a> {
     }
 
     pub fn cell_count(&self) -> u16 {
-        let header = PageHeader::from_bytes(self.data).unwrap();
+        let header = PageHeader::from_bytes(self.data).unwrap(); // INVARIANT: page validated in from_page/init constructor
         header.cell_count()
     }
 
     fn free_start(&self) -> u16 {
-        let header = PageHeader::from_bytes(self.data).unwrap();
+        let header = PageHeader::from_bytes(self.data).unwrap(); // INVARIANT: page validated in from_page/init constructor
         header.free_start()
     }
 
     fn free_end(&self) -> u16 {
-        let header = PageHeader::from_bytes(self.data).unwrap();
+        let header = PageHeader::from_bytes(self.data).unwrap(); // INVARIANT: page validated in from_page/init constructor
         header.free_end()
     }
 
@@ -379,7 +379,7 @@ impl<'a> LeafNodeMut<'a> {
     }
 
     fn frag_bytes(&self) -> u8 {
-        let header = PageHeader::from_bytes(self.data).unwrap();
+        let header = PageHeader::from_bytes(self.data).unwrap(); // INVARIANT: page validated in from_page/init constructor
         header.frag_bytes()
     }
 

@@ -168,7 +168,7 @@ impl Wal {
         use std::time::SystemTime;
         let nanos = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
-            .unwrap()
+            .unwrap() // INVARIANT: system time is always after UNIX epoch on any reasonable system
             .as_nanos();
         (nanos as u32) ^ ((nanos >> 32) as u32)
     }
@@ -357,7 +357,7 @@ impl Wal {
             *mmap_guard = Some((segment_num, mmap));
         }
 
-        let (_seg, mmap) = mmap_guard.as_ref().unwrap();
+        let (_seg, mmap) = mmap_guard.as_ref().unwrap(); // INVARIANT: just set to Some above
 
         let frame_start = offset as usize;
         ensure!(

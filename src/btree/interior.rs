@@ -184,12 +184,12 @@ impl<'a> InteriorNode<'a> {
     }
 
     pub fn cell_count(&self) -> u16 {
-        let header = PageHeader::from_bytes(self.data).unwrap();
+        let header = PageHeader::from_bytes(self.data).unwrap(); // INVARIANT: page validated in from_page constructor
         header.cell_count()
     }
 
     pub fn right_child(&self) -> u32 {
-        let header = PageHeader::from_bytes(self.data).unwrap();
+        let header = PageHeader::from_bytes(self.data).unwrap(); // INVARIANT: page validated in from_page constructor
         header.right_child()
     }
 
@@ -283,22 +283,22 @@ impl<'a> InteriorNodeMut<'a> {
     }
 
     pub fn cell_count(&self) -> u16 {
-        let header = PageHeader::from_bytes(self.data).unwrap();
+        let header = PageHeader::from_bytes(self.data).unwrap(); // INVARIANT: page validated in from_page/init constructor
         header.cell_count()
     }
 
     pub fn right_child(&self) -> u32 {
-        let header = PageHeader::from_bytes(self.data).unwrap();
+        let header = PageHeader::from_bytes(self.data).unwrap(); // INVARIANT: page validated in from_page/init constructor
         header.right_child()
     }
 
     fn free_start(&self) -> u16 {
-        let header = PageHeader::from_bytes(self.data).unwrap();
+        let header = PageHeader::from_bytes(self.data).unwrap(); // INVARIANT: page validated in from_page/init constructor
         header.free_start()
     }
 
     fn free_end(&self) -> u16 {
-        let header = PageHeader::from_bytes(self.data).unwrap();
+        let header = PageHeader::from_bytes(self.data).unwrap(); // INVARIANT: page validated in from_page/init constructor
         header.free_end()
     }
 
