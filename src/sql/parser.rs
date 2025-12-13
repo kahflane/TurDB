@@ -2275,7 +2275,10 @@ mod tests {
         if let Statement::CreateTable(ct) = stmt {
             assert_eq!(ct.name, "embeddings");
             assert_eq!(ct.columns.len(), 2);
-            assert!(matches!(ct.columns[1].data_type, DataType::Vector(Some(128))));
+            assert!(matches!(
+                ct.columns[1].data_type,
+                DataType::Vector(Some(128))
+            ));
         } else {
             panic!("Expected CreateTable statement");
         }

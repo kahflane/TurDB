@@ -439,7 +439,11 @@ mod tests {
         let n_vectors = 100;
 
         let vectors: Vec<Vec<f32>> = (0..n_vectors)
-            .map(|i| (0..dim).map(|j| ((i * 7 + j * 13) % 100) as f32 / 100.0).collect())
+            .map(|i| {
+                (0..dim)
+                    .map(|j| ((i * 7 + j * 13) % 100) as f32 / 100.0)
+                    .collect()
+            })
             .collect();
 
         let sq8_vectors: Vec<SQ8Vector> = vectors.iter().map(|v| SQ8Vector::from_f32(v)).collect();
