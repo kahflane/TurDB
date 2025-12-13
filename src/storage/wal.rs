@@ -97,6 +97,7 @@ use zerocopy::{IntoBytes, FromBytes, Immutable};
 use crc::{Crc, CRC_64_ECMA_182};
 
 pub const WAL_FRAME_HEADER_SIZE: usize = 32;
+pub const MAX_SEGMENT_SIZE: u64 = 64 * 1024 * 1024;
 
 const CRC64: Crc<u64> = Crc::<u64>::new(&CRC_64_ECMA_182);
 
@@ -143,7 +144,7 @@ pub fn validate_checksum(header: &WalFrameHeader, page_data: &[u8]) -> bool {
 }
 
 use eyre::{Result, WrapErr, ensure, bail};
-use std::fs::{File, OpenOptions, create_dir_all};
+use std::fs::{File, OpenOptions, create_dir_all, read_dir};
 use std::path::{Path, PathBuf};
 use std::io::{Write, Read, Seek, SeekFrom};
 use parking_lot::{Mutex, RwLock};
@@ -156,8 +157,8 @@ pub struct Wal {
     #[allow(dead_code)]
     dir: PathBuf,
     current_segment: Mutex<WalSegment>,
-    page_index: RwLock<HashMap<u32, u64>>,
-    read_mmap: RwLock<Option<Mmap>>,
+    page_index: RwLock<HashMap<u32, (u64, u64)>>,
+    read_mmap: RwLock<Option<(u64, Mmap)>>,
     salt1: u32,
     salt2: u32,
 }
@@ -170,6 +171,32 @@ impl Wal {
             .unwrap()
             .as_nanos();
         (nanos as u32) ^ ((nanos >> 32) as u32)
+    }
+
+    pub fn find_latest_segment(dir: &Path) -> Result<u64> {
+        if !dir.exists() {
+            return Ok(1);
+        }
+
+        let entries = read_dir(dir)
+            .wrap_err_with(|| format!("failed to read WAL directory {:?}", dir))?;
+
+        let mut max_segment = 0u64;
+
+        for entry in entries {
+            let entry = entry.wrap_err("failed to read directory entry")?;
+            let file_name = entry.file_name();
+            let file_name_str = file_name.to_string_lossy();
+
+            if file_name_str.starts_with("wal.") && file_name_str.len() == 10 {
+                let num_part = &file_name_str[4..];
+                if let Ok(segment_num) = num_part.parse::<u64>() {
+                    max_segment = max_segment.max(segment_num);
+                }
+            }
+        }
+
+        Ok(if max_segment == 0 { 1 } else { max_segment })
     }
 
     pub fn create(dir: &Path) -> Result<Self> {
@@ -195,12 +222,13 @@ impl Wal {
                 .wrap_err_with(|| format!("failed to create WAL directory at {:?}", dir))?;
         }
 
-        let segment_path = dir.join("wal.000001");
+        let segment_num = Self::find_latest_segment(dir)?;
+        let segment_path = dir.join(format!("wal.{:06}", segment_num));
 
         let segment = if segment_path.exists() {
-            WalSegment::open(&segment_path, 1)?
+            WalSegment::open(&segment_path, segment_num)?
         } else {
-            WalSegment::create(&segment_path, 1)?
+            WalSegment::create(&segment_path, segment_num)?
         };
 
         let mut page_index = HashMap::new();
@@ -208,23 +236,18 @@ impl Wal {
         let mut salt2 = Self::generate_salt();
 
         if segment_path.exists() {
-            let mut scan_segment = WalSegment::open(&segment_path, 1)?;
+            let mut scan_segment = WalSegment::open(&segment_path, segment_num)?;
             let mut offset = 0u64;
             let mut first_frame = true;
 
-            loop {
-                match scan_segment.read_frame() {
-                    Ok((header, _)) => {
-                        if first_frame {
-                            salt1 = header.salt1;
-                            salt2 = header.salt2;
-                            first_frame = false;
-                        }
-                        page_index.insert(header.page_no, offset);
-                        offset += (WAL_FRAME_HEADER_SIZE + PAGE_SIZE) as u64;
-                    }
-                    Err(_) => break,
+            while let Ok((header, _)) = scan_segment.read_frame() {
+                if first_frame {
+                    salt1 = header.salt1;
+                    salt2 = header.salt2;
+                    first_frame = false;
                 }
+                page_index.insert(header.page_no, (segment_num, offset));
+                offset += (WAL_FRAME_HEADER_SIZE + PAGE_SIZE) as u64;
             }
         }
 
@@ -248,17 +271,12 @@ impl Wal {
         let mut segment = WalSegment::open(&segment_path, 1)?;
         let mut frames_applied = 0;
 
-        loop {
-            match segment.read_frame() {
-                Ok((header, page_data)) => {
-                    let page_mut = storage.page_mut(header.page_no)
-                        .wrap_err_with(|| format!("failed to get page {} for WAL recovery", header.page_no))?;
+        while let Ok((header, page_data)) = segment.read_frame() {
+            let page_mut = storage.page_mut(header.page_no)
+                .wrap_err_with(|| format!("failed to get page {} for WAL recovery", header.page_no))?;
 
-                    page_mut.copy_from_slice(&page_data);
-                    frames_applied += 1;
-                }
-                Err(_) => break,
-            }
+            page_mut.copy_from_slice(&page_data);
+            frames_applied += 1;
         }
 
         Ok(frames_applied)
@@ -305,15 +323,20 @@ impl Wal {
 
     pub fn read_page(&self, page_no: u32) -> Result<Option<Vec<u8>>> {
         let index = self.page_index.read();
-        let offset = match index.get(&page_no) {
-            Some(&offset) => offset,
+        let (segment_num, offset) = match index.get(&page_no) {
+            Some(&(seg, off)) => (seg, off),
             None => return Ok(None),
         };
         drop(index);
 
         let mut mmap_guard = self.read_mmap.write();
-        if mmap_guard.is_none() {
-            let segment_path = self.dir.join("wal.000001");
+        let needs_reload = match mmap_guard.as_ref() {
+            None => true,
+            Some((cached_seg, _)) => *cached_seg != segment_num,
+        };
+
+        if needs_reload {
+            let segment_path = self.dir.join(format!("wal.{:06}", segment_num));
             if !segment_path.exists() {
                 return Ok(None);
             }
@@ -324,10 +347,10 @@ impl Wal {
                 Mmap::map(&file)
                     .wrap_err_with(|| format!("failed to mmap WAL segment at {:?}", segment_path))?
             };
-            *mmap_guard = Some(mmap);
+            *mmap_guard = Some((segment_num, mmap));
         }
 
-        let mmap = mmap_guard.as_ref().unwrap();
+        let (_seg, mmap) = mmap_guard.as_ref().unwrap();
 
         let frame_start = offset as usize;
         ensure!(
@@ -359,20 +382,27 @@ impl Wal {
             page_data.len()
         );
 
+        if self.needs_rotation() {
+            self.rotate_segment()
+                .wrap_err("failed to rotate WAL segment during write_frame")?;
+        }
+
         let header = WalFrameHeader::new(page_no, db_size, self.salt1, self.salt2, 0);
         let checksum = compute_checksum(&header, page_data);
         let mut header_with_checksum = header;
         header_with_checksum.checksum = checksum;
 
         let current_offset;
+        let segment_num;
         {
             let mut segment = self.current_segment.lock();
             current_offset = segment.offset();
+            segment_num = segment.sequence;
             segment.write_frame(&header_with_checksum, page_data)?;
         }
 
         let mut index = self.page_index.write();
-        index.insert(page_no, current_offset);
+        index.insert(page_no, (segment_num, current_offset));
         drop(index);
 
         let mut mmap = self.read_mmap.write();
@@ -384,6 +414,28 @@ impl Wal {
     pub fn current_offset(&self) -> u64 {
         let segment = self.current_segment.lock();
         segment.offset()
+    }
+
+    pub fn needs_rotation(&self) -> bool {
+        self.current_offset() >= MAX_SEGMENT_SIZE
+    }
+
+    pub fn rotate_segment(&mut self) -> Result<()> {
+        let mut segment_guard = self.current_segment.lock();
+        let current_sequence = segment_guard.sequence;
+        let new_sequence = current_sequence + 1;
+
+        let new_segment_path = self.dir.join(format!("wal.{:06}", new_sequence));
+        let new_segment = WalSegment::create(&new_segment_path, new_sequence)
+            .wrap_err_with(|| format!("failed to create new WAL segment {}", new_sequence))?;
+
+        *segment_guard = new_segment;
+        drop(segment_guard);
+
+        let mut mmap_guard = self.read_mmap.write();
+        *mmap_guard = None;
+
+        Ok(())
     }
 }
 
@@ -481,6 +533,7 @@ impl WalSegment {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::tempdir;
 
     #[test]
     fn wal_frame_header_size_is_32_bytes() {
@@ -1094,5 +1147,187 @@ mod tests {
         assert!(read_after.is_none());
 
         std::fs::remove_dir_all(&temp_dir).ok();
+    }
+
+    #[test]
+    fn find_latest_segment_returns_one_when_empty() {
+        let temp_dir = std::env::temp_dir().join("turdb_test_find_latest_empty");
+
+        if temp_dir.exists() {
+            std::fs::remove_dir_all(&temp_dir).ok();
+        }
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        let latest = Wal::find_latest_segment(&temp_dir).expect("should find latest");
+        assert_eq!(latest, 1);
+
+        std::fs::remove_dir_all(&temp_dir).ok();
+    }
+
+    #[test]
+    fn find_latest_segment_finds_highest_numbered() {
+        use std::fs::File;
+
+        let temp_dir = std::env::temp_dir().join("turdb_test_find_latest_highest");
+
+        if temp_dir.exists() {
+            std::fs::remove_dir_all(&temp_dir).ok();
+        }
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        File::create(temp_dir.join("wal.000001")).unwrap();
+        File::create(temp_dir.join("wal.000003")).unwrap();
+        File::create(temp_dir.join("wal.000007")).unwrap();
+        File::create(temp_dir.join("wal.000005")).unwrap();
+
+        let latest = Wal::find_latest_segment(&temp_dir).expect("should find latest");
+        assert_eq!(latest, 7);
+
+        std::fs::remove_dir_all(&temp_dir).ok();
+    }
+
+    #[test]
+    fn find_latest_segment_ignores_non_wal_files() {
+        use std::fs::File;
+
+        let temp_dir = std::env::temp_dir().join("turdb_test_find_latest_ignore");
+
+        if temp_dir.exists() {
+            std::fs::remove_dir_all(&temp_dir).ok();
+        }
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        File::create(temp_dir.join("wal.000002")).unwrap();
+        File::create(temp_dir.join("other.txt")).unwrap();
+        File::create(temp_dir.join("wal.invalid")).unwrap();
+        File::create(temp_dir.join("000003")).unwrap();
+
+        let latest = Wal::find_latest_segment(&temp_dir).expect("should find latest");
+        assert_eq!(latest, 2);
+
+        std::fs::remove_dir_all(&temp_dir).ok();
+    }
+
+    #[test]
+    fn needs_rotation_returns_false_when_below_threshold() {
+        let temp_dir = tempdir().expect("failed to create temp dir");
+        let wal_dir = temp_dir.path().join("wal");
+
+        let mut wal = Wal::create(&wal_dir).expect("should create WAL");
+
+        for i in 0..10 {
+            let page_data = vec![i as u8; PAGE_SIZE];
+            wal.write_frame(i, 100, &page_data).expect("should write frame");
+        }
+
+        assert!(!wal.needs_rotation(), "should not need rotation with only 10 frames");
+
+        temp_dir.close().ok();
+    }
+
+    #[test]
+    fn needs_rotation_returns_true_when_exceeds_threshold() {
+        let temp_dir = tempdir().expect("failed to create temp dir");
+        let wal_dir = temp_dir.path().join("wal");
+
+        let mut wal = Wal::create(&wal_dir).expect("should create WAL");
+
+        let frames_needed = (MAX_SEGMENT_SIZE / (WAL_FRAME_HEADER_SIZE + PAGE_SIZE) as u64) + 1;
+
+        for i in 0..frames_needed {
+            let page_data = vec![(i % 256) as u8; PAGE_SIZE];
+            wal.write_frame(i as u32, 100, &page_data).expect("should write frame");
+        }
+
+        assert!(wal.needs_rotation(), "should need rotation after exceeding 64MB");
+
+        temp_dir.close().ok();
+    }
+
+    #[test]
+    fn rotate_segment_creates_new_segment_file() {
+        let temp_dir = tempdir().expect("failed to create temp dir");
+        let wal_dir = temp_dir.path().join("wal");
+
+        let mut wal = Wal::create(&wal_dir).expect("should create WAL");
+
+        let page_data = vec![42u8; PAGE_SIZE];
+        wal.write_frame(1, 100, &page_data).expect("should write frame");
+
+        wal.rotate_segment().expect("should rotate segment");
+
+        assert!(wal_dir.join("wal.000001").exists(), "original segment should exist");
+        assert!(wal_dir.join("wal.000002").exists(), "new segment should exist");
+
+        temp_dir.close().ok();
+    }
+
+    #[test]
+    fn rotate_segment_switches_to_new_segment() {
+        let temp_dir = tempdir().expect("failed to create temp dir");
+        let wal_dir = temp_dir.path().join("wal");
+
+        let mut wal = Wal::create(&wal_dir).expect("should create WAL");
+
+        let page_data = vec![42u8; PAGE_SIZE];
+        wal.write_frame(1, 100, &page_data).expect("should write frame");
+
+        wal.rotate_segment().expect("should rotate segment");
+
+        let page_data2 = vec![99u8; PAGE_SIZE];
+        wal.write_frame(2, 100, &page_data2).expect("should write frame after rotation");
+
+        let metadata1 = std::fs::metadata(wal_dir.join("wal.000001")).unwrap();
+        let metadata2 = std::fs::metadata(wal_dir.join("wal.000002")).unwrap();
+
+        assert_eq!(metadata1.len(), (WAL_FRAME_HEADER_SIZE + PAGE_SIZE) as u64, "segment 1 should have 1 frame");
+        assert_eq!(metadata2.len(), (WAL_FRAME_HEADER_SIZE + PAGE_SIZE) as u64, "segment 2 should have 1 frame");
+
+        temp_dir.close().ok();
+    }
+
+    #[test]
+    fn rotate_segment_preserves_page_index() {
+        let temp_dir = tempdir().expect("failed to create temp dir");
+        let wal_dir = temp_dir.path().join("wal");
+
+        let mut wal = Wal::create(&wal_dir).expect("should create WAL");
+
+        let page_data = vec![42u8; PAGE_SIZE];
+        wal.write_frame(1, 100, &page_data).expect("should write frame");
+
+        wal.rotate_segment().expect("should rotate segment");
+
+        let read_page = wal.read_page(1).expect("should read page");
+        assert!(read_page.is_some(), "should still be able to read page from old segment");
+        assert_eq!(read_page.unwrap()[0], 42);
+
+        temp_dir.close().ok();
+    }
+
+    #[test]
+    fn write_frame_auto_rotates_when_exceeds_threshold() {
+        let temp_dir = tempdir().expect("failed to create temp dir");
+        let wal_dir = temp_dir.path().join("wal");
+
+        let mut wal = Wal::create(&wal_dir).expect("should create WAL");
+
+        let frames_needed = (MAX_SEGMENT_SIZE / (WAL_FRAME_HEADER_SIZE + PAGE_SIZE) as u64) + 10;
+
+        for i in 0..frames_needed {
+            let page_data = vec![(i % 256) as u8; PAGE_SIZE];
+            wal.write_frame(i as u32, 100, &page_data).expect("should write frame");
+        }
+
+        assert!(wal_dir.join("wal.000001").exists(), "segment 1 should exist");
+        assert!(wal_dir.join("wal.000002").exists(), "segment 2 should exist after auto-rotation");
+
+        for i in 0..frames_needed {
+            let read_page = wal.read_page(i as u32).expect("should read page");
+            assert!(read_page.is_some(), "should be able to read page {}", i);
+            assert_eq!(read_page.unwrap()[0], (i % 256) as u8);
+        }
+
+        temp_dir.close().ok();
     }
 }
