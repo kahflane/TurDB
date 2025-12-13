@@ -293,6 +293,36 @@ pub struct PhysicalPlan<'a> {
     pub root: &'a PhysicalOperator<'a>,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub enum PlanNode<'a> {
+    Logical(&'a LogicalOperator<'a>),
+    Physical(&'a PhysicalOperator<'a>),
+}
+
+impl<'a> PlanNode<'a> {
+    pub fn is_logical(&self) -> bool {
+        matches!(self, PlanNode::Logical(_))
+    }
+
+    pub fn is_physical(&self) -> bool {
+        matches!(self, PlanNode::Physical(_))
+    }
+
+    pub fn as_logical(&self) -> Option<&'a LogicalOperator<'a>> {
+        match self {
+            PlanNode::Logical(op) => Some(op),
+            PlanNode::Physical(_) => None,
+        }
+    }
+
+    pub fn as_physical(&self) -> Option<&'a PhysicalOperator<'a>> {
+        match self {
+            PlanNode::Logical(_) => None,
+            PlanNode::Physical(op) => Some(op),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -490,5 +520,61 @@ mod tests {
         assert!(matches!(AggregateFunction::Avg, AggregateFunction::Avg));
         assert!(matches!(AggregateFunction::Min, AggregateFunction::Min));
         assert!(matches!(AggregateFunction::Max, AggregateFunction::Max));
+    }
+
+    #[test]
+    fn plan_node_logical_variant() {
+        let bump = Bump::new();
+
+        let scan = bump.alloc(LogicalOperator::Scan(LogicalScan {
+            schema: None,
+            table: "users",
+            alias: None,
+        }));
+
+        let node = PlanNode::Logical(scan);
+        assert!(node.is_logical());
+        assert!(!node.is_physical());
+        assert!(node.as_logical().is_some());
+        assert!(node.as_physical().is_none());
+    }
+
+    #[test]
+    fn plan_node_physical_variant() {
+        let bump = Bump::new();
+
+        let scan = bump.alloc(PhysicalOperator::TableScan(PhysicalTableScan {
+            schema: None,
+            table: "users",
+            alias: None,
+            post_scan_filter: None,
+        }));
+
+        let node = PlanNode::Physical(scan);
+        assert!(node.is_physical());
+        assert!(!node.is_logical());
+        assert!(node.as_physical().is_some());
+        assert!(node.as_logical().is_none());
+    }
+
+    #[test]
+    fn plan_node_as_logical_returns_operator() {
+        let bump = Bump::new();
+
+        let logical_scan = bump.alloc(LogicalOperator::Scan(LogicalScan {
+            schema: Some("public"),
+            table: "orders",
+            alias: Some("o"),
+        }));
+
+        let node = PlanNode::Logical(logical_scan);
+        let op = node.as_logical().unwrap();
+
+        if let LogicalOperator::Scan(scan) = op {
+            assert_eq!(scan.table, "orders");
+            assert_eq!(scan.alias, Some("o"));
+        } else {
+            panic!("Expected Scan operator");
+        }
     }
 }
