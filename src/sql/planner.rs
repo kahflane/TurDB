@@ -609,13 +609,13 @@ impl<'a> Planner<'a> {
 
     fn validate_table_exists(&self, schema: Option<&str>, table: &str) -> Result<()> {
         let table_name = if let Some(s) = schema {
-            format!("{}.{}", s, table)
+            self.arena.alloc_str(&format!("{}.{}", s, table))
         } else {
-            table.to_string()
+            table
         };
 
         self.catalog
-            .resolve_table(&table_name)
+            .resolve_table(table_name)
             .map(|_| ())
     }
 
@@ -837,7 +837,7 @@ impl<'a> Planner<'a> {
         let table_def = self.catalog.resolve_table(table_name).ok()?;
 
         let filter_columns = self.extract_filter_columns(filter.predicate);
-        let best_index = self.select_best_index(table_def, &filter_columns)?;
+        let best_index = self.select_best_index(table_def, filter_columns)?;
 
         let first_index_col = best_index.columns().first()?;
         let bounds = self.extract_scan_bounds_for_column(filter.predicate, first_index_col);
@@ -935,13 +935,17 @@ impl<'a> Planner<'a> {
         }
     }
 
-    pub fn extract_filter_columns(&self, expr: &Expr<'a>) -> Vec<&'a str> {
-        let mut columns = Vec::new();
+    pub fn extract_filter_columns(&self, expr: &Expr<'a>) -> &'a [&'a str] {
+        let mut columns = bumpalo::collections::Vec::new_in(self.arena);
         self.collect_columns_from_expr(expr, &mut columns);
-        columns
+        columns.into_bump_slice()
     }
 
-    fn collect_columns_from_expr(&self, expr: &Expr<'a>, columns: &mut Vec<&'a str>) {
+    fn collect_columns_from_expr(
+        &self,
+        expr: &Expr<'a>,
+        columns: &mut bumpalo::collections::Vec<'a, &'a str>,
+    ) {
         match expr {
             Expr::Column(col_ref) => {
                 columns.push(col_ref.column);
@@ -1085,16 +1089,19 @@ impl<'a> Planner<'a> {
         }
     }
 
-    pub fn extract_join_tables(&self, op: &'a LogicalOperator<'a>) -> Vec<&'a LogicalOperator<'a>> {
-        let mut tables = Vec::new();
+    pub fn extract_join_tables(
+        &self,
+        op: &'a LogicalOperator<'a>,
+    ) -> &'a [&'a LogicalOperator<'a>] {
+        let mut tables = bumpalo::collections::Vec::new_in(self.arena);
         self.collect_join_tables(op, &mut tables);
-        tables
+        tables.into_bump_slice()
     }
 
     fn collect_join_tables(
         &self,
         op: &'a LogicalOperator<'a>,
-        tables: &mut Vec<&'a LogicalOperator<'a>>,
+        tables: &mut bumpalo::collections::Vec<'a, &'a LogicalOperator<'a>>,
     ) {
         match op {
             LogicalOperator::Join(join) => {
@@ -1115,11 +1122,17 @@ impl<'a> Planner<'a> {
 
     pub fn order_tables_by_cardinality(
         &self,
-        tables_with_card: Vec<(&'a LogicalOperator<'a>, u64)>,
-    ) -> Vec<&'a LogicalOperator<'a>> {
-        let mut sorted = tables_with_card;
+        tables_with_card: &[(&'a LogicalOperator<'a>, u64)],
+    ) -> &'a [&'a LogicalOperator<'a>] {
+        let mut sorted: bumpalo::collections::Vec<(&'a LogicalOperator<'a>, u64)> =
+            bumpalo::collections::Vec::from_iter_in(tables_with_card.iter().copied(), self.arena);
         sorted.sort_by_key(|(_, card)| *card);
-        sorted.into_iter().map(|(op, _)| op).collect()
+
+        let mut result = bumpalo::collections::Vec::new_in(self.arena);
+        for (op, _) in sorted {
+            result.push(op);
+        }
+        result.into_bump_slice()
     }
 
     pub fn extract_scan_bounds_for_column(
@@ -2564,7 +2577,7 @@ mod tests {
             ),
         ];
 
-        let ordered = planner.order_tables_by_cardinality(scans);
+        let ordered = planner.order_tables_by_cardinality(&scans);
         assert_eq!(ordered.len(), 3);
         if let LogicalOperator::Scan(s) = ordered[0] {
             assert_eq!(s.table, "small_table");
