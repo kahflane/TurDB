@@ -95,7 +95,7 @@
 
 use crate::records::types::DataType;
 use crate::schema::{Catalog, TableDef};
-use crate::sql::ast::{Expr, JoinType, Statement};
+use crate::sql::ast::{Expr, JoinType, Literal, Statement};
 use bumpalo::Bump;
 use eyre::{bail, Result};
 
@@ -997,13 +997,31 @@ impl<'a> Planner<'a> {
             LogicalOperator::Join(join) => {
                 let left = self.logical_to_physical(join.left)?;
                 let right = self.logical_to_physical(join.right)?;
-                let physical = self.arena.alloc(PhysicalOperator::NestedLoopJoin(PhysicalNestedLoopJoin {
-                    left,
-                    right,
-                    join_type: join.join_type,
-                    condition: join.condition,
-                }));
-                Ok(physical)
+
+                if self.has_equi_join_keys(join.condition) {
+                    let equi_keys = self.extract_equi_join_keys(join.condition);
+                    let join_keys = self.convert_equi_keys_to_join_keys(equi_keys);
+                    let physical =
+                        self.arena
+                            .alloc(PhysicalOperator::GraceHashJoin(PhysicalGraceHashJoin {
+                                left,
+                                right,
+                                join_type: join.join_type,
+                                join_keys,
+                                num_partitions: 16,
+                            }));
+                    Ok(physical)
+                } else {
+                    let physical = self.arena.alloc(PhysicalOperator::NestedLoopJoin(
+                        PhysicalNestedLoopJoin {
+                            left,
+                            right,
+                            join_type: join.join_type,
+                            condition: join.condition,
+                        },
+                    ));
+                    Ok(physical)
+                }
             }
             LogicalOperator::Sort(sort) => {
                 let input = self.logical_to_physical(sort.input)?;
@@ -1127,16 +1145,11 @@ impl<'a> Planner<'a> {
             return None;
         }
 
-        let key_range = match scan_type {
-            ScanBoundType::Point => ScanRange::PrefixScan {
-                prefix: &[],
-            },
-            ScanBoundType::Range => ScanRange::RangeScan {
-                start: None,
-                end: None,
-            },
-            ScanBoundType::Full => ScanRange::FullScan,
-        };
+        let key_range = self.encode_scan_bounds(&bounds);
+
+        if matches!(key_range, ScanRange::FullScan) {
+            return None;
+        }
 
         let residual = self.compute_residual_filter(filter.predicate, best_index.columns());
 
@@ -1296,31 +1309,99 @@ impl<'a> Planner<'a> {
             return None;
         }
 
-        candidates.into_iter().max_by(|a, b| {
-            let a_matched = a
-                .columns()
-                .iter()
-                .filter(|c| filter_columns.contains(&c.as_str()))
-                .count();
-            let b_matched = b
-                .columns()
-                .iter()
-                .filter(|c| filter_columns.contains(&c.as_str()))
-                .count();
-
-            match a_matched.cmp(&b_matched) {
-                std::cmp::Ordering::Equal => {
-                    if a.is_unique() && !b.is_unique() {
-                        std::cmp::Ordering::Greater
-                    } else if !a.is_unique() && b.is_unique() {
-                        std::cmp::Ordering::Less
-                    } else {
-                        std::cmp::Ordering::Equal
-                    }
-                }
-                ord => ord,
-            }
+        candidates.into_iter().min_by(|a, b| {
+            let cost_a = self.estimate_index_access_cost(a, filter_columns);
+            let cost_b = self.estimate_index_access_cost(b, filter_columns);
+            cost_a.partial_cmp(&cost_b).unwrap_or(std::cmp::Ordering::Equal)
         })
+    }
+
+    pub fn estimate_index_access_cost(
+        &self,
+        index: &crate::schema::IndexDef,
+        filter_columns: &[&str],
+    ) -> f64 {
+        const TABLE_CARDINALITY: f64 = 1000.0;
+        const PAGE_SIZE: f64 = 16384.0;
+        const AVG_ROW_SIZE: f64 = 100.0;
+        const IO_COST_PER_PAGE: f64 = 1.0;
+        const CPU_COST_PER_ROW: f64 = 0.01;
+
+        let matched_columns: usize = index
+            .columns()
+            .iter()
+            .filter(|c| filter_columns.contains(&c.as_str()))
+            .count();
+
+        let selectivity = self.estimate_index_selectivity(index, matched_columns);
+        let estimated_rows = (TABLE_CARDINALITY * selectivity).max(1.0);
+
+        let rows_per_page = (PAGE_SIZE / AVG_ROW_SIZE).max(1.0);
+        let data_pages = (estimated_rows / rows_per_page).ceil();
+
+        let index_height = 3.0;
+        let index_io = index_height + (estimated_rows / rows_per_page).ceil().min(10.0);
+
+        let total_io = index_io + data_pages;
+        let io_cost = total_io * IO_COST_PER_PAGE;
+        let cpu_cost = estimated_rows * CPU_COST_PER_ROW;
+
+        io_cost + cpu_cost
+    }
+
+    pub fn estimate_index_selectivity(
+        &self,
+        index: &crate::schema::IndexDef,
+        matched_columns: usize,
+    ) -> f64 {
+        const EQUALITY_SELECTIVITY: f64 = 0.01;
+        const UNIQUE_SELECTIVITY: f64 = 0.001;
+
+        if matched_columns == 0 {
+            return 1.0;
+        }
+
+        if index.is_unique() && matched_columns >= index.columns().len() {
+            return UNIQUE_SELECTIVITY;
+        }
+
+        let base_selectivity = if matched_columns == 1 {
+            EQUALITY_SELECTIVITY
+        } else {
+            EQUALITY_SELECTIVITY.powf(matched_columns as f64).max(UNIQUE_SELECTIVITY)
+        };
+
+        if index.is_unique() {
+            base_selectivity * 0.5
+        } else {
+            base_selectivity
+        }
+    }
+
+    pub fn estimate_table_scan_cost(&self, table_cardinality: u64) -> f64 {
+        const PAGE_SIZE: f64 = 16384.0;
+        const AVG_ROW_SIZE: f64 = 100.0;
+        const IO_COST_PER_PAGE: f64 = 1.0;
+        const CPU_COST_PER_ROW: f64 = 0.01;
+
+        let rows_per_page = (PAGE_SIZE / AVG_ROW_SIZE).max(1.0);
+        let total_pages = (table_cardinality as f64 / rows_per_page).ceil();
+
+        let io_cost = total_pages * IO_COST_PER_PAGE;
+        let cpu_cost = table_cardinality as f64 * CPU_COST_PER_ROW;
+
+        io_cost + cpu_cost
+    }
+
+    pub fn should_use_index(
+        &self,
+        index: &crate::schema::IndexDef,
+        filter_columns: &[&str],
+        table_cardinality: u64,
+    ) -> bool {
+        let index_cost = self.estimate_index_access_cost(index, filter_columns);
+        let scan_cost = self.estimate_table_scan_cost(table_cardinality);
+        index_cost < scan_cost
     }
 
     pub fn estimate_cardinality(&self, op: &LogicalOperator<'a>) -> u64 {
@@ -1549,6 +1630,121 @@ impl<'a> Planner<'a> {
         } else {
             ScanBoundType::Full
         }
+    }
+
+    fn encode_literal_to_bytes(&self, expr: &Expr<'a>) -> Option<&'a [u8]> {
+        match expr {
+            Expr::Literal(lit) => {
+                let mut buf = bumpalo::collections::Vec::with_capacity_in(32, self.arena);
+                match lit {
+                    Literal::Null => return None,
+                    Literal::Boolean(b) => {
+                        buf.push(if *b { 0x03 } else { 0x02 });
+                    }
+                    Literal::Integer(s) => {
+                        if let Ok(n) = s.parse::<i64>() {
+                            self.encode_int_to_arena(n, &mut buf);
+                        } else {
+                            return None;
+                        }
+                    }
+                    Literal::Float(s) => {
+                        if let Ok(f) = s.parse::<f64>() {
+                            self.encode_float_to_arena(f, &mut buf);
+                        } else {
+                            return None;
+                        }
+                    }
+                    Literal::String(s) => {
+                        self.encode_text_to_arena(s, &mut buf);
+                    }
+                    Literal::HexNumber(s) => {
+                        if let Ok(n) = i64::from_str_radix(s.trim_start_matches("0x"), 16) {
+                            self.encode_int_to_arena(n, &mut buf);
+                        } else {
+                            return None;
+                        }
+                    }
+                    Literal::BinaryNumber(s) => {
+                        if let Ok(n) = i64::from_str_radix(s.trim_start_matches("0b"), 2) {
+                            self.encode_int_to_arena(n, &mut buf);
+                        } else {
+                            return None;
+                        }
+                    }
+                }
+                Some(buf.into_bump_slice())
+            }
+            _ => None,
+        }
+    }
+
+    fn encode_int_to_arena(&self, n: i64, buf: &mut bumpalo::collections::Vec<'a, u8>) {
+        use crate::encoding::key::type_prefix;
+        if n < 0 {
+            buf.push(type_prefix::NEG_INT);
+            buf.extend((n as u64).to_be_bytes());
+        } else if n == 0 {
+            buf.push(type_prefix::ZERO);
+        } else {
+            buf.push(type_prefix::POS_INT);
+            buf.extend((n as u64).to_be_bytes());
+        }
+    }
+
+    fn encode_float_to_arena(&self, f: f64, buf: &mut bumpalo::collections::Vec<'a, u8>) {
+        use crate::encoding::key::type_prefix;
+        if f.is_nan() {
+            buf.push(type_prefix::NAN);
+        } else if f == f64::NEG_INFINITY {
+            buf.push(type_prefix::NEG_INFINITY);
+        } else if f == f64::INFINITY {
+            buf.push(type_prefix::POS_INFINITY);
+        } else if f < 0.0 {
+            buf.push(type_prefix::NEG_FLOAT);
+            buf.extend((!f.to_bits()).to_be_bytes());
+        } else if f == 0.0 {
+            buf.push(type_prefix::ZERO);
+        } else {
+            buf.push(type_prefix::POS_FLOAT);
+            buf.extend((f.to_bits() ^ (1u64 << 63)).to_be_bytes());
+        }
+    }
+
+    fn encode_text_to_arena(&self, s: &str, buf: &mut bumpalo::collections::Vec<'a, u8>) {
+        use crate::encoding::key::type_prefix;
+        buf.push(type_prefix::TEXT);
+        for &byte in s.as_bytes() {
+            match byte {
+                0x00 => {
+                    buf.push(0x00);
+                    buf.push(0xFF);
+                }
+                0xFF => {
+                    buf.push(0xFF);
+                    buf.push(0x00);
+                }
+                b => buf.push(b),
+            }
+        }
+        buf.push(0x00);
+        buf.push(0x00);
+    }
+
+    fn encode_scan_bounds(&self, bounds: &ColumnScanBounds<'a>) -> ScanRange<'a> {
+        if let Some(point) = bounds.point_value {
+            if let Some(encoded) = self.encode_literal_to_bytes(point.value) {
+                return ScanRange::PrefixScan { prefix: encoded };
+            }
+        }
+
+        if bounds.lower.is_some() || bounds.upper.is_some() {
+            let start = bounds.lower.and_then(|b| self.encode_literal_to_bytes(b.value));
+            let end = bounds.upper.and_then(|b| self.encode_literal_to_bytes(b.value));
+            return ScanRange::RangeScan { start, end };
+        }
+
+        ScanRange::FullScan
     }
 
     pub fn extract_equi_join_keys(
@@ -2724,6 +2920,66 @@ mod tests {
     }
 
     #[test]
+    fn cost_based_index_selection_prefers_lower_cost() {
+        use crate::schema::{IndexDef, IndexType};
+
+        let arena = Bump::new();
+        let catalog = Catalog::new();
+        let planner = Planner::new(&catalog, &arena);
+
+        let unique_idx = IndexDef::new("idx_unique_id", vec!["id"], true, IndexType::BTree);
+        let nonunique_idx = IndexDef::new("idx_nonunique_id", vec!["id"], false, IndexType::BTree);
+        let filter_columns: Vec<&str> = vec!["id"];
+
+        let unique_cost = planner.estimate_index_access_cost(&unique_idx, &filter_columns);
+        let nonunique_cost = planner.estimate_index_access_cost(&nonunique_idx, &filter_columns);
+
+        assert!(
+            unique_cost < nonunique_cost,
+            "unique index should have lower cost (unique={}, non-unique={})",
+            unique_cost,
+            nonunique_cost
+        );
+    }
+
+    #[test]
+    fn should_use_index_when_selective() {
+        use crate::schema::{IndexDef, IndexType};
+
+        let arena = Bump::new();
+        let catalog = Catalog::new();
+        let planner = Planner::new(&catalog, &arena);
+
+        let unique_idx = IndexDef::new("idx_pk", vec!["id"], true, IndexType::BTree);
+        let filter_columns: Vec<&str> = vec!["id"];
+
+        let should_use = planner.should_use_index(&unique_idx, &filter_columns, 10000);
+        assert!(should_use, "should use unique index on large table");
+    }
+
+    #[test]
+    fn should_not_use_index_on_tiny_table() {
+        use crate::schema::{IndexDef, IndexType};
+
+        let arena = Bump::new();
+        let catalog = Catalog::new();
+        let planner = Planner::new(&catalog, &arena);
+
+        let idx = IndexDef::new("idx_col", vec!["col"], false, IndexType::BTree);
+        let filter_columns: Vec<&str> = vec!["col"];
+
+        let table_scan_cost = planner.estimate_table_scan_cost(5);
+        let index_cost = planner.estimate_index_access_cost(&idx, &filter_columns);
+
+        assert!(
+            table_scan_cost <= index_cost,
+            "table scan should be cheaper for tiny table (scan={}, index={})",
+            table_scan_cost,
+            index_cost
+        );
+    }
+
+    #[test]
     fn estimate_scan_cardinality() {
         let arena = Bump::new();
         let catalog = Catalog::new();
@@ -2972,6 +3228,114 @@ mod tests {
 
         let plan = physical.unwrap();
         assert!(matches!(plan.root, PhysicalOperator::NestedLoopJoin(_)));
+    }
+
+    #[test]
+    fn optimize_join_with_equi_keys_uses_grace_hash_join() {
+        use crate::sql::ast::{BinaryOperator, ColumnRef, Expr};
+
+        let arena = Bump::new();
+        let catalog = create_test_catalog();
+        let planner = Planner::new(&catalog, &arena);
+
+        let left = arena.alloc(LogicalOperator::Scan(LogicalScan {
+            schema: None,
+            table: "orders",
+            alias: None,
+        }));
+        let right = arena.alloc(LogicalOperator::Scan(LogicalScan {
+            schema: None,
+            table: "users",
+            alias: None,
+        }));
+
+        let left_col = arena.alloc(Expr::Column(ColumnRef {
+            schema: None,
+            table: Some("orders"),
+            column: "user_id",
+        }));
+        let right_col = arena.alloc(Expr::Column(ColumnRef {
+            schema: None,
+            table: Some("users"),
+            column: "id",
+        }));
+        let equi_condition = arena.alloc(Expr::BinaryOp {
+            left: left_col,
+            op: BinaryOperator::Eq,
+            right: right_col,
+        });
+
+        let join = arena.alloc(LogicalOperator::Join(LogicalJoin {
+            left,
+            right,
+            join_type: JoinType::Inner,
+            condition: Some(equi_condition),
+        }));
+        let logical = LogicalPlan { root: join };
+
+        let physical = planner.optimize_to_physical(&logical);
+        assert!(physical.is_ok());
+
+        let plan = physical.unwrap();
+        assert!(
+            matches!(plan.root, PhysicalOperator::GraceHashJoin(_)),
+            "Expected GraceHashJoin for equi-join condition, got {:?}",
+            plan.root
+        );
+
+        if let PhysicalOperator::GraceHashJoin(hash_join) = plan.root {
+            assert!(!hash_join.join_keys.is_empty());
+            assert_eq!(hash_join.num_partitions, 16);
+        }
+    }
+
+    #[test]
+    fn optimize_join_without_equi_keys_uses_nested_loop() {
+        use crate::sql::ast::{BinaryOperator, ColumnRef, Expr, Literal};
+
+        let arena = Bump::new();
+        let catalog = create_test_catalog();
+        let planner = Planner::new(&catalog, &arena);
+
+        let left = arena.alloc(LogicalOperator::Scan(LogicalScan {
+            schema: None,
+            table: "orders",
+            alias: None,
+        }));
+        let right = arena.alloc(LogicalOperator::Scan(LogicalScan {
+            schema: None,
+            table: "users",
+            alias: None,
+        }));
+
+        let left_col = arena.alloc(Expr::Column(ColumnRef {
+            schema: None,
+            table: Some("orders"),
+            column: "total",
+        }));
+        let literal = arena.alloc(Expr::Literal(Literal::Integer("100")));
+        let range_condition = arena.alloc(Expr::BinaryOp {
+            left: left_col,
+            op: BinaryOperator::Gt,
+            right: literal,
+        });
+
+        let join = arena.alloc(LogicalOperator::Join(LogicalJoin {
+            left,
+            right,
+            join_type: JoinType::Inner,
+            condition: Some(range_condition),
+        }));
+        let logical = LogicalPlan { root: join };
+
+        let physical = planner.optimize_to_physical(&logical);
+        assert!(physical.is_ok());
+
+        let plan = physical.unwrap();
+        assert!(
+            matches!(plan.root, PhysicalOperator::NestedLoopJoin(_)),
+            "Expected NestedLoopJoin for non-equi-join condition"
+        );
     }
 
     #[test]
@@ -4173,6 +4537,145 @@ mod tests {
             }
         } else {
             panic!("Expected ProjectExec at root");
+        }
+    }
+
+    #[test]
+    fn index_scan_key_range_encodes_point_value() {
+        use crate::records::types::DataType;
+        use crate::schema::{ColumnDef, IndexDef, IndexType, TableDef};
+        use crate::sql::ast::{BinaryOperator, ColumnRef, Expr, Literal};
+
+        let arena = Bump::new();
+        let mut catalog = Catalog::new();
+
+        let columns = vec![
+            ColumnDef::new("id", DataType::Int8),
+            ColumnDef::new("name", DataType::Text),
+        ];
+        let mut table = TableDef::new(1, "users", columns);
+        let index = IndexDef::new("idx_id", vec!["id"], true, IndexType::BTree);
+        table = table.with_index(index);
+
+        let schema = catalog.get_schema_mut("root").unwrap();
+        schema.add_table(table);
+
+        let planner = Planner::new(&catalog, &arena);
+
+        let scan = arena.alloc(LogicalOperator::Scan(LogicalScan {
+            schema: None,
+            table: "users",
+            alias: None,
+        }));
+
+        let id_col = arena.alloc(Expr::Column(ColumnRef {
+            schema: None,
+            table: None,
+            column: "id",
+        }));
+        let val = arena.alloc(Expr::Literal(Literal::Integer("42")));
+        let predicate = arena.alloc(Expr::BinaryOp {
+            left: id_col,
+            op: BinaryOperator::Eq,
+            right: val,
+        });
+
+        let filter = LogicalFilter {
+            input: scan,
+            predicate,
+        };
+
+        let result = planner.try_optimize_filter_to_index_scan(&filter);
+        assert!(result.is_some());
+
+        if let Some(PhysicalOperator::IndexScan(index_scan)) = result {
+            match index_scan.key_range {
+                ScanRange::PrefixScan { prefix } => {
+                    assert!(
+                        !prefix.is_empty(),
+                        "PrefixScan should have encoded key bytes, not empty"
+                    );
+                    assert_eq!(
+                        prefix[0], 0x16,
+                        "First byte should be POS_INT type prefix (0x16)"
+                    );
+                }
+                _ => panic!("Expected PrefixScan for equality predicate"),
+            }
+        } else {
+            panic!("Expected IndexScan");
+        }
+    }
+
+    #[test]
+    fn index_scan_key_range_encodes_range_bounds() {
+        use crate::records::types::DataType;
+        use crate::schema::{ColumnDef, IndexDef, IndexType, TableDef};
+        use crate::sql::ast::{BinaryOperator, ColumnRef, Expr, Literal};
+
+        let arena = Bump::new();
+        let mut catalog = Catalog::new();
+
+        let columns = vec![
+            ColumnDef::new("age", DataType::Int8),
+            ColumnDef::new("name", DataType::Text),
+        ];
+        let mut table = TableDef::new(1, "users", columns);
+        let index = IndexDef::new("idx_age", vec!["age"], false, IndexType::BTree);
+        table = table.with_index(index);
+
+        let schema = catalog.get_schema_mut("root").unwrap();
+        schema.add_table(table);
+
+        let planner = Planner::new(&catalog, &arena);
+
+        let scan = arena.alloc(LogicalOperator::Scan(LogicalScan {
+            schema: None,
+            table: "users",
+            alias: None,
+        }));
+
+        let age_col = arena.alloc(Expr::Column(ColumnRef {
+            schema: None,
+            table: None,
+            column: "age",
+        }));
+        let val = arena.alloc(Expr::Literal(Literal::Integer("18")));
+        let predicate = arena.alloc(Expr::BinaryOp {
+            left: age_col,
+            op: BinaryOperator::GtEq,
+            right: val,
+        });
+
+        let filter = LogicalFilter {
+            input: scan,
+            predicate,
+        };
+
+        let result = planner.try_optimize_filter_to_index_scan(&filter);
+        assert!(result.is_some());
+
+        if let Some(PhysicalOperator::IndexScan(index_scan)) = result {
+            match index_scan.key_range {
+                ScanRange::RangeScan { start, end: _ } => {
+                    assert!(
+                        start.is_some(),
+                        "RangeScan should have encoded start bound"
+                    );
+                    let start_bytes = start.unwrap();
+                    assert!(
+                        !start_bytes.is_empty(),
+                        "Start bound should have encoded bytes"
+                    );
+                    assert_eq!(
+                        start_bytes[0], 0x16,
+                        "First byte should be POS_INT type prefix (0x16)"
+                    );
+                }
+                _ => panic!("Expected RangeScan for range predicate"),
+            }
+        } else {
+            panic!("Expected IndexScan");
         }
     }
 }
