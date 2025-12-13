@@ -20,7 +20,7 @@ fn bench_value_creation(c: &mut Criterion) {
     });
 
     group.bench_function("float", |b| {
-        b.iter(|| hint_black_box(Value::Float(black_box(3.14159))));
+        b.iter(|| hint_black_box(Value::Float(black_box(std::f64::consts::PI))));
     });
 
     group.bench_function("text_borrowed", |b| {
@@ -112,8 +112,8 @@ fn bench_value_comparison(c: &mut Criterion) {
     });
 
     group.bench_function("float_vs_float", |b| {
-        let v1 = Value::Float(3.14159);
-        let v2 = Value::Float(2.71828);
+        let v1 = Value::Float(std::f64::consts::PI);
+        let v2 = Value::Float(std::f64::consts::E);
         b.iter(|| {
             let result = black_box(&v1).compare(black_box(&v2));
             hint_black_box(result)
@@ -216,7 +216,7 @@ fn bench_value_clone(c: &mut Criterion) {
     });
 
     group.bench_function("float", |b| {
-        let v = Value::Float(3.14159);
+        let v = Value::Float(std::f64::consts::PI);
         b.iter(|| hint_black_box(black_box(&v).clone()));
     });
 

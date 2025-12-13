@@ -1235,13 +1235,13 @@ fn interval_roundtrip() {
     let schema = Schema::new(vec![ColumnDef::new("duration", DataType::Interval)]);
 
     let mut builder = RecordBuilder::new(&schema);
-    builder.set_interval(0, 3600_000_000, 5, 2).unwrap();
+    builder.set_interval(0, 3_600_000_000, 5, 2).unwrap();
 
     let data = builder.build().unwrap();
     let view = RecordView::new(&data, &schema).unwrap();
 
     let (micros, days, months) = view.get_interval(0).unwrap();
-    assert_eq!(micros, 3600_000_000);
+    assert_eq!(micros, 3_600_000_000);
     assert_eq!(days, 5);
     assert_eq!(months, 2);
 }
@@ -1761,7 +1761,7 @@ fn nested_composite_within_composite() {
 
     let mut addr_builder = RecordBuilder::new(&address_schema);
     addr_builder.set_text(0, "Boston").unwrap();
-    addr_builder.set_int4(1, 02101).unwrap();
+    addr_builder.set_int4(1, 2101).unwrap();
     let addr_data = addr_builder.build().unwrap();
 
     let person_schema = Schema::new(vec![

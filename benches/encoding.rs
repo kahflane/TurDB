@@ -106,7 +106,7 @@ fn bench_key_encode(c: &mut Criterion) {
         let mut buf = Vec::with_capacity(16);
         b.iter(|| {
             buf.clear();
-            encode_float(black_box(3.14159265358979), &mut buf);
+            encode_float(black_box(std::f64::consts::PI), &mut buf);
             hint_black_box(buf.len())
         });
     });
@@ -115,7 +115,7 @@ fn bench_key_encode(c: &mut Criterion) {
         let mut buf = Vec::with_capacity(16);
         b.iter(|| {
             buf.clear();
-            encode_float(black_box(-3.14159265358979), &mut buf);
+            encode_float(black_box(-std::f64::consts::PI), &mut buf);
             hint_black_box(buf.len())
         });
     });
@@ -166,7 +166,8 @@ fn bench_key_encode(c: &mut Criterion) {
 fn bench_key_decode(c: &mut Criterion) {
     let mut group = c.benchmark_group("key_decode");
 
-    let test_cases: Vec<(&str, Box<dyn Fn(&mut Vec<u8>)>)> = vec![
+    type EncodeFn = Box<dyn Fn(&mut Vec<u8>)>;
+    let test_cases: Vec<(&str, EncodeFn)> = vec![
         ("null", Box::new(|buf: &mut Vec<u8>| encode_null(buf))),
         (
             "int_positive",
@@ -178,7 +179,7 @@ fn bench_key_decode(c: &mut Criterion) {
         ),
         (
             "float",
-            Box::new(|buf: &mut Vec<u8>| encode_float(3.14159265358979, buf)),
+            Box::new(|buf: &mut Vec<u8>| encode_float(std::f64::consts::PI, buf)),
         ),
         (
             "text_short",
@@ -242,7 +243,7 @@ fn bench_encode_value(c: &mut Criterion) {
 
     group.bench_function("float", |b| {
         let mut buf = Vec::with_capacity(16);
-        let value = Value::Float(3.14159);
+        let value = Value::Float(std::f64::consts::PI);
         b.iter(|| {
             buf.clear();
             encode_value(black_box(&value), &mut buf);

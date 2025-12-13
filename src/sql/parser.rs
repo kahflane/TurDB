@@ -339,17 +339,19 @@ mod tests {
         let mut parser = Parser::new("SELECT 1 + 2 * 3", &arena);
         let stmt = parser.parse_statement().unwrap();
         if let Statement::Select(select) = stmt {
-            if let SelectColumn::Expr { expr, .. } = &select.columns[0] {
-                if let Expr::BinaryOp { op, right, .. } = expr {
-                    assert_eq!(*op, BinaryOperator::Plus);
-                    assert!(matches!(
-                        right,
-                        Expr::BinaryOp {
-                            op: BinaryOperator::Multiply,
-                            ..
-                        }
-                    ));
-                }
+            if let SelectColumn::Expr {
+                expr: Expr::BinaryOp { op, right, .. },
+                ..
+            } = &select.columns[0]
+            {
+                assert_eq!(*op, BinaryOperator::Plus);
+                assert!(matches!(
+                    right,
+                    Expr::BinaryOp {
+                        op: BinaryOperator::Multiply,
+                        ..
+                    }
+                ));
             }
         }
     }
@@ -521,11 +523,13 @@ mod tests {
         let mut parser = Parser::new("SELECT COUNT(*) FROM users", &arena);
         let stmt = parser.parse_statement().unwrap();
         if let Statement::Select(select) = stmt {
-            if let SelectColumn::Expr { expr, .. } = &select.columns[0] {
-                if let Expr::Function(f) = expr {
-                    assert_eq!(f.name.name, "COUNT");
-                    assert!(matches!(f.args, FunctionArgs::Star));
-                }
+            if let SelectColumn::Expr {
+                expr: Expr::Function(f),
+                ..
+            } = &select.columns[0]
+            {
+                assert_eq!(f.name.name, "COUNT");
+                assert!(matches!(f.args, FunctionArgs::Star));
             }
         }
     }
@@ -536,12 +540,14 @@ mod tests {
         let mut parser = Parser::new("SELECT COALESCE(a, b, c)", &arena);
         let stmt = parser.parse_statement().unwrap();
         if let Statement::Select(select) = stmt {
-            if let SelectColumn::Expr { expr, .. } = &select.columns[0] {
-                if let Expr::Function(f) = expr {
-                    assert_eq!(f.name.name, "COALESCE");
-                    if let FunctionArgs::Args(args) = &f.args {
-                        assert_eq!(args.len(), 3);
-                    }
+            if let SelectColumn::Expr {
+                expr: Expr::Function(f),
+                ..
+            } = &select.columns[0]
+            {
+                assert_eq!(f.name.name, "COALESCE");
+                if let FunctionArgs::Args(args) = &f.args {
+                    assert_eq!(args.len(), 3);
                 }
             }
         }
@@ -553,10 +559,12 @@ mod tests {
         let mut parser = Parser::new("SELECT CAST(id AS TEXT)", &arena);
         let stmt = parser.parse_statement().unwrap();
         if let Statement::Select(select) = stmt {
-            if let SelectColumn::Expr { expr, .. } = &select.columns[0] {
-                if let Expr::Cast { data_type, .. } = expr {
-                    assert!(matches!(data_type, DataType::Text));
-                }
+            if let SelectColumn::Expr {
+                expr: Expr::Cast { data_type, .. },
+                ..
+            } = &select.columns[0]
+            {
+                assert!(matches!(data_type, DataType::Text));
             }
         }
     }
@@ -567,16 +575,18 @@ mod tests {
         let mut parser = Parser::new("SELECT CASE WHEN a > 0 THEN 'pos' ELSE 'neg' END", &arena);
         let stmt = parser.parse_statement().unwrap();
         if let Statement::Select(select) = stmt {
-            if let SelectColumn::Expr { expr, .. } = &select.columns[0] {
-                if let Expr::Case {
-                    conditions,
-                    else_result,
-                    ..
-                } = expr
-                {
-                    assert_eq!(conditions.len(), 1);
-                    assert!(else_result.is_some());
-                }
+            if let SelectColumn::Expr {
+                expr:
+                    Expr::Case {
+                        conditions,
+                        else_result,
+                        ..
+                    },
+                ..
+            } = &select.columns[0]
+            {
+                assert_eq!(conditions.len(), 1);
+                assert!(else_result.is_some());
             }
         }
     }
