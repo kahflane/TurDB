@@ -625,8 +625,100 @@ impl<'a> Planner<'a> {
         Ok(LogicalPlan { root: delete_op })
     }
 
-    fn optimize_to_physical(&self, _logical: &LogicalPlan<'a>) -> Result<PhysicalPlan<'a>> {
-        bail!("optimize_to_physical not yet implemented")
+    fn optimize_to_physical(&self, logical: &LogicalPlan<'a>) -> Result<PhysicalPlan<'a>> {
+        let physical_root = self.logical_to_physical(logical.root)?;
+        Ok(PhysicalPlan { root: physical_root })
+    }
+
+    fn logical_to_physical(
+        &self,
+        op: &'a LogicalOperator<'a>,
+    ) -> Result<&'a PhysicalOperator<'a>> {
+        match op {
+            LogicalOperator::Scan(scan) => {
+                let physical = self.arena.alloc(PhysicalOperator::TableScan(PhysicalTableScan {
+                    schema: scan.schema,
+                    table: scan.table,
+                    alias: scan.alias,
+                    post_scan_filter: None,
+                }));
+                Ok(physical)
+            }
+            LogicalOperator::Filter(filter) => {
+                let input = self.logical_to_physical(filter.input)?;
+                let physical = self.arena.alloc(PhysicalOperator::FilterExec(PhysicalFilterExec {
+                    input,
+                    predicate: filter.predicate,
+                }));
+                Ok(physical)
+            }
+            LogicalOperator::Project(project) => {
+                let input = self.logical_to_physical(project.input)?;
+                let physical = self.arena.alloc(PhysicalOperator::ProjectExec(PhysicalProjectExec {
+                    input,
+                    expressions: project.expressions,
+                    aliases: project.aliases,
+                }));
+                Ok(physical)
+            }
+            LogicalOperator::Join(join) => {
+                let left = self.logical_to_physical(join.left)?;
+                let right = self.logical_to_physical(join.right)?;
+                let physical = self.arena.alloc(PhysicalOperator::NestedLoopJoin(PhysicalNestedLoopJoin {
+                    left,
+                    right,
+                    join_type: join.join_type,
+                    condition: join.condition,
+                }));
+                Ok(physical)
+            }
+            LogicalOperator::Sort(sort) => {
+                let input = self.logical_to_physical(sort.input)?;
+                let physical = self.arena.alloc(PhysicalOperator::SortExec(PhysicalSortExec {
+                    input,
+                    order_by: sort.order_by,
+                }));
+                Ok(physical)
+            }
+            LogicalOperator::Limit(limit) => {
+                let input = self.logical_to_physical(limit.input)?;
+                let physical = self.arena.alloc(PhysicalOperator::LimitExec(PhysicalLimitExec {
+                    input,
+                    limit: limit.limit,
+                    offset: limit.offset,
+                }));
+                Ok(physical)
+            }
+            LogicalOperator::Aggregate(agg) => {
+                let input = self.logical_to_physical(agg.input)?;
+                let aggregates = self.convert_aggregates_to_physical(agg.aggregates);
+                let physical = self.arena.alloc(PhysicalOperator::HashAggregate(PhysicalHashAggregate {
+                    input,
+                    group_by: agg.group_by,
+                    aggregates,
+                }));
+                Ok(physical)
+            }
+            LogicalOperator::Values(_) => {
+                bail!("Values operator cannot be directly converted to physical - only valid as INSERT source")
+            }
+            LogicalOperator::Insert(_) => {
+                bail!("Insert operator cannot be converted to physical plan - DML handled separately")
+            }
+            LogicalOperator::Update(_) => {
+                bail!("Update operator cannot be converted to physical plan - DML handled separately")
+            }
+            LogicalOperator::Delete(_) => {
+                bail!("Delete operator cannot be converted to physical plan - DML handled separately")
+            }
+        }
+    }
+
+    fn convert_aggregates_to_physical(
+        &self,
+        _aggregates: &'a [&'a Expr<'a>],
+    ) -> &'a [AggregateExpr<'a>] {
+        &[]
     }
 
     pub fn extract_filter_columns(&self, expr: &Expr<'a>) -> Vec<&'a str> {
@@ -1962,5 +2054,188 @@ mod tests {
         if let LogicalOperator::Scan(s) = ordered[0] {
             assert_eq!(s.table, "small_table");
         }
+    }
+
+    #[test]
+    fn optimize_scan_to_table_scan() {
+        let arena = Bump::new();
+        let catalog = Catalog::new();
+        let planner = Planner::new(&catalog, &arena);
+
+        let scan = arena.alloc(LogicalOperator::Scan(LogicalScan {
+            schema: None,
+            table: "users",
+            alias: None,
+        }));
+        let logical = LogicalPlan { root: scan };
+
+        let physical = planner.optimize_to_physical(&logical);
+        assert!(physical.is_ok());
+
+        let plan = physical.unwrap();
+        assert!(matches!(plan.root, PhysicalOperator::TableScan(_)));
+
+        if let PhysicalOperator::TableScan(ts) = plan.root {
+            assert_eq!(ts.table, "users");
+        }
+    }
+
+    #[test]
+    fn optimize_filter_to_filter_exec() {
+        let arena = Bump::new();
+        let catalog = Catalog::new();
+        let planner = Planner::new(&catalog, &arena);
+
+        let scan = arena.alloc(LogicalOperator::Scan(LogicalScan {
+            schema: None,
+            table: "users",
+            alias: None,
+        }));
+        let predicate = arena.alloc(Expr::Literal(crate::sql::ast::Literal::Boolean(true)));
+        let filter = arena.alloc(LogicalOperator::Filter(LogicalFilter {
+            input: scan,
+            predicate,
+        }));
+        let logical = LogicalPlan { root: filter };
+
+        let physical = planner.optimize_to_physical(&logical);
+        assert!(physical.is_ok());
+
+        let plan = physical.unwrap();
+        assert!(matches!(plan.root, PhysicalOperator::FilterExec(_)));
+    }
+
+    #[test]
+    fn optimize_project_to_project_exec() {
+        let arena = Bump::new();
+        let catalog = Catalog::new();
+        let planner = Planner::new(&catalog, &arena);
+
+        let scan = arena.alloc(LogicalOperator::Scan(LogicalScan {
+            schema: None,
+            table: "users",
+            alias: None,
+        }));
+        let project = arena.alloc(LogicalOperator::Project(LogicalProject {
+            input: scan,
+            expressions: &[],
+            aliases: &[],
+        }));
+        let logical = LogicalPlan { root: project };
+
+        let physical = planner.optimize_to_physical(&logical);
+        assert!(physical.is_ok());
+
+        let plan = physical.unwrap();
+        assert!(matches!(plan.root, PhysicalOperator::ProjectExec(_)));
+    }
+
+    #[test]
+    fn optimize_join_to_nested_loop_join() {
+        let arena = Bump::new();
+        let catalog = Catalog::new();
+        let planner = Planner::new(&catalog, &arena);
+
+        let left = arena.alloc(LogicalOperator::Scan(LogicalScan {
+            schema: None,
+            table: "orders",
+            alias: None,
+        }));
+        let right = arena.alloc(LogicalOperator::Scan(LogicalScan {
+            schema: None,
+            table: "customers",
+            alias: None,
+        }));
+        let join = arena.alloc(LogicalOperator::Join(LogicalJoin {
+            left,
+            right,
+            join_type: JoinType::Inner,
+            condition: None,
+        }));
+        let logical = LogicalPlan { root: join };
+
+        let physical = planner.optimize_to_physical(&logical);
+        assert!(physical.is_ok());
+
+        let plan = physical.unwrap();
+        assert!(matches!(plan.root, PhysicalOperator::NestedLoopJoin(_)));
+    }
+
+    #[test]
+    fn optimize_sort_to_sort_exec() {
+        let arena = Bump::new();
+        let catalog = Catalog::new();
+        let planner = Planner::new(&catalog, &arena);
+
+        let scan = arena.alloc(LogicalOperator::Scan(LogicalScan {
+            schema: None,
+            table: "users",
+            alias: None,
+        }));
+        let sort = arena.alloc(LogicalOperator::Sort(LogicalSort {
+            input: scan,
+            order_by: &[],
+        }));
+        let logical = LogicalPlan { root: sort };
+
+        let physical = planner.optimize_to_physical(&logical);
+        assert!(physical.is_ok());
+
+        let plan = physical.unwrap();
+        assert!(matches!(plan.root, PhysicalOperator::SortExec(_)));
+    }
+
+    #[test]
+    fn optimize_limit_to_limit_exec() {
+        let arena = Bump::new();
+        let catalog = Catalog::new();
+        let planner = Planner::new(&catalog, &arena);
+
+        let scan = arena.alloc(LogicalOperator::Scan(LogicalScan {
+            schema: None,
+            table: "users",
+            alias: None,
+        }));
+        let limit = arena.alloc(LogicalOperator::Limit(LogicalLimit {
+            input: scan,
+            limit: Some(10),
+            offset: None,
+        }));
+        let logical = LogicalPlan { root: limit };
+
+        let physical = planner.optimize_to_physical(&logical);
+        assert!(physical.is_ok());
+
+        let plan = physical.unwrap();
+        assert!(matches!(plan.root, PhysicalOperator::LimitExec(_)));
+
+        if let PhysicalOperator::LimitExec(le) = plan.root {
+            assert_eq!(le.limit, Some(10));
+        }
+    }
+
+    #[test]
+    fn optimize_aggregate_to_hash_aggregate() {
+        let arena = Bump::new();
+        let catalog = Catalog::new();
+        let planner = Planner::new(&catalog, &arena);
+
+        let scan = arena.alloc(LogicalOperator::Scan(LogicalScan {
+            schema: None,
+            table: "users",
+            alias: None,
+        }));
+        let agg = arena.alloc(LogicalOperator::Aggregate(LogicalAggregate {
+            input: scan,
+            group_by: &[],
+            aggregates: &[],
+        }));
+        let logical = LogicalPlan { root: agg };
+
+        let physical = planner.optimize_to_physical(&logical);
+        assert!(physical.is_ok());
+
+        let plan = physical.unwrap();
+        assert!(matches!(plan.root, PhysicalOperator::HashAggregate(_)));
     }
 }
