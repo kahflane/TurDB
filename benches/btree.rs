@@ -76,29 +76,33 @@ fn bench_get(c: &mut Criterion) {
     let mut group = c.benchmark_group("btree_get");
 
     for count in [100, 1000].iter() {
-        group.bench_with_input(BenchmarkId::new("existing_key", count), count, |b, &count| {
-            let dir = tempdir().unwrap();
-            let path = dir.path().join("bench.tbd");
-            let mut storage = MmapStorage::create(&path, count as u32 / 10 + 100).unwrap();
+        group.bench_with_input(
+            BenchmarkId::new("existing_key", count),
+            count,
+            |b, &count| {
+                let dir = tempdir().unwrap();
+                let path = dir.path().join("bench.tbd");
+                let mut storage = MmapStorage::create(&path, count as u32 / 10 + 100).unwrap();
 
-            {
-                let mut btree = BTree::create(&mut storage, 0).unwrap();
-                for i in 0..count {
-                    let key = format!("key{:08}", i);
-                    let value = format!("value{:08}", i);
-                    btree.insert(key.as_bytes(), value.as_bytes()).unwrap();
+                {
+                    let mut btree = BTree::create(&mut storage, 0).unwrap();
+                    for i in 0..count {
+                        let key = format!("key{:08}", i);
+                        let value = format!("value{:08}", i);
+                        btree.insert(key.as_bytes(), value.as_bytes()).unwrap();
+                    }
                 }
-            }
 
-            let key = format!("key{:08}", count / 2);
-            b.iter(|| {
-                let btree = BTree::new(&mut storage, 0).unwrap();
-                let result = btree.get(black_box(key.as_bytes()));
-                hint_black_box(result.is_ok())
-            });
+                let key = format!("key{:08}", count / 2);
+                b.iter(|| {
+                    let btree = BTree::new(&mut storage, 0).unwrap();
+                    let result = btree.get(black_box(key.as_bytes()));
+                    hint_black_box(result.is_ok())
+                });
 
-            drop(dir);
-        });
+                drop(dir);
+            },
+        );
 
         group.bench_with_input(
             BenchmarkId::new("nonexistent_key", count),

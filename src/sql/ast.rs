@@ -90,12 +90,25 @@ pub enum Statement<'a> {
     CreateSchema(&'a CreateSchemaStmt<'a>),
     AlterTable(&'a AlterTableStmt<'a>),
     Drop(&'a DropStmt<'a>),
+    Truncate(&'a TruncateStmt<'a>),
+    CreateView(&'a CreateViewStmt<'a>),
+    CreateFunction(&'a CreateFunctionStmt<'a>),
+    CreateProcedure(&'a CreateProcedureStmt<'a>),
+    CreateTrigger(&'a CreateTriggerStmt<'a>),
+    CreateType(&'a CreateTypeStmt<'a>),
+    Call(&'a CallStmt<'a>),
+    Merge(&'a MergeStmt<'a>),
     Begin(&'a BeginStmt),
     Commit,
     Rollback(&'a RollbackStmt<'a>),
     Savepoint(&'a SavepointStmt<'a>),
     Release(&'a ReleaseStmt<'a>),
     Explain(&'a ExplainStmt<'a>),
+    Set(&'a SetStmt<'a>),
+    Show(&'a ShowStmt<'a>),
+    Reset(&'a ResetStmt<'a>),
+    Grant(&'a GrantStmt<'a>),
+    Revoke(&'a RevokeStmt<'a>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -111,6 +124,29 @@ pub struct SelectStmt<'a> {
     pub limit: Option<&'a Expr<'a>>,
     pub offset: Option<&'a Expr<'a>>,
     pub set_op: Option<&'a SetOperation<'a>>,
+    pub for_clause: Option<&'a ForClause<'a>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ForClause<'a> {
+    pub lock_mode: LockMode,
+    pub tables: Option<&'a [&'a str]>,
+    pub wait_policy: WaitPolicy,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LockMode {
+    Update,
+    NoKeyUpdate,
+    Share,
+    KeyShare,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WaitPolicy {
+    Wait,
+    Nowait,
+    SkipLocked,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -260,7 +296,7 @@ pub enum OnConflictAction<'a> {
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Assignment<'a> {
-    pub column: &'a str,
+    pub column: ColumnRef<'a>,
     pub value: &'a Expr<'a>,
 }
 
@@ -476,6 +512,138 @@ pub enum ObjectType {
     Function,
     Procedure,
     Trigger,
+    Database,
+    Type,
+    Domain,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TruncateStmt<'a> {
+    pub tables: &'a [TableRef<'a>],
+    pub restart_identity: bool,
+    pub cascade: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CreateViewStmt<'a> {
+    pub or_replace: bool,
+    pub materialized: bool,
+    pub schema: Option<&'a str>,
+    pub name: &'a str,
+    pub columns: Option<&'a [&'a str]>,
+    pub query: &'a SelectStmt<'a>,
+    pub with_check_option: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CreateFunctionStmt<'a> {
+    pub or_replace: bool,
+    pub schema: Option<&'a str>,
+    pub name: &'a str,
+    pub params: &'a [FunctionParam<'a>],
+    pub return_type: DataType<'a>,
+    pub body: &'a str,
+    pub language: &'a str,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct FunctionParam<'a> {
+    pub name: &'a str,
+    pub data_type: DataType<'a>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CreateProcedureStmt<'a> {
+    pub or_replace: bool,
+    pub schema: Option<&'a str>,
+    pub name: &'a str,
+    pub params: &'a [FunctionParam<'a>],
+    pub body: &'a str,
+    pub language: &'a str,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CreateTriggerStmt<'a> {
+    pub or_replace: bool,
+    pub name: &'a str,
+    pub timing: TriggerTiming,
+    pub events: &'a [TriggerEvent],
+    pub table: &'a str,
+    pub for_each_row: bool,
+    pub function_name: &'a str,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TriggerTiming {
+    Before,
+    After,
+    InsteadOf,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TriggerEvent {
+    Insert,
+    Update,
+    Delete,
+    Truncate,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CreateTypeStmt<'a> {
+    pub schema: Option<&'a str>,
+    pub name: &'a str,
+    pub definition: TypeDefinition<'a>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum TypeDefinition<'a> {
+    Enum(&'a [&'a str]),
+    Composite(&'a [TypeField<'a>]),
+    Domain(DataType<'a>),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TypeField<'a> {
+    pub name: &'a str,
+    pub data_type: DataType<'a>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CallStmt<'a> {
+    pub schema: Option<&'a str>,
+    pub name: &'a str,
+    pub args: &'a [&'a Expr<'a>],
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct MergeStmt<'a> {
+    pub target_table: &'a str,
+    pub target_alias: Option<&'a str>,
+    pub source: MergeSource<'a>,
+    pub on_condition: &'a Expr<'a>,
+    pub clauses: &'a [MergeClause<'a>],
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum MergeSource<'a> {
+    Table {
+        name: &'a str,
+        alias: Option<&'a str>,
+    },
+    Subquery {
+        query: &'a SelectStmt<'a>,
+        alias: &'a str,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum MergeClause<'a> {
+    MatchedUpdate(&'a [Assignment<'a>]),
+    MatchedDelete,
+    NotMatchedInsert {
+        columns: Option<&'a [&'a str]>,
+        values: &'a [&'a Expr<'a>],
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -521,6 +689,67 @@ pub enum ExplainFormat {
     Json,
     Xml,
     Yaml,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SetStmt<'a> {
+    pub scope: SetScope,
+    pub name: &'a str,
+    pub value: &'a [&'a Expr<'a>],
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SetScope {
+    Session,
+    Local,
+    Global,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ShowStmt<'a> {
+    pub name: Option<&'a str>,
+    pub all: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ResetStmt<'a> {
+    pub name: Option<&'a str>,
+    pub all: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct GrantStmt<'a> {
+    pub privileges: &'a [Privilege],
+    pub object_type: Option<ObjectType>,
+    pub object_name: Option<TableRef<'a>>,
+    pub grantees: &'a [&'a str],
+    pub with_grant_option: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RevokeStmt<'a> {
+    pub privileges: &'a [Privilege],
+    pub object_type: Option<ObjectType>,
+    pub object_name: Option<TableRef<'a>>,
+    pub grantees: &'a [&'a str],
+    pub cascade: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Privilege {
+    Select,
+    Insert,
+    Update,
+    Delete,
+    Truncate,
+    References,
+    Trigger,
+    Create,
+    Connect,
+    Temporary,
+    Execute,
+    Usage,
+    All,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -747,6 +976,7 @@ mod tests {
             limit: None,
             offset: None,
             set_op: None,
+            for_clause: None,
         });
         let stmt = Statement::Select(select);
         assert!(matches!(stmt, Statement::Select(_)));

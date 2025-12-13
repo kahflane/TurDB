@@ -231,7 +231,9 @@ fn bench_value_clone(c: &mut Criterion) {
     });
 
     group.bench_function("text_owned_long", |b| {
-        let v = Value::Text(Cow::Owned("The quick brown fox jumps over the lazy dog".to_string()));
+        let v = Value::Text(Cow::Owned(
+            "The quick brown fox jumps over the lazy dog".to_string(),
+        ));
         b.iter(|| hint_black_box(black_box(&v).clone()));
     });
 
