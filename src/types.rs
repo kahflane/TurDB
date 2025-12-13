@@ -159,6 +159,43 @@ pub enum DataType {
     Vector(u32),
 }
 
+/// Type affinity for SQLite-compatible type system.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TypeAffinity {
+    Integer,
+    Real,
+    Text,
+    Blob,
+    Numeric,
+}
+
+impl DataType {
+    /// Returns the type affinity for this data type.
+    pub fn affinity(&self) -> TypeAffinity {
+        match self {
+            DataType::Int2 | DataType::Int4 | DataType::Int8 | DataType::Bool => {
+                TypeAffinity::Integer
+            }
+            DataType::Float4 | DataType::Float8 => TypeAffinity::Real,
+            DataType::Text
+            | DataType::Varchar(_)
+            | DataType::Char(_)
+            | DataType::Json
+            | DataType::Jsonb => TypeAffinity::Text,
+            DataType::Blob | DataType::Bytea | DataType::Vector(_) => TypeAffinity::Blob,
+            DataType::Date
+            | DataType::Time
+            | DataType::Timestamp
+            | DataType::TimestampTz
+            | DataType::Interval
+            | DataType::Uuid
+            | DataType::Inet
+            | DataType::MacAddr => TypeAffinity::Numeric,
+            DataType::Array(_) => TypeAffinity::Blob,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -220,5 +257,35 @@ mod tests {
         let _bytea = DataType::Bytea;
         let _array = DataType::Array(Box::new(DataType::Int4));
         let _vector = DataType::Vector(128);
+    }
+
+    #[test]
+    fn test_type_affinity_variants() {
+        let _integer = TypeAffinity::Integer;
+        let _real = TypeAffinity::Real;
+        let _text = TypeAffinity::Text;
+        let _blob = TypeAffinity::Blob;
+        let _numeric = TypeAffinity::Numeric;
+    }
+
+    #[test]
+    fn test_datatype_affinity_mapping() {
+        assert_eq!(DataType::Int2.affinity(), TypeAffinity::Integer);
+        assert_eq!(DataType::Int4.affinity(), TypeAffinity::Integer);
+        assert_eq!(DataType::Int8.affinity(), TypeAffinity::Integer);
+        assert_eq!(DataType::Bool.affinity(), TypeAffinity::Integer);
+
+        assert_eq!(DataType::Float4.affinity(), TypeAffinity::Real);
+        assert_eq!(DataType::Float8.affinity(), TypeAffinity::Real);
+
+        assert_eq!(DataType::Text.affinity(), TypeAffinity::Text);
+        assert_eq!(DataType::Varchar(100).affinity(), TypeAffinity::Text);
+        assert_eq!(DataType::Char(10).affinity(), TypeAffinity::Text);
+        assert_eq!(DataType::Json.affinity(), TypeAffinity::Text);
+        assert_eq!(DataType::Jsonb.affinity(), TypeAffinity::Text);
+
+        assert_eq!(DataType::Blob.affinity(), TypeAffinity::Blob);
+        assert_eq!(DataType::Bytea.affinity(), TypeAffinity::Blob);
+        assert_eq!(DataType::Vector(128).affinity(), TypeAffinity::Blob);
     }
 }
