@@ -1174,6 +1174,26 @@ impl<'a> Lexer<'a> {
                 self.advance();
                 Token::LtAt
             }
+            b'-' => {
+                self.advance();
+                if !self.is_eof() && self.current() == b'>' {
+                    self.advance();
+                    Token::LtMinusGt
+                } else {
+                    self.pos -= 1;
+                    Token::Lt
+                }
+            }
+            b'#' => {
+                self.advance();
+                if !self.is_eof() && self.current() == b'>' {
+                    self.advance();
+                    Token::LtHashGt
+                } else {
+                    self.pos -= 1;
+                    Token::Lt
+                }
+            }
             _ => Token::Lt,
         }
     }
@@ -1595,5 +1615,55 @@ mod tests {
     fn error_invalid_hex() {
         let mut lexer = Lexer::new("0x");
         assert!(matches!(lexer.next_token(), Token::Error(_)));
+    }
+
+    #[test]
+    fn lexer_vector_l2_distance_operator() {
+        let mut lexer = Lexer::new("<->");
+        assert_eq!(lexer.next_token(), Token::LtMinusGt);
+        assert_eq!(lexer.next_token(), Token::Eof);
+    }
+
+    #[test]
+    fn lexer_vector_inner_product_operator() {
+        let mut lexer = Lexer::new("<#>");
+        assert_eq!(lexer.next_token(), Token::LtHashGt);
+        assert_eq!(lexer.next_token(), Token::Eof);
+    }
+
+    #[test]
+    fn lexer_vector_cosine_distance_operator() {
+        let mut lexer = Lexer::new("<=>");
+        assert_eq!(lexer.next_token(), Token::Spaceship);
+        assert_eq!(lexer.next_token(), Token::Eof);
+    }
+
+    #[test]
+    fn lexer_vector_operators_in_expression() {
+        let mut lexer = Lexer::new("a <-> b <#> c <=> d");
+        assert_eq!(lexer.next_token(), Token::Ident("a"));
+        assert_eq!(lexer.next_token(), Token::LtMinusGt);
+        assert_eq!(lexer.next_token(), Token::Ident("b"));
+        assert_eq!(lexer.next_token(), Token::LtHashGt);
+        assert_eq!(lexer.next_token(), Token::Ident("c"));
+        assert_eq!(lexer.next_token(), Token::Spaceship);
+        assert_eq!(lexer.next_token(), Token::Ident("d"));
+        assert_eq!(lexer.next_token(), Token::Eof);
+    }
+
+    #[test]
+    fn lexer_less_than_followed_by_minus() {
+        let mut lexer = Lexer::new("< -");
+        assert_eq!(lexer.next_token(), Token::Lt);
+        assert_eq!(lexer.next_token(), Token::Minus);
+        assert_eq!(lexer.next_token(), Token::Eof);
+    }
+
+    #[test]
+    fn lexer_less_than_followed_by_hash() {
+        let mut lexer = Lexer::new("< #");
+        assert_eq!(lexer.next_token(), Token::Lt);
+        assert_eq!(lexer.next_token(), Token::Hash);
+        assert_eq!(lexer.next_token(), Token::Eof);
     }
 }

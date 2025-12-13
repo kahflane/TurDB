@@ -882,6 +882,9 @@ pub enum BinaryOperator {
     ArrayContains,
     ArrayContainedBy,
     ArrayOverlaps,
+    VectorL2Distance,
+    VectorInnerProduct,
+    VectorCosineDistance,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
