@@ -93,10 +93,41 @@
 //! - Complex queries: < 10ms planning time
 //! - Achieved through arena allocation and heuristic optimization
 
+use crate::records::types::DataType;
 use crate::schema::Catalog;
 use crate::sql::ast::{Expr, JoinType, Statement};
 use bumpalo::Bump;
 use eyre::{bail, Result};
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct OutputColumn<'a> {
+    pub name: &'a str,
+    pub data_type: DataType,
+    pub nullable: bool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct OutputSchema<'a> {
+    pub columns: &'a [OutputColumn<'a>],
+}
+
+impl<'a> OutputSchema<'a> {
+    pub fn empty() -> Self {
+        Self { columns: &[] }
+    }
+
+    pub fn column_count(&self) -> usize {
+        self.columns.len()
+    }
+
+    pub fn get_column(&self, name: &str) -> Option<&OutputColumn<'a>> {
+        self.columns.iter().find(|c| c.name == name)
+    }
+
+    pub fn get_column_by_index(&self, idx: usize) -> Option<&OutputColumn<'a>> {
+        self.columns.get(idx)
+    }
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum LogicalOperator<'a> {
@@ -333,6 +364,7 @@ pub struct PhysicalLimitExec<'a> {
 #[derive(Debug, Clone, PartialEq)]
 pub struct PhysicalPlan<'a> {
     pub root: &'a PhysicalOperator<'a>,
+    pub output_schema: OutputSchema<'a>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -676,7 +708,242 @@ impl<'a> Planner<'a> {
 
     fn optimize_to_physical(&self, logical: &LogicalPlan<'a>) -> Result<PhysicalPlan<'a>> {
         let physical_root = self.logical_to_physical(logical.root)?;
-        Ok(PhysicalPlan { root: physical_root })
+        let output_schema = self.compute_output_schema(physical_root)?;
+        Ok(PhysicalPlan {
+            root: physical_root,
+            output_schema,
+        })
+    }
+
+    fn compute_output_schema(&self, op: &'a PhysicalOperator<'a>) -> Result<OutputSchema<'a>> {
+        match op {
+            PhysicalOperator::TableScan(scan) => {
+                let table_name = if let Some(schema) = scan.schema {
+                    self.arena.alloc_str(&format!("{}.{}", schema, scan.table))
+                } else {
+                    scan.table
+                };
+
+                let table_def = self.catalog.resolve_table(table_name)?;
+                let mut columns = bumpalo::collections::Vec::new_in(self.arena);
+
+                for col in table_def.columns() {
+                    columns.push(OutputColumn {
+                        name: self.arena.alloc_str(col.name()),
+                        data_type: col.data_type(),
+                        nullable: col.is_nullable(),
+                    });
+                }
+
+                Ok(OutputSchema {
+                    columns: columns.into_bump_slice(),
+                })
+            }
+            PhysicalOperator::IndexScan(scan) => {
+                let table_name = if let Some(schema) = scan.schema {
+                    self.arena.alloc_str(&format!("{}.{}", schema, scan.table))
+                } else {
+                    scan.table
+                };
+
+                let table_def = self.catalog.resolve_table(table_name)?;
+                let mut columns = bumpalo::collections::Vec::new_in(self.arena);
+
+                for col in table_def.columns() {
+                    columns.push(OutputColumn {
+                        name: self.arena.alloc_str(col.name()),
+                        data_type: col.data_type(),
+                        nullable: col.is_nullable(),
+                    });
+                }
+
+                Ok(OutputSchema {
+                    columns: columns.into_bump_slice(),
+                })
+            }
+            PhysicalOperator::FilterExec(filter) => self.compute_output_schema(filter.input),
+            PhysicalOperator::LimitExec(limit) => self.compute_output_schema(limit.input),
+            PhysicalOperator::SortExec(sort) => self.compute_output_schema(sort.input),
+            PhysicalOperator::ProjectExec(project) => {
+                let input_schema = self.compute_output_schema(project.input)?;
+
+                if project.expressions.is_empty() {
+                    return Ok(input_schema);
+                }
+
+                let mut columns = bumpalo::collections::Vec::new_in(self.arena);
+
+                for (i, expr) in project.expressions.iter().enumerate() {
+                    let (name, data_type, nullable) = self.infer_expr_type(expr, &input_schema)?;
+                    let col_name = if let Some(alias) = project.aliases.get(i).and_then(|a| *a) {
+                        alias
+                    } else {
+                        name
+                    };
+                    columns.push(OutputColumn {
+                        name: col_name,
+                        data_type,
+                        nullable,
+                    });
+                }
+
+                Ok(OutputSchema {
+                    columns: columns.into_bump_slice(),
+                })
+            }
+            PhysicalOperator::NestedLoopJoin(join) => {
+                let left_schema = self.compute_output_schema(join.left)?;
+                let right_schema = self.compute_output_schema(join.right)?;
+                let mut columns = bumpalo::collections::Vec::new_in(self.arena);
+
+                for col in left_schema.columns {
+                    columns.push(*col);
+                }
+                for col in right_schema.columns {
+                    columns.push(*col);
+                }
+
+                Ok(OutputSchema {
+                    columns: columns.into_bump_slice(),
+                })
+            }
+            PhysicalOperator::GraceHashJoin(join) => {
+                let left_schema = self.compute_output_schema(join.left)?;
+                let right_schema = self.compute_output_schema(join.right)?;
+                let mut columns = bumpalo::collections::Vec::new_in(self.arena);
+
+                for col in left_schema.columns {
+                    columns.push(*col);
+                }
+                for col in right_schema.columns {
+                    columns.push(*col);
+                }
+
+                Ok(OutputSchema {
+                    columns: columns.into_bump_slice(),
+                })
+            }
+            PhysicalOperator::HashAggregate(agg) => {
+                let mut columns = bumpalo::collections::Vec::new_in(self.arena);
+                let input_schema = self.compute_output_schema(agg.input)?;
+
+                for group_expr in agg.group_by.iter() {
+                    let (name, data_type, nullable) =
+                        self.infer_expr_type(group_expr, &input_schema)?;
+                    columns.push(OutputColumn {
+                        name,
+                        data_type,
+                        nullable,
+                    });
+                }
+
+                for agg_expr in agg.aggregates.iter() {
+                    let (name, data_type) = self.infer_aggregate_type(agg_expr, &input_schema)?;
+                    columns.push(OutputColumn {
+                        name,
+                        data_type,
+                        nullable: true,
+                    });
+                }
+
+                Ok(OutputSchema {
+                    columns: columns.into_bump_slice(),
+                })
+            }
+            PhysicalOperator::SortedAggregate(agg) => {
+                let mut columns = bumpalo::collections::Vec::new_in(self.arena);
+                let input_schema = self.compute_output_schema(agg.input)?;
+
+                for group_expr in agg.group_by.iter() {
+                    let (name, data_type, nullable) =
+                        self.infer_expr_type(group_expr, &input_schema)?;
+                    columns.push(OutputColumn {
+                        name,
+                        data_type,
+                        nullable,
+                    });
+                }
+
+                for agg_expr in agg.aggregates.iter() {
+                    let (name, data_type) = self.infer_aggregate_type(agg_expr, &input_schema)?;
+                    columns.push(OutputColumn {
+                        name,
+                        data_type,
+                        nullable: true,
+                    });
+                }
+
+                Ok(OutputSchema {
+                    columns: columns.into_bump_slice(),
+                })
+            }
+        }
+    }
+
+    fn infer_expr_type(
+        &self,
+        expr: &'a Expr<'a>,
+        input_schema: &OutputSchema<'a>,
+    ) -> Result<(&'a str, DataType, bool)> {
+        use crate::sql::ast::Literal;
+
+        match expr {
+            Expr::Column(col_ref) => {
+                if let Some(col) = input_schema.get_column(col_ref.column) {
+                    Ok((col.name, col.data_type, col.nullable))
+                } else {
+                    Ok((col_ref.column, DataType::Text, true))
+                }
+            }
+            Expr::Literal(lit) => {
+                let (name, data_type) = match lit {
+                    Literal::Null => ("?column?", DataType::Text),
+                    Literal::Boolean(_) => ("?column?", DataType::Bool),
+                    Literal::Integer(_) => ("?column?", DataType::Int8),
+                    Literal::Float(_) => ("?column?", DataType::Float8),
+                    Literal::String(_) => ("?column?", DataType::Text),
+                    Literal::HexNumber(_) => ("?column?", DataType::Int8),
+                    Literal::BinaryNumber(_) => ("?column?", DataType::Int8),
+                };
+                Ok((self.arena.alloc_str(name), data_type, true))
+            }
+            Expr::BinaryOp { .. } => Ok((self.arena.alloc_str("?column?"), DataType::Bool, true)),
+            Expr::UnaryOp { expr, .. } => self.infer_expr_type(expr, input_schema),
+            Expr::Function(func) => {
+                let name = self.arena.alloc_str(func.name.name);
+                Ok((name, DataType::Text, true))
+            }
+            _ => Ok((self.arena.alloc_str("?column?"), DataType::Text, true)),
+        }
+    }
+
+    fn infer_aggregate_type(
+        &self,
+        agg: &AggregateExpr<'a>,
+        input_schema: &OutputSchema<'a>,
+    ) -> Result<(&'a str, DataType)> {
+        let func_name = match agg.function {
+            AggregateFunction::Count => "count",
+            AggregateFunction::Sum => "sum",
+            AggregateFunction::Avg => "avg",
+            AggregateFunction::Min => "min",
+            AggregateFunction::Max => "max",
+        };
+
+        let data_type = match agg.function {
+            AggregateFunction::Count => DataType::Int8,
+            AggregateFunction::Avg => DataType::Float8,
+            AggregateFunction::Sum | AggregateFunction::Min | AggregateFunction::Max => {
+                if let Some(arg) = agg.argument {
+                    let (_, dt, _) = self.infer_expr_type(arg, input_schema)?;
+                    dt
+                } else {
+                    DataType::Int8
+                }
+            }
+        };
+
+        Ok((self.arena.alloc_str(func_name), data_type))
     }
 
     fn logical_to_physical(
@@ -2587,7 +2854,7 @@ mod tests {
     #[test]
     fn optimize_scan_to_table_scan() {
         let arena = Bump::new();
-        let catalog = Catalog::new();
+        let catalog = create_test_catalog();
         let planner = Planner::new(&catalog, &arena);
 
         let scan = arena.alloc(LogicalOperator::Scan(LogicalScan {
@@ -2611,7 +2878,7 @@ mod tests {
     #[test]
     fn optimize_filter_to_filter_exec() {
         let arena = Bump::new();
-        let catalog = Catalog::new();
+        let catalog = create_test_catalog();
         let planner = Planner::new(&catalog, &arena);
 
         let scan = arena.alloc(LogicalOperator::Scan(LogicalScan {
@@ -2636,7 +2903,7 @@ mod tests {
     #[test]
     fn optimize_project_to_project_exec() {
         let arena = Bump::new();
-        let catalog = Catalog::new();
+        let catalog = create_test_catalog();
         let planner = Planner::new(&catalog, &arena);
 
         let scan = arena.alloc(LogicalOperator::Scan(LogicalScan {
@@ -2661,7 +2928,7 @@ mod tests {
     #[test]
     fn optimize_join_to_nested_loop_join() {
         let arena = Bump::new();
-        let catalog = Catalog::new();
+        let catalog = create_test_catalog();
         let planner = Planner::new(&catalog, &arena);
 
         let left = arena.alloc(LogicalOperator::Scan(LogicalScan {
@@ -2671,7 +2938,7 @@ mod tests {
         }));
         let right = arena.alloc(LogicalOperator::Scan(LogicalScan {
             schema: None,
-            table: "customers",
+            table: "products",
             alias: None,
         }));
         let join = arena.alloc(LogicalOperator::Join(LogicalJoin {
@@ -2692,7 +2959,7 @@ mod tests {
     #[test]
     fn optimize_sort_to_sort_exec() {
         let arena = Bump::new();
-        let catalog = Catalog::new();
+        let catalog = create_test_catalog();
         let planner = Planner::new(&catalog, &arena);
 
         let scan = arena.alloc(LogicalOperator::Scan(LogicalScan {
@@ -2716,7 +2983,7 @@ mod tests {
     #[test]
     fn optimize_limit_to_limit_exec() {
         let arena = Bump::new();
-        let catalog = Catalog::new();
+        let catalog = create_test_catalog();
         let planner = Planner::new(&catalog, &arena);
 
         let scan = arena.alloc(LogicalOperator::Scan(LogicalScan {
@@ -2745,7 +3012,7 @@ mod tests {
     #[test]
     fn optimize_aggregate_to_hash_aggregate() {
         let arena = Bump::new();
-        let catalog = Catalog::new();
+        let catalog = create_test_catalog();
         let planner = Planner::new(&catalog, &arena);
 
         let scan = arena.alloc(LogicalOperator::Scan(LogicalScan {
@@ -3764,5 +4031,86 @@ mod tests {
         assert!(result.is_err());
         let err_msg = result.unwrap_err().to_string();
         assert!(err_msg.contains("not found") || err_msg.contains("schema"));
+    }
+
+    #[test]
+    fn test_physical_plan_has_output_schema() {
+        use crate::sql::ast::{Distinct, FromClause, SelectColumn, SelectStmt, TableRef};
+
+        let arena = Bump::new();
+        let catalog = create_test_catalog();
+        let planner = Planner::new(&catalog, &arena);
+
+        let select = arena.alloc(SelectStmt {
+            with: None,
+            distinct: Distinct::All,
+            columns: arena.alloc_slice_copy(&[SelectColumn::AllColumns]),
+            from: Some(arena.alloc(FromClause::Table(TableRef {
+                schema: None,
+                name: "users",
+                alias: None,
+            }))),
+            where_clause: None,
+            group_by: &[],
+            having: None,
+            order_by: &[],
+            limit: None,
+            offset: None,
+            set_op: None,
+            for_clause: None,
+        });
+
+        let logical = planner.plan_select(select).unwrap();
+        let physical = planner.optimize_to_physical(&logical).unwrap();
+
+        assert!(!physical.output_schema.columns.is_empty());
+        assert_eq!(physical.output_schema.column_count(), 4);
+    }
+
+    #[test]
+    fn test_table_scan_output_schema_from_catalog() {
+        use crate::records::types::DataType;
+        use crate::sql::ast::{Distinct, FromClause, SelectColumn, SelectStmt, TableRef};
+
+        let arena = Bump::new();
+        let catalog = create_test_catalog();
+        let planner = Planner::new(&catalog, &arena);
+
+        let select = arena.alloc(SelectStmt {
+            with: None,
+            distinct: Distinct::All,
+            columns: arena.alloc_slice_copy(&[SelectColumn::AllColumns]),
+            from: Some(arena.alloc(FromClause::Table(TableRef {
+                schema: None,
+                name: "users",
+                alias: None,
+            }))),
+            where_clause: None,
+            group_by: &[],
+            having: None,
+            order_by: &[],
+            limit: None,
+            offset: None,
+            set_op: None,
+            for_clause: None,
+        });
+
+        let logical = planner.plan_select(select).unwrap();
+        let physical = planner.optimize_to_physical(&logical).unwrap();
+
+        let schema = &physical.output_schema;
+        assert_eq!(schema.column_count(), 4);
+
+        let id_col = schema.get_column("id").expect("id column should exist");
+        assert_eq!(id_col.data_type, DataType::Int8);
+
+        let name_col = schema.get_column("name").expect("name column should exist");
+        assert_eq!(name_col.data_type, DataType::Text);
+
+        let email_col = schema.get_column("email").expect("email column should exist");
+        assert_eq!(email_col.data_type, DataType::Text);
+
+        let active_col = schema.get_column("active").expect("active column should exist");
+        assert_eq!(active_col.data_type, DataType::Bool);
     }
 }
