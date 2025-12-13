@@ -26,8 +26,10 @@
       "Bash(wc:*)",
       "Bash(grep:*)",
       "Bash(git rev-list:*)",
-      "Bash(git -C /Users/julfikar/Documents/PassionFruit.nosync/tur/rust log --oneline -20)",
-      "Bash(git -C /Users/julfikar/Documents/PassionFruit.nosync/tur/rust diff --stat a56824b52f13dbaaa4eea0e2ca1f9fdbd4fb89e1..1d6903c25d2ae1b67197c1abacbb917912b22774)"
+      "Bash(git -C:*)",
+      "Bash(sort:*)",
+      "Bash(git grep:*)",
+      "Bash(RUST_BACKTRACE=1 cargo test:*)"
     ]
   }
 }
