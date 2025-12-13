@@ -287,4 +287,43 @@ mod tests {
         }
         assert_eq!(mgr.active_slots[slot_idx].load(Ordering::SeqCst), 0);
     }
+
+    #[test]
+    fn watermark_equals_global_ts_when_no_active_transactions() {
+        let mgr = TransactionManager::new();
+        assert_eq!(mgr.get_global_watermark(), 1);
+    }
+
+    #[test]
+    fn watermark_equals_oldest_active_transaction() {
+        let mgr = TransactionManager::new();
+        let _txn1 = mgr.begin_txn().unwrap();
+        let _txn2 = mgr.begin_txn().unwrap();
+        let _txn3 = mgr.begin_txn().unwrap();
+        assert_eq!(mgr.get_global_watermark(), 1);
+    }
+
+    #[test]
+    fn watermark_advances_after_oldest_commits() {
+        let mgr = TransactionManager::new();
+        let txn1 = mgr.begin_txn().unwrap();
+        let _txn2 = mgr.begin_txn().unwrap();
+        assert_eq!(mgr.get_global_watermark(), 1);
+        txn1.commit();
+        assert_eq!(mgr.get_global_watermark(), 2);
+    }
+
+    #[test]
+    fn watermark_stays_at_oldest_uncommitted() {
+        let mgr = TransactionManager::new();
+        let txn1 = mgr.begin_txn().unwrap();
+        let txn2 = mgr.begin_txn().unwrap();
+        let txn3 = mgr.begin_txn().unwrap();
+        txn2.commit();
+        assert_eq!(mgr.get_global_watermark(), 1);
+        txn3.commit();
+        assert_eq!(mgr.get_global_watermark(), 1);
+        txn1.commit();
+        assert!(mgr.get_global_watermark() > 3);
+    }
 }
