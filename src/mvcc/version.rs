@@ -140,6 +140,14 @@ impl<'a> VersionChainReader<'a> {
             None
         }
     }
+
+    pub fn has_newer_version(&self) -> bool {
+        self.current_header.txn_id > self.read_ts
+    }
+
+    pub fn is_reclaimable(&self, global_watermark: TxnId) -> bool {
+        !self.current_header.is_locked() && self.current_header.txn_id < global_watermark
+    }
 }
 
 pub struct VersionChainWriter {
@@ -392,5 +400,69 @@ mod tests {
         let parsed = RecordHeader::from_bytes(&buf);
         assert_eq!(parsed.txn_id, 42);
         assert!(parsed.is_locked());
+    }
+
+    #[test]
+    fn has_newer_version_when_txn_id_greater_than_read_ts() {
+        let hdr = RecordHeader::new(100);
+        let record = make_record(&hdr, b"data");
+        let reader = VersionChainReader::new(&record, 50);
+
+        assert!(reader.has_newer_version());
+    }
+
+    #[test]
+    fn no_newer_version_when_txn_id_at_read_ts() {
+        let hdr = RecordHeader::new(50);
+        let record = make_record(&hdr, b"data");
+        let reader = VersionChainReader::new(&record, 50);
+
+        assert!(!reader.has_newer_version());
+    }
+
+    #[test]
+    fn no_newer_version_when_txn_id_before_read_ts() {
+        let hdr = RecordHeader::new(30);
+        let record = make_record(&hdr, b"data");
+        let reader = VersionChainReader::new(&record, 50);
+
+        assert!(!reader.has_newer_version());
+    }
+
+    #[test]
+    fn is_reclaimable_when_older_than_watermark() {
+        let hdr = RecordHeader::new(10);
+        let record = make_record(&hdr, b"data");
+        let reader = VersionChainReader::new(&record, 100);
+
+        assert!(reader.is_reclaimable(20));
+    }
+
+    #[test]
+    fn not_reclaimable_when_at_watermark() {
+        let hdr = RecordHeader::new(20);
+        let record = make_record(&hdr, b"data");
+        let reader = VersionChainReader::new(&record, 100);
+
+        assert!(!reader.is_reclaimable(20));
+    }
+
+    #[test]
+    fn not_reclaimable_when_locked() {
+        let mut hdr = RecordHeader::new(10);
+        hdr.set_locked(true);
+        let record = make_record(&hdr, b"data");
+        let reader = VersionChainReader::new(&record, 100);
+
+        assert!(!reader.is_reclaimable(20));
+    }
+
+    #[test]
+    fn not_reclaimable_when_newer_than_watermark() {
+        let hdr = RecordHeader::new(30);
+        let record = make_record(&hdr, b"data");
+        let reader = VersionChainReader::new(&record, 100);
+
+        assert!(!reader.is_reclaimable(20));
     }
 }
