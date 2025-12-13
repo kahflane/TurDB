@@ -185,4 +185,46 @@ mod tests {
         txn.add_to_write_set(100, vec![1, 2, 3]);
         assert_eq!(txn.write_set().len(), 1);
     }
+
+    #[test]
+    fn begin_txn_returns_transaction_with_start_timestamp() {
+        let mgr = TransactionManager::new();
+        let txn = mgr.begin_txn().unwrap();
+        assert_eq!(txn.id(), 1);
+    }
+
+    #[test]
+    fn begin_txn_increments_timestamp_for_each_transaction() {
+        let mgr = TransactionManager::new();
+        let txn1 = mgr.begin_txn().unwrap();
+        let txn2 = mgr.begin_txn().unwrap();
+        assert_eq!(txn1.id(), 1);
+        assert_eq!(txn2.id(), 2);
+    }
+
+    #[test]
+    fn begin_txn_assigns_unique_slot() {
+        let mgr = TransactionManager::new();
+        let txn1 = mgr.begin_txn().unwrap();
+        let txn2 = mgr.begin_txn().unwrap();
+        assert_ne!(txn1.slot_idx(), txn2.slot_idx());
+    }
+
+    #[test]
+    fn begin_txn_marks_slot_as_active() {
+        let mgr = TransactionManager::new();
+        let txn = mgr.begin_txn().unwrap();
+        let slot_val = mgr.active_slots[txn.slot_idx()].load(Ordering::SeqCst);
+        assert_eq!(slot_val, txn.id());
+    }
+
+    #[test]
+    fn begin_txn_fails_when_all_slots_full() {
+        let mgr = TransactionManager::new();
+        let mut txns = Vec::new();
+        for _ in 0..MAX_CONCURRENT_TXNS {
+            txns.push(mgr.begin_txn().unwrap());
+        }
+        assert!(mgr.begin_txn().is_err());
+    }
 }
