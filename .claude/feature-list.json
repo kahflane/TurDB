@@ -933,29 +933,29 @@
     {
       "title": "Types - Value Representation",
       "description": "Type-safe value representation without boxing",
-      "isCompleted": false,
+      "isCompleted": true,
       "priority": 17,
       "phase": 4,
       "tasks": [
         {
           "task": "Define Value enum (Null, Int, Float, Text, Blob, Vector)",
-          "done": false
+          "done": true
         },
         {
           "task": "Define DataType enum for column types",
-          "done": false
+          "done": true
         },
         {
           "task": "Define TypeAffinity enum (Integer, Real, Text, Blob, Numeric)",
-          "done": false
+          "done": true
         },
         {
           "task": "Implement type coercion between affinities",
-          "done": false
+          "done": true
         },
         {
           "task": "Implement comparison for Value",
-          "done": false
+          "done": true
         }
       ]
     },
