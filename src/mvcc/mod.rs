@@ -84,8 +84,10 @@
 //! The RecordHeader uses manual byte parsing to handle potentially unaligned
 //! memory from mmap. This avoids UB on architectures requiring alignment.
 
+pub mod record_header;
 pub mod transaction;
 
+pub use record_header::RecordHeader;
 pub use transaction::{Transaction, TransactionManager, TxnId, TxnState, MAX_CONCURRENT_TXNS};
 
 #[cfg(test)]
