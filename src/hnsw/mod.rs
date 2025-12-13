@@ -134,6 +134,118 @@ pub enum QuantizationType {
     PQ = 2,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NodeId {
+    page_no: u32,
+    slot_index: u16,
+}
+
+impl NodeId {
+    pub const fn new(page_no: u32, slot_index: u16) -> Self {
+        Self {
+            page_no,
+            slot_index,
+        }
+    }
+
+    pub const fn none() -> Self {
+        Self {
+            page_no: u32::MAX,
+            slot_index: u16::MAX,
+        }
+    }
+
+    pub const fn page_no(&self) -> u32 {
+        self.page_no
+    }
+
+    pub const fn slot_index(&self) -> u16 {
+        self.slot_index
+    }
+
+    pub const fn is_none(&self) -> bool {
+        self.page_no == u32::MAX && self.slot_index == u16::MAX
+    }
+}
+
+impl Default for NodeId {
+    fn default() -> Self {
+        Self::none()
+    }
+}
+
+const MAX_LEVEL0_NEIGHBORS: usize = 32;
+const MAX_LEVEL_NEIGHBORS: usize = 16;
+
+pub struct HnswNode {
+    row_id: u64,
+    max_level: u8,
+    l0_count: u8,
+    l0_neighbors: [NodeId; MAX_LEVEL0_NEIGHBORS],
+    higher_levels: Vec<Vec<NodeId>>,
+}
+
+impl HnswNode {
+    pub fn new(row_id: u64, max_level: u8) -> Self {
+        let mut higher_levels = Vec::with_capacity(max_level as usize);
+        for _ in 0..max_level {
+            higher_levels.push(Vec::with_capacity(MAX_LEVEL_NEIGHBORS));
+        }
+
+        Self {
+            row_id,
+            max_level,
+            l0_count: 0,
+            l0_neighbors: [NodeId::none(); MAX_LEVEL0_NEIGHBORS],
+            higher_levels,
+        }
+    }
+
+    pub fn row_id(&self) -> u64 {
+        self.row_id
+    }
+
+    pub fn max_level(&self) -> u8 {
+        self.max_level
+    }
+
+    pub fn level0_neighbor_count(&self) -> u8 {
+        self.l0_count
+    }
+
+    pub fn level0_neighbors(&self) -> &[NodeId] {
+        &self.l0_neighbors[..self.l0_count as usize]
+    }
+
+    pub fn add_level0_neighbor(&mut self, neighbor: NodeId) {
+        if (self.l0_count as usize) < MAX_LEVEL0_NEIGHBORS {
+            self.l0_neighbors[self.l0_count as usize] = neighbor;
+            self.l0_count += 1;
+        }
+    }
+
+    pub fn neighbors_at_level(&self, level: u8) -> &[NodeId] {
+        if level == 0 {
+            self.level0_neighbors()
+        } else if (level as usize) <= self.higher_levels.len() {
+            &self.higher_levels[(level - 1) as usize]
+        } else {
+            &[]
+        }
+    }
+
+    pub fn add_neighbor_at_level(&mut self, level: u8, neighbor: NodeId) {
+        if level == 0 {
+            self.add_level0_neighbor(neighbor);
+        } else if (level as usize) <= self.higher_levels.len() {
+            let level_vec = &mut self.higher_levels[(level - 1) as usize];
+            if level_vec.len() < MAX_LEVEL_NEIGHBORS {
+                level_vec.push(neighbor);
+            }
+        }
+    }
+}
+
 pub struct HnswIndex {
     dimensions: u16,
     m: u16,
@@ -272,5 +384,63 @@ mod tests {
     fn hnsw_index_has_quantization_type() {
         let index = HnswIndex::with_defaults(128);
         assert_eq!(index.quantization(), QuantizationType::None);
+    }
+
+    #[test]
+    fn node_id_stores_page_and_slot() {
+        let node_id = NodeId::new(42, 5);
+
+        assert_eq!(node_id.page_no(), 42);
+        assert_eq!(node_id.slot_index(), 5);
+    }
+
+    #[test]
+    fn node_id_none_represents_null() {
+        let null_id = NodeId::none();
+
+        assert!(null_id.is_none());
+        assert_eq!(null_id.page_no(), u32::MAX);
+    }
+
+    #[test]
+    fn hnsw_node_has_row_id_and_level() {
+        let node = HnswNode::new(12345, 3);
+
+        assert_eq!(node.row_id(), 12345);
+        assert_eq!(node.max_level(), 3);
+    }
+
+    #[test]
+    fn hnsw_node_starts_with_no_neighbors() {
+        let node = HnswNode::new(100, 0);
+
+        assert_eq!(node.level0_neighbor_count(), 0);
+        assert!(node.level0_neighbors().is_empty());
+    }
+
+    #[test]
+    fn hnsw_node_can_add_level0_neighbors() {
+        let mut node = HnswNode::new(100, 0);
+        let neighbor = NodeId::new(1, 0);
+
+        node.add_level0_neighbor(neighbor);
+
+        assert_eq!(node.level0_neighbor_count(), 1);
+        assert_eq!(node.level0_neighbors()[0], neighbor);
+    }
+
+    #[test]
+    fn hnsw_node_stores_higher_level_neighbors() {
+        let mut node = HnswNode::new(100, 2);
+        let neighbor1 = NodeId::new(1, 0);
+        let neighbor2 = NodeId::new(2, 0);
+
+        node.add_neighbor_at_level(1, neighbor1);
+        node.add_neighbor_at_level(2, neighbor2);
+
+        assert_eq!(node.neighbors_at_level(1).len(), 1);
+        assert_eq!(node.neighbors_at_level(2).len(), 1);
+        assert_eq!(node.neighbors_at_level(1)[0], neighbor1);
+        assert_eq!(node.neighbors_at_level(2)[0], neighbor2);
     }
 }
