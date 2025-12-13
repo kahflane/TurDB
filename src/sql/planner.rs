@@ -1114,6 +1114,118 @@ impl<'a> Planner<'a> {
             ScanBoundType::Full
         }
     }
+
+    pub fn extract_equi_join_keys(
+        &self,
+        condition: Option<&'a Expr<'a>>,
+    ) -> &'a [EquiJoinKey<'a>] {
+        let condition = match condition {
+            Some(c) => c,
+            None => return &[],
+        };
+
+        let mut keys = bumpalo::collections::Vec::new_in(self.arena);
+        self.collect_equi_join_keys(condition, &mut keys);
+        keys.into_bump_slice()
+    }
+
+    fn collect_equi_join_keys(
+        &self,
+        expr: &'a Expr<'a>,
+        keys: &mut bumpalo::collections::Vec<'a, EquiJoinKey<'a>>,
+    ) {
+        use crate::sql::ast::BinaryOperator;
+
+        if let Expr::BinaryOp { left, op, right } = expr {
+            match op {
+                BinaryOperator::And => {
+                    self.collect_equi_join_keys(left, keys);
+                    self.collect_equi_join_keys(right, keys);
+                }
+                BinaryOperator::Eq => {
+                    if let (Expr::Column(left_col), Expr::Column(right_col)) = (*left, *right) {
+                        keys.push(EquiJoinKey {
+                            left_expr: left,
+                            right_expr: right,
+                            left_column: left_col.column,
+                            right_column: right_col.column,
+                            left_table: left_col.table,
+                            right_table: right_col.table,
+                        });
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    pub fn has_equi_join_keys(&self, condition: Option<&'a Expr<'a>>) -> bool {
+        !self.extract_equi_join_keys(condition).is_empty()
+    }
+
+    pub fn convert_equi_keys_to_join_keys(
+        &self,
+        equi_keys: &'a [EquiJoinKey<'a>],
+    ) -> &'a [(&'a Expr<'a>, &'a Expr<'a>)] {
+        let mut join_keys = bumpalo::collections::Vec::new_in(self.arena);
+        for key in equi_keys {
+            join_keys.push((key.left_expr, key.right_expr));
+        }
+        join_keys.into_bump_slice()
+    }
+
+    pub fn extract_non_equi_conditions(
+        &self,
+        condition: Option<&'a Expr<'a>>,
+    ) -> Option<&'a Expr<'a>> {
+        let condition = condition?;
+        self.collect_non_equi_conditions(condition)
+    }
+
+    fn collect_non_equi_conditions(&self, expr: &'a Expr<'a>) -> Option<&'a Expr<'a>> {
+        use crate::sql::ast::BinaryOperator;
+
+        match expr {
+            Expr::BinaryOp { left, op, right } => match op {
+                BinaryOperator::And => {
+                    let left_non_equi = self.collect_non_equi_conditions(left);
+                    let right_non_equi = self.collect_non_equi_conditions(right);
+
+                    match (left_non_equi, right_non_equi) {
+                        (Some(l), Some(r)) => {
+                            Some(self.arena.alloc(Expr::BinaryOp {
+                                left: l,
+                                op: BinaryOperator::And,
+                                right: r,
+                            }))
+                        }
+                        (Some(l), None) => Some(l),
+                        (None, Some(r)) => Some(r),
+                        (None, None) => None,
+                    }
+                }
+                BinaryOperator::Eq => {
+                    if matches!((*left, *right), (Expr::Column(_), Expr::Column(_))) {
+                        None
+                    } else {
+                        Some(expr)
+                    }
+                }
+                _ => Some(expr),
+            },
+            _ => Some(expr),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct EquiJoinKey<'a> {
+    pub left_expr: &'a Expr<'a>,
+    pub right_expr: &'a Expr<'a>,
+    pub left_column: &'a str,
+    pub right_column: &'a str,
+    pub left_table: Option<&'a str>,
+    pub right_table: Option<&'a str>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -2973,5 +3085,206 @@ mod tests {
         assert!(bounds.upper.is_none());
         assert!(bounds.point_value.is_none());
         assert_eq!(planner.bounds_to_scan_type(&bounds), ScanBoundType::Full);
+    }
+
+    #[test]
+    fn extract_equi_join_keys_simple() {
+        use crate::sql::ast::{BinaryOperator, ColumnRef};
+
+        let arena = Bump::new();
+        let catalog = Catalog::new();
+        let planner = Planner::new(&catalog, &arena);
+
+        let left_col = arena.alloc(Expr::Column(ColumnRef {
+            schema: None,
+            table: Some("users"),
+            column: "id",
+        }));
+        let right_col = arena.alloc(Expr::Column(ColumnRef {
+            schema: None,
+            table: Some("orders"),
+            column: "user_id",
+        }));
+        let condition = arena.alloc(Expr::BinaryOp {
+            left: left_col,
+            op: BinaryOperator::Eq,
+            right: right_col,
+        });
+
+        let keys = planner.extract_equi_join_keys(Some(condition));
+
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0].left_column, "id");
+        assert_eq!(keys[0].right_column, "user_id");
+        assert_eq!(keys[0].left_table, Some("users"));
+        assert_eq!(keys[0].right_table, Some("orders"));
+    }
+
+    #[test]
+    fn extract_equi_join_keys_multiple() {
+        use crate::sql::ast::{BinaryOperator, ColumnRef};
+
+        let arena = Bump::new();
+        let catalog = Catalog::new();
+        let planner = Planner::new(&catalog, &arena);
+
+        let left_col1 = arena.alloc(Expr::Column(ColumnRef {
+            schema: None,
+            table: Some("a"),
+            column: "id",
+        }));
+        let right_col1 = arena.alloc(Expr::Column(ColumnRef {
+            schema: None,
+            table: Some("b"),
+            column: "a_id",
+        }));
+        let cond1 = arena.alloc(Expr::BinaryOp {
+            left: left_col1,
+            op: BinaryOperator::Eq,
+            right: right_col1,
+        });
+
+        let left_col2 = arena.alloc(Expr::Column(ColumnRef {
+            schema: None,
+            table: Some("a"),
+            column: "type",
+        }));
+        let right_col2 = arena.alloc(Expr::Column(ColumnRef {
+            schema: None,
+            table: Some("b"),
+            column: "type",
+        }));
+        let cond2 = arena.alloc(Expr::BinaryOp {
+            left: left_col2,
+            op: BinaryOperator::Eq,
+            right: right_col2,
+        });
+
+        let condition = arena.alloc(Expr::BinaryOp {
+            left: cond1,
+            op: BinaryOperator::And,
+            right: cond2,
+        });
+
+        let keys = planner.extract_equi_join_keys(Some(condition));
+
+        assert_eq!(keys.len(), 2);
+        assert_eq!(keys[0].left_column, "id");
+        assert_eq!(keys[0].right_column, "a_id");
+        assert_eq!(keys[1].left_column, "type");
+        assert_eq!(keys[1].right_column, "type");
+    }
+
+    #[test]
+    fn extract_equi_join_keys_no_equi() {
+        use crate::sql::ast::{BinaryOperator, ColumnRef, Literal};
+
+        let arena = Bump::new();
+        let catalog = Catalog::new();
+        let planner = Planner::new(&catalog, &arena);
+
+        let col = arena.alloc(Expr::Column(ColumnRef {
+            schema: None,
+            table: Some("users"),
+            column: "age",
+        }));
+        let val = arena.alloc(Expr::Literal(Literal::Integer("18")));
+        let condition = arena.alloc(Expr::BinaryOp {
+            left: col,
+            op: BinaryOperator::Gt,
+            right: val,
+        });
+
+        let keys = planner.extract_equi_join_keys(Some(condition));
+        assert_eq!(keys.len(), 0);
+    }
+
+    #[test]
+    fn extract_equi_join_keys_none_condition() {
+        let arena = Bump::new();
+        let catalog = Catalog::new();
+        let planner = Planner::new(&catalog, &arena);
+
+        let keys = planner.extract_equi_join_keys(None);
+        assert_eq!(keys.len(), 0);
+    }
+
+    #[test]
+    fn has_equi_join_keys_returns_true() {
+        use crate::sql::ast::{BinaryOperator, ColumnRef};
+
+        let arena = Bump::new();
+        let catalog = Catalog::new();
+        let planner = Planner::new(&catalog, &arena);
+
+        let left_col = arena.alloc(Expr::Column(ColumnRef {
+            schema: None,
+            table: Some("a"),
+            column: "id",
+        }));
+        let right_col = arena.alloc(Expr::Column(ColumnRef {
+            schema: None,
+            table: Some("b"),
+            column: "a_id",
+        }));
+        let condition = arena.alloc(Expr::BinaryOp {
+            left: left_col,
+            op: BinaryOperator::Eq,
+            right: right_col,
+        });
+
+        assert!(planner.has_equi_join_keys(Some(condition)));
+    }
+
+    #[test]
+    fn extract_non_equi_conditions_mixed() {
+        use crate::sql::ast::{BinaryOperator, ColumnRef, Literal};
+
+        let arena = Bump::new();
+        let catalog = Catalog::new();
+        let planner = Planner::new(&catalog, &arena);
+
+        let left_col = arena.alloc(Expr::Column(ColumnRef {
+            schema: None,
+            table: Some("a"),
+            column: "id",
+        }));
+        let right_col = arena.alloc(Expr::Column(ColumnRef {
+            schema: None,
+            table: Some("b"),
+            column: "a_id",
+        }));
+        let equi_cond = arena.alloc(Expr::BinaryOp {
+            left: left_col,
+            op: BinaryOperator::Eq,
+            right: right_col,
+        });
+
+        let filter_col = arena.alloc(Expr::Column(ColumnRef {
+            schema: None,
+            table: Some("a"),
+            column: "age",
+        }));
+        let filter_val = arena.alloc(Expr::Literal(Literal::Integer("18")));
+        let filter_cond = arena.alloc(Expr::BinaryOp {
+            left: filter_col,
+            op: BinaryOperator::Gt,
+            right: filter_val,
+        });
+
+        let combined = arena.alloc(Expr::BinaryOp {
+            left: equi_cond,
+            op: BinaryOperator::And,
+            right: filter_cond,
+        });
+
+        let non_equi = planner.extract_non_equi_conditions(Some(combined));
+        assert!(non_equi.is_some());
+
+        if let Some(Expr::BinaryOp { op, .. }) = non_equi {
+            assert_eq!(*op, BinaryOperator::Gt);
+        } else {
+            panic!("Expected BinaryOp");
+        }
     }
 }
