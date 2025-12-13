@@ -1,7 +1,9 @@
-//! Database Integration Benchmarks for TurDB
+//! Database Integration Benchmarks for TurDB vs SQLite
 //!
-//! These benchmarks measure end-to-end database performance through the public API.
-//! They test the full SQL execution pipeline: Parse → Plan → Execute.
+//! These benchmarks compare TurDB against SQLite with optimized settings:
+//! - journal_mode=WAL
+//! - synchronous=OFF
+//! - mmap_size=268435456 (256MB)
 //!
 //! ## Performance Targets (from CLAUDE.md)
 //!
@@ -9,28 +11,20 @@
 //! - Sequential scan: > 1M rows/sec
 //! - Insert: > 100K rows/sec
 //!
-//! ## Benchmark Groups
-//!
-//! 1. **Insert Throughput**: Measures INSERT statement performance
-//! 2. **Point Read Latency**: Measures SELECT with WHERE clause
-//! 3. **Sequential Scan**: Measures full table scan throughput
-//! 4. **Mixed Workload**: Simulates realistic read/write patterns
-//!
 //! ## Running Benchmarks
 //!
 //! ```bash
 //! cargo bench --bench database
-//! cargo bench --bench database -- --save-baseline main
-//! cargo bench --bench database -- --baseline main
+//! cargo bench --bench database -- "insert"
+//! cargo bench --bench database -- "scan"
 //! ```
 
-use criterion::{
-    black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput,
-};
+use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use rusqlite::{Connection, params};
 use tempfile::tempdir;
 use turdb::Database;
 
-fn create_test_database(row_count: usize) -> (tempfile::TempDir, Database) {
+fn create_turdb_test_database(row_count: usize) -> (tempfile::TempDir, Database) {
     let dir = tempdir().unwrap();
     let db_path = dir.path().join("bench_db");
     let db = Database::create(&db_path).unwrap();
@@ -52,13 +46,48 @@ fn create_test_database(row_count: usize) -> (tempfile::TempDir, Database) {
     (dir, db)
 }
 
-fn bench_insert_throughput(c: &mut Criterion) {
-    let mut group = c.benchmark_group("database_insert");
+fn create_sqlite_connection(dir: &tempfile::TempDir) -> Connection {
+    let db_path = dir.path().join("sqlite_bench.db");
+    let conn = Connection::open(&db_path).unwrap();
+
+    conn.execute_batch(
+        "PRAGMA journal_mode=WAL;
+         PRAGMA synchronous=OFF;
+         PRAGMA mmap_size=268435456;
+         PRAGMA cache_size=-65536;
+         PRAGMA temp_store=MEMORY;"
+    ).unwrap();
+
+    conn
+}
+
+fn create_sqlite_test_database(row_count: usize) -> (tempfile::TempDir, Connection) {
+    let dir = tempdir().unwrap();
+    let conn = create_sqlite_connection(&dir);
+
+    conn.execute(
+        "CREATE TABLE users (id INTEGER, name TEXT, age INTEGER, score REAL)",
+        [],
+    ).unwrap();
+
+    for i in 0..row_count {
+        conn.execute(
+            "INSERT INTO users VALUES (?1, ?2, ?3, ?4)",
+            params![i as i64, format!("user{}", i), 20 + (i % 60) as i64, (i as f64) * 0.1],
+        ).unwrap();
+    }
+
+    (dir, conn)
+}
+
+fn bench_insert_comparison(c: &mut Criterion) {
+    let mut group = c.benchmark_group("insert_comparison");
 
     for count in [100, 1000, 10000].iter() {
         group.throughput(Throughput::Elements(*count as u64));
+
         group.bench_with_input(
-            BenchmarkId::new("sequential", count),
+            BenchmarkId::new("turdb", count),
             count,
             |b, &count| {
                 b.iter_with_setup(
@@ -74,13 +103,38 @@ fn bench_insert_throughput(c: &mut Criterion) {
                         for i in 0..count {
                             let sql = format!(
                                 "INSERT INTO users VALUES ({}, 'user{}', {})",
-                                i,
-                                i,
-                                20 + (i % 60)
+                                i, i, 20 + (i % 60)
                             );
                             db.execute(&sql).unwrap();
                         }
                         db
+                    },
+                );
+            },
+        );
+
+        group.bench_with_input(
+            BenchmarkId::new("sqlite", count),
+            count,
+            |b, &count| {
+                b.iter_with_setup(
+                    || {
+                        let dir = tempdir().unwrap();
+                        let conn = create_sqlite_connection(&dir);
+                        conn.execute(
+                            "CREATE TABLE users (id INTEGER, name TEXT, age INTEGER)",
+                            [],
+                        ).unwrap();
+                        (dir, conn)
+                    },
+                    |(_dir, conn)| {
+                        for i in 0..count {
+                            conn.execute(
+                                "INSERT INTO users VALUES (?1, ?2, ?3)",
+                                params![i as i64, format!("user{}", i), 20 + (i % 60) as i64],
+                            ).unwrap();
+                        }
+                        conn
                     },
                 );
             },
@@ -90,26 +144,16 @@ fn bench_insert_throughput(c: &mut Criterion) {
     group.finish();
 }
 
-fn bench_insert_batch(c: &mut Criterion) {
-    let mut group = c.benchmark_group("database_insert_batch");
+fn bench_insert_prepared_comparison(c: &mut Criterion) {
+    let mut group = c.benchmark_group("insert_prepared_comparison");
 
-    for count in [100, 1000].iter() {
+    for count in [1000, 10000].iter() {
         group.throughput(Throughput::Elements(*count as u64));
+
         group.bench_with_input(
-            BenchmarkId::new("batch_insert", count),
+            BenchmarkId::new("turdb", count),
             count,
             |b, &count| {
-                let statements: Vec<String> = (0..count)
-                    .map(|i| {
-                        format!(
-                            "INSERT INTO users VALUES ({}, 'user{}', {})",
-                            i,
-                            i,
-                            20 + (i % 60)
-                        )
-                    })
-                    .collect();
-
                 b.iter_with_setup(
                     || {
                         let dir = tempdir().unwrap();
@@ -120,10 +164,47 @@ fn bench_insert_batch(c: &mut Criterion) {
                         (dir, db)
                     },
                     |(_dir, db)| {
-                        for sql in &statements {
-                            db.execute(sql).unwrap();
+                        for i in 0..count {
+                            let sql = format!(
+                                "INSERT INTO users VALUES ({}, 'user{}', {})",
+                                i, i, 20 + (i % 60)
+                            );
+                            db.execute(&sql).unwrap();
                         }
                         db
+                    },
+                );
+            },
+        );
+
+        group.bench_with_input(
+            BenchmarkId::new("sqlite_prepared", count),
+            count,
+            |b, &count| {
+                b.iter_with_setup(
+                    || {
+                        let dir = tempdir().unwrap();
+                        let conn = create_sqlite_connection(&dir);
+                        conn.execute(
+                            "CREATE TABLE users (id INTEGER, name TEXT, age INTEGER)",
+                            [],
+                        ).unwrap();
+                        (dir, conn)
+                    },
+                    |(_dir, conn)| {
+                        {
+                            let mut stmt = conn.prepare_cached(
+                                "INSERT INTO users VALUES (?1, ?2, ?3)"
+                            ).unwrap();
+                            for i in 0..count {
+                                stmt.execute(params![
+                                    i as i64,
+                                    format!("user{}", i),
+                                    20 + (i % 60) as i64
+                                ]).unwrap();
+                            }
+                        }
+                        conn
                     },
                 );
             },
@@ -133,20 +214,40 @@ fn bench_insert_batch(c: &mut Criterion) {
     group.finish();
 }
 
-fn bench_select_scan(c: &mut Criterion) {
-    let mut group = c.benchmark_group("database_select_scan");
+fn bench_scan_comparison(c: &mut Criterion) {
+    let mut group = c.benchmark_group("scan_comparison");
 
     for count in [100, 1000, 10000].iter() {
         group.throughput(Throughput::Elements(*count as u64));
 
-        let (_dir, db) = create_test_database(*count);
+        let (_turdb_dir, turdb) = create_turdb_test_database(*count);
+        let (_sqlite_dir, sqlite_conn) = create_sqlite_test_database(*count);
 
         group.bench_with_input(
-            BenchmarkId::new("full_scan", count),
+            BenchmarkId::new("turdb", count),
             count,
             |b, _count| {
                 b.iter(|| {
-                    let rows = db.query(black_box("SELECT * FROM users")).unwrap();
+                    let rows = turdb.query(black_box("SELECT * FROM users")).unwrap();
+                    black_box(rows.len())
+                });
+            },
+        );
+
+        group.bench_with_input(
+            BenchmarkId::new("sqlite", count),
+            count,
+            |b, _count| {
+                b.iter(|| {
+                    let mut stmt = sqlite_conn.prepare_cached("SELECT * FROM users").unwrap();
+                    let rows: Vec<_> = stmt.query_map([], |row| {
+                        Ok((
+                            row.get::<_, i64>(0).unwrap(),
+                            row.get::<_, String>(1).unwrap(),
+                            row.get::<_, i64>(2).unwrap(),
+                            row.get::<_, f64>(3).unwrap(),
+                        ))
+                    }).unwrap().collect();
                     black_box(rows.len())
                 });
             },
@@ -156,31 +257,35 @@ fn bench_select_scan(c: &mut Criterion) {
     group.finish();
 }
 
-fn bench_select_projection(c: &mut Criterion) {
-    let mut group = c.benchmark_group("database_select_projection");
+fn bench_projection_comparison(c: &mut Criterion) {
+    let mut group = c.benchmark_group("projection_comparison");
 
-    for count in [100, 1000, 10000].iter() {
+    for count in [1000, 10000].iter() {
         group.throughput(Throughput::Elements(*count as u64));
 
-        let (_dir, db) = create_test_database(*count);
+        let (_turdb_dir, turdb) = create_turdb_test_database(*count);
+        let (_sqlite_dir, sqlite_conn) = create_sqlite_test_database(*count);
 
         group.bench_with_input(
-            BenchmarkId::new("single_column", count),
+            BenchmarkId::new("turdb_single_col", count),
             count,
             |b, _count| {
                 b.iter(|| {
-                    let rows = db.query(black_box("SELECT id FROM users")).unwrap();
+                    let rows = turdb.query(black_box("SELECT id FROM users")).unwrap();
                     black_box(rows.len())
                 });
             },
         );
 
         group.bench_with_input(
-            BenchmarkId::new("two_columns", count),
+            BenchmarkId::new("sqlite_single_col", count),
             count,
             |b, _count| {
                 b.iter(|| {
-                    let rows = db.query(black_box("SELECT id, name FROM users")).unwrap();
+                    let mut stmt = sqlite_conn.prepare_cached("SELECT id FROM users").unwrap();
+                    let rows: Vec<_> = stmt.query_map([], |row| {
+                        Ok(row.get::<_, i64>(0).unwrap())
+                    }).unwrap().collect();
                     black_box(rows.len())
                 });
             },
@@ -190,130 +295,47 @@ fn bench_select_projection(c: &mut Criterion) {
     group.finish();
 }
 
-fn bench_database_create(c: &mut Criterion) {
-    let mut group = c.benchmark_group("database_lifecycle");
+fn bench_mixed_workload_comparison(c: &mut Criterion) {
+    let mut group = c.benchmark_group("mixed_workload_comparison");
 
-    group.bench_function("create_empty", |b| {
-        b.iter_with_setup(
-            || {
-                let dir = tempdir().unwrap();
-                let db_path = dir.path().join("bench_db");
-                (dir, db_path)
-            },
-            |(dir, db_path)| {
-                let db = Database::create(&db_path).unwrap();
-                (dir, db)
-            },
-        );
-    });
+    let (_turdb_dir, turdb) = create_turdb_test_database(1000);
+    let (_sqlite_dir, sqlite_conn) = create_sqlite_test_database(1000);
 
-    group.bench_function("create_with_table", |b| {
-        b.iter_with_setup(
-            || {
-                let dir = tempdir().unwrap();
-                let db_path = dir.path().join("bench_db");
-                (dir, db_path)
-            },
-            |(dir, db_path)| {
-                let db = Database::create(&db_path).unwrap();
-                db.execute("CREATE TABLE test (id INT, value TEXT)")
-                    .unwrap();
-                (dir, db)
-            },
-        );
-    });
-
-    group.bench_function("open_existing", |b| {
-        let dir = tempdir().unwrap();
-        let db_path = dir.path().join("bench_db");
-        {
-            let db = Database::create(&db_path).unwrap();
-            db.execute("CREATE TABLE test (id INT, value TEXT)")
-                .unwrap();
-            for i in 0..100 {
-                db.execute(&format!("INSERT INTO test VALUES ({}, 'val{}')", i, i))
-                    .unwrap();
-            }
-        }
-
-        b.iter(|| {
-            let db = Database::open(black_box(&db_path)).unwrap();
-            black_box(db)
-        });
-    });
-
-    group.finish();
-}
-
-fn bench_sql_parsing(c: &mut Criterion) {
-    let mut group = c.benchmark_group("sql_parsing");
-
-    group.bench_function("simple_select", |b| {
-        let (_dir, db) = create_test_database(10);
-        b.iter(|| {
-            let rows = db.query(black_box("SELECT * FROM users")).unwrap();
-            black_box(rows.len())
-        });
-    });
-
-    group.bench_function("simple_insert", |b| {
-        let dir = tempdir().unwrap();
-        let db_path = dir.path().join("bench_db");
-        let db = Database::create(&db_path).unwrap();
-        db.execute("CREATE TABLE test (id INT)").unwrap();
-
-        let mut counter = 0;
-        b.iter(|| {
-            let sql = format!("INSERT INTO test VALUES ({})", counter);
-            db.execute(black_box(&sql)).unwrap();
-            counter += 1;
-        });
-    });
-
-    group.finish();
-}
-
-fn bench_mixed_workload(c: &mut Criterion) {
-    let mut group = c.benchmark_group("database_mixed_workload");
-
-    group.bench_function("read_heavy_90_10", |b| {
-        let (_dir, db) = create_test_database(1000);
+    group.bench_function("turdb_read_heavy_90_10", |b| {
         let mut op_counter = 0;
-
         b.iter(|| {
             if op_counter % 10 == 0 {
                 let sql = format!(
                     "INSERT INTO users VALUES ({}, 'newuser{}', {}, {})",
-                    10000 + op_counter,
-                    op_counter,
-                    25,
-                    1.5
+                    10000 + op_counter, op_counter, 25, 1.5
                 );
-                db.execute(&sql).unwrap();
+                turdb.execute(&sql).unwrap();
             } else {
-                let rows = db.query("SELECT * FROM users").unwrap();
+                let rows = turdb.query("SELECT * FROM users").unwrap();
                 black_box(rows.len());
             }
             op_counter += 1;
         });
     });
 
-    group.bench_function("write_heavy_50_50", |b| {
-        let (_dir, db) = create_test_database(100);
+    group.bench_function("sqlite_read_heavy_90_10", |b| {
         let mut op_counter = 0;
-
         b.iter(|| {
-            if op_counter % 2 == 0 {
-                let sql = format!(
-                    "INSERT INTO users VALUES ({}, 'newuser{}', {}, {})",
-                    10000 + op_counter,
-                    op_counter,
-                    25,
-                    1.5
-                );
-                db.execute(&sql).unwrap();
+            if op_counter % 10 == 0 {
+                sqlite_conn.execute(
+                    "INSERT INTO users VALUES (?1, ?2, ?3, ?4)",
+                    params![10000 + op_counter, format!("newuser{}", op_counter), 25i64, 1.5f64],
+                ).unwrap();
             } else {
-                let rows = db.query("SELECT * FROM users").unwrap();
+                let mut stmt = sqlite_conn.prepare_cached("SELECT * FROM users").unwrap();
+                let rows: Vec<_> = stmt.query_map([], |row| {
+                    Ok((
+                        row.get::<_, i64>(0).unwrap(),
+                        row.get::<_, String>(1).unwrap(),
+                        row.get::<_, i64>(2).unwrap(),
+                        row.get::<_, f64>(3).unwrap(),
+                    ))
+                }).unwrap().collect();
                 black_box(rows.len());
             }
             op_counter += 1;
@@ -323,37 +345,45 @@ fn bench_mixed_workload(c: &mut Criterion) {
     group.finish();
 }
 
-fn bench_large_rows(c: &mut Criterion) {
-    let mut group = c.benchmark_group("database_large_rows");
+fn bench_large_text_comparison(c: &mut Criterion) {
+    let mut group = c.benchmark_group("large_text_comparison");
 
-    group.bench_function("insert_large_text", |b| {
+    let large_text = "x".repeat(1000);
+
+    group.bench_function("turdb_insert_1kb", |b| {
         let dir = tempdir().unwrap();
         let db_path = dir.path().join("bench_db");
         let db = Database::create(&db_path).unwrap();
-        db.execute("CREATE TABLE docs (id INT, content TEXT)")
-            .unwrap();
+        db.execute("CREATE TABLE docs (id INT, content TEXT)").unwrap();
 
-        let large_text = "x".repeat(1000);
         let mut counter = 0;
-
         b.iter(|| {
-            let sql = format!(
-                "INSERT INTO docs VALUES ({}, '{}')",
-                counter, large_text
-            );
+            let sql = format!("INSERT INTO docs VALUES ({}, '{}')", counter, large_text);
             db.execute(&sql).unwrap();
             counter += 1;
         });
     });
 
-    group.bench_function("select_large_text", |b| {
+    group.bench_function("sqlite_insert_1kb", |b| {
+        let dir = tempdir().unwrap();
+        let conn = create_sqlite_connection(&dir);
+        conn.execute("CREATE TABLE docs (id INTEGER, content TEXT)", []).unwrap();
+
+        let mut counter = 0;
+        b.iter(|| {
+            conn.execute(
+                "INSERT INTO docs VALUES (?1, ?2)",
+                params![counter as i64, &large_text],
+            ).unwrap();
+            counter += 1;
+        });
+    });
+
+    group.bench_function("turdb_scan_1kb_rows", |b| {
         let dir = tempdir().unwrap();
         let db_path = dir.path().join("bench_db");
         let db = Database::create(&db_path).unwrap();
-        db.execute("CREATE TABLE docs (id INT, content TEXT)")
-            .unwrap();
-
-        let large_text = "x".repeat(1000);
+        db.execute("CREATE TABLE docs (id INT, content TEXT)").unwrap();
         for i in 0..100 {
             let sql = format!("INSERT INTO docs VALUES ({}, '{}')", i, large_text);
             db.execute(&sql).unwrap();
@@ -365,19 +395,124 @@ fn bench_large_rows(c: &mut Criterion) {
         });
     });
 
+    group.bench_function("sqlite_scan_1kb_rows", |b| {
+        let dir = tempdir().unwrap();
+        let conn = create_sqlite_connection(&dir);
+        conn.execute("CREATE TABLE docs (id INTEGER, content TEXT)", []).unwrap();
+        for i in 0..100 {
+            conn.execute(
+                "INSERT INTO docs VALUES (?1, ?2)",
+                params![i as i64, &large_text],
+            ).unwrap();
+        }
+
+        b.iter(|| {
+            let mut stmt = conn.prepare_cached("SELECT * FROM docs").unwrap();
+            let rows: Vec<_> = stmt.query_map([], |row| {
+                Ok((row.get::<_, i64>(0).unwrap(), row.get::<_, String>(1).unwrap()))
+            }).unwrap().collect();
+            black_box(rows.len())
+        });
+    });
+
+    group.finish();
+}
+
+fn bench_lifecycle_comparison(c: &mut Criterion) {
+    let mut group = c.benchmark_group("lifecycle_comparison");
+
+    group.bench_function("turdb_create_empty", |b| {
+        b.iter_with_setup(
+            || {
+                let dir = tempdir().unwrap();
+                let db_path = dir.path().join("bench_db");
+                (dir, db_path)
+            },
+            |(dir, db_path)| {
+                let db = Database::create(&db_path).unwrap();
+                (dir, db)
+            },
+        );
+    });
+
+    group.bench_function("sqlite_create_empty", |b| {
+        b.iter_with_setup(
+            || {
+                let dir = tempdir().unwrap();
+                let db_path = dir.path().join("sqlite.db");
+                (dir, db_path)
+            },
+            |(dir, db_path)| {
+                let conn = Connection::open(&db_path).unwrap();
+                conn.execute_batch(
+                    "PRAGMA journal_mode=WAL;
+                     PRAGMA synchronous=OFF;
+                     PRAGMA mmap_size=268435456;"
+                ).unwrap();
+                (dir, conn)
+            },
+        );
+    });
+
+    group.bench_function("turdb_open_existing", |b| {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("bench_db");
+        {
+            let db = Database::create(&db_path).unwrap();
+            db.execute("CREATE TABLE test (id INT, value TEXT)").unwrap();
+            for i in 0..100 {
+                db.execute(&format!("INSERT INTO test VALUES ({}, 'val{}')", i, i)).unwrap();
+            }
+        }
+
+        b.iter(|| {
+            let db = Database::open(black_box(&db_path)).unwrap();
+            black_box(db)
+        });
+    });
+
+    group.bench_function("sqlite_open_existing", |b| {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("sqlite.db");
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                "PRAGMA journal_mode=WAL;
+                 PRAGMA synchronous=OFF;
+                 PRAGMA mmap_size=268435456;"
+            ).unwrap();
+            conn.execute("CREATE TABLE test (id INTEGER, value TEXT)", []).unwrap();
+            for i in 0..100 {
+                conn.execute(
+                    "INSERT INTO test VALUES (?1, ?2)",
+                    params![i as i64, format!("val{}", i)],
+                ).unwrap();
+            }
+        }
+
+        b.iter(|| {
+            let conn = Connection::open(black_box(&db_path)).unwrap();
+            conn.execute_batch(
+                "PRAGMA journal_mode=WAL;
+                 PRAGMA synchronous=OFF;
+                 PRAGMA mmap_size=268435456;"
+            ).unwrap();
+            black_box(conn)
+        });
+    });
+
     group.finish();
 }
 
 criterion_group!(
     benches,
-    bench_insert_throughput,
-    bench_insert_batch,
-    bench_select_scan,
-    bench_select_projection,
-    bench_database_create,
-    bench_sql_parsing,
-    bench_mixed_workload,
-    bench_large_rows,
+    bench_insert_comparison,
+    bench_insert_prepared_comparison,
+    bench_scan_comparison,
+    bench_projection_comparison,
+    bench_mixed_workload_comparison,
+    bench_large_text_comparison,
+    bench_lifecycle_comparison,
 );
 
 criterion_main!(benches);
