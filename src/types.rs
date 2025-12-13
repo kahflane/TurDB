@@ -131,6 +131,34 @@ pub enum Value<'a> {
     Vector(Cow<'a, [f32]>),
 }
 
+/// Schema-level column data types.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DataType {
+    Int2,
+    Int4,
+    Int8,
+    Float4,
+    Float8,
+    Bool,
+    Text,
+    Varchar(u32),
+    Char(u32),
+    Blob,
+    Bytea,
+    Date,
+    Time,
+    Timestamp,
+    TimestampTz,
+    Interval,
+    Uuid,
+    Inet,
+    MacAddr,
+    Json,
+    Jsonb,
+    Array(Box<DataType>),
+    Vector(u32),
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -149,5 +177,48 @@ mod tests {
     fn test_value_sizes() {
         use std::mem::size_of;
         assert!(size_of::<Value>() <= 32, "Value should be compact");
+    }
+
+    #[test]
+    fn test_datatype_primitive_variants() {
+        let _int2 = DataType::Int2;
+        let _int4 = DataType::Int4;
+        let _int8 = DataType::Int8;
+        let _float4 = DataType::Float4;
+        let _float8 = DataType::Float8;
+        let _bool = DataType::Bool;
+    }
+
+    #[test]
+    fn test_datatype_text_variants() {
+        let _text = DataType::Text;
+        let _varchar = DataType::Varchar(255);
+        let _char = DataType::Char(10);
+    }
+
+    #[test]
+    fn test_datatype_datetime_variants() {
+        let _date = DataType::Date;
+        let _time = DataType::Time;
+        let _timestamp = DataType::Timestamp;
+        let _timestamptz = DataType::TimestampTz;
+        let _interval = DataType::Interval;
+    }
+
+    #[test]
+    fn test_datatype_special_variants() {
+        let _uuid = DataType::Uuid;
+        let _inet = DataType::Inet;
+        let _macaddr = DataType::MacAddr;
+        let _json = DataType::Json;
+        let _jsonb = DataType::Jsonb;
+    }
+
+    #[test]
+    fn test_datatype_composite_variants() {
+        let _blob = DataType::Blob;
+        let _bytea = DataType::Bytea;
+        let _array = DataType::Array(Box::new(DataType::Int4));
+        let _vector = DataType::Vector(128);
     }
 }
