@@ -89,7 +89,7 @@
 //! - Query planning: < 100µs for simple queries
 
 use crate::schema::{Catalog, ColumnDef as SchemaColumnDef};
-use crate::sql::executor::{BTreeCursorAdapter, ExecutionContext, Executor, ExecutorBuilder};
+use crate::sql::executor::{ExecutionContext, Executor, ExecutorBuilder, StreamingBTreeSource};
 use crate::sql::planner::Planner;
 use crate::sql::Parser;
 use crate::storage::{FileManager, Wal};
@@ -399,7 +399,7 @@ impl Database {
 
         let catalog_guard = self.catalog.read();
         let catalog = catalog_guard.as_ref().unwrap();
-        let planner = Planner::new(&catalog, &arena);
+        let planner = Planner::new(catalog, &arena);
         let physical_plan = planner
             .create_physical_plan(&stmt)
             .wrap_err("failed to create query plan")?;
@@ -469,7 +469,7 @@ impl Database {
             let projections = find_projections(physical_plan.root, table_def);
 
             let storage = file_manager
-                .table_data_mut(schema_name, table_name)
+                .table_data(schema_name, table_name)
                 .wrap_err_with(|| {
                     format!(
                         "failed to open table storage for {}.{}",
@@ -478,7 +478,7 @@ impl Database {
                 })?;
 
             let root_page = 1u32;
-            let source = BTreeCursorAdapter::from_btree_scan_with_projections(
+            let source = StreamingBTreeSource::from_btree_scan_with_projections(
                 storage,
                 root_page,
                 column_types,

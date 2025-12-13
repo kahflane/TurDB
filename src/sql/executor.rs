@@ -177,7 +177,7 @@ pub trait RecordDecoder {
 
 pub struct SimpleDecoder {
     column_types: Vec<crate::records::types::DataType>,
-    projected_columns: Option<Vec<usize>>,
+    decode_columns: Vec<usize>,
     cached_schema: crate::records::Schema,
 }
 
@@ -190,9 +190,10 @@ impl SimpleDecoder {
             .map(|(i, dt)| ColumnDef::new(format!("col{}", i), *dt))
             .collect();
         let cached_schema = crate::records::Schema::new(column_defs);
+        let decode_columns: Vec<usize> = (0..column_types.len()).collect();
         Self {
             column_types,
-            projected_columns: None,
+            decode_columns,
             cached_schema,
         }
     }
@@ -207,7 +208,7 @@ impl SimpleDecoder {
         let cached_schema = crate::records::Schema::new(column_defs);
         Self {
             column_types,
-            projected_columns: Some(projections),
+            decode_columns: projections,
             cached_schema,
         }
     }
@@ -215,37 +216,35 @@ impl SimpleDecoder {
 
 impl RecordDecoder for SimpleDecoder {
     fn decode(&self, _key: &[u8], value: &[u8]) -> Result<Vec<Value<'static>>> {
-        let columns_to_decode: &[usize] = match &self.projected_columns {
-            Some(cols) => cols,
-            None => {
-                let indices: Vec<usize> = (0..self.column_types.len()).collect();
-                return self.decode_columns(_key, value, &indices);
-            }
-        };
-
-        self.decode_columns(_key, value, columns_to_decode)
+        self.decode_columns_vec(_key, value, &self.decode_columns)
     }
 }
 
 impl SimpleDecoder {
-    fn decode_columns(&self, _key: &[u8], value: &[u8], columns: &[usize]) -> Result<Vec<Value<'static>>> {
+    fn decode_columns_vec(&self, _key: &[u8], value: &[u8], columns: &[usize]) -> Result<Vec<Value<'static>>> {
+        let mut output = Vec::with_capacity(columns.len());
+        self.decode_columns_into(_key, value, columns, &mut output)?;
+        Ok(output)
+    }
+
+    fn decode_columns_into(&self, _key: &[u8], value: &[u8], columns: &[usize], output: &mut Vec<Value<'static>>) -> Result<()> {
         use crate::records::types::DataType;
         use crate::records::RecordView;
 
         if value.is_empty() {
-            return Ok(vec![Value::Null; columns.len()]);
+            output.extend(std::iter::repeat_n(Value::Null, columns.len()));
+            return Ok(());
         }
 
         let view = RecordView::new(value, &self.cached_schema)?;
 
-        let mut values = Vec::with_capacity(columns.len());
         for &idx in columns {
             if idx >= self.column_types.len() {
-                values.push(Value::Null);
+                output.push(Value::Null);
                 continue;
             }
             if view.is_null(idx) {
-                values.push(Value::Null);
+                output.push(Value::Null);
                 continue;
             }
             let dt = &self.column_types[idx];
@@ -260,9 +259,13 @@ impl SimpleDecoder {
                 DataType::Blob => Value::Blob(Cow::Owned(view.get_blob(idx)?.to_vec())),
                 _ => Value::Null,
             };
-            values.push(val);
+            output.push(val);
         }
-        Ok(values)
+        Ok(())
+    }
+
+    pub fn decode_into(&self, _key: &[u8], value: &[u8], output: &mut Vec<Value<'static>>) -> Result<()> {
+        self.decode_columns_into(_key, value, &self.decode_columns, output)
     }
 }
 
@@ -404,6 +407,76 @@ impl RowSource for BTreeCursorAdapter {
 
         let decoded = self.decoder.decode(key, value)?;
         Ok(Some(decoded))
+    }
+}
+
+pub struct StreamingBTreeSource<'storage> {
+    cursor: crate::btree::Cursor<'storage>,
+    decoder: SimpleDecoder,
+    started: bool,
+    row_buffer: Vec<Value<'static>>,
+}
+
+impl<'storage> StreamingBTreeSource<'storage> {
+    pub fn new(cursor: crate::btree::Cursor<'storage>, decoder: SimpleDecoder, column_count: usize) -> Self {
+        Self {
+            cursor,
+            decoder,
+            started: false,
+            row_buffer: Vec::with_capacity(column_count),
+        }
+    }
+
+    pub fn from_btree_scan(
+        storage: &'storage crate::storage::MmapStorage,
+        root_page: u32,
+        column_types: Vec<crate::records::types::DataType>,
+    ) -> Result<Self> {
+        Self::from_btree_scan_with_projections(storage, root_page, column_types, None)
+    }
+
+    pub fn from_btree_scan_with_projections(
+        storage: &'storage crate::storage::MmapStorage,
+        root_page: u32,
+        column_types: Vec<crate::records::types::DataType>,
+        projections: Option<Vec<usize>>,
+    ) -> Result<Self> {
+        use crate::btree::BTreeReader;
+
+        let reader = BTreeReader::new(storage, root_page)?;
+        let cursor = reader.cursor_first()?;
+
+        let output_count = projections.as_ref().map(|p| p.len()).unwrap_or(column_types.len());
+        let decoder = match projections {
+            Some(proj) => SimpleDecoder::with_projections(column_types, proj),
+            None => SimpleDecoder::new(column_types),
+        };
+
+        Ok(Self::new(cursor, decoder, output_count))
+    }
+}
+
+impl<'storage> RowSource for StreamingBTreeSource<'storage> {
+    fn reset(&mut self) -> Result<()> {
+        self.started = false;
+        Ok(())
+    }
+
+    fn next_row(&mut self) -> Result<Option<Vec<Value<'static>>>> {
+        if !self.started {
+            self.started = true;
+            if !self.cursor.valid() {
+                return Ok(None);
+            }
+        } else if !self.cursor.advance()? {
+            return Ok(None);
+        }
+
+        let key = self.cursor.key()?;
+        let value = self.cursor.value()?;
+        self.row_buffer.clear();
+        self.decoder.decode_into(key, value, &mut self.row_buffer)?;
+        Ok(Some(std::mem::take(&mut self.row_buffer)))
     }
 }
 
