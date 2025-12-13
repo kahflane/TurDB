@@ -158,9 +158,20 @@ pub struct Wal {
     current_segment: Mutex<WalSegment>,
     page_index: RwLock<HashMap<u32, u64>>,
     read_mmap: RwLock<Option<Mmap>>,
+    salt1: u32,
+    salt2: u32,
 }
 
 impl Wal {
+    fn generate_salt() -> u32 {
+        use std::time::SystemTime;
+        let nanos = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        (nanos as u32) ^ ((nanos >> 32) as u32)
+    }
+
     pub fn create(dir: &Path) -> Result<Self> {
         create_dir_all(dir)
             .wrap_err_with(|| format!("failed to create WAL directory at {:?}", dir))?;
@@ -173,6 +184,8 @@ impl Wal {
             current_segment: Mutex::new(segment),
             page_index: RwLock::new(HashMap::new()),
             read_mmap: RwLock::new(None),
+            salt1: Self::generate_salt(),
+            salt2: Self::generate_salt(),
         })
     }
 
@@ -191,14 +204,22 @@ impl Wal {
         };
 
         let mut page_index = HashMap::new();
+        let mut salt1 = Self::generate_salt();
+        let mut salt2 = Self::generate_salt();
 
         if segment_path.exists() {
             let mut scan_segment = WalSegment::open(&segment_path, 1)?;
             let mut offset = 0u64;
+            let mut first_frame = true;
 
             loop {
                 match scan_segment.read_frame() {
                     Ok((header, _)) => {
+                        if first_frame {
+                            salt1 = header.salt1;
+                            salt2 = header.salt2;
+                            first_frame = false;
+                        }
                         page_index.insert(header.page_no, offset);
                         offset += (WAL_FRAME_HEADER_SIZE + PAGE_SIZE) as u64;
                     }
@@ -212,6 +233,8 @@ impl Wal {
             current_segment: Mutex::new(segment),
             page_index: RwLock::new(page_index),
             read_mmap: RwLock::new(None),
+            salt1,
+            salt2,
         })
     }
 
@@ -328,7 +351,7 @@ impl Wal {
         Ok(Some(page_data.to_vec()))
     }
 
-    pub fn write_frame(&mut self, header: &WalFrameHeader, page_data: &[u8]) -> Result<()> {
+    pub fn write_frame(&mut self, page_no: u32, db_size: u32, page_data: &[u8]) -> Result<()> {
         ensure!(
             page_data.len() == PAGE_SIZE,
             "page data must be exactly {} bytes, got {}",
@@ -336,8 +359,9 @@ impl Wal {
             page_data.len()
         );
 
-        let checksum = compute_checksum(header, page_data);
-        let mut header_with_checksum = *header;
+        let header = WalFrameHeader::new(page_no, db_size, self.salt1, self.salt2, 0);
+        let checksum = compute_checksum(&header, page_data);
+        let mut header_with_checksum = header;
         header_with_checksum.checksum = checksum;
 
         let current_offset;
@@ -348,7 +372,7 @@ impl Wal {
         }
 
         let mut index = self.page_index.write();
-        index.insert(header.page_no, current_offset);
+        index.insert(page_no, current_offset);
         drop(index);
 
         let mut mmap = self.read_mmap.write();
@@ -571,9 +595,8 @@ mod tests {
         let mut wal = Wal::create(&wal_dir).expect("should create WAL");
 
         let page_data = vec![42u8; PAGE_SIZE];
-        let header = WalFrameHeader::new(5, 10, 0x12345678, 0x9ABCDEF0, 0);
 
-        wal.write_frame(&header, &page_data).expect("should write frame");
+        wal.write_frame(5, 10, &page_data).expect("should write frame");
 
         std::fs::remove_dir_all(&temp_dir).ok();
     }
@@ -592,9 +615,8 @@ mod tests {
         let mut wal = Wal::create(&wal_dir).expect("should create WAL");
 
         let page_data = vec![99u8; PAGE_SIZE];
-        let header = WalFrameHeader::new(1, 1, 0, 0, 0);
 
-        wal.write_frame(&header, &page_data).expect("should write frame");
+        wal.write_frame(1, 1, &page_data).expect("should write frame");
 
         let expected_offset = WAL_FRAME_HEADER_SIZE + PAGE_SIZE;
         assert_eq!(wal.current_offset(), expected_offset as u64);
@@ -698,19 +720,18 @@ mod tests {
         let mut wal = Wal::create(&wal_dir).expect("should create WAL");
 
         let page_data = vec![42u8; PAGE_SIZE];
-        let header = WalFrameHeader::new(5, 10, 0x12345678, 0x9ABCDEF0, 0);
 
-        wal.write_frame(&header, &page_data).expect("should write frame");
+        wal.write_frame(5, 10, &page_data).expect("should write frame");
 
         let segment_path = wal_dir.join("wal.000001");
         let mut segment = WalSegment::open(&segment_path, 1).expect("should open segment");
 
         let (read_header, read_data) = segment.read_frame().expect("should read frame");
 
-        assert_eq!(read_header.page_no, header.page_no);
-        assert_eq!(read_header.db_size, header.db_size);
-        assert_eq!(read_header.salt1, header.salt1);
-        assert_eq!(read_header.salt2, header.salt2);
+        assert_eq!(read_header.page_no, 5);
+        assert_eq!(read_header.db_size, 10);
+        assert_ne!(read_header.salt1, 0);
+        assert_ne!(read_header.salt2, 0);
         assert_eq!(read_data, page_data);
 
         std::fs::remove_dir_all(&temp_dir).ok();
@@ -730,9 +751,8 @@ mod tests {
         let mut wal = Wal::create(&wal_dir).expect("should create WAL");
 
         let page_data = vec![99u8; PAGE_SIZE];
-        let header = WalFrameHeader::new(1, 1, 100, 200, 0);
 
-        wal.write_frame(&header, &page_data).expect("should write frame");
+        wal.write_frame(1, 1, &page_data).expect("should write frame");
 
         let segment_path = wal_dir.join("wal.000001");
         let mut segment = WalSegment::open(&segment_path, 1).expect("should open segment");
@@ -759,8 +779,7 @@ mod tests {
 
         for i in 0..3 {
             let page_data = vec![i as u8; PAGE_SIZE];
-            let header = WalFrameHeader::new(i as u32, (i + 1) as u32, 0, 0, 0);
-            wal.write_frame(&header, &page_data).expect("should write frame");
+            wal.write_frame(i as u32, (i + 1) as u32, &page_data).expect("should write frame");
         }
 
         let segment_path = wal_dir.join("wal.000001");
@@ -793,12 +812,10 @@ mod tests {
         let mut wal = Wal::create(&wal_dir).expect("should create WAL");
 
         let page_data_0 = vec![100u8; PAGE_SIZE];
-        let header_0 = WalFrameHeader::new(0, 10, 1, 2, 0);
-        wal.write_frame(&header_0, &page_data_0).expect("should write frame 0");
+        wal.write_frame(0, 10, &page_data_0).expect("should write frame 0");
 
         let page_data_5 = vec![200u8; PAGE_SIZE];
-        let header_5 = WalFrameHeader::new(5, 10, 1, 2, 0);
-        wal.write_frame(&header_5, &page_data_5).expect("should write frame 5");
+        wal.write_frame(5, 10, &page_data_5).expect("should write frame 5");
 
         drop(wal);
 
@@ -859,16 +876,13 @@ mod tests {
         let mut wal = Wal::create(&wal_dir).expect("should create WAL");
 
         let page_data_1 = vec![10u8; PAGE_SIZE];
-        let header_1 = WalFrameHeader::new(3, 10, 1, 2, 0);
-        wal.write_frame(&header_1, &page_data_1).expect("should write frame");
+        wal.write_frame(3, 10, &page_data_1).expect("should write frame");
 
         let page_data_2 = vec![20u8; PAGE_SIZE];
-        let header_2 = WalFrameHeader::new(3, 10, 1, 2, 0);
-        wal.write_frame(&header_2, &page_data_2).expect("should write frame");
+        wal.write_frame(3, 10, &page_data_2).expect("should write frame");
 
         let page_data_3 = vec![30u8; PAGE_SIZE];
-        let header_3 = WalFrameHeader::new(3, 10, 1, 2, 0);
-        wal.write_frame(&header_3, &page_data_3).expect("should write frame");
+        wal.write_frame(3, 10, &page_data_3).expect("should write frame");
 
         drop(wal);
 
@@ -898,8 +912,7 @@ mod tests {
         let mut wal = Wal::create(&wal_dir).expect("should create WAL");
 
         let page_data = vec![42u8; PAGE_SIZE];
-        let header = WalFrameHeader::new(1, 1, 100, 200, 0);
-        wal.write_frame(&header, &page_data).expect("should write frame");
+        wal.write_frame(1, 1, &page_data).expect("should write frame");
 
         assert!(wal.current_offset() > 0);
 
@@ -928,12 +941,10 @@ mod tests {
         let mut wal = Wal::create(&wal_dir).expect("should create WAL");
 
         let page_data_0 = vec![111u8; PAGE_SIZE];
-        let header_0 = WalFrameHeader::new(0, 10, 1, 2, 0);
-        wal.write_frame(&header_0, &page_data_0).expect("should write frame");
+        wal.write_frame(0, 10, &page_data_0).expect("should write frame");
 
         let page_data_7 = vec![222u8; PAGE_SIZE];
-        let header_7 = WalFrameHeader::new(7, 10, 1, 2, 0);
-        wal.write_frame(&header_7, &page_data_7).expect("should write frame");
+        wal.write_frame(7, 10, &page_data_7).expect("should write frame");
 
         assert!(wal.current_offset() > 0);
 
@@ -968,8 +979,7 @@ mod tests {
         assert!(!wal.needs_checkpoint(1000));
 
         let page_data = vec![99u8; PAGE_SIZE];
-        let header = WalFrameHeader::new(1, 1, 0, 0, 0);
-        wal.write_frame(&header, &page_data).expect("should write frame");
+        wal.write_frame(1, 1, &page_data).expect("should write frame");
 
         let frame_size = (WAL_FRAME_HEADER_SIZE + PAGE_SIZE) as u64;
 
@@ -1010,8 +1020,7 @@ mod tests {
         let mut wal = Wal::create(&wal_dir).expect("should create WAL");
 
         let page_data = vec![123u8; PAGE_SIZE];
-        let header = WalFrameHeader::new(5, 10, 1, 2, 0);
-        wal.write_frame(&header, &page_data).expect("should write frame");
+        wal.write_frame(5, 10, &page_data).expect("should write frame");
 
         let read_data = wal.read_page(5).expect("should read page");
         assert!(read_data.is_some());
@@ -1038,16 +1047,13 @@ mod tests {
         let mut wal = Wal::create(&wal_dir).expect("should create WAL");
 
         let page_data_1 = vec![10u8; PAGE_SIZE];
-        let header_1 = WalFrameHeader::new(3, 10, 1, 2, 0);
-        wal.write_frame(&header_1, &page_data_1).expect("should write frame 1");
+        wal.write_frame(3, 10, &page_data_1).expect("should write frame 1");
 
         let page_data_2 = vec![20u8; PAGE_SIZE];
-        let header_2 = WalFrameHeader::new(3, 10, 1, 2, 0);
-        wal.write_frame(&header_2, &page_data_2).expect("should write frame 2");
+        wal.write_frame(3, 10, &page_data_2).expect("should write frame 2");
 
         let page_data_3 = vec![30u8; PAGE_SIZE];
-        let header_3 = WalFrameHeader::new(3, 10, 1, 2, 0);
-        wal.write_frame(&header_3, &page_data_3).expect("should write frame 3");
+        wal.write_frame(3, 10, &page_data_3).expect("should write frame 3");
 
         let read_data = wal.read_page(3).expect("should read page");
         assert!(read_data.is_some());
@@ -1077,8 +1083,7 @@ mod tests {
         let mut wal = Wal::create(&wal_dir).expect("should create WAL");
 
         let page_data = vec![77u8; PAGE_SIZE];
-        let header = WalFrameHeader::new(2, 10, 1, 2, 0);
-        wal.write_frame(&header, &page_data).expect("should write frame");
+        wal.write_frame(2, 10, &page_data).expect("should write frame");
 
         let read_before = wal.read_page(2).expect("should read page");
         assert!(read_before.is_some());
