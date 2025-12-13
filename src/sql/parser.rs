@@ -774,10 +774,7 @@ mod tests {
     #[test]
     fn parse_union() {
         let arena = Bump::new();
-        let mut parser = Parser::new(
-            "SELECT id FROM users UNION SELECT id FROM admins",
-            &arena,
-        );
+        let mut parser = Parser::new("SELECT id FROM users UNION SELECT id FROM admins", &arena);
         let stmt = parser.parse_statement().unwrap();
         if let Statement::Select(select) = stmt {
             assert!(select.set_op.is_some());
@@ -951,7 +948,10 @@ mod tests {
     #[test]
     fn parse_between_expression() {
         let arena = Bump::new();
-        let mut parser = Parser::new("SELECT * FROM orders WHERE amount BETWEEN 100 AND 500", &arena);
+        let mut parser = Parser::new(
+            "SELECT * FROM orders WHERE amount BETWEEN 100 AND 500",
+            &arena,
+        );
         let stmt = parser.parse_statement().unwrap();
         if let Statement::Select(select) = stmt {
             assert!(matches!(select.where_clause, Some(Expr::Between { .. })));

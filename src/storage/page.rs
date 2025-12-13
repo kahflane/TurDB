@@ -80,7 +80,10 @@
 //! is provided by the page cache layer which controls access to page buffers.
 
 use eyre::{ensure, Result};
-use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
+use zerocopy::{
+    byteorder::{LittleEndian, U16, U32},
+    FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned,
+};
 
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -109,16 +112,16 @@ impl PageType {
 }
 
 #[repr(C)]
-#[derive(Debug, Clone, Copy, FromBytes, IntoBytes, Immutable, KnownLayout)]
+#[derive(Debug, Clone, Copy, FromBytes, IntoBytes, Immutable, KnownLayout, Unaligned)]
 pub struct PageHeader {
     page_type: u8,
     flags: u8,
-    cell_count: u16,
-    free_start: u16,
-    free_end: u16,
+    cell_count: U16<LittleEndian>,
+    free_start: U16<LittleEndian>,
+    free_end: U16<LittleEndian>,
     frag_bytes: u8,
     reserved: [u8; 3],
-    right_child: u32,
+    right_child: U32<LittleEndian>,
 }
 
 impl PageHeader {
@@ -126,12 +129,12 @@ impl PageHeader {
         Self {
             page_type: page_type as u8,
             flags: 0,
-            cell_count: 0,
-            free_start: super::PAGE_HEADER_SIZE as u16,
-            free_end: super::PAGE_SIZE as u16,
+            cell_count: U16::new(0),
+            free_start: U16::new(super::PAGE_HEADER_SIZE as u16),
+            free_end: U16::new(super::PAGE_SIZE as u16),
             frag_bytes: 0,
             reserved: [0; 3],
-            right_child: 0,
+            right_child: U32::new(0),
         }
     }
 
@@ -188,31 +191,31 @@ impl PageHeader {
     }
 
     pub fn cell_count(&self) -> u16 {
-        self.cell_count
+        self.cell_count.get()
     }
 
     pub fn set_cell_count(&mut self, count: u16) {
-        self.cell_count = count;
+        self.cell_count.set(count);
     }
 
     pub fn free_start(&self) -> u16 {
-        self.free_start
+        self.free_start.get()
     }
 
     pub fn set_free_start(&mut self, offset: u16) {
-        self.free_start = offset;
+        self.free_start.set(offset);
     }
 
     pub fn free_end(&self) -> u16 {
-        self.free_end
+        self.free_end.get()
     }
 
     pub fn set_free_end(&mut self, offset: u16) {
-        self.free_end = offset;
+        self.free_end.set(offset);
     }
 
     pub fn free_space(&self) -> u16 {
-        self.free_end.saturating_sub(self.free_start)
+        self.free_end.get().saturating_sub(self.free_start.get())
     }
 
     pub fn frag_bytes(&self) -> u8 {
@@ -224,19 +227,19 @@ impl PageHeader {
     }
 
     pub fn right_child(&self) -> u32 {
-        self.right_child
+        self.right_child.get()
     }
 
     pub fn set_right_child(&mut self, page_no: u32) {
-        self.right_child = page_no;
+        self.right_child.set(page_no);
     }
 
     pub fn next_leaf(&self) -> u32 {
-        self.right_child
+        self.right_child.get()
     }
 
     pub fn set_next_leaf(&mut self, page_no: u32) {
-        self.right_child = page_no;
+        self.right_child.set(page_no);
     }
 }
 
@@ -252,9 +255,9 @@ pub fn validate_page(data: &[u8]) -> Result<()> {
 
     let is_zeroed = header.page_type == 0
         && header.flags == 0
-        && header.cell_count == 0
-        && header.free_start == 0
-        && header.free_end == 0;
+        && header.cell_count() == 0
+        && header.free_start() == 0
+        && header.free_end() == 0;
 
     if is_zeroed {
         return Ok(());
