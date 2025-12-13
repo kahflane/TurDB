@@ -93,7 +93,10 @@
 //! - Complex queries: < 10ms planning time
 //! - Achieved through arena allocation and heuristic optimization
 
-use crate::sql::ast::{Expr, JoinType};
+use crate::schema::Catalog;
+use crate::sql::ast::{Expr, JoinType, Statement};
+use bumpalo::Bump;
+use eyre::{bail, Result};
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum LogicalOperator<'a> {
@@ -320,6 +323,60 @@ impl<'a> PlanNode<'a> {
             PlanNode::Logical(_) => None,
             PlanNode::Physical(op) => Some(op),
         }
+    }
+}
+
+pub struct Planner<'a> {
+    catalog: &'a Catalog,
+    arena: &'a Bump,
+}
+
+impl<'a> Planner<'a> {
+    pub fn new(catalog: &'a Catalog, arena: &'a Bump) -> Self {
+        Self { catalog, arena }
+    }
+
+    pub fn catalog(&self) -> &'a Catalog {
+        self.catalog
+    }
+
+    pub fn arena(&self) -> &'a Bump {
+        self.arena
+    }
+
+    pub fn create_logical_plan(&self, stmt: &'a Statement<'a>) -> Result<LogicalPlan<'a>> {
+        match stmt {
+            Statement::Select(select) => self.plan_select(select),
+            Statement::Insert(insert) => self.plan_insert(insert),
+            Statement::Update(update) => self.plan_update(update),
+            Statement::Delete(delete) => self.plan_delete(delete),
+            _ => bail!("unsupported statement type for logical planning"),
+        }
+    }
+
+    pub fn create_physical_plan(&self, stmt: &'a Statement<'a>) -> Result<PhysicalPlan<'a>> {
+        let logical = self.create_logical_plan(stmt)?;
+        self.optimize_to_physical(&logical)
+    }
+
+    fn plan_select(&self, _select: &crate::sql::ast::SelectStmt<'a>) -> Result<LogicalPlan<'a>> {
+        bail!("plan_select not yet implemented")
+    }
+
+    fn plan_insert(&self, _insert: &crate::sql::ast::InsertStmt<'a>) -> Result<LogicalPlan<'a>> {
+        bail!("plan_insert not yet implemented")
+    }
+
+    fn plan_update(&self, _update: &crate::sql::ast::UpdateStmt<'a>) -> Result<LogicalPlan<'a>> {
+        bail!("plan_update not yet implemented")
+    }
+
+    fn plan_delete(&self, _delete: &crate::sql::ast::DeleteStmt<'a>) -> Result<LogicalPlan<'a>> {
+        bail!("plan_delete not yet implemented")
+    }
+
+    fn optimize_to_physical(&self, _logical: &LogicalPlan<'a>) -> Result<PhysicalPlan<'a>> {
+        bail!("optimize_to_physical not yet implemented")
     }
 }
 
@@ -576,5 +633,37 @@ mod tests {
         } else {
             panic!("Expected Scan operator");
         }
+    }
+
+    #[test]
+    fn planner_new_creates_instance() {
+        let catalog = Catalog::new();
+        let arena = Bump::new();
+        let planner = Planner::new(&catalog, &arena);
+
+        assert!(std::ptr::eq(planner.catalog(), &catalog));
+        assert!(std::ptr::eq(planner.arena(), &arena));
+    }
+
+    #[test]
+    fn planner_create_logical_plan_returns_error_for_unsupported() {
+        let catalog = Catalog::new();
+        let arena = Bump::new();
+        let planner = Planner::new(&catalog, &arena);
+
+        let stmt = Statement::Commit;
+        let result = planner.create_logical_plan(&stmt);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn planner_create_physical_plan_dispatches_to_logical_first() {
+        let catalog = Catalog::new();
+        let arena = Bump::new();
+        let planner = Planner::new(&catalog, &arena);
+
+        let stmt = Statement::Commit;
+        let result = planner.create_physical_plan(&stmt);
+        assert!(result.is_err());
     }
 }
