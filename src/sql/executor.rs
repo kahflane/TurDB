@@ -121,11 +121,48 @@ pub trait Executor<'a> {
 
 pub struct ExecutionContext<'a> {
     pub arena: &'a Bump,
+    pub file_manager: Option<&'a mut crate::storage::FileManager>,
+    pub catalog: Option<&'a crate::schema::Catalog>,
 }
 
 impl<'a> ExecutionContext<'a> {
     pub fn new(arena: &'a Bump) -> Self {
-        Self { arena }
+        Self {
+            arena,
+            file_manager: None,
+            catalog: None,
+        }
+    }
+
+    pub fn with_storage(
+        arena: &'a Bump,
+        file_manager: &'a mut crate::storage::FileManager,
+        catalog: &'a crate::schema::Catalog,
+    ) -> Self {
+        Self {
+            arena,
+            file_manager: Some(file_manager),
+            catalog: Some(catalog),
+        }
+    }
+
+    pub fn get_table_storage(
+        &mut self,
+        schema: &str,
+        table: &str,
+    ) -> Result<&mut crate::storage::MmapStorage> {
+        let fm = self
+            .file_manager
+            .as_mut()
+            .ok_or_else(|| eyre::eyre!("file manager not available in execution context"))?;
+        fm.table_data_mut(schema, table)
+    }
+
+    pub fn get_table_def(&self, table_name: &str) -> Result<&crate::schema::TableDef> {
+        let catalog = self
+            .catalog
+            .ok_or_else(|| eyre::eyre!("catalog not available in execution context"))?;
+        catalog.resolve_table(table_name)
     }
 }
 
@@ -150,15 +187,16 @@ impl SimpleDecoder {
 
 impl RecordDecoder for SimpleDecoder {
     fn decode(&self, _key: &[u8], value: &[u8]) -> Result<Vec<Value<'static>>> {
-        use crate::records::Schema;
-        use crate::records::RecordView;
         use crate::records::types::{ColumnDef, DataType};
+        use crate::records::RecordView;
+        use crate::records::Schema;
 
         if value.is_empty() {
             return Ok(vec![Value::Null; self.column_types.len()]);
         }
 
-        let column_defs: Vec<ColumnDef> = self.column_types
+        let column_defs: Vec<ColumnDef> = self
+            .column_types
             .iter()
             .enumerate()
             .map(|(i, dt)| ColumnDef::new(format!("col{}", i), *dt))
@@ -218,6 +256,71 @@ impl BTreeCursorAdapter {
         let (keys, values): (Vec<_>, Vec<_>) = pairs.into_iter().unzip();
         Self::new(keys, values, decoder)
     }
+
+    pub fn from_btree_scan(
+        storage: &mut crate::storage::MmapStorage,
+        root_page: u32,
+        column_types: Vec<crate::records::types::DataType>,
+    ) -> Result<Self> {
+        use crate::btree::BTree;
+
+        let btree = BTree::new(storage, root_page)?;
+        let mut cursor = btree.cursor_first()?;
+        let mut keys = Vec::new();
+        let mut values = Vec::new();
+
+        if cursor.valid() {
+            loop {
+                keys.push(cursor.key()?.to_vec());
+                values.push(cursor.value()?.to_vec());
+                if !cursor.advance()? {
+                    break;
+                }
+            }
+        }
+
+        let decoder = Box::new(SimpleDecoder::new(column_types));
+        Ok(Self::new(keys, values, decoder))
+    }
+
+    pub fn from_btree_range_scan(
+        storage: &mut crate::storage::MmapStorage,
+        root_page: u32,
+        start_key: Option<&[u8]>,
+        end_key: Option<&[u8]>,
+        column_types: Vec<crate::records::types::DataType>,
+    ) -> Result<Self> {
+        use crate::btree::BTree;
+
+        let btree = BTree::new(storage, root_page)?;
+        let mut cursor = if let Some(start) = start_key {
+            btree.cursor_seek(start)?
+        } else {
+            btree.cursor_first()?
+        };
+
+        let mut keys = Vec::new();
+        let mut values = Vec::new();
+
+        if cursor.valid() {
+            loop {
+                let current_key = cursor.key()?;
+                if let Some(end) = end_key {
+                    if current_key >= end {
+                        break;
+                    }
+                }
+                keys.push(current_key.to_vec());
+                values.push(cursor.value()?.to_vec());
+                if !cursor.advance()? {
+                    break;
+                }
+            }
+        }
+
+        let decoder = Box::new(SimpleDecoder::new(column_types));
+        Ok(Self::new(keys, values, decoder))
+    }
 }
 
 impl RowSource for BTreeCursorAdapter {
@@ -268,29 +371,30 @@ impl<'a, S: RowSource> Executor<'a> for TableScanExecutor<'a, S> {
         match row_data {
             Some(values) => {
                 let allocated: &'a [Value<'a>] =
-                    self.arena.alloc_slice_fill_iter(values.into_iter().map(|v| match v {
-                        Value::Null => Value::Null,
-                        Value::Int(i) => Value::Int(i),
-                        Value::Float(f) => Value::Float(f),
-                        Value::Text(Cow::Owned(s)) => {
-                            Value::Text(Cow::Borrowed(self.arena.alloc_str(&s)))
-                        }
-                        Value::Text(Cow::Borrowed(s)) => {
-                            Value::Text(Cow::Borrowed(self.arena.alloc_str(s)))
-                        }
-                        Value::Blob(Cow::Owned(b)) => {
-                            Value::Blob(Cow::Borrowed(self.arena.alloc_slice_copy(&b)))
-                        }
-                        Value::Blob(Cow::Borrowed(b)) => {
-                            Value::Blob(Cow::Borrowed(self.arena.alloc_slice_copy(b)))
-                        }
-                        Value::Vector(Cow::Owned(v)) => {
-                            Value::Vector(Cow::Borrowed(self.arena.alloc_slice_copy(&v)))
-                        }
-                        Value::Vector(Cow::Borrowed(v)) => {
-                            Value::Vector(Cow::Borrowed(self.arena.alloc_slice_copy(v)))
-                        }
-                    }));
+                    self.arena
+                        .alloc_slice_fill_iter(values.into_iter().map(|v| match v {
+                            Value::Null => Value::Null,
+                            Value::Int(i) => Value::Int(i),
+                            Value::Float(f) => Value::Float(f),
+                            Value::Text(Cow::Owned(s)) => {
+                                Value::Text(Cow::Borrowed(self.arena.alloc_str(&s)))
+                            }
+                            Value::Text(Cow::Borrowed(s)) => {
+                                Value::Text(Cow::Borrowed(self.arena.alloc_str(s)))
+                            }
+                            Value::Blob(Cow::Owned(b)) => {
+                                Value::Blob(Cow::Borrowed(self.arena.alloc_slice_copy(&b)))
+                            }
+                            Value::Blob(Cow::Borrowed(b)) => {
+                                Value::Blob(Cow::Borrowed(self.arena.alloc_slice_copy(b)))
+                            }
+                            Value::Vector(Cow::Owned(v)) => {
+                                Value::Vector(Cow::Borrowed(self.arena.alloc_slice_copy(&v)))
+                            }
+                            Value::Vector(Cow::Borrowed(v)) => {
+                                Value::Vector(Cow::Borrowed(self.arena.alloc_slice_copy(v)))
+                            }
+                        }));
                 Ok(Some(ExecutorRow::new(allocated)))
             }
             None => Ok(None),
@@ -400,14 +504,14 @@ where
         match self.child.next()? {
             Some(row) => {
                 let arena = self.arena;
-                let projected: &'a [Value<'a>] = self.arena.alloc_slice_fill_iter(
-                    self.projections.iter().map(|&idx| {
-                        match row.get(idx) {
-                            Some(v) => ExecutorRow::clone_value_to_arena(v, arena),
-                            None => Value::Null,
-                        }
-                    }),
-                );
+                let projected: &'a [Value<'a>] =
+                    self.arena
+                        .alloc_slice_fill_iter(self.projections.iter().map(
+                            |&idx| match row.get(idx) {
+                                Some(v) => ExecutorRow::clone_value_to_arena(v, arena),
+                                None => Value::Null,
+                            },
+                        ));
                 Ok(Some(ExecutorRow::new(projected)))
             }
             None => Ok(None),
@@ -510,15 +614,17 @@ where
 
     fn combine_rows(&self, left: &ExecutorRow<'a>, right: &ExecutorRow<'a>) -> ExecutorRow<'a> {
         let total_cols = left.column_count() + right.column_count();
-        let combined: &'a [Value<'a>] = self.arena.alloc_slice_fill_iter(
-            (0..total_cols).map(|i| {
+        let combined: &'a [Value<'a>] =
+            self.arena.alloc_slice_fill_iter((0..total_cols).map(|i| {
                 if i < left.column_count() {
                     left.get(i).cloned().unwrap_or(Value::Null)
                 } else {
-                    right.get(i - left.column_count()).cloned().unwrap_or(Value::Null)
+                    right
+                        .get(i - left.column_count())
+                        .cloned()
+                        .unwrap_or(Value::Null)
                 }
-            }),
-        );
+            }));
         ExecutorRow::new(combined)
     }
 
@@ -561,7 +667,7 @@ where
                 }
             }
 
-            let left_row = self.current_left_row.as_ref().unwrap(); // INVARIANT: is_none check above sets to Some
+            let left_row = self.current_left_row.as_ref().unwrap();
 
             while self.right_index < self.right_rows.len() {
                 let right_row = &self.right_rows[self.right_index];
@@ -636,8 +742,8 @@ where
     }
 
     fn hash_keys(row: &[Value<'static>], key_indices: &[usize]) -> u64 {
-        use std::hash::{Hash, Hasher};
         use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
 
         let mut hasher = DefaultHasher::new();
         for &idx in key_indices {
@@ -692,7 +798,10 @@ where
         self.partition_hash_table.clear();
         for (idx, row) in self.partition_build_rows.iter().enumerate() {
             let hash = Self::hash_keys(row, &self.right_key_indices);
-            self.partition_hash_table.entry(hash).or_insert_with(Vec::new).push(idx);
+            self.partition_hash_table
+                .entry(hash)
+                .or_insert_with(Vec::new)
+                .push(idx);
         }
     }
 
@@ -741,7 +850,9 @@ where
     fn next(&mut self) -> Result<Option<ExecutorRow<'a>>> {
         if !self.partitioned {
             while let Some(row) = self.left.next()? {
-                let owned: Vec<Value<'static>> = row.values.iter()
+                let owned: Vec<Value<'static>> = row
+                    .values
+                    .iter()
                     .map(|v| match v {
                         Value::Null => Value::Null,
                         Value::Int(i) => Value::Int(*i),
@@ -757,7 +868,9 @@ where
             }
 
             while let Some(row) = self.right.next()? {
-                let owned: Vec<Value<'static>> = row.values.iter()
+                let owned: Vec<Value<'static>> = row
+                    .values
+                    .iter()
                     .map(|v| match v {
                         Value::Null => Value::Null,
                         Value::Int(i) => Value::Int(*i),
@@ -783,7 +896,8 @@ where
 
         loop {
             if self.current_match_idx < self.current_matches.len() {
-                let probe_row = &self.left_partitions[self.current_partition][self.current_probe_idx - 1];
+                let probe_row =
+                    &self.left_partitions[self.current_partition][self.current_probe_idx - 1];
                 let build_idx = self.current_matches[self.current_match_idx];
                 let build_row = &self.partition_build_rows[build_idx];
                 self.current_match_idx += 1;
@@ -791,7 +905,8 @@ where
             }
 
             while self.current_probe_idx < self.left_partitions[self.current_partition].len() {
-                let probe_row = &self.left_partitions[self.current_partition][self.current_probe_idx];
+                let probe_row =
+                    &self.left_partitions[self.current_partition][self.current_probe_idx];
                 self.current_probe_idx += 1;
 
                 let hash = Self::hash_keys(probe_row, &self.left_key_indices);
@@ -827,7 +942,8 @@ where
             self.current_matches.clear();
             self.partition_hash_table.clear();
             if !self.right_partitions[self.current_partition].is_empty() {
-                self.partition_build_rows = std::mem::take(&mut self.right_partitions[self.current_partition]);
+                self.partition_build_rows =
+                    std::mem::take(&mut self.right_partitions[self.current_partition]);
                 self.build_partition_hash_table();
             } else {
                 self.partition_build_rows.clear();
@@ -1096,8 +1212,11 @@ where
             }
 
             if self.groups.is_empty() && self.group_by.is_empty() {
-                let states: Vec<AggregateState> =
-                    self.aggregates.iter().map(|_| AggregateState::new()).collect();
+                let states: Vec<AggregateState> = self
+                    .aggregates
+                    .iter()
+                    .map(|_| AggregateState::new())
+                    .collect();
                 self.groups.insert(Vec::new(), (Vec::new(), states));
             }
 
@@ -1108,9 +1227,8 @@ where
 
         if let Some(ref mut iter) = self.result_iter {
             if let Some((group_values, states)) = iter.next() {
-                let mut values: Vec<Value<'a>> = Vec::with_capacity(
-                    group_values.len() + self.aggregates.len(),
-                );
+                let mut values: Vec<Value<'a>> =
+                    Vec::with_capacity(group_values.len() + self.aggregates.len());
 
                 for val in group_values {
                     let arena_val = match val {
@@ -1264,11 +1382,7 @@ where
                     let b_val = b.get(key.column).unwrap_or(&Value::Null);
                     let cmp = Self::compare_values(a_val, b_val);
                     if cmp != std::cmp::Ordering::Equal {
-                        return if key.ascending {
-                            cmp
-                        } else {
-                            cmp.reverse()
-                        };
+                        return if key.ascending { cmp } else { cmp.reverse() };
                     }
                 }
                 std::cmp::Ordering::Equal
@@ -1430,38 +1544,41 @@ impl<'a> CompiledPredicate<'a> {
     }
 
     fn eval_expr(&self, expr: &crate::sql::ast::Expr<'a>, row: &ExecutorRow<'a>) -> bool {
-        use crate::sql::ast::{Expr, BinaryOperator, Literal};
+        use crate::sql::ast::{BinaryOperator, Expr, Literal};
 
         match expr {
-            Expr::BinaryOp { left, op, right } => {
-                match op {
-                    BinaryOperator::And => {
-                        self.eval_expr(left, row) && self.eval_expr(right, row)
-                    }
-                    BinaryOperator::Or => {
-                        self.eval_expr(left, row) || self.eval_expr(right, row)
-                    }
-                    BinaryOperator::Eq | BinaryOperator::NotEq |
-                    BinaryOperator::Lt | BinaryOperator::LtEq |
-                    BinaryOperator::Gt | BinaryOperator::GtEq => {
-                        let left_val = self.eval_value(left, row);
-                        let right_val = self.eval_value(right, row);
-                        self.compare_values(&left_val, &right_val, op)
-                    }
-                    _ => true,
+            Expr::BinaryOp { left, op, right } => match op {
+                BinaryOperator::And => self.eval_expr(left, row) && self.eval_expr(right, row),
+                BinaryOperator::Or => self.eval_expr(left, row) || self.eval_expr(right, row),
+                BinaryOperator::Eq
+                | BinaryOperator::NotEq
+                | BinaryOperator::Lt
+                | BinaryOperator::LtEq
+                | BinaryOperator::Gt
+                | BinaryOperator::GtEq => {
+                    let left_val = self.eval_value(left, row);
+                    let right_val = self.eval_value(right, row);
+                    self.compare_values(&left_val, &right_val, op)
                 }
-            }
+                _ => true,
+            },
             Expr::Literal(Literal::Boolean(b)) => *b,
             _ => true,
         }
     }
 
-    fn eval_value(&self, expr: &crate::sql::ast::Expr<'a>, row: &ExecutorRow<'a>) -> Option<Value<'a>> {
+    fn eval_value(
+        &self,
+        expr: &crate::sql::ast::Expr<'a>,
+        row: &ExecutorRow<'a>,
+    ) -> Option<Value<'a>> {
         use crate::sql::ast::{Expr, Literal};
 
         match expr {
             Expr::Column(col_ref) => {
-                let col_idx = self.column_map.iter()
+                let col_idx = self
+                    .column_map
+                    .iter()
                     .find(|(name, _)| name.eq_ignore_ascii_case(col_ref.column))
                     .map(|(_, idx)| *idx)?;
                 row.get(col_idx).cloned()
@@ -1472,14 +1589,23 @@ impl<'a> CompiledPredicate<'a> {
                 Literal::String(s) => Value::Text(Cow::Borrowed(*s)),
                 Literal::Boolean(b) => Value::Int(if *b { 1 } else { 0 }),
                 Literal::Null => Value::Null,
-                Literal::HexNumber(s) => Value::Int(i64::from_str_radix(s.trim_start_matches("0x"), 16).ok()?),
-                Literal::BinaryNumber(s) => Value::Int(i64::from_str_radix(s.trim_start_matches("0b"), 2).ok()?),
+                Literal::HexNumber(s) => {
+                    Value::Int(i64::from_str_radix(s.trim_start_matches("0x"), 16).ok()?)
+                }
+                Literal::BinaryNumber(s) => {
+                    Value::Int(i64::from_str_radix(s.trim_start_matches("0b"), 2).ok()?)
+                }
             }),
             _ => None,
         }
     }
 
-    fn compare_values(&self, left: &Option<Value<'a>>, right: &Option<Value<'a>>, op: &crate::sql::ast::BinaryOperator) -> bool {
+    fn compare_values(
+        &self,
+        left: &Option<Value<'a>>,
+        right: &Option<Value<'a>>,
+        op: &crate::sql::ast::BinaryOperator,
+    ) -> bool {
         use crate::sql::ast::BinaryOperator;
         use std::cmp::Ordering;
 
@@ -1542,7 +1668,9 @@ impl<'a, S: RowSource> Executor<'a> for DynamicExecutor<'a, S> {
                     state.right.open()?;
                     state.right_rows.clear();
                     while let Some(row) = state.right.next()? {
-                        let owned: Vec<Value<'static>> = row.values.iter()
+                        let owned: Vec<Value<'static>> = row
+                            .values
+                            .iter()
                             .map(|v| match v {
                                 Value::Null => Value::Null,
                                 Value::Int(i) => Value::Int(*i),
@@ -1567,7 +1695,9 @@ impl<'a, S: RowSource> Executor<'a> for DynamicExecutor<'a, S> {
                     while let Some(row) = state.left.next()? {
                         let hash = hash_keys(&row, &state.left_key_indices);
                         let partition = (hash as usize) % state.num_partitions;
-                        let owned: Vec<Value<'static>> = row.values.iter()
+                        let owned: Vec<Value<'static>> = row
+                            .values
+                            .iter()
                             .map(|v| match v {
                                 Value::Null => Value::Null,
                                 Value::Int(i) => Value::Int(*i),
@@ -1585,7 +1715,9 @@ impl<'a, S: RowSource> Executor<'a> for DynamicExecutor<'a, S> {
                     while let Some(row) = state.right.next()? {
                         let hash = hash_keys(&row, &state.right_key_indices);
                         let partition = (hash as usize) % state.num_partitions;
-                        let owned: Vec<Value<'static>> = row.values.iter()
+                        let owned: Vec<Value<'static>> = row
+                            .values
+                            .iter()
                             .map(|v| match v {
                                 Value::Null => Value::Null,
                                 Value::Int(i) => Value::Int(*i),
@@ -1620,60 +1752,52 @@ impl<'a, S: RowSource> Executor<'a> for DynamicExecutor<'a, S> {
     fn next(&mut self) -> Result<Option<ExecutorRow<'a>>> {
         match self {
             DynamicExecutor::TableScan(ts) => ts.next(),
-            DynamicExecutor::IndexScan(state) => {
-                loop {
-                    match state.source.next_row()? {
-                        Some(row_data) => {
-                            let values: &'a [Value<'a>] = state.arena.alloc_slice_fill_iter(
-                                row_data.into_iter().map(|v| match v {
-                                    Value::Null => Value::Null,
-                                    Value::Int(i) => Value::Int(i),
-                                    Value::Float(f) => Value::Float(f),
-                                    Value::Text(s) => Value::Text(Cow::Owned(s.into_owned())),
-                                    Value::Blob(b) => Value::Blob(Cow::Owned(b.into_owned())),
-                                    Value::Vector(v) => Value::Vector(Cow::Owned(v.into_owned())),
-                                }),
-                            );
-                            let row = ExecutorRow::new(values);
-                            if let Some(ref filter) = state.residual_filter {
-                                if !filter.evaluate(&row) {
-                                    continue;
-                                }
-                            }
-                            return Ok(Some(row));
-                        }
-                        None => return Ok(None),
-                    }
-                }
-            }
-            DynamicExecutor::Filter(child, predicate) => {
-                loop {
-                    match child.next()? {
-                        Some(row) => {
-                            if predicate.evaluate(&row) {
-                                return Ok(Some(row));
-                            }
-                        }
-                        None => return Ok(None),
-                    }
-                }
-            }
-            DynamicExecutor::Project(child, projections, arena) => {
-                match child.next()? {
-                    Some(row) => {
-                        let projected: &'a [Value<'a>] = arena.alloc_slice_fill_iter(
-                            projections.iter().map(|&idx| {
-                                match row.get(idx) {
-                                    Some(v) => ExecutorRow::clone_value_to_arena(v, arena),
-                                    None => Value::Null,
-                                }
+            DynamicExecutor::IndexScan(state) => loop {
+                match state.source.next_row()? {
+                    Some(row_data) => {
+                        let values: &'a [Value<'a>] = state.arena.alloc_slice_fill_iter(
+                            row_data.into_iter().map(|v| match v {
+                                Value::Null => Value::Null,
+                                Value::Int(i) => Value::Int(i),
+                                Value::Float(f) => Value::Float(f),
+                                Value::Text(s) => Value::Text(Cow::Owned(s.into_owned())),
+                                Value::Blob(b) => Value::Blob(Cow::Owned(b.into_owned())),
+                                Value::Vector(v) => Value::Vector(Cow::Owned(v.into_owned())),
                             }),
                         );
-                        Ok(Some(ExecutorRow::new(projected)))
+                        let row = ExecutorRow::new(values);
+                        if let Some(ref filter) = state.residual_filter {
+                            if !filter.evaluate(&row) {
+                                continue;
+                            }
+                        }
+                        return Ok(Some(row));
                     }
-                    None => Ok(None),
+                    None => return Ok(None),
                 }
-            }
+            },
+            DynamicExecutor::Filter(child, predicate) => loop {
+                match child.next()? {
+                    Some(row) => {
+                        if predicate.evaluate(&row) {
+                            return Ok(Some(row));
+                        }
+                    }
+                    None => return Ok(None),
+                }
+            },
+            DynamicExecutor::Project(child, projections, arena) => match child.next()? {
+                Some(row) => {
+                    let projected: &'a [Value<'a>] = arena.alloc_slice_fill_iter(
+                        projections.iter().map(|&idx| match row.get(idx) {
+                            Some(v) => ExecutorRow::clone_value_to_arena(v, arena),
+                            None => Value::Null,
+                        }),
+                    );
+                    Ok(Some(ExecutorRow::new(projected)))
+                }
+                None => Ok(None),
+            },
             DynamicExecutor::Limit(state) => {
                 let offset_val = state.offset.unwrap_or(0);
                 let limit_val = state.limit;
@@ -1700,7 +1824,9 @@ impl<'a, S: RowSource> Executor<'a> for DynamicExecutor<'a, S> {
             DynamicExecutor::Sort(state) => {
                 if !state.sorted {
                     while let Some(row) = state.child.next()? {
-                        let owned: Vec<Value<'static>> = row.values.iter()
+                        let owned: Vec<Value<'static>> = row
+                            .values
+                            .iter()
                             .map(|v| match v {
                                 Value::Null => Value::Null,
                                 Value::Int(i) => Value::Int(*i),
@@ -1732,14 +1858,19 @@ impl<'a, S: RowSource> Executor<'a> for DynamicExecutor<'a, S> {
                 if state.iter_idx < state.rows.len() {
                     let values = &state.rows[state.iter_idx];
                     state.iter_idx += 1;
-                    let arena_values: Vec<Value<'a>> = values.iter()
+                    let arena_values: Vec<Value<'a>> = values
+                        .iter()
                         .map(|v| match v {
                             Value::Null => Value::Null,
                             Value::Int(i) => Value::Int(*i),
                             Value::Float(f) => Value::Float(*f),
                             Value::Text(s) => Value::Text(Cow::Borrowed(state.arena.alloc_str(s))),
-                            Value::Blob(b) => Value::Blob(Cow::Borrowed(state.arena.alloc_slice_copy(b))),
-                            Value::Vector(v) => Value::Vector(Cow::Borrowed(state.arena.alloc_slice_copy(v))),
+                            Value::Blob(b) => {
+                                Value::Blob(Cow::Borrowed(state.arena.alloc_slice_copy(b)))
+                            }
+                            Value::Vector(v) => {
+                                Value::Vector(Cow::Borrowed(state.arena.alloc_slice_copy(v)))
+                            }
                         })
                         .collect();
                     let allocated = state.arena.alloc_slice_fill_iter(arena_values);
@@ -1747,130 +1878,115 @@ impl<'a, S: RowSource> Executor<'a> for DynamicExecutor<'a, S> {
                 }
                 Ok(None)
             }
-            DynamicExecutor::NestedLoopJoin(state) => {
-                loop {
-                    if state.current_left_row.is_none() {
-                        match state.left.next()? {
-                            Some(row) => {
-                                let owned: Vec<Value<'static>> = row.values.iter()
-                                    .map(|v| match v {
-                                        Value::Null => Value::Null,
-                                        Value::Int(i) => Value::Int(*i),
-                                        Value::Float(f) => Value::Float(*f),
-                                        Value::Text(s) => Value::Text(Cow::Owned(s.to_string())),
-                                        Value::Blob(b) => Value::Blob(Cow::Owned(b.to_vec())),
-                                        Value::Vector(v) => Value::Vector(Cow::Owned(v.to_vec())),
-                                    })
-                                    .collect();
-                                state.current_left_row = Some(owned);
-                                state.right_index = 0;
-                            }
-                            None => return Ok(None),
-                        }
-                    }
-
-                    let left_row = state.current_left_row.as_ref().unwrap(); // INVARIANT: is_none check above sets to Some
-                    let left_col_count = left_row.len();
-
-                    while state.right_index < state.right_rows.len() {
-                        let right_row = &state.right_rows[state.right_index];
-                        state.right_index += 1;
-
-                        let should_join = if let Some(ref cond) = state.condition {
-                            let combined_len = left_row.len() + right_row.len();
-                            let combined: Vec<Value<'a>> = (0..combined_len)
-                                .map(|i| {
-                                    if i < left_row.len() {
-                                        match &left_row[i] {
-                                            Value::Null => Value::Null,
-                                            Value::Int(n) => Value::Int(*n),
-                                            Value::Float(f) => Value::Float(*f),
-                                            Value::Text(s) => Value::Text(Cow::Borrowed(state.arena.alloc_str(s))),
-                                            Value::Blob(b) => Value::Blob(Cow::Borrowed(state.arena.alloc_slice_copy(b))),
-                                            Value::Vector(v) => Value::Vector(Cow::Borrowed(state.arena.alloc_slice_copy(v))),
-                                        }
-                                    } else {
-                                        let r = &right_row[i - left_row.len()];
-                                        match r {
-                                            Value::Null => Value::Null,
-                                            Value::Int(n) => Value::Int(*n),
-                                            Value::Float(f) => Value::Float(*f),
-                                            Value::Text(s) => Value::Text(Cow::Borrowed(state.arena.alloc_str(s))),
-                                            Value::Blob(b) => Value::Blob(Cow::Borrowed(state.arena.alloc_slice_copy(b))),
-                                            Value::Vector(v) => Value::Vector(Cow::Borrowed(state.arena.alloc_slice_copy(v))),
-                                        }
-                                    }
+            DynamicExecutor::NestedLoopJoin(state) => loop {
+                if state.current_left_row.is_none() {
+                    match state.left.next()? {
+                        Some(row) => {
+                            let owned: Vec<Value<'static>> = row
+                                .values
+                                .iter()
+                                .map(|v| match v {
+                                    Value::Null => Value::Null,
+                                    Value::Int(i) => Value::Int(*i),
+                                    Value::Float(f) => Value::Float(*f),
+                                    Value::Text(s) => Value::Text(Cow::Owned(s.to_string())),
+                                    Value::Blob(b) => Value::Blob(Cow::Owned(b.to_vec())),
+                                    Value::Vector(v) => Value::Vector(Cow::Owned(v.to_vec())),
                                 })
                                 .collect();
-                            let allocated = state.arena.alloc_slice_fill_iter(combined);
-                            let temp_row = ExecutorRow::new(allocated);
-                            cond.evaluate(&temp_row)
-                        } else {
-                            true
-                        };
-
-                        if should_join {
-                            let combined_len = left_col_count + right_row.len();
-                            let combined: Vec<Value<'a>> = (0..combined_len)
-                                .map(|i| {
-                                    if i < left_col_count {
-                                        match &left_row[i] {
-                                            Value::Null => Value::Null,
-                                            Value::Int(n) => Value::Int(*n),
-                                            Value::Float(f) => Value::Float(*f),
-                                            Value::Text(s) => Value::Text(Cow::Borrowed(state.arena.alloc_str(s))),
-                                            Value::Blob(b) => Value::Blob(Cow::Borrowed(state.arena.alloc_slice_copy(b))),
-                                            Value::Vector(v) => Value::Vector(Cow::Borrowed(state.arena.alloc_slice_copy(v))),
-                                        }
-                                    } else {
-                                        let r = &right_row[i - left_col_count];
-                                        match r {
-                                            Value::Null => Value::Null,
-                                            Value::Int(n) => Value::Int(*n),
-                                            Value::Float(f) => Value::Float(*f),
-                                            Value::Text(s) => Value::Text(Cow::Borrowed(state.arena.alloc_str(s))),
-                                            Value::Blob(b) => Value::Blob(Cow::Borrowed(state.arena.alloc_slice_copy(b))),
-                                            Value::Vector(v) => Value::Vector(Cow::Borrowed(state.arena.alloc_slice_copy(v))),
-                                        }
-                                    }
-                                })
-                                .collect();
-                            let allocated = state.arena.alloc_slice_fill_iter(combined);
-                            return Ok(Some(ExecutorRow::new(allocated)));
+                            state.current_left_row = Some(owned);
+                            state.right_index = 0;
                         }
+                        None => return Ok(None),
                     }
-                    state.current_left_row = None;
                 }
-            }
-            DynamicExecutor::GraceHashJoin(state) => {
-                loop {
-                    if state.current_match_idx < state.current_matches.len() {
-                        let build_idx = state.current_matches[state.current_match_idx];
-                        state.current_match_idx += 1;
-                        let build_row = &state.partition_build_rows[build_idx];
-                        let probe_row = &state.right_partitions[state.current_partition][state.current_probe_idx - 1];
 
-                        let combined_len = build_row.len() + probe_row.len();
+                let left_row = state.current_left_row.as_ref().unwrap();
+                let left_col_count = left_row.len();
+
+                while state.right_index < state.right_rows.len() {
+                    let right_row = &state.right_rows[state.right_index];
+                    state.right_index += 1;
+
+                    let should_join = if let Some(ref cond) = state.condition {
+                        let combined_len = left_row.len() + right_row.len();
                         let combined: Vec<Value<'a>> = (0..combined_len)
                             .map(|i| {
-                                if i < build_row.len() {
-                                    match &build_row[i] {
+                                if i < left_row.len() {
+                                    match &left_row[i] {
                                         Value::Null => Value::Null,
                                         Value::Int(n) => Value::Int(*n),
                                         Value::Float(f) => Value::Float(*f),
-                                        Value::Text(s) => Value::Text(Cow::Borrowed(state.arena.alloc_str(s))),
-                                        Value::Blob(b) => Value::Blob(Cow::Borrowed(state.arena.alloc_slice_copy(b))),
-                                        Value::Vector(v) => Value::Vector(Cow::Borrowed(state.arena.alloc_slice_copy(v))),
+                                        Value::Text(s) => {
+                                            Value::Text(Cow::Borrowed(state.arena.alloc_str(s)))
+                                        }
+                                        Value::Blob(b) => Value::Blob(Cow::Borrowed(
+                                            state.arena.alloc_slice_copy(b),
+                                        )),
+                                        Value::Vector(v) => Value::Vector(Cow::Borrowed(
+                                            state.arena.alloc_slice_copy(v),
+                                        )),
                                     }
                                 } else {
-                                    let r = &probe_row[i - build_row.len()];
+                                    let r = &right_row[i - left_row.len()];
                                     match r {
                                         Value::Null => Value::Null,
                                         Value::Int(n) => Value::Int(*n),
                                         Value::Float(f) => Value::Float(*f),
-                                        Value::Text(s) => Value::Text(Cow::Borrowed(state.arena.alloc_str(s))),
-                                        Value::Blob(b) => Value::Blob(Cow::Borrowed(state.arena.alloc_slice_copy(b))),
-                                        Value::Vector(v) => Value::Vector(Cow::Borrowed(state.arena.alloc_slice_copy(v))),
+                                        Value::Text(s) => {
+                                            Value::Text(Cow::Borrowed(state.arena.alloc_str(s)))
+                                        }
+                                        Value::Blob(b) => Value::Blob(Cow::Borrowed(
+                                            state.arena.alloc_slice_copy(b),
+                                        )),
+                                        Value::Vector(v) => Value::Vector(Cow::Borrowed(
+                                            state.arena.alloc_slice_copy(v),
+                                        )),
+                                    }
+                                }
+                            })
+                            .collect();
+                        let allocated = state.arena.alloc_slice_fill_iter(combined);
+                        let temp_row = ExecutorRow::new(allocated);
+                        cond.evaluate(&temp_row)
+                    } else {
+                        true
+                    };
+
+                    if should_join {
+                        let combined_len = left_col_count + right_row.len();
+                        let combined: Vec<Value<'a>> = (0..combined_len)
+                            .map(|i| {
+                                if i < left_col_count {
+                                    match &left_row[i] {
+                                        Value::Null => Value::Null,
+                                        Value::Int(n) => Value::Int(*n),
+                                        Value::Float(f) => Value::Float(*f),
+                                        Value::Text(s) => {
+                                            Value::Text(Cow::Borrowed(state.arena.alloc_str(s)))
+                                        }
+                                        Value::Blob(b) => Value::Blob(Cow::Borrowed(
+                                            state.arena.alloc_slice_copy(b),
+                                        )),
+                                        Value::Vector(v) => Value::Vector(Cow::Borrowed(
+                                            state.arena.alloc_slice_copy(v),
+                                        )),
+                                    }
+                                } else {
+                                    let r = &right_row[i - left_col_count];
+                                    match r {
+                                        Value::Null => Value::Null,
+                                        Value::Int(n) => Value::Int(*n),
+                                        Value::Float(f) => Value::Float(*f),
+                                        Value::Text(s) => {
+                                            Value::Text(Cow::Borrowed(state.arena.alloc_str(s)))
+                                        }
+                                        Value::Blob(b) => Value::Blob(Cow::Borrowed(
+                                            state.arena.alloc_slice_copy(b),
+                                        )),
+                                        Value::Vector(v) => Value::Vector(Cow::Borrowed(
+                                            state.arena.alloc_slice_copy(v),
+                                        )),
                                     }
                                 }
                             })
@@ -1878,47 +1994,109 @@ impl<'a, S: RowSource> Executor<'a> for DynamicExecutor<'a, S> {
                         let allocated = state.arena.alloc_slice_fill_iter(combined);
                         return Ok(Some(ExecutorRow::new(allocated)));
                     }
-
-                    if state.current_probe_idx < state.right_partitions[state.current_partition].len() {
-                        let probe_row = &state.right_partitions[state.current_partition][state.current_probe_idx];
-                        state.current_probe_idx += 1;
-                        let hash = hash_keys_static(probe_row, &state.right_key_indices);
-                        if let Some(matches) = state.partition_hash_table.get(&hash) {
-                            state.current_matches = matches
-                                .iter()
-                                .filter(|&&idx| {
-                                    keys_match_static(&state.partition_build_rows[idx], probe_row, &state.left_key_indices, &state.right_key_indices)
-                                })
-                                .copied()
-                                .collect();
-                            state.current_match_idx = 0;
-                        } else {
-                            state.current_matches.clear();
-                        }
-                        continue;
-                    }
-
-                    state.current_partition += 1;
-                    if state.current_partition >= state.num_partitions {
-                        return Ok(None);
-                    }
-
-                    state.partition_hash_table.clear();
-                    state.partition_build_rows = std::mem::take(&mut state.left_partitions[state.current_partition]);
-                    for (idx, row) in state.partition_build_rows.iter().enumerate() {
-                        let hash = hash_keys_static(row, &state.left_key_indices);
-                        state.partition_hash_table.entry(hash).or_insert_with(Vec::new).push(idx);
-                    }
-                    state.current_probe_idx = 0;
-                    state.current_match_idx = 0;
-                    state.current_matches.clear();
                 }
-            }
+                state.current_left_row = None;
+            },
+            DynamicExecutor::GraceHashJoin(state) => loop {
+                if state.current_match_idx < state.current_matches.len() {
+                    let build_idx = state.current_matches[state.current_match_idx];
+                    state.current_match_idx += 1;
+                    let build_row = &state.partition_build_rows[build_idx];
+                    let probe_row = &state.right_partitions[state.current_partition]
+                        [state.current_probe_idx - 1];
+
+                    let combined_len = build_row.len() + probe_row.len();
+                    let combined: Vec<Value<'a>> = (0..combined_len)
+                        .map(|i| {
+                            if i < build_row.len() {
+                                match &build_row[i] {
+                                    Value::Null => Value::Null,
+                                    Value::Int(n) => Value::Int(*n),
+                                    Value::Float(f) => Value::Float(*f),
+                                    Value::Text(s) => {
+                                        Value::Text(Cow::Borrowed(state.arena.alloc_str(s)))
+                                    }
+                                    Value::Blob(b) => {
+                                        Value::Blob(Cow::Borrowed(state.arena.alloc_slice_copy(b)))
+                                    }
+                                    Value::Vector(v) => Value::Vector(Cow::Borrowed(
+                                        state.arena.alloc_slice_copy(v),
+                                    )),
+                                }
+                            } else {
+                                let r = &probe_row[i - build_row.len()];
+                                match r {
+                                    Value::Null => Value::Null,
+                                    Value::Int(n) => Value::Int(*n),
+                                    Value::Float(f) => Value::Float(*f),
+                                    Value::Text(s) => {
+                                        Value::Text(Cow::Borrowed(state.arena.alloc_str(s)))
+                                    }
+                                    Value::Blob(b) => {
+                                        Value::Blob(Cow::Borrowed(state.arena.alloc_slice_copy(b)))
+                                    }
+                                    Value::Vector(v) => Value::Vector(Cow::Borrowed(
+                                        state.arena.alloc_slice_copy(v),
+                                    )),
+                                }
+                            }
+                        })
+                        .collect();
+                    let allocated = state.arena.alloc_slice_fill_iter(combined);
+                    return Ok(Some(ExecutorRow::new(allocated)));
+                }
+
+                if state.current_probe_idx < state.right_partitions[state.current_partition].len() {
+                    let probe_row =
+                        &state.right_partitions[state.current_partition][state.current_probe_idx];
+                    state.current_probe_idx += 1;
+                    let hash = hash_keys_static(probe_row, &state.right_key_indices);
+                    if let Some(matches) = state.partition_hash_table.get(&hash) {
+                        state.current_matches = matches
+                            .iter()
+                            .filter(|&&idx| {
+                                keys_match_static(
+                                    &state.partition_build_rows[idx],
+                                    probe_row,
+                                    &state.left_key_indices,
+                                    &state.right_key_indices,
+                                )
+                            })
+                            .copied()
+                            .collect();
+                        state.current_match_idx = 0;
+                    } else {
+                        state.current_matches.clear();
+                    }
+                    continue;
+                }
+
+                state.current_partition += 1;
+                if state.current_partition >= state.num_partitions {
+                    return Ok(None);
+                }
+
+                state.partition_hash_table.clear();
+                state.partition_build_rows =
+                    std::mem::take(&mut state.left_partitions[state.current_partition]);
+                for (idx, row) in state.partition_build_rows.iter().enumerate() {
+                    let hash = hash_keys_static(row, &state.left_key_indices);
+                    state
+                        .partition_hash_table
+                        .entry(hash)
+                        .or_insert_with(Vec::new)
+                        .push(idx);
+                }
+                state.current_probe_idx = 0;
+                state.current_match_idx = 0;
+                state.current_matches.clear();
+            },
             DynamicExecutor::HashAggregate(state) => {
                 if !state.computed {
                     while let Some(row) = state.child.next()? {
                         let group_key = compute_group_key_for_dynamic(&row, &state.group_by);
-                        let group_values: Vec<Value<'static>> = state.group_by
+                        let group_values: Vec<Value<'static>> = state
+                            .group_by
                             .iter()
                             .map(|&col| {
                                 row.get(col)
@@ -1935,7 +2113,8 @@ impl<'a, S: RowSource> Executor<'a> for DynamicExecutor<'a, S> {
                             .collect();
 
                         let entry = state.groups.entry(group_key).or_insert_with(|| {
-                            let initial_states: Vec<AggregateState> = state.aggregates
+                            let initial_states: Vec<AggregateState> = state
+                                .aggregates
                                 .iter()
                                 .map(|_| AggregateState::new())
                                 .collect();
@@ -1947,24 +2126,29 @@ impl<'a, S: RowSource> Executor<'a> for DynamicExecutor<'a, S> {
                         }
                     }
 
-                    let results: Vec<(Vec<Value<'static>>, Vec<AggregateState>)> = state.groups
-                        .drain()
-                        .map(|(_, v)| v)
-                        .collect();
+                    let results: Vec<(Vec<Value<'static>>, Vec<AggregateState>)> =
+                        state.groups.drain().map(|(_, v)| v).collect();
                     state.result_iter = Some(results.into_iter());
                     state.computed = true;
                 }
 
                 if let Some(ref mut iter) = state.result_iter {
                     if let Some((group_vals, agg_states)) = iter.next() {
-                        let mut result_values: Vec<Value<'a>> = group_vals.into_iter()
+                        let mut result_values: Vec<Value<'a>> = group_vals
+                            .into_iter()
                             .map(|v| match v {
                                 Value::Null => Value::Null,
                                 Value::Int(i) => Value::Int(i),
                                 Value::Float(f) => Value::Float(f),
-                                Value::Text(s) => Value::Text(Cow::Borrowed(state.arena.alloc_str(&s))),
-                                Value::Blob(b) => Value::Blob(Cow::Borrowed(state.arena.alloc_slice_copy(&b))),
-                                Value::Vector(v) => Value::Vector(Cow::Borrowed(state.arena.alloc_slice_copy(&v))),
+                                Value::Text(s) => {
+                                    Value::Text(Cow::Borrowed(state.arena.alloc_str(&s)))
+                                }
+                                Value::Blob(b) => {
+                                    Value::Blob(Cow::Borrowed(state.arena.alloc_slice_copy(&b)))
+                                }
+                                Value::Vector(v) => {
+                                    Value::Vector(Cow::Borrowed(state.arena.alloc_slice_copy(&v)))
+                                }
                             })
                             .collect();
 
@@ -2015,8 +2199,8 @@ fn compare_values_for_sort(a: &Value, b: &Value) -> std::cmp::Ordering {
 }
 
 fn hash_keys<'a>(row: &ExecutorRow<'a>, key_indices: &[usize]) -> u64 {
-    use std::hash::{Hash, Hasher};
     use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
 
     let mut hasher = DefaultHasher::new();
     for &idx in key_indices {
@@ -2039,8 +2223,8 @@ fn hash_keys<'a>(row: &ExecutorRow<'a>, key_indices: &[usize]) -> u64 {
 }
 
 fn hash_keys_static(row: &[Value<'static>], key_indices: &[usize]) -> u64 {
-    use std::hash::{Hash, Hasher};
     use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
 
     let mut hasher = DefaultHasher::new();
     for &idx in key_indices {
@@ -2077,7 +2261,9 @@ fn keys_match_static(
         match (lv, rv) {
             (Some(Value::Null), _) | (_, Some(Value::Null)) => return false,
             (Some(Value::Int(a)), Some(Value::Int(b))) if a != b => return false,
-            (Some(Value::Float(a)), Some(Value::Float(b))) if (a - b).abs() > f64::EPSILON => return false,
+            (Some(Value::Float(a)), Some(Value::Float(b))) if (a - b).abs() > f64::EPSILON => {
+                return false
+            }
             (Some(Value::Text(a)), Some(Value::Text(b))) if a != b => return false,
             (Some(Value::Blob(a)), Some(Value::Blob(b))) if a != b => return false,
             (Some(_), Some(_)) => {}
@@ -2137,7 +2323,9 @@ impl<'a> ExecutorBuilder<'a> {
         plan: &crate::sql::planner::PhysicalPlan<'a>,
         source: S,
     ) -> Result<DynamicExecutor<'a, S>> {
-        let column_map: Vec<(String, usize)> = plan.output_schema.columns
+        let column_map: Vec<(String, usize)> = plan
+            .output_schema
+            .columns
             .iter()
             .enumerate()
             .map(|(idx, col)| (col.name.to_string(), idx))
@@ -2155,9 +2343,9 @@ impl<'a> ExecutorBuilder<'a> {
         use crate::sql::planner::PhysicalOperator;
 
         match op {
-            PhysicalOperator::TableScan(_) => {
-                Ok(DynamicExecutor::TableScan(TableScanExecutor::new(source, self.ctx.arena)))
-            }
+            PhysicalOperator::TableScan(_) => Ok(DynamicExecutor::TableScan(
+                TableScanExecutor::new(source, self.ctx.arena),
+            )),
             PhysicalOperator::FilterExec(filter) => {
                 let child = self.build_operator(filter.input, source, column_map)?;
                 let predicate = CompiledPredicate::new(filter.predicate, column_map.to_vec());
@@ -2166,7 +2354,11 @@ impl<'a> ExecutorBuilder<'a> {
             PhysicalOperator::ProjectExec(project) => {
                 let child = self.build_operator(project.input, source, column_map)?;
                 let projections: Vec<usize> = (0..project.expressions.len()).collect();
-                Ok(DynamicExecutor::Project(Box::new(child), projections, self.ctx.arena))
+                Ok(DynamicExecutor::Project(
+                    Box::new(child),
+                    projections,
+                    self.ctx.arena,
+                ))
             }
             PhysicalOperator::LimitExec(limit) => {
                 let child = self.build_operator(limit.input, source, column_map)?;
@@ -2180,9 +2372,14 @@ impl<'a> ExecutorBuilder<'a> {
             }
             PhysicalOperator::SortExec(sort) => {
                 let child = self.build_operator(sort.input, source, column_map)?;
-                let sort_keys: Vec<SortKey> = sort.order_by.iter()
+                let sort_keys: Vec<SortKey> = sort
+                    .order_by
+                    .iter()
                     .enumerate()
-                    .map(|(idx, key)| SortKey { column: idx, ascending: key.ascending })
+                    .map(|(idx, key)| SortKey {
+                        column: idx,
+                        ascending: key.ascending,
+                    })
                     .collect();
                 Ok(DynamicExecutor::Sort(SortState {
                     child: Box::new(child),
@@ -2194,36 +2391,61 @@ impl<'a> ExecutorBuilder<'a> {
                 }))
             }
             PhysicalOperator::IndexScan(_) => {
-                eyre::bail!("IndexScan requires explicit BTreeCursorAdapter - use build_index_scan instead")
+                eyre::bail!(
+                    "IndexScan requires explicit BTreeCursorAdapter - use build_index_scan instead"
+                )
             }
             PhysicalOperator::HashAggregate(agg) => {
                 let child = self.build_operator(agg.input, source, column_map)?;
-                let group_by_indices: Vec<usize> = agg.group_by
+                let group_by_indices: Vec<usize> = agg
+                    .group_by
                     .iter()
                     .filter_map(|expr| {
                         if let crate::sql::ast::Expr::Column(col) = expr {
-                            column_map.iter().find(|(n, _)| n.eq_ignore_ascii_case(col.column)).map(|(_, i)| *i)
+                            column_map
+                                .iter()
+                                .find(|(n, _)| n.eq_ignore_ascii_case(col.column))
+                                .map(|(_, i)| *i)
                         } else {
                             None
                         }
                     })
                     .collect();
-                let agg_funcs: Vec<AggregateFunction> = agg.aggregates
+                let agg_funcs: Vec<AggregateFunction> = agg
+                    .aggregates
                     .iter()
                     .map(|agg_expr| {
-                        let column_idx = agg_expr.argument.and_then(|arg| {
-                            if let crate::sql::ast::Expr::Column(col) = arg {
-                                column_map.iter().find(|(n, _)| n.eq_ignore_ascii_case(col.column)).map(|(_, i)| *i)
-                            } else {
-                                None
-                            }
-                        }).unwrap_or(0);
+                        let column_idx = agg_expr
+                            .argument
+                            .and_then(|arg| {
+                                if let crate::sql::ast::Expr::Column(col) = arg {
+                                    column_map
+                                        .iter()
+                                        .find(|(n, _)| n.eq_ignore_ascii_case(col.column))
+                                        .map(|(_, i)| *i)
+                                } else {
+                                    None
+                                }
+                            })
+                            .unwrap_or(0);
                         match agg_expr.function {
-                            crate::sql::planner::AggregateFunction::Count => AggregateFunction::Count { distinct: agg_expr.distinct },
-                            crate::sql::planner::AggregateFunction::Sum => AggregateFunction::Sum { column: column_idx },
-                            crate::sql::planner::AggregateFunction::Avg => AggregateFunction::Avg { column: column_idx },
-                            crate::sql::planner::AggregateFunction::Min => AggregateFunction::Min { column: column_idx },
-                            crate::sql::planner::AggregateFunction::Max => AggregateFunction::Max { column: column_idx },
+                            crate::sql::planner::AggregateFunction::Count => {
+                                AggregateFunction::Count {
+                                    distinct: agg_expr.distinct,
+                                }
+                            }
+                            crate::sql::planner::AggregateFunction::Sum => {
+                                AggregateFunction::Sum { column: column_idx }
+                            }
+                            crate::sql::planner::AggregateFunction::Avg => {
+                                AggregateFunction::Avg { column: column_idx }
+                            }
+                            crate::sql::planner::AggregateFunction::Min => {
+                                AggregateFunction::Min { column: column_idx }
+                            }
+                            crate::sql::planner::AggregateFunction::Max => {
+                                AggregateFunction::Max { column: column_idx }
+                            }
                         }
                     })
                     .collect();
@@ -2239,32 +2461,55 @@ impl<'a> ExecutorBuilder<'a> {
             }
             PhysicalOperator::SortedAggregate(agg) => {
                 let child = self.build_operator(agg.input, source, column_map)?;
-                let group_by_indices: Vec<usize> = agg.group_by
+                let group_by_indices: Vec<usize> = agg
+                    .group_by
                     .iter()
                     .filter_map(|expr| {
                         if let crate::sql::ast::Expr::Column(col) = expr {
-                            column_map.iter().find(|(n, _)| n.eq_ignore_ascii_case(col.column)).map(|(_, i)| *i)
+                            column_map
+                                .iter()
+                                .find(|(n, _)| n.eq_ignore_ascii_case(col.column))
+                                .map(|(_, i)| *i)
                         } else {
                             None
                         }
                     })
                     .collect();
-                let agg_funcs: Vec<AggregateFunction> = agg.aggregates
+                let agg_funcs: Vec<AggregateFunction> = agg
+                    .aggregates
                     .iter()
                     .map(|agg_expr| {
-                        let column_idx = agg_expr.argument.and_then(|arg| {
-                            if let crate::sql::ast::Expr::Column(col) = arg {
-                                column_map.iter().find(|(n, _)| n.eq_ignore_ascii_case(col.column)).map(|(_, i)| *i)
-                            } else {
-                                None
-                            }
-                        }).unwrap_or(0);
+                        let column_idx = agg_expr
+                            .argument
+                            .and_then(|arg| {
+                                if let crate::sql::ast::Expr::Column(col) = arg {
+                                    column_map
+                                        .iter()
+                                        .find(|(n, _)| n.eq_ignore_ascii_case(col.column))
+                                        .map(|(_, i)| *i)
+                                } else {
+                                    None
+                                }
+                            })
+                            .unwrap_or(0);
                         match agg_expr.function {
-                            crate::sql::planner::AggregateFunction::Count => AggregateFunction::Count { distinct: agg_expr.distinct },
-                            crate::sql::planner::AggregateFunction::Sum => AggregateFunction::Sum { column: column_idx },
-                            crate::sql::planner::AggregateFunction::Avg => AggregateFunction::Avg { column: column_idx },
-                            crate::sql::planner::AggregateFunction::Min => AggregateFunction::Min { column: column_idx },
-                            crate::sql::planner::AggregateFunction::Max => AggregateFunction::Max { column: column_idx },
+                            crate::sql::planner::AggregateFunction::Count => {
+                                AggregateFunction::Count {
+                                    distinct: agg_expr.distinct,
+                                }
+                            }
+                            crate::sql::planner::AggregateFunction::Sum => {
+                                AggregateFunction::Sum { column: column_idx }
+                            }
+                            crate::sql::planner::AggregateFunction::Avg => {
+                                AggregateFunction::Avg { column: column_idx }
+                            }
+                            crate::sql::planner::AggregateFunction::Min => {
+                                AggregateFunction::Min { column: column_idx }
+                            }
+                            crate::sql::planner::AggregateFunction::Max => {
+                                AggregateFunction::Max { column: column_idx }
+                            }
                         }
                     })
                     .collect();
@@ -2279,10 +2524,14 @@ impl<'a> ExecutorBuilder<'a> {
                 }))
             }
             PhysicalOperator::NestedLoopJoin(_) => {
-                eyre::bail!("NestedLoopJoin requires two sources - use build_nested_loop_join instead")
+                eyre::bail!(
+                    "NestedLoopJoin requires two sources - use build_nested_loop_join instead"
+                )
             }
             PhysicalOperator::GraceHashJoin(_) => {
-                eyre::bail!("GraceHashJoin requires two sources - use build_grace_hash_join instead")
+                eyre::bail!(
+                    "GraceHashJoin requires two sources - use build_grace_hash_join instead"
+                )
             }
         }
     }
@@ -2293,11 +2542,15 @@ impl<'a> ExecutorBuilder<'a> {
         adapter: BTreeCursorAdapter,
         column_map: &[(String, usize)],
     ) -> Result<IndexScanState<'a>> {
-        let residual_filter = index_scan.residual_filter.map(|expr| {
-            CompiledPredicate::new(expr, column_map.to_vec())
-        });
+        let residual_filter = index_scan
+            .residual_filter
+            .map(|expr| CompiledPredicate::new(expr, column_map.to_vec()));
 
-        Ok(IndexScanState::new(adapter, self.ctx.arena, residual_filter))
+        Ok(IndexScanState::new(
+            adapter,
+            self.ctx.arena,
+            residual_filter,
+        ))
     }
 
     pub fn build_nested_loop_join<S: RowSource>(
@@ -2307,9 +2560,8 @@ impl<'a> ExecutorBuilder<'a> {
         condition: Option<&'a crate::sql::ast::Expr<'a>>,
         column_map: &[(String, usize)],
     ) -> NestedLoopJoinState<'a, S> {
-        let compiled_condition = condition.map(|expr| {
-            CompiledPredicate::new(expr, column_map.to_vec())
-        });
+        let compiled_condition =
+            condition.map(|expr| CompiledPredicate::new(expr, column_map.to_vec()));
         NestedLoopJoinState {
             left: Box::new(left),
             right: Box::new(right),
@@ -2402,7 +2654,9 @@ impl ExprEvaluator {
 
     pub fn eval_eq<'a>(&self, row: &ExecutorRow<'a>, column_idx: usize, value: &Value<'a>) -> bool {
         match row.get(column_idx) {
-            Some(col_val) => Self::compare_values(col_val, value) == Some(std::cmp::Ordering::Equal),
+            Some(col_val) => {
+                Self::compare_values(col_val, value) == Some(std::cmp::Ordering::Equal)
+            }
             None => false,
         }
     }
@@ -2414,7 +2668,9 @@ impl ExprEvaluator {
         value: &Value<'a>,
     ) -> bool {
         match row.get(column_idx) {
-            Some(col_val) => Self::compare_values(col_val, value) != Some(std::cmp::Ordering::Equal),
+            Some(col_val) => {
+                Self::compare_values(col_val, value) != Some(std::cmp::Ordering::Equal)
+            }
             None => true,
         }
     }
@@ -2619,9 +2875,10 @@ mod tests {
     fn table_scan_executor_returns_correct_values() {
         let arena = Bump::new();
 
-        let rows_data: Vec<Vec<Value>> = vec![
-            vec![Value::Int(42), Value::Text(Cow::Owned("test".to_string()))],
-        ];
+        let rows_data: Vec<Vec<Value>> = vec![vec![
+            Value::Int(42),
+            Value::Text(Cow::Owned("test".to_string())),
+        ]];
 
         let source = MockRowSource::new(rows_data);
         let mut executor = TableScanExecutor::new(source, &arena);
@@ -2649,9 +2906,8 @@ mod tests {
 
         let source = MockRowSource::new(rows_data);
         let scan = TableScanExecutor::new(source, &arena);
-        let predicate = |row: &ExecutorRow| -> bool {
-            matches!(row.get(0), Some(Value::Int(i)) if *i > 2)
-        };
+        let predicate =
+            |row: &ExecutorRow| -> bool { matches!(row.get(0), Some(Value::Int(i)) if *i > 2) };
         let mut filter = FilterExecutor::new(scan, predicate);
 
         filter.open().unwrap();
@@ -2671,16 +2927,12 @@ mod tests {
     fn filter_executor_handles_empty_result() {
         let arena = Bump::new();
 
-        let rows_data: Vec<Vec<Value>> = vec![
-            vec![Value::Int(1)],
-            vec![Value::Int(2)],
-        ];
+        let rows_data: Vec<Vec<Value>> = vec![vec![Value::Int(1)], vec![Value::Int(2)]];
 
         let source = MockRowSource::new(rows_data);
         let scan = TableScanExecutor::new(source, &arena);
-        let predicate = |row: &ExecutorRow| -> bool {
-            matches!(row.get(0), Some(Value::Int(i)) if *i > 100)
-        };
+        let predicate =
+            |row: &ExecutorRow| -> bool { matches!(row.get(0), Some(Value::Int(i)) if *i > 100) };
         let mut filter = FilterExecutor::new(scan, predicate);
 
         filter.open().unwrap();
@@ -2911,9 +3163,7 @@ mod tests {
         let left_scan = TableScanExecutor::new(left, &arena);
         let right_scan = TableScanExecutor::new(right, &arena);
 
-        let condition = |left: &ExecutorRow, right: &ExecutorRow| {
-            matches!((left.get(0), right.get(0)), (Some(&Value::Int(l)), Some(&Value::Int(r))) if l == r)
-        };
+        let condition = |left: &ExecutorRow, right: &ExecutorRow| matches!((left.get(0), right.get(0)), (Some(&Value::Int(l)), Some(&Value::Int(r))) if l == r);
         let mut join = NestedLoopJoinExecutor::new(left_scan, right_scan, condition, &arena);
 
         join.open().unwrap();
@@ -3254,8 +3504,10 @@ mod tests {
 
     #[test]
     fn executor_builder_creates_table_scan() {
-        use crate::sql::planner::{PhysicalOperator, PhysicalPlan, PhysicalTableScan, OutputSchema, OutputColumn};
         use crate::records::types::DataType;
+        use crate::sql::planner::{
+            OutputColumn, OutputSchema, PhysicalOperator, PhysicalPlan, PhysicalTableScan,
+        };
 
         let arena = Bump::new();
 
@@ -3272,8 +3524,16 @@ mod tests {
             root: op,
             output_schema: OutputSchema {
                 columns: arena.alloc_slice_fill_iter([
-                    OutputColumn { name: "id", data_type: DataType::Int8, nullable: false },
-                    OutputColumn { name: "name", data_type: DataType::Text, nullable: false },
+                    OutputColumn {
+                        name: "id",
+                        data_type: DataType::Int8,
+                        nullable: false,
+                    },
+                    OutputColumn {
+                        name: "name",
+                        data_type: DataType::Text,
+                        nullable: false,
+                    },
                 ]),
             },
         };
@@ -3301,9 +3561,12 @@ mod tests {
 
     #[test]
     fn executor_builder_creates_filter() {
-        use crate::sql::planner::{PhysicalOperator, PhysicalPlan, PhysicalTableScan, PhysicalFilterExec, OutputSchema, OutputColumn};
-        use crate::sql::ast::{Expr, BinaryOperator, Literal, ColumnRef};
         use crate::records::types::DataType;
+        use crate::sql::ast::{BinaryOperator, ColumnRef, Expr, Literal};
+        use crate::sql::planner::{
+            OutputColumn, OutputSchema, PhysicalFilterExec, PhysicalOperator, PhysicalPlan,
+            PhysicalTableScan,
+        };
 
         let arena = Bump::new();
 
@@ -3336,8 +3599,16 @@ mod tests {
             root: filter_op,
             output_schema: OutputSchema {
                 columns: arena.alloc_slice_fill_iter([
-                    OutputColumn { name: "id", data_type: DataType::Int8, nullable: false },
-                    OutputColumn { name: "name", data_type: DataType::Text, nullable: false },
+                    OutputColumn {
+                        name: "id",
+                        data_type: DataType::Int8,
+                        nullable: false,
+                    },
+                    OutputColumn {
+                        name: "name",
+                        data_type: DataType::Text,
+                        nullable: false,
+                    },
                 ]),
             },
         };
@@ -3368,8 +3639,11 @@ mod tests {
 
     #[test]
     fn executor_builder_creates_limit() {
-        use crate::sql::planner::{PhysicalOperator, PhysicalPlan, PhysicalTableScan, PhysicalLimitExec, OutputSchema, OutputColumn};
         use crate::records::types::DataType;
+        use crate::sql::planner::{
+            OutputColumn, OutputSchema, PhysicalLimitExec, PhysicalOperator, PhysicalPlan,
+            PhysicalTableScan,
+        };
 
         let arena = Bump::new();
 
@@ -3392,9 +3666,11 @@ mod tests {
         let plan = PhysicalPlan {
             root: limit_op,
             output_schema: OutputSchema {
-                columns: arena.alloc_slice_fill_iter([
-                    OutputColumn { name: "id", data_type: DataType::Int8, nullable: false },
-                ]),
+                columns: arena.alloc_slice_fill_iter([OutputColumn {
+                    name: "id",
+                    data_type: DataType::Int8,
+                    nullable: false,
+                }]),
             },
         };
 
@@ -3483,7 +3759,10 @@ mod tests {
         assert!(row3.is_none(), "expected no more rows");
 
         adapter.reset().unwrap();
-        let row1_again = adapter.next_row().unwrap().expect("expected row 1 after reset");
+        let row1_again = adapter
+            .next_row()
+            .unwrap()
+            .expect("expected row 1 after reset");
         if let Value::Int(id) = row1_again[0] {
             assert_eq!(id, 100);
         }
@@ -3537,10 +3816,7 @@ mod tests {
             right: literal_expr,
         });
 
-        let column_map = vec![
-            ("id".to_string(), 0),
-            ("age".to_string(), 1),
-        ];
+        let column_map = vec![("id".to_string(), 0), ("age".to_string(), 1)];
         let residual_filter = CompiledPredicate::new(filter_expr, column_map);
 
         let index_scan_state = IndexScanState::new(adapter, &arena, Some(residual_filter));
@@ -3569,7 +3845,10 @@ mod tests {
         let left_rows: Vec<Vec<Value<'static>>> = vec![
             vec![Value::Int(1), Value::Text(Cow::Owned("alice".to_string()))],
             vec![Value::Int(2), Value::Text(Cow::Owned("bob".to_string()))],
-            vec![Value::Int(3), Value::Text(Cow::Owned("charlie".to_string()))],
+            vec![
+                Value::Int(3),
+                Value::Text(Cow::Owned("charlie".to_string())),
+            ],
         ];
         let right_rows: Vec<Vec<Value<'static>>> = vec![
             vec![Value::Int(1), Value::Int(100)],
@@ -3583,14 +3862,8 @@ mod tests {
         let left_exec = TableScanExecutor::new(left_source, &arena);
         let right_exec = TableScanExecutor::new(right_source, &arena);
 
-        let mut join = GraceHashJoinExecutor::new(
-            left_exec,
-            right_exec,
-            vec![0],
-            vec![0],
-            &arena,
-            4,
-        );
+        let mut join =
+            GraceHashJoinExecutor::new(left_exec, right_exec, vec![0], vec![0], &arena, 4);
 
         join.open().unwrap();
 
@@ -3625,7 +3898,12 @@ mod tests {
         let arena = Bump::new();
 
         let left_rows: Vec<Vec<Value<'static>>> = (0..100)
-            .map(|i| vec![Value::Int(i), Value::Text(Cow::Owned(format!("left_{}", i)))])
+            .map(|i| {
+                vec![
+                    Value::Int(i),
+                    Value::Text(Cow::Owned(format!("left_{}", i))),
+                ]
+            })
             .collect();
 
         let right_rows: Vec<Vec<Value<'static>>> = (0..100)
@@ -3639,14 +3917,8 @@ mod tests {
         let left_exec = TableScanExecutor::new(left_source, &arena);
         let right_exec = TableScanExecutor::new(right_source, &arena);
 
-        let mut join = GraceHashJoinExecutor::new(
-            left_exec,
-            right_exec,
-            vec![0],
-            vec![0],
-            &arena,
-            16,
-        );
+        let mut join =
+            GraceHashJoinExecutor::new(left_exec, right_exec, vec![0], vec![0], &arena, 16);
 
         join.open().unwrap();
 
@@ -3677,12 +3949,10 @@ mod tests {
         let left_source = MockRowSource::new(left_rows);
         let right_source = MockRowSource::new(right_rows);
 
-        let left_executor: DynamicExecutor<MockRowSource> = DynamicExecutor::TableScan(
-            TableScanExecutor::new(left_source, &arena)
-        );
-        let right_executor: DynamicExecutor<MockRowSource> = DynamicExecutor::TableScan(
-            TableScanExecutor::new(right_source, &arena)
-        );
+        let left_executor: DynamicExecutor<MockRowSource> =
+            DynamicExecutor::TableScan(TableScanExecutor::new(left_source, &arena));
+        let right_executor: DynamicExecutor<MockRowSource> =
+            DynamicExecutor::TableScan(TableScanExecutor::new(right_source, &arena));
 
         let mut join_executor = DynamicExecutor::NestedLoopJoin(NestedLoopJoinState {
             left: Box::new(left_executor),
@@ -3723,12 +3993,10 @@ mod tests {
         let left_source = MockRowSource::new(left_rows);
         let right_source = MockRowSource::new(right_rows);
 
-        let left_executor: DynamicExecutor<MockRowSource> = DynamicExecutor::TableScan(
-            TableScanExecutor::new(left_source, &arena)
-        );
-        let right_executor: DynamicExecutor<MockRowSource> = DynamicExecutor::TableScan(
-            TableScanExecutor::new(right_source, &arena)
-        );
+        let left_executor: DynamicExecutor<MockRowSource> =
+            DynamicExecutor::TableScan(TableScanExecutor::new(left_source, &arena));
+        let right_executor: DynamicExecutor<MockRowSource> =
+            DynamicExecutor::TableScan(TableScanExecutor::new(right_source, &arena));
 
         let mut join_executor = DynamicExecutor::GraceHashJoin(GraceHashJoinState {
             left: Box::new(left_executor),
@@ -3779,9 +4047,8 @@ mod tests {
 
         let source = MockRowSource::new(rows);
 
-        let child_executor: DynamicExecutor<MockRowSource> = DynamicExecutor::TableScan(
-            TableScanExecutor::new(source, &arena)
-        );
+        let child_executor: DynamicExecutor<MockRowSource> =
+            DynamicExecutor::TableScan(TableScanExecutor::new(source, &arena));
 
         let mut agg_executor = DynamicExecutor::HashAggregate(HashAggregateState {
             child: Box::new(child_executor),
@@ -3841,12 +4108,10 @@ mod tests {
         let left_source = MockRowSource::new(left_rows);
         let right_source = MockRowSource::new(right_rows);
 
-        let left_executor: DynamicExecutor<MockRowSource> = DynamicExecutor::TableScan(
-            TableScanExecutor::new(left_source, &arena)
-        );
-        let right_executor: DynamicExecutor<MockRowSource> = DynamicExecutor::TableScan(
-            TableScanExecutor::new(right_source, &arena)
-        );
+        let left_executor: DynamicExecutor<MockRowSource> =
+            DynamicExecutor::TableScan(TableScanExecutor::new(left_source, &arena));
+        let right_executor: DynamicExecutor<MockRowSource> =
+            DynamicExecutor::TableScan(TableScanExecutor::new(right_source, &arena));
 
         let column_map = vec![
             ("id".to_string(), 0),
@@ -3855,12 +4120,8 @@ mod tests {
             ("score".to_string(), 3),
         ];
 
-        let join_state = builder.build_nested_loop_join(
-            left_executor,
-            right_executor,
-            None,
-            &column_map,
-        );
+        let join_state =
+            builder.build_nested_loop_join(left_executor, right_executor, None, &column_map);
 
         let mut join_executor = DynamicExecutor::NestedLoopJoin(join_state);
         join_executor.open().unwrap();
@@ -3892,20 +4153,13 @@ mod tests {
         let left_source = MockRowSource::new(left_rows);
         let right_source = MockRowSource::new(right_rows);
 
-        let left_executor: DynamicExecutor<MockRowSource> = DynamicExecutor::TableScan(
-            TableScanExecutor::new(left_source, &arena)
-        );
-        let right_executor: DynamicExecutor<MockRowSource> = DynamicExecutor::TableScan(
-            TableScanExecutor::new(right_source, &arena)
-        );
+        let left_executor: DynamicExecutor<MockRowSource> =
+            DynamicExecutor::TableScan(TableScanExecutor::new(left_source, &arena));
+        let right_executor: DynamicExecutor<MockRowSource> =
+            DynamicExecutor::TableScan(TableScanExecutor::new(right_source, &arena));
 
-        let join_state = builder.build_grace_hash_join(
-            left_executor,
-            right_executor,
-            vec![0],
-            vec![0],
-            4,
-        );
+        let join_state =
+            builder.build_grace_hash_join(left_executor, right_executor, vec![0], vec![0], 4);
 
         let mut join_executor = DynamicExecutor::GraceHashJoin(join_state);
         join_executor.open().unwrap();
@@ -3932,9 +4186,8 @@ mod tests {
         ];
 
         let source = MockRowSource::new(rows);
-        let child_executor: DynamicExecutor<MockRowSource> = DynamicExecutor::TableScan(
-            TableScanExecutor::new(source, &arena)
-        );
+        let child_executor: DynamicExecutor<MockRowSource> =
+            DynamicExecutor::TableScan(TableScanExecutor::new(source, &arena));
 
         let agg_state = builder.build_hash_aggregate(
             child_executor,

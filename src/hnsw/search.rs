@@ -504,11 +504,7 @@ mod tests {
 
     #[test]
     fn greedy_search_step_finds_closer_neighbor() {
-        let neighbors = vec![
-            NodeId::new(1, 0),
-            NodeId::new(2, 0),
-            NodeId::new(3, 0),
-        ];
+        let neighbors = vec![NodeId::new(1, 0), NodeId::new(2, 0), NodeId::new(3, 0)];
 
         let distances = [0.5, 0.3, 0.8];
 
@@ -646,7 +642,13 @@ mod tests {
         let is_visible = |n: NodeId| !invisible_nodes.contains(&(n.page_no() as i32));
 
         let entry = Candidate::new(NodeId::new(0, 0), 0.5);
-        beam_search_filtered(&mut ctx, &[entry], get_neighbors, compute_distance, is_visible);
+        beam_search_filtered(
+            &mut ctx,
+            &[entry],
+            get_neighbors,
+            compute_distance,
+            is_visible,
+        );
 
         ctx.finalize_results(10);
         let results = ctx.results();
@@ -684,15 +686,30 @@ mod tests {
         let is_visible = |n: NodeId| !invisible_nodes.contains(&(n.page_no() as i32));
 
         let entry = Candidate::new(NodeId::new(0, 0), 1.0);
-        beam_search_filtered(&mut ctx, &[entry], get_neighbors, compute_distance, is_visible);
+        beam_search_filtered(
+            &mut ctx,
+            &[entry],
+            get_neighbors,
+            compute_distance,
+            is_visible,
+        );
 
         ctx.finalize_results(10);
         let results = ctx.results();
 
-        assert!(results.len() >= 2, "should find node 0 and 2 through invisible node 1");
+        assert!(
+            results.len() >= 2,
+            "should find node 0 and 2 through invisible node 1"
+        );
 
         let result_pages: Vec<u32> = results.iter().map(|c| c.node_id.page_no()).collect();
-        assert!(result_pages.contains(&2), "node 2 should be reachable through invisible node 1");
-        assert!(!result_pages.contains(&1), "node 1 should be invisible in results");
+        assert!(
+            result_pages.contains(&2),
+            "node 2 should be reachable through invisible node 1"
+        );
+        assert!(
+            !result_pages.contains(&1),
+            "node 1 should be invisible in results"
+        );
     }
 }

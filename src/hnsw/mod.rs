@@ -796,8 +796,10 @@ impl PersistentHnswIndex {
         operations::insert_descent_phase(&mut insert_ctx, get_neighbors, compute_distance);
 
         let max_nodes_estimate = (self.index.node_count() as usize).max(1000);
-        let mut search_ctx =
-            search::HnswSearchContext::new(self.index.ef_construction() as usize, max_nodes_estimate);
+        let mut search_ctx = search::HnswSearchContext::new(
+            self.index.ef_construction() as usize,
+            max_nodes_estimate,
+        );
 
         operations::insert_connection_phase(
             &mut insert_ctx,
@@ -1598,7 +1600,8 @@ mod tests {
 
     #[test]
     fn persistent_hnsw_delete_queues_for_vacuum() {
-        let temp_dir = std::env::temp_dir().join(format!("test_delete_queue_{}", std::process::id()));
+        let temp_dir =
+            std::env::temp_dir().join(format!("test_delete_queue_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&temp_dir);
         std::fs::create_dir_all(&temp_dir).unwrap();
         let path = temp_dir.join("test.hnsw");

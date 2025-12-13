@@ -156,11 +156,7 @@ pub fn insert_connection_phase<F>(
         let max_neighbors = if level == 0 { m0 } else { m };
 
         search_ctx.finalize_results(max_neighbors);
-        let selected: Vec<NodeId> = search_ctx
-            .results()
-            .iter()
-            .map(|c| c.node_id)
-            .collect();
+        let selected: Vec<NodeId> = search_ctx.results().iter().map(|c| c.node_id).collect();
 
         ctx.neighbors_to_add.push((level, selected));
 
@@ -249,10 +245,7 @@ pub fn prune_neighbors(
         .map(|&n| (n, compute_distance(n)))
         .collect();
 
-    with_distances.sort_by(|a, b| {
-        a.1.partial_cmp(&b.1)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
+    with_distances.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
 
     with_distances
         .into_iter()
