@@ -85,3 +85,4 @@ pub mod records;
 pub mod schema;
 pub mod sql;
 pub mod storage;
+pub mod types;
