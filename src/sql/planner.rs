@@ -108,6 +108,9 @@ pub enum LogicalOperator<'a> {
     Sort(LogicalSort<'a>),
     Limit(LogicalLimit<'a>),
     Values(LogicalValues<'a>),
+    Insert(LogicalInsert<'a>),
+    Update(LogicalUpdate<'a>),
+    Delete(LogicalDelete<'a>),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -168,6 +171,42 @@ pub struct LogicalLimit<'a> {
 #[derive(Debug, Clone, PartialEq)]
 pub struct LogicalValues<'a> {
     pub rows: &'a [&'a [&'a Expr<'a>]],
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct LogicalInsert<'a> {
+    pub schema: Option<&'a str>,
+    pub table: &'a str,
+    pub columns: Option<&'a [&'a str]>,
+    pub source: InsertSource<'a>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum InsertSource<'a> {
+    Values(&'a [&'a [&'a Expr<'a>]]),
+    Select(&'a LogicalOperator<'a>),
+    Default,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct LogicalUpdate<'a> {
+    pub schema: Option<&'a str>,
+    pub table: &'a str,
+    pub assignments: &'a [UpdateAssignment<'a>],
+    pub filter: Option<&'a Expr<'a>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct UpdateAssignment<'a> {
+    pub column: &'a str,
+    pub value: &'a Expr<'a>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct LogicalDelete<'a> {
+    pub schema: Option<&'a str>,
+    pub table: &'a str,
+    pub filter: Option<&'a Expr<'a>>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -537,16 +576,53 @@ impl<'a> Planner<'a> {
         }
     }
 
-    fn plan_insert(&self, _insert: &crate::sql::ast::InsertStmt<'a>) -> Result<LogicalPlan<'a>> {
-        bail!("plan_insert not yet implemented")
+    fn plan_insert(&self, insert: &crate::sql::ast::InsertStmt<'a>) -> Result<LogicalPlan<'a>> {
+        let source = match insert.source {
+            crate::sql::ast::InsertSource::Values(rows) => InsertSource::Values(rows),
+            crate::sql::ast::InsertSource::Select(select) => {
+                let select_plan = self.plan_select(select)?;
+                InsertSource::Select(select_plan.root)
+            }
+            crate::sql::ast::InsertSource::Default => InsertSource::Default,
+        };
+
+        let insert_op = self.arena.alloc(LogicalOperator::Insert(LogicalInsert {
+            schema: insert.table.schema,
+            table: insert.table.name,
+            columns: insert.columns,
+            source,
+        }));
+
+        Ok(LogicalPlan { root: insert_op })
     }
 
-    fn plan_update(&self, _update: &crate::sql::ast::UpdateStmt<'a>) -> Result<LogicalPlan<'a>> {
-        bail!("plan_update not yet implemented")
+    fn plan_update(&self, update: &crate::sql::ast::UpdateStmt<'a>) -> Result<LogicalPlan<'a>> {
+        let mut assignments = bumpalo::collections::Vec::new_in(self.arena);
+        for assign in update.assignments {
+            assignments.push(UpdateAssignment {
+                column: assign.column.column,
+                value: assign.value,
+            });
+        }
+
+        let update_op = self.arena.alloc(LogicalOperator::Update(LogicalUpdate {
+            schema: update.table.schema,
+            table: update.table.name,
+            assignments: assignments.into_bump_slice(),
+            filter: update.where_clause,
+        }));
+
+        Ok(LogicalPlan { root: update_op })
     }
 
-    fn plan_delete(&self, _delete: &crate::sql::ast::DeleteStmt<'a>) -> Result<LogicalPlan<'a>> {
-        bail!("plan_delete not yet implemented")
+    fn plan_delete(&self, delete: &crate::sql::ast::DeleteStmt<'a>) -> Result<LogicalPlan<'a>> {
+        let delete_op = self.arena.alloc(LogicalOperator::Delete(LogicalDelete {
+            schema: delete.table.schema,
+            table: delete.table.name,
+            filter: delete.where_clause,
+        }));
+
+        Ok(LogicalPlan { root: delete_op })
     }
 
     fn optimize_to_physical(&self, _logical: &LogicalPlan<'a>) -> Result<PhysicalPlan<'a>> {
@@ -1029,6 +1105,375 @@ mod tests {
             if let LogicalOperator::Join(join) = project.input {
                 assert_eq!(join.join_type, JoinType::Inner);
             }
+        }
+    }
+
+    #[test]
+    fn plan_insert_values_basic() {
+        use crate::sql::ast::{InsertStmt, Literal, TableRef};
+
+        let arena = Bump::new();
+        let catalog = Catalog::new();
+        let planner = Planner::new(&catalog, &arena);
+
+        let val1 = arena.alloc(Expr::Literal(Literal::Integer("1")));
+        let val2 = arena.alloc(Expr::Literal(Literal::String("Alice")));
+        let row: &[&Expr] = arena.alloc_slice_copy(&[val1 as &Expr, val2 as &Expr]);
+        let rows: &[&[&Expr]] = arena.alloc_slice_copy(&[row]);
+
+        let insert = arena.alloc(InsertStmt {
+            table: TableRef {
+                schema: None,
+                name: "users",
+                alias: None,
+            },
+            columns: None,
+            source: crate::sql::ast::InsertSource::Values(rows),
+            on_conflict: None,
+            returning: None,
+        });
+
+        let stmt = Statement::Insert(insert);
+        let result = planner.create_logical_plan(&stmt);
+        assert!(result.is_ok());
+
+        let plan = result.unwrap();
+        assert!(matches!(plan.root, LogicalOperator::Insert(_)));
+
+        if let LogicalOperator::Insert(insert_op) = plan.root {
+            assert_eq!(insert_op.table, "users");
+            assert!(insert_op.schema.is_none());
+            assert!(insert_op.columns.is_none());
+            assert!(matches!(insert_op.source, InsertSource::Values(_)));
+        }
+    }
+
+    #[test]
+    fn plan_insert_values_with_columns() {
+        use crate::sql::ast::{InsertStmt, Literal, TableRef};
+
+        let arena = Bump::new();
+        let catalog = Catalog::new();
+        let planner = Planner::new(&catalog, &arena);
+
+        let val1 = arena.alloc(Expr::Literal(Literal::Integer("1")));
+        let row: &[&Expr] = arena.alloc_slice_copy(&[val1 as &Expr]);
+        let rows: &[&[&Expr]] = arena.alloc_slice_copy(&[row]);
+        let columns: &[&str] = arena.alloc_slice_copy(&["id"]);
+
+        let insert = arena.alloc(InsertStmt {
+            table: TableRef {
+                schema: Some("public"),
+                name: "users",
+                alias: None,
+            },
+            columns: Some(columns),
+            source: crate::sql::ast::InsertSource::Values(rows),
+            on_conflict: None,
+            returning: None,
+        });
+
+        let stmt = Statement::Insert(insert);
+        let result = planner.create_logical_plan(&stmt);
+        assert!(result.is_ok());
+
+        let plan = result.unwrap();
+        if let LogicalOperator::Insert(insert_op) = plan.root {
+            assert_eq!(insert_op.table, "users");
+            assert_eq!(insert_op.schema, Some("public"));
+            assert_eq!(insert_op.columns, Some(&["id"][..]));
+        }
+    }
+
+    #[test]
+    fn plan_insert_default_values() {
+        use crate::sql::ast::{InsertStmt, TableRef};
+
+        let arena = Bump::new();
+        let catalog = Catalog::new();
+        let planner = Planner::new(&catalog, &arena);
+
+        let insert = arena.alloc(InsertStmt {
+            table: TableRef {
+                schema: None,
+                name: "users",
+                alias: None,
+            },
+            columns: None,
+            source: crate::sql::ast::InsertSource::Default,
+            on_conflict: None,
+            returning: None,
+        });
+
+        let stmt = Statement::Insert(insert);
+        let result = planner.create_logical_plan(&stmt);
+        assert!(result.is_ok());
+
+        let plan = result.unwrap();
+        if let LogicalOperator::Insert(insert_op) = plan.root {
+            assert!(matches!(insert_op.source, InsertSource::Default));
+        }
+    }
+
+    #[test]
+    fn plan_insert_select() {
+        use crate::sql::ast::{Distinct, FromClause, InsertStmt, SelectColumn, SelectStmt, TableRef};
+
+        let arena = Bump::new();
+        let catalog = Catalog::new();
+        let planner = Planner::new(&catalog, &arena);
+
+        let table_ref = TableRef {
+            schema: None,
+            name: "source_table",
+            alias: None,
+        };
+        let from = arena.alloc(FromClause::Table(table_ref));
+
+        let select = arena.alloc(SelectStmt {
+            with: None,
+            distinct: Distinct::All,
+            columns: &[SelectColumn::AllColumns],
+            from: Some(from),
+            where_clause: None,
+            group_by: &[],
+            having: None,
+            order_by: &[],
+            limit: None,
+            offset: None,
+            set_op: None,
+            for_clause: None,
+        });
+
+        let insert = arena.alloc(InsertStmt {
+            table: TableRef {
+                schema: None,
+                name: "target_table",
+                alias: None,
+            },
+            columns: None,
+            source: crate::sql::ast::InsertSource::Select(select),
+            on_conflict: None,
+            returning: None,
+        });
+
+        let stmt = Statement::Insert(insert);
+        let result = planner.create_logical_plan(&stmt);
+        assert!(result.is_ok());
+
+        let plan = result.unwrap();
+        if let LogicalOperator::Insert(insert_op) = plan.root {
+            assert_eq!(insert_op.table, "target_table");
+            assert!(matches!(insert_op.source, InsertSource::Select(_)));
+        }
+    }
+
+    #[test]
+    fn plan_update_basic() {
+        use crate::sql::ast::{Assignment, ColumnRef, Literal, TableRef, UpdateStmt};
+
+        let arena = Bump::new();
+        let catalog = Catalog::new();
+        let planner = Planner::new(&catalog, &arena);
+
+        let value = arena.alloc(Expr::Literal(Literal::Integer("42")));
+        let assignments: &[Assignment] = arena.alloc_slice_copy(&[Assignment {
+            column: ColumnRef {
+                schema: None,
+                table: None,
+                column: "age",
+            },
+            value,
+        }]);
+
+        let update = arena.alloc(UpdateStmt {
+            table: TableRef {
+                schema: None,
+                name: "users",
+                alias: None,
+            },
+            assignments,
+            from: None,
+            where_clause: None,
+            returning: None,
+        });
+
+        let stmt = Statement::Update(update);
+        let result = planner.create_logical_plan(&stmt);
+        assert!(result.is_ok());
+
+        let plan = result.unwrap();
+        assert!(matches!(plan.root, LogicalOperator::Update(_)));
+
+        if let LogicalOperator::Update(update_op) = plan.root {
+            assert_eq!(update_op.table, "users");
+            assert!(update_op.schema.is_none());
+            assert_eq!(update_op.assignments.len(), 1);
+            assert_eq!(update_op.assignments[0].column, "age");
+            assert!(update_op.filter.is_none());
+        }
+    }
+
+    #[test]
+    fn plan_update_with_where() {
+        use crate::sql::ast::{Assignment, ColumnRef, Literal, TableRef, UpdateStmt};
+
+        let arena = Bump::new();
+        let catalog = Catalog::new();
+        let planner = Planner::new(&catalog, &arena);
+
+        let value = arena.alloc(Expr::Literal(Literal::String("inactive")));
+        let assignments: &[Assignment] = arena.alloc_slice_copy(&[Assignment {
+            column: ColumnRef {
+                schema: None,
+                table: None,
+                column: "status",
+            },
+            value,
+        }]);
+
+        let where_clause = arena.alloc(Expr::Literal(Literal::Boolean(true)));
+
+        let update = arena.alloc(UpdateStmt {
+            table: TableRef {
+                schema: Some("public"),
+                name: "users",
+                alias: None,
+            },
+            assignments,
+            from: None,
+            where_clause: Some(where_clause),
+            returning: None,
+        });
+
+        let stmt = Statement::Update(update);
+        let result = planner.create_logical_plan(&stmt);
+        assert!(result.is_ok());
+
+        let plan = result.unwrap();
+        if let LogicalOperator::Update(update_op) = plan.root {
+            assert_eq!(update_op.table, "users");
+            assert_eq!(update_op.schema, Some("public"));
+            assert!(update_op.filter.is_some());
+        }
+    }
+
+    #[test]
+    fn plan_update_multiple_assignments() {
+        use crate::sql::ast::{Assignment, ColumnRef, Literal, TableRef, UpdateStmt};
+
+        let arena = Bump::new();
+        let catalog = Catalog::new();
+        let planner = Planner::new(&catalog, &arena);
+
+        let val1 = arena.alloc(Expr::Literal(Literal::String("John")));
+        let val2 = arena.alloc(Expr::Literal(Literal::Integer("30")));
+        let assignments: &[Assignment] = arena.alloc_slice_copy(&[
+            Assignment {
+                column: ColumnRef {
+                    schema: None,
+                    table: None,
+                    column: "name",
+                },
+                value: val1,
+            },
+            Assignment {
+                column: ColumnRef {
+                    schema: None,
+                    table: None,
+                    column: "age",
+                },
+                value: val2,
+            },
+        ]);
+
+        let update = arena.alloc(UpdateStmt {
+            table: TableRef {
+                schema: None,
+                name: "users",
+                alias: None,
+            },
+            assignments,
+            from: None,
+            where_clause: None,
+            returning: None,
+        });
+
+        let stmt = Statement::Update(update);
+        let result = planner.create_logical_plan(&stmt);
+        assert!(result.is_ok());
+
+        let plan = result.unwrap();
+        if let LogicalOperator::Update(update_op) = plan.root {
+            assert_eq!(update_op.assignments.len(), 2);
+            assert_eq!(update_op.assignments[0].column, "name");
+            assert_eq!(update_op.assignments[1].column, "age");
+        }
+    }
+
+    #[test]
+    fn plan_delete_basic() {
+        use crate::sql::ast::{DeleteStmt, TableRef};
+
+        let arena = Bump::new();
+        let catalog = Catalog::new();
+        let planner = Planner::new(&catalog, &arena);
+
+        let delete = arena.alloc(DeleteStmt {
+            table: TableRef {
+                schema: None,
+                name: "users",
+                alias: None,
+            },
+            using: None,
+            where_clause: None,
+            returning: None,
+        });
+
+        let stmt = Statement::Delete(delete);
+        let result = planner.create_logical_plan(&stmt);
+        assert!(result.is_ok());
+
+        let plan = result.unwrap();
+        assert!(matches!(plan.root, LogicalOperator::Delete(_)));
+
+        if let LogicalOperator::Delete(delete_op) = plan.root {
+            assert_eq!(delete_op.table, "users");
+            assert!(delete_op.schema.is_none());
+            assert!(delete_op.filter.is_none());
+        }
+    }
+
+    #[test]
+    fn plan_delete_with_where() {
+        use crate::sql::ast::{DeleteStmt, Literal, TableRef};
+
+        let arena = Bump::new();
+        let catalog = Catalog::new();
+        let planner = Planner::new(&catalog, &arena);
+
+        let where_clause = arena.alloc(Expr::Literal(Literal::Boolean(true)));
+
+        let delete = arena.alloc(DeleteStmt {
+            table: TableRef {
+                schema: Some("public"),
+                name: "users",
+                alias: None,
+            },
+            using: None,
+            where_clause: Some(where_clause),
+            returning: None,
+        });
+
+        let stmt = Statement::Delete(delete);
+        let result = planner.create_logical_plan(&stmt);
+        assert!(result.is_ok());
+
+        let plan = result.unwrap();
+        if let LogicalOperator::Delete(delete_op) = plan.root {
+            assert_eq!(delete_op.table, "users");
+            assert_eq!(delete_op.schema, Some("public"));
+            assert!(delete_op.filter.is_some());
         }
     }
 }
