@@ -170,6 +170,82 @@ impl Wal {
         })
     }
 
+    pub fn open(dir: &Path) -> Result<Self> {
+        if !dir.exists() {
+            create_dir_all(dir)
+                .wrap_err_with(|| format!("failed to create WAL directory at {:?}", dir))?;
+        }
+
+        let segment_path = dir.join("wal.000001");
+
+        let segment = if segment_path.exists() {
+            WalSegment::open(&segment_path, 1)?
+        } else {
+            WalSegment::create(&segment_path, 1)?
+        };
+
+        Ok(Self {
+            dir: dir.to_path_buf(),
+            current_segment: Mutex::new(segment),
+        })
+    }
+
+    pub fn recover(&mut self, storage: &mut super::MmapStorage) -> Result<u32> {
+        let segment_path = self.dir.join("wal.000001");
+
+        if !segment_path.exists() {
+            return Ok(0);
+        }
+
+        let mut segment = WalSegment::open(&segment_path, 1)?;
+        let mut frames_applied = 0;
+
+        loop {
+            match segment.read_frame() {
+                Ok((header, page_data)) => {
+                    let page_mut = storage.page_mut(header.page_no)
+                        .wrap_err_with(|| format!("failed to get page {} for WAL recovery", header.page_no))?;
+
+                    page_mut.copy_from_slice(&page_data);
+                    frames_applied += 1;
+                }
+                Err(_) => break,
+            }
+        }
+
+        Ok(frames_applied)
+    }
+
+    pub fn checkpoint(&mut self, storage: &mut super::MmapStorage) -> Result<u32> {
+        let frames_applied = self.recover(storage)?;
+
+        self.truncate()?;
+
+        Ok(frames_applied)
+    }
+
+    pub fn truncate(&mut self) -> Result<()> {
+        use std::io::Write;
+
+        let mut segment = self.current_segment.lock();
+
+        segment.file
+            .set_len(0)
+            .wrap_err("failed to truncate WAL segment file")?;
+
+        segment.file
+            .flush()
+            .wrap_err("failed to flush WAL segment after truncate")?;
+
+        segment.offset = 0;
+
+        Ok(())
+    }
+
+    pub fn needs_checkpoint(&self, threshold_bytes: u64) -> bool {
+        self.current_offset() >= threshold_bytes
+    }
+
     pub fn write_frame(&mut self, header: &WalFrameHeader, page_data: &[u8]) -> Result<()> {
         ensure!(
             page_data.len() == PAGE_SIZE,
@@ -516,7 +592,6 @@ mod tests {
     #[test]
     fn read_frame_roundtrip() {
         use super::super::PAGE_SIZE;
-        use std::io::{Seek, SeekFrom};
 
         let temp_dir = std::env::temp_dir().join("turdb_test_read_frame");
         let wal_dir = temp_dir.join("wal");
@@ -601,6 +676,210 @@ mod tests {
             assert_eq!(header.page_no, expected_i as u32);
             assert_eq!(data[0], expected_i as u8);
         }
+
+        std::fs::remove_dir_all(&temp_dir).ok();
+    }
+
+    #[test]
+    fn recover_applies_frames_to_storage() {
+        use super::super::{PAGE_SIZE, MmapStorage};
+
+        let temp_dir = std::env::temp_dir().join("turdb_test_recover");
+        let db_path = temp_dir.join("test.db");
+        let wal_dir = temp_dir.join("wal");
+
+        if temp_dir.exists() {
+            std::fs::remove_dir_all(&temp_dir).ok();
+        }
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        let mut storage = MmapStorage::create(&db_path, 10).expect("should create storage");
+
+        let mut wal = Wal::create(&wal_dir).expect("should create WAL");
+
+        let page_data_0 = vec![100u8; PAGE_SIZE];
+        let header_0 = WalFrameHeader::new(0, 10, 1, 2, 0);
+        wal.write_frame(&header_0, &page_data_0).expect("should write frame 0");
+
+        let page_data_5 = vec![200u8; PAGE_SIZE];
+        let header_5 = WalFrameHeader::new(5, 10, 1, 2, 0);
+        wal.write_frame(&header_5, &page_data_5).expect("should write frame 5");
+
+        drop(wal);
+
+        let mut wal_recovered = Wal::open(&wal_dir).expect("should open WAL");
+        let frames_applied = wal_recovered.recover(&mut storage).expect("should recover");
+
+        assert_eq!(frames_applied, 2);
+
+        let page_0 = storage.page(0).expect("should read page 0");
+        assert_eq!(page_0[0], 100);
+        assert_eq!(page_0[PAGE_SIZE - 1], 100);
+
+        let page_5 = storage.page(5).expect("should read page 5");
+        assert_eq!(page_5[0], 200);
+        assert_eq!(page_5[PAGE_SIZE - 1], 200);
+
+        std::fs::remove_dir_all(&temp_dir).ok();
+    }
+
+    #[test]
+    fn recover_returns_zero_when_no_wal_exists() {
+        use super::super::MmapStorage;
+
+        let temp_dir = std::env::temp_dir().join("turdb_test_recover_no_wal");
+        let db_path = temp_dir.join("test.db");
+        let wal_dir = temp_dir.join("wal");
+
+        if temp_dir.exists() {
+            std::fs::remove_dir_all(&temp_dir).ok();
+        }
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        let mut storage = MmapStorage::create(&db_path, 5).expect("should create storage");
+
+        let mut wal = Wal::open(&wal_dir).expect("should open WAL");
+        let frames_applied = wal.recover(&mut storage).expect("should recover");
+
+        assert_eq!(frames_applied, 0);
+
+        std::fs::remove_dir_all(&temp_dir).ok();
+    }
+
+    #[test]
+    fn recover_updates_same_page_multiple_times() {
+        use super::super::{PAGE_SIZE, MmapStorage};
+
+        let temp_dir = std::env::temp_dir().join("turdb_test_recover_same_page");
+        let db_path = temp_dir.join("test.db");
+        let wal_dir = temp_dir.join("wal");
+
+        if temp_dir.exists() {
+            std::fs::remove_dir_all(&temp_dir).ok();
+        }
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        let mut storage = MmapStorage::create(&db_path, 10).expect("should create storage");
+
+        let mut wal = Wal::create(&wal_dir).expect("should create WAL");
+
+        let page_data_1 = vec![10u8; PAGE_SIZE];
+        let header_1 = WalFrameHeader::new(3, 10, 1, 2, 0);
+        wal.write_frame(&header_1, &page_data_1).expect("should write frame");
+
+        let page_data_2 = vec![20u8; PAGE_SIZE];
+        let header_2 = WalFrameHeader::new(3, 10, 1, 2, 0);
+        wal.write_frame(&header_2, &page_data_2).expect("should write frame");
+
+        let page_data_3 = vec![30u8; PAGE_SIZE];
+        let header_3 = WalFrameHeader::new(3, 10, 1, 2, 0);
+        wal.write_frame(&header_3, &page_data_3).expect("should write frame");
+
+        drop(wal);
+
+        let mut wal_recovered = Wal::open(&wal_dir).expect("should open WAL");
+        let frames_applied = wal_recovered.recover(&mut storage).expect("should recover");
+
+        assert_eq!(frames_applied, 3);
+
+        let page_3 = storage.page(3).expect("should read page 3");
+        assert_eq!(page_3[0], 30);
+        assert_eq!(page_3[PAGE_SIZE - 1], 30);
+
+        std::fs::remove_dir_all(&temp_dir).ok();
+    }
+
+    #[test]
+    fn truncate_resets_wal_to_empty() {
+        use super::super::PAGE_SIZE;
+
+        let temp_dir = std::env::temp_dir().join("turdb_test_truncate");
+        let wal_dir = temp_dir.join("wal");
+
+        if temp_dir.exists() {
+            std::fs::remove_dir_all(&temp_dir).ok();
+        }
+
+        let mut wal = Wal::create(&wal_dir).expect("should create WAL");
+
+        let page_data = vec![42u8; PAGE_SIZE];
+        let header = WalFrameHeader::new(1, 1, 100, 200, 0);
+        wal.write_frame(&header, &page_data).expect("should write frame");
+
+        assert!(wal.current_offset() > 0);
+
+        wal.truncate().expect("should truncate");
+
+        assert_eq!(wal.current_offset(), 0);
+
+        std::fs::remove_dir_all(&temp_dir).ok();
+    }
+
+    #[test]
+    fn checkpoint_applies_frames_and_truncates() {
+        use super::super::{PAGE_SIZE, MmapStorage};
+
+        let temp_dir = std::env::temp_dir().join("turdb_test_checkpoint");
+        let db_path = temp_dir.join("test.db");
+        let wal_dir = temp_dir.join("wal");
+
+        if temp_dir.exists() {
+            std::fs::remove_dir_all(&temp_dir).ok();
+        }
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        let mut storage = MmapStorage::create(&db_path, 10).expect("should create storage");
+
+        let mut wal = Wal::create(&wal_dir).expect("should create WAL");
+
+        let page_data_0 = vec![111u8; PAGE_SIZE];
+        let header_0 = WalFrameHeader::new(0, 10, 1, 2, 0);
+        wal.write_frame(&header_0, &page_data_0).expect("should write frame");
+
+        let page_data_7 = vec![222u8; PAGE_SIZE];
+        let header_7 = WalFrameHeader::new(7, 10, 1, 2, 0);
+        wal.write_frame(&header_7, &page_data_7).expect("should write frame");
+
+        assert!(wal.current_offset() > 0);
+
+        let frames_checkpointed = wal.checkpoint(&mut storage).expect("should checkpoint");
+
+        assert_eq!(frames_checkpointed, 2);
+
+        assert_eq!(wal.current_offset(), 0);
+
+        let page_0 = storage.page(0).expect("should read page 0");
+        assert_eq!(page_0[0], 111);
+
+        let page_7 = storage.page(7).expect("should read page 7");
+        assert_eq!(page_7[0], 222);
+
+        std::fs::remove_dir_all(&temp_dir).ok();
+    }
+
+    #[test]
+    fn needs_checkpoint_returns_true_when_threshold_exceeded() {
+        use super::super::PAGE_SIZE;
+
+        let temp_dir = std::env::temp_dir().join("turdb_test_needs_checkpoint");
+        let wal_dir = temp_dir.join("wal");
+
+        if temp_dir.exists() {
+            std::fs::remove_dir_all(&temp_dir).ok();
+        }
+
+        let mut wal = Wal::create(&wal_dir).expect("should create WAL");
+
+        assert!(!wal.needs_checkpoint(1000));
+
+        let page_data = vec![99u8; PAGE_SIZE];
+        let header = WalFrameHeader::new(1, 1, 0, 0, 0);
+        wal.write_frame(&header, &page_data).expect("should write frame");
+
+        let frame_size = (WAL_FRAME_HEADER_SIZE + PAGE_SIZE) as u64;
+
+        assert!(wal.needs_checkpoint(frame_size - 1));
+        assert!(!wal.needs_checkpoint(frame_size + 1));
 
         std::fs::remove_dir_all(&temp_dir).ok();
     }
