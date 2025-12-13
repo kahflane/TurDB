@@ -628,6 +628,110 @@ impl<'a> Planner<'a> {
     fn optimize_to_physical(&self, _logical: &LogicalPlan<'a>) -> Result<PhysicalPlan<'a>> {
         bail!("optimize_to_physical not yet implemented")
     }
+
+    pub fn extract_filter_columns(&self, expr: &Expr<'a>) -> Vec<&'a str> {
+        let mut columns = Vec::new();
+        self.collect_columns_from_expr(expr, &mut columns);
+        columns
+    }
+
+    fn collect_columns_from_expr(&self, expr: &Expr<'a>, columns: &mut Vec<&'a str>) {
+        match expr {
+            Expr::Column(col_ref) => {
+                columns.push(col_ref.column);
+            }
+            Expr::BinaryOp { left, op, right } => {
+                match op {
+                    crate::sql::ast::BinaryOperator::And | crate::sql::ast::BinaryOperator::Or => {
+                        self.collect_columns_from_expr(left, columns);
+                        self.collect_columns_from_expr(right, columns);
+                    }
+                    crate::sql::ast::BinaryOperator::Eq
+                    | crate::sql::ast::BinaryOperator::NotEq
+                    | crate::sql::ast::BinaryOperator::Lt
+                    | crate::sql::ast::BinaryOperator::LtEq
+                    | crate::sql::ast::BinaryOperator::Gt
+                    | crate::sql::ast::BinaryOperator::GtEq => {
+                        self.collect_columns_from_expr(left, columns);
+                        self.collect_columns_from_expr(right, columns);
+                    }
+                    _ => {}
+                }
+            }
+            Expr::IsNull { expr, .. } => {
+                self.collect_columns_from_expr(expr, columns);
+            }
+            Expr::Between { expr, low, high, .. } => {
+                self.collect_columns_from_expr(expr, columns);
+                self.collect_columns_from_expr(low, columns);
+                self.collect_columns_from_expr(high, columns);
+            }
+            Expr::InList { expr, list, .. } => {
+                self.collect_columns_from_expr(expr, columns);
+                for item in *list {
+                    self.collect_columns_from_expr(item, columns);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    pub fn find_applicable_indexes<'t>(
+        &self,
+        table: &'t crate::schema::TableDef,
+        filter_columns: &[&str],
+    ) -> Vec<&'t crate::schema::IndexDef> {
+        table
+            .indexes()
+            .iter()
+            .filter(|idx| {
+                if idx.columns().is_empty() {
+                    return false;
+                }
+                idx.columns()
+                    .first()
+                    .map(|first_col| filter_columns.contains(&first_col.as_str()))
+                    .unwrap_or(false)
+            })
+            .collect()
+    }
+
+    pub fn select_best_index<'t>(
+        &self,
+        table: &'t crate::schema::TableDef,
+        filter_columns: &[&str],
+    ) -> Option<&'t crate::schema::IndexDef> {
+        let candidates = self.find_applicable_indexes(table, filter_columns);
+        if candidates.is_empty() {
+            return None;
+        }
+
+        candidates.into_iter().max_by(|a, b| {
+            let a_matched = a
+                .columns()
+                .iter()
+                .filter(|c| filter_columns.contains(&c.as_str()))
+                .count();
+            let b_matched = b
+                .columns()
+                .iter()
+                .filter(|c| filter_columns.contains(&c.as_str()))
+                .count();
+
+            match a_matched.cmp(&b_matched) {
+                std::cmp::Ordering::Equal => {
+                    if a.is_unique() && !b.is_unique() {
+                        std::cmp::Ordering::Greater
+                    } else if !a.is_unique() && b.is_unique() {
+                        std::cmp::Ordering::Less
+                    } else {
+                        std::cmp::Ordering::Equal
+                    }
+                }
+                ord => ord,
+            }
+        })
+    }
 }
 
 #[cfg(test)]
@@ -1475,5 +1579,159 @@ mod tests {
             assert_eq!(delete_op.schema, Some("public"));
             assert!(delete_op.filter.is_some());
         }
+    }
+
+    #[test]
+    fn extract_column_refs_from_equality() {
+        use crate::sql::ast::{BinaryOperator, ColumnRef, Literal};
+
+        let arena = Bump::new();
+        let catalog = Catalog::new();
+        let planner = Planner::new(&catalog, &arena);
+
+        let col = arena.alloc(Expr::Column(ColumnRef {
+            schema: None,
+            table: None,
+            column: "id",
+        }));
+        let val = arena.alloc(Expr::Literal(Literal::Integer("1")));
+        let eq_expr = Expr::BinaryOp {
+            left: col,
+            op: BinaryOperator::Eq,
+            right: val,
+        };
+
+        let columns = planner.extract_filter_columns(&eq_expr);
+        assert_eq!(columns.len(), 1);
+        assert!(columns.contains(&"id"));
+    }
+
+    #[test]
+    fn extract_column_refs_from_and() {
+        use crate::sql::ast::{BinaryOperator, ColumnRef, Literal};
+
+        let arena = Bump::new();
+        let catalog = Catalog::new();
+        let planner = Planner::new(&catalog, &arena);
+
+        let col1 = arena.alloc(Expr::Column(ColumnRef {
+            schema: None,
+            table: None,
+            column: "id",
+        }));
+        let val1 = arena.alloc(Expr::Literal(Literal::Integer("1")));
+        let eq1 = arena.alloc(Expr::BinaryOp {
+            left: col1,
+            op: BinaryOperator::Eq,
+            right: val1,
+        });
+
+        let col2 = arena.alloc(Expr::Column(ColumnRef {
+            schema: None,
+            table: None,
+            column: "status",
+        }));
+        let val2 = arena.alloc(Expr::Literal(Literal::String("active")));
+        let eq2 = arena.alloc(Expr::BinaryOp {
+            left: col2,
+            op: BinaryOperator::Eq,
+            right: val2,
+        });
+
+        let and_expr = Expr::BinaryOp {
+            left: eq1,
+            op: BinaryOperator::And,
+            right: eq2,
+        };
+
+        let columns = planner.extract_filter_columns(&and_expr);
+        assert_eq!(columns.len(), 2);
+        assert!(columns.contains(&"id"));
+        assert!(columns.contains(&"status"));
+    }
+
+    #[test]
+    fn find_applicable_indexes_single_column() {
+        use crate::schema::{IndexDef, IndexType, TableDef};
+
+        let arena = Bump::new();
+        let catalog = Catalog::new();
+        let planner = Planner::new(&catalog, &arena);
+
+        let table = TableDef::new(1, "users", vec![])
+            .with_index(IndexDef::new("idx_id", vec!["id"], true, IndexType::BTree))
+            .with_index(IndexDef::new("idx_email", vec!["email"], true, IndexType::BTree));
+
+        let filter_columns: Vec<&str> = vec!["id"];
+        let candidates = planner.find_applicable_indexes(&table, &filter_columns);
+
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].name(), "idx_id");
+    }
+
+    #[test]
+    fn find_applicable_indexes_multi_column() {
+        use crate::schema::{IndexDef, IndexType, TableDef};
+
+        let arena = Bump::new();
+        let catalog = Catalog::new();
+        let planner = Planner::new(&catalog, &arena);
+
+        let table = TableDef::new(1, "users", vec![])
+            .with_index(IndexDef::new("idx_id", vec!["id"], true, IndexType::BTree))
+            .with_index(IndexDef::new(
+                "idx_name_email",
+                vec!["name", "email"],
+                false,
+                IndexType::BTree,
+            ));
+
+        let filter_columns: Vec<&str> = vec!["name", "email"];
+        let candidates = planner.find_applicable_indexes(&table, &filter_columns);
+
+        assert!(candidates.iter().any(|idx| idx.name() == "idx_name_email"));
+    }
+
+    #[test]
+    fn select_best_index_prefers_unique() {
+        use crate::schema::{IndexDef, IndexType, TableDef};
+
+        let arena = Bump::new();
+        let catalog = Catalog::new();
+        let planner = Planner::new(&catalog, &arena);
+
+        let table = TableDef::new(1, "users", vec![])
+            .with_index(IndexDef::new("idx_id", vec!["id"], true, IndexType::BTree))
+            .with_index(IndexDef::new("idx_id_nonunique", vec!["id"], false, IndexType::BTree));
+
+        let filter_columns: Vec<&str> = vec!["id"];
+        let best = planner.select_best_index(&table, &filter_columns);
+
+        assert!(best.is_some());
+        assert_eq!(best.unwrap().name(), "idx_id");
+    }
+
+    #[test]
+    fn select_best_index_prefers_more_columns() {
+        use crate::schema::{IndexDef, IndexType, TableDef};
+
+        let arena = Bump::new();
+        let catalog = Catalog::new();
+        let planner = Planner::new(&catalog, &arena);
+
+        let table = TableDef::new(1, "users", vec![])
+            .with_index(IndexDef::new("idx_id", vec!["id"], false, IndexType::BTree))
+            .with_index(IndexDef::new(
+                "idx_id_status",
+                vec!["id", "status"],
+                false,
+                IndexType::BTree,
+            ));
+
+        let filter_columns: Vec<&str> = vec!["id", "status"];
+        let best = planner.select_best_index(&table, &filter_columns);
+
+        assert!(best.is_some());
+        assert_eq!(best.unwrap().name(), "idx_id_status");
     }
 }
