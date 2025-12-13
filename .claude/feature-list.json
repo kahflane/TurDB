@@ -1580,27 +1580,27 @@
       "tasks": [
         {
           "task": "Define WalFrameHeader with page_no, db_size, checksum",
-          "done": false
+          "done": true
         },
         {
           "task": "Define Wal struct with dir, current segment",
-          "done": false
+          "done": true
         },
         {
           "task": "Define WalSegment struct with file, sequence, offset",
-          "done": false
+          "done": true
         },
         {
           "task": "Implement write_frame() appending to WAL",
-          "done": false
+          "done": true
         },
         {
           "task": "Implement read_frame() with checksum validation",
-          "done": false
+          "done": true
         },
         {
           "task": "Implement sync() for durability",
-          "done": false
+          "done": true
         }
       ]
     },
