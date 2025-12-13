@@ -86,10 +86,12 @@
 
 pub mod record_header;
 pub mod transaction;
+pub mod undo_page;
 pub mod version;
 
 pub use record_header::RecordHeader;
 pub use transaction::{Transaction, TransactionManager, TxnId, TxnState, MAX_CONCURRENT_TXNS};
+pub use undo_page::{UndoHeader, UndoPageReader, UndoPageWriter, UndoRecord};
 pub use version::{VersionChainReader, VersionChainWriter, VisibilityResult, WriteCheckResult};
 
 #[cfg(test)]
