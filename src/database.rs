@@ -95,7 +95,7 @@ use crate::sql::Parser;
 use crate::storage::{FileManager, Wal};
 use crate::types::Value;
 use bumpalo::Bump;
-use eyre::{bail, Result, WrapErr};
+use eyre::{bail, ensure, Result, WrapErr};
 use parking_lot::{Mutex, RwLock};
 use std::path::{Path, PathBuf};
 
@@ -202,9 +202,10 @@ pub struct CheckpointInfo {
 
 pub struct Database {
     path: PathBuf,
-    file_manager: RwLock<FileManager>,
-    catalog: RwLock<Catalog>,
+    file_manager: RwLock<Option<FileManager>>,
+    catalog: RwLock<Option<Catalog>>,
     wal: Mutex<Option<Wal>>,
+    wal_dir: PathBuf,
     next_row_id: std::sync::atomic::AtomicU64,
     closed: std::sync::atomic::AtomicBool,
 }
@@ -216,33 +217,60 @@ impl Database {
 
     pub fn open_with_recovery<P: AsRef<Path>>(path: P) -> Result<(Self, RecoveryInfo)> {
         use std::sync::atomic::{AtomicBool, AtomicU64};
+        use std::fs::File;
+        use std::io::Read;
 
         let path = path.as_ref().to_path_buf();
 
-        let file_manager = FileManager::open(&path, 64)
-            .wrap_err_with(|| format!("failed to open database at {:?}", path))?;
+        let meta_path = path.join("turdb.meta");
+        ensure!(
+            meta_path.exists(),
+            "database not found at {:?}",
+            path
+        );
 
-        let catalog = Self::load_catalog(&path)?;
+        let mut header = [0u8; 32];
+        File::open(&meta_path)
+            .wrap_err_with(|| format!("failed to open metadata file at {:?}", meta_path))?
+            .read_exact(&mut header)
+            .wrap_err("failed to read database header")?;
+
+        const MAGIC: &[u8; 16] = b"TurDB Rust v1\x00\x00\x00";
+        ensure!(
+            &header[..16] == MAGIC,
+            "invalid database: magic bytes mismatch"
+        );
+
+        let version = u32::from_le_bytes(header[16..20].try_into().unwrap());
+        ensure!(version == 1, "unsupported database version: {}", version);
 
         let wal_dir = path.join("wal");
-        let wal =
-            Wal::open(&wal_dir).wrap_err_with(|| format!("failed to open WAL at {:?}", wal_dir))?;
 
-        let wal_size_bytes = wal.current_offset();
+        let wal_size_bytes = if wal_dir.exists() {
+            let segment_path = wal_dir.join("wal.000001");
+            if segment_path.exists() {
+                std::fs::metadata(&segment_path)
+                    .map(|m| m.len())
+                    .unwrap_or(0)
+            } else {
+                0
+            }
+        } else {
+            0
+        };
 
         let db = Self {
             path,
-            file_manager: RwLock::new(file_manager),
-            catalog: RwLock::new(catalog),
-            wal: Mutex::new(Some(wal)),
+            file_manager: RwLock::new(None),
+            catalog: RwLock::new(None),
+            wal: Mutex::new(None),
+            wal_dir,
             next_row_id: AtomicU64::new(1),
             closed: AtomicBool::new(false),
         };
 
-        let frames_recovered = 0;
-
         let recovery_info = RecoveryInfo {
-            frames_recovered,
+            frames_recovered: 0,
             wal_size_bytes,
         };
 
@@ -251,6 +279,8 @@ impl Database {
 
     pub fn create<P: AsRef<Path>>(path: P) -> Result<Self> {
         use std::sync::atomic::{AtomicBool, AtomicU64};
+        use std::fs::File;
+        use std::io::Write;
 
         let path = path.as_ref().to_path_buf();
 
@@ -262,27 +292,29 @@ impl Database {
             format!("failed to create root schema directory at {:?}", root_dir)
         })?;
 
-        let file_manager = FileManager::create(&path, 64)
-            .wrap_err_with(|| format!("failed to create database at {:?}", path))?;
+        let meta_path = path.join("turdb.meta");
+        const PAGE_SIZE: usize = 16384;
+        let mut page = vec![0u8; PAGE_SIZE];
+        page[..16].copy_from_slice(b"TurDB Rust v1\x00\x00\x00");
+        page[16..20].copy_from_slice(&1u32.to_le_bytes());
+        page[20..24].copy_from_slice(&(PAGE_SIZE as u32).to_le_bytes());
+
+        let mut file = File::create(&meta_path)
+            .wrap_err_with(|| format!("failed to create metadata file at {:?}", meta_path))?;
+        file.write_all(&page)
+            .wrap_err("failed to write database header")?;
 
         let wal_dir = path.join("wal");
-        let wal = Wal::create(&wal_dir)
-            .wrap_err_with(|| format!("failed to create WAL at {:?}", wal_dir))?;
 
-        let catalog = Catalog::new();
-
-        let db = Self {
+        Ok(Self {
             path,
-            file_manager: RwLock::new(file_manager),
-            catalog: RwLock::new(catalog),
-            wal: Mutex::new(Some(wal)),
+            file_manager: RwLock::new(None),
+            catalog: RwLock::new(None),
+            wal: Mutex::new(None),
+            wal_dir,
             next_row_id: AtomicU64::new(1),
             closed: AtomicBool::new(false),
-        };
-
-        db.save_catalog()?;
-
-        Ok(db)
+        })
     }
 
     pub fn open_or_create<P: AsRef<Path>>(path: P) -> Result<Self> {
@@ -294,6 +326,40 @@ impl Database {
         } else {
             Self::create(path)
         }
+    }
+
+    fn ensure_file_manager(&self) -> Result<()> {
+        let mut guard = self.file_manager.write();
+        if guard.is_none() {
+            let fm = FileManager::open(&self.path, 64)
+                .wrap_err_with(|| format!("failed to open file manager at {:?}", self.path))?;
+            *guard = Some(fm);
+        }
+        Ok(())
+    }
+
+    fn ensure_catalog(&self) -> Result<()> {
+        let mut guard = self.catalog.write();
+        if guard.is_none() {
+            let catalog = Self::load_catalog(&self.path)?;
+            *guard = Some(catalog);
+        }
+        Ok(())
+    }
+
+    pub fn ensure_wal(&self) -> Result<()> {
+        let mut guard = self.wal.lock();
+        if guard.is_none() {
+            let wal = if self.wal_dir.exists() {
+                Wal::open(&self.wal_dir)
+                    .wrap_err_with(|| format!("failed to open WAL at {:?}", self.wal_dir))?
+            } else {
+                Wal::create(&self.wal_dir)
+                    .wrap_err_with(|| format!("failed to create WAL at {:?}", self.wal_dir))?
+            };
+            *guard = Some(wal);
+        }
+        Ok(())
     }
 
     fn load_catalog(path: &Path) -> Result<Catalog> {
@@ -312,12 +378,18 @@ impl Database {
         use crate::schema::persistence::CatalogPersistence;
 
         let catalog_path = self.path.join("turdb.catalog");
-        let catalog = self.catalog.read();
-        CatalogPersistence::save(&catalog, &catalog_path)
-            .wrap_err_with(|| format!("failed to save catalog to {:?}", catalog_path))
+        let catalog_guard = self.catalog.read();
+        if let Some(ref catalog) = *catalog_guard {
+            CatalogPersistence::save(catalog, &catalog_path)
+                .wrap_err_with(|| format!("failed to save catalog to {:?}", catalog_path))?;
+        }
+        Ok(())
     }
 
     pub fn query(&self, sql: &str) -> Result<Vec<Row>> {
+        self.ensure_catalog()?;
+        self.ensure_file_manager()?;
+
         let arena = Bump::new();
 
         let mut parser = Parser::new(sql, &arena);
@@ -325,13 +397,15 @@ impl Database {
             .parse_statement()
             .wrap_err("failed to parse SQL statement")?;
 
-        let catalog = self.catalog.read();
+        let catalog_guard = self.catalog.read();
+        let catalog = catalog_guard.as_ref().unwrap();
         let planner = Planner::new(&catalog, &arena);
         let physical_plan = planner
             .create_physical_plan(&stmt)
             .wrap_err("failed to create query plan")?;
 
-        let mut file_manager = self.file_manager.write();
+        let mut file_manager_guard = self.file_manager.write();
+        let file_manager = file_manager_guard.as_mut().unwrap();
 
         fn find_table_scan<'a>(
             op: &'a crate::sql::planner::PhysicalOperator<'a>,
@@ -343,6 +417,39 @@ impl Database {
                 PhysicalOperator::ProjectExec(project) => find_table_scan(project.input),
                 PhysicalOperator::LimitExec(limit) => find_table_scan(limit.input),
                 PhysicalOperator::SortExec(sort) => find_table_scan(sort.input),
+                _ => None,
+            }
+        }
+
+        fn find_projections<'a>(
+            op: &'a crate::sql::planner::PhysicalOperator<'a>,
+            table_def: &crate::schema::TableDef,
+        ) -> Option<Vec<usize>> {
+            use crate::sql::planner::PhysicalOperator;
+            use crate::sql::ast::Expr;
+
+            match op {
+                PhysicalOperator::ProjectExec(project) => {
+                    let mut indices = Vec::new();
+                    for expr in project.expressions.iter() {
+                        if let Expr::Column(col_ref) = expr {
+                            for (idx, col) in table_def.columns().iter().enumerate() {
+                                if col.name().eq_ignore_ascii_case(col_ref.column) {
+                                    indices.push(idx);
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    if indices.is_empty() || indices.len() != project.expressions.len() {
+                        None
+                    } else {
+                        Some(indices)
+                    }
+                }
+                PhysicalOperator::FilterExec(filter) => find_projections(filter.input, table_def),
+                PhysicalOperator::LimitExec(limit) => find_projections(limit.input, table_def),
+                PhysicalOperator::SortExec(sort) => find_projections(sort.input, table_def),
                 _ => None,
             }
         }
@@ -359,6 +466,8 @@ impl Database {
 
             let column_types: Vec<_> = table_def.columns().iter().map(|c| c.data_type()).collect();
 
+            let projections = find_projections(physical_plan.root, table_def);
+
             let storage = file_manager
                 .table_data_mut(schema_name, table_name)
                 .wrap_err_with(|| {
@@ -369,8 +478,13 @@ impl Database {
                 })?;
 
             let root_page = 1u32;
-            let source = BTreeCursorAdapter::from_btree_scan(storage, root_page, column_types)
-                .wrap_err("failed to create table scan")?;
+            let source = BTreeCursorAdapter::from_btree_scan_with_projections(
+                storage,
+                root_page,
+                column_types,
+                projections,
+            )
+            .wrap_err("failed to create table scan")?;
 
             let ctx = ExecutionContext::new(&arena);
             let builder = ExecutorBuilder::new(&ctx);
@@ -428,7 +542,11 @@ impl Database {
         create: &crate::sql::ast::CreateTableStmt<'_>,
         _arena: &Bump,
     ) -> Result<ExecuteResult> {
-        let mut catalog = self.catalog.write();
+        self.ensure_catalog()?;
+        self.ensure_file_manager()?;
+
+        let mut catalog_guard = self.catalog.write();
+        let catalog = catalog_guard.as_mut().unwrap();
 
         let schema_name = create.schema.unwrap_or("root");
         let table_name = create.name;
@@ -458,9 +576,10 @@ impl Database {
 
         let table_id = catalog.create_table(schema_name, table_name, columns)?;
 
-        drop(catalog);
+        drop(catalog_guard);
 
-        let mut file_manager = self.file_manager.write();
+        let mut file_manager_guard = self.file_manager.write();
+        let file_manager = file_manager_guard.as_mut().unwrap();
         file_manager.create_table(schema_name, table_name, table_id)?;
 
         let storage = file_manager.table_data_mut(schema_name, table_name)?;
@@ -476,7 +595,10 @@ impl Database {
         &self,
         create: &crate::sql::ast::CreateSchemaStmt<'_>,
     ) -> Result<ExecuteResult> {
-        let mut catalog = self.catalog.write();
+        self.ensure_catalog()?;
+
+        let mut catalog_guard = self.catalog.write();
+        let catalog = catalog_guard.as_mut().unwrap();
 
         if catalog.schema_exists(create.name) {
             if create.if_not_exists {
@@ -487,7 +609,7 @@ impl Database {
 
         catalog.create_schema(create.name)?;
 
-        drop(catalog);
+        drop(catalog_guard);
 
         let schema_dir = self.path.join(create.name);
         std::fs::create_dir_all(&schema_dir)?;
@@ -503,6 +625,9 @@ impl Database {
         _arena: &Bump,
     ) -> Result<ExecuteResult> {
         use crate::sql::ast::Expr;
+
+        self.ensure_catalog()?;
+        self.ensure_file_manager()?;
 
         let schema_name = create.table.schema.unwrap_or("root");
         let table_name = create.table.name;
@@ -527,7 +652,8 @@ impl Database {
             crate::schema::table::IndexType::BTree,
         );
 
-        let mut catalog = self.catalog.write();
+        let mut catalog_guard = self.catalog.write();
+        let catalog = catalog_guard.as_mut().unwrap();
 
         if let Some(schema) = catalog.get_schema_mut(schema_name) {
             if let Some(table) = schema.get_table(table_name) {
@@ -539,9 +665,10 @@ impl Database {
 
         let table_id = catalog.resolve_table(table_name)?.id();
 
-        drop(catalog);
+        drop(catalog_guard);
 
-        let mut file_manager = self.file_manager.write();
+        let mut file_manager_guard = self.file_manager.write();
+        let file_manager = file_manager_guard.as_mut().unwrap();
         file_manager.create_index(schema_name, table_name, index_name, table_id, create.unique)?;
 
         self.save_catalog()?;
@@ -558,7 +685,11 @@ impl Database {
         use crate::records::types::ColumnDef as RecordColumnDef;
         use crate::records::{RecordBuilder, Schema};
 
-        let catalog = self.catalog.read();
+        self.ensure_catalog()?;
+        self.ensure_file_manager()?;
+
+        let catalog_guard = self.catalog.read();
+        let catalog = catalog_guard.as_ref().unwrap();
 
         let schema_name = insert.table.schema.unwrap_or("root");
         let table_name = insert.table.name;
@@ -566,9 +697,10 @@ impl Database {
         let table_def = catalog.resolve_table(table_name)?;
         let columns = table_def.columns().to_vec();
 
-        drop(catalog);
+        drop(catalog_guard);
 
-        let mut file_manager = self.file_manager.write();
+        let mut file_manager_guard = self.file_manager.write();
+        let file_manager = file_manager_guard.as_mut().unwrap();
         let storage = file_manager.table_data_mut(schema_name, table_name)?;
 
         let record_columns: Vec<RecordColumnDef> = columns
@@ -618,7 +750,11 @@ impl Database {
         &self,
         drop_stmt: &crate::sql::ast::DropStmt<'_>,
     ) -> Result<ExecuteResult> {
-        let mut catalog = self.catalog.write();
+        self.ensure_catalog()?;
+        self.ensure_file_manager()?;
+
+        let mut catalog_guard = self.catalog.write();
+        let catalog = catalog_guard.as_mut().unwrap();
 
         for table_ref in drop_stmt.names.iter() {
             let schema_name = table_ref.schema.unwrap_or("root");
@@ -638,11 +774,12 @@ impl Database {
                 bail!("schema '{}' not found", schema_name);
             }
 
-            let mut file_manager = self.file_manager.write();
+            let mut file_manager_guard = self.file_manager.write();
+            let file_manager = file_manager_guard.as_mut().unwrap();
             let _ = file_manager.drop_table(schema_name, table_name);
         }
 
-        drop(catalog);
+        drop(catalog_guard);
         self.save_catalog()?;
 
         Ok(ExecuteResult::DropTable { dropped: true })
@@ -723,8 +860,11 @@ impl Database {
             }
         };
 
+        self.ensure_file_manager()?;
+
         let frames_checkpointed = {
-            let mut file_manager = self.file_manager.write();
+            let mut file_manager_guard = self.file_manager.write();
+            let file_manager = file_manager_guard.as_mut().unwrap();
             let meta_storage = file_manager.meta_storage_mut();
             wal.checkpoint(meta_storage)?
         };
@@ -751,8 +891,10 @@ impl Database {
 
         self.save_catalog()?;
 
-        let mut file_manager = self.file_manager.write();
-        file_manager.sync_all()?;
+        let mut file_manager_guard = self.file_manager.write();
+        if let Some(ref mut file_manager) = *file_manager_guard {
+            file_manager.sync_all()?;
+        }
 
         checkpoint_result
     }
@@ -782,8 +924,10 @@ impl Drop for Database {
 
         let _ = self.save_catalog();
 
-        if let Some(mut file_manager) = self.file_manager.try_write() {
-            let _ = file_manager.sync_all();
+        if let Some(mut file_manager_guard) = self.file_manager.try_write() {
+            if let Some(ref mut file_manager) = *file_manager_guard {
+                let _ = file_manager.sync_all();
+            }
         }
     }
 }
@@ -891,19 +1035,26 @@ mod tests {
     }
 
     #[test]
-    fn test_wal_directory_created_on_database_create() {
+    fn test_wal_directory_created_lazily() {
         let dir = tempdir().unwrap();
         let db_path = dir.path().join("test_db");
 
-        let _db = Database::create(&db_path).unwrap();
+        let db = Database::create(&db_path).unwrap();
 
         let wal_dir = db_path.join("wal");
-        assert!(wal_dir.exists(), "WAL directory should exist");
+        assert!(!wal_dir.exists(), "WAL directory should NOT exist before first write");
+
+        db.execute("CREATE TABLE test (id INT)").unwrap();
+        db.execute("INSERT INTO test VALUES (1)").unwrap();
+
+        db.ensure_wal().unwrap();
+
+        assert!(wal_dir.exists(), "WAL directory should exist after ensure_wal");
         assert!(wal_dir.is_dir(), "WAL should be a directory");
     }
 
     #[test]
-    fn test_wal_directory_exists_on_database_open() {
+    fn test_wal_directory_created_on_checkpoint() {
         let dir = tempdir().unwrap();
         let db_path = dir.path().join("test_db");
 
@@ -912,10 +1063,12 @@ mod tests {
             drop(db);
         }
 
-        let _db = Database::open(&db_path).unwrap();
+        let db = Database::open(&db_path).unwrap();
 
         let wal_dir = db_path.join("wal");
-        assert!(wal_dir.exists(), "WAL directory should exist after open");
+        assert!(!wal_dir.exists(), "WAL directory should NOT exist immediately after open");
+
+        db.checkpoint().unwrap();
     }
 
     #[test]
