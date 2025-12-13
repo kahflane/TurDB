@@ -918,7 +918,7 @@
         },
         {
           "task": "Implement deserialize_catalog() from bytes",
-          "done": false
+          "done": true
         },
         {
           "task": "Implement lazy loading (schema names only at startup)",
