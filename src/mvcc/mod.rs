@@ -91,12 +91,12 @@ pub mod undo_page;
 pub mod version;
 
 pub use record_header::RecordHeader;
+pub use table::{MvccTable, MvccValue};
 pub use transaction::{
     PageId, TableId, Transaction, TransactionManager, TxnId, TxnState, WriteEntry, WriteKey,
     MAX_CONCURRENT_TXNS,
 };
 pub use undo_page::{UndoHeader, UndoPageReader, UndoPageWriter, UndoRecord};
-pub use table::{MvccTable, MvccValue};
 pub use version::{
     VersionChainReader, VersionChainWriter, VisibilityResult, VisibleVersion, WriteCheckResult,
 };

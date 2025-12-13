@@ -592,6 +592,123 @@ impl FileManager {
         Ok(self.open_files.get_mut(&key).unwrap())
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_hnsw_index(
+        &mut self,
+        schema: &str,
+        table: &str,
+        index_name: &str,
+        index_id: u64,
+        dimensions: u16,
+        m: u16,
+        ef_construction: u16,
+    ) -> Result<()> {
+        Self::validate_name(index_name)?;
+
+        ensure!(
+            self.table_exists(schema, table),
+            "table '{}.{}' does not exist",
+            schema,
+            table
+        );
+
+        let hnsw_path = self.hnsw_file_path(schema, table, index_name);
+
+        ensure!(
+            !hnsw_path.exists(),
+            "HNSW index '{}.{}.{}' already exists",
+            schema,
+            table,
+            index_name
+        );
+
+        let mut storage = MmapStorage::create(&hnsw_path, 1)?;
+
+        let page = storage.page_mut(0)?;
+        page[..16].copy_from_slice(HNSW_MAGIC);
+        page[16..24].copy_from_slice(&index_id.to_le_bytes());
+        page[32..34].copy_from_slice(&dimensions.to_le_bytes());
+        page[34..36].copy_from_slice(&m.to_le_bytes());
+        page[36..38].copy_from_slice(&(m * 2).to_le_bytes());
+        page[38..40].copy_from_slice(&ef_construction.to_le_bytes());
+        page[40..42].copy_from_slice(&32u16.to_le_bytes());
+        page[44..48].copy_from_slice(&u32::MAX.to_le_bytes());
+        page[48..50].copy_from_slice(&u16::MAX.to_le_bytes());
+
+        storage.sync()?;
+
+        Ok(())
+    }
+
+    pub fn hnsw_exists(&self, schema: &str, table: &str, index_name: &str) -> bool {
+        let hnsw_path = self.hnsw_file_path(schema, table, index_name);
+        hnsw_path.exists()
+    }
+
+    pub fn hnsw_data(
+        &mut self,
+        schema: &str,
+        table: &str,
+        index_name: &str,
+    ) -> Result<&MmapStorage> {
+        ensure!(
+            self.hnsw_exists(schema, table, index_name),
+            "HNSW index '{}.{}.{}' does not exist",
+            schema,
+            table,
+            index_name
+        );
+
+        let key = FileKey::Hnsw {
+            schema: schema.to_string(),
+            table: table.to_string(),
+            index_name: index_name.to_string(),
+        };
+
+        if self.open_files.get(&key).is_none() {
+            let path = self.hnsw_file_path(schema, table, index_name);
+            let storage = MmapStorage::open(&path)?;
+            self.open_files.insert(key.clone(), storage);
+        }
+
+        Ok(self.open_files.get(&key).unwrap())
+    }
+
+    pub fn hnsw_data_mut(
+        &mut self,
+        schema: &str,
+        table: &str,
+        index_name: &str,
+    ) -> Result<&mut MmapStorage> {
+        ensure!(
+            self.hnsw_exists(schema, table, index_name),
+            "HNSW index '{}.{}.{}' does not exist",
+            schema,
+            table,
+            index_name
+        );
+
+        let key = FileKey::Hnsw {
+            schema: schema.to_string(),
+            table: table.to_string(),
+            index_name: index_name.to_string(),
+        };
+
+        if self.open_files.get(&key).is_none() {
+            let path = self.hnsw_file_path(schema, table, index_name);
+            let storage = MmapStorage::open(&path)?;
+            self.open_files.insert(key.clone(), storage);
+        }
+
+        Ok(self.open_files.get_mut(&key).unwrap())
+    }
+
+    fn hnsw_file_path(&self, schema: &str, table: &str, index_name: &str) -> PathBuf {
+        self.base_path
+            .join(schema)
+            .join(format!("{}_{}.{}", table, index_name, HNSW_FILE_EXTENSION))
+    }
+
     fn list_indexes(&self, schema: &str, table: &str) -> Result<Vec<String>> {
         let schema_path = self.base_path.join(schema);
         let prefix = format!("{}_{}", table, "");
@@ -1089,5 +1206,106 @@ mod tests {
 
         let result = FileManager::open(&db_path, DEFAULT_MAX_OPEN_FILES);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn create_hnsw_index_creates_file() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("testdb");
+
+        let mut fm = FileManager::create(&db_path, DEFAULT_MAX_OPEN_FILES).unwrap();
+
+        fm.create_table(DEFAULT_SCHEMA, "vectors", 1).unwrap();
+        fm.create_hnsw_index(DEFAULT_SCHEMA, "vectors", "vec_idx", 1, 128, 16, 200)
+            .unwrap();
+
+        let hnsw_path = db_path.join(DEFAULT_SCHEMA).join("vectors_vec_idx.hnsw");
+        assert!(hnsw_path.exists());
+    }
+
+    #[test]
+    fn hnsw_exists_returns_correct_values() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("testdb");
+
+        let mut fm = FileManager::create(&db_path, DEFAULT_MAX_OPEN_FILES).unwrap();
+
+        fm.create_table(DEFAULT_SCHEMA, "vectors", 1).unwrap();
+
+        assert!(!fm.hnsw_exists(DEFAULT_SCHEMA, "vectors", "vec_idx"));
+
+        fm.create_hnsw_index(DEFAULT_SCHEMA, "vectors", "vec_idx", 1, 128, 16, 200)
+            .unwrap();
+
+        assert!(fm.hnsw_exists(DEFAULT_SCHEMA, "vectors", "vec_idx"));
+    }
+
+    #[test]
+    fn hnsw_data_returns_storage() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("testdb");
+
+        let mut fm = FileManager::create(&db_path, DEFAULT_MAX_OPEN_FILES).unwrap();
+
+        fm.create_table(DEFAULT_SCHEMA, "vectors", 1).unwrap();
+        fm.create_hnsw_index(DEFAULT_SCHEMA, "vectors", "vec_idx", 1, 128, 16, 200)
+            .unwrap();
+
+        let storage = fm.hnsw_data(DEFAULT_SCHEMA, "vectors", "vec_idx").unwrap();
+        let page = storage.page(0).unwrap();
+        assert_eq!(&page[..16], HNSW_MAGIC);
+    }
+
+    #[test]
+    fn hnsw_data_mut_allows_modification() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("testdb");
+
+        let mut fm = FileManager::create(&db_path, DEFAULT_MAX_OPEN_FILES).unwrap();
+
+        fm.create_table(DEFAULT_SCHEMA, "vectors", 1).unwrap();
+        fm.create_hnsw_index(DEFAULT_SCHEMA, "vectors", "vec_idx", 1, 128, 16, 200)
+            .unwrap();
+
+        {
+            let storage = fm
+                .hnsw_data_mut(DEFAULT_SCHEMA, "vectors", "vec_idx")
+                .unwrap();
+            let page = storage.page_mut(0).unwrap();
+            page[100] = 0xCD;
+        }
+
+        let storage = fm.hnsw_data(DEFAULT_SCHEMA, "vectors", "vec_idx").unwrap();
+        let page = storage.page(0).unwrap();
+        assert_eq!(page[100], 0xCD);
+    }
+
+    #[test]
+    fn hnsw_header_initialized_correctly() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("testdb");
+
+        let mut fm = FileManager::create(&db_path, DEFAULT_MAX_OPEN_FILES).unwrap();
+
+        fm.create_table(DEFAULT_SCHEMA, "vectors", 1).unwrap();
+        fm.create_hnsw_index(DEFAULT_SCHEMA, "vectors", "vec_idx", 42, 256, 32, 100)
+            .unwrap();
+
+        let storage = fm.hnsw_data(DEFAULT_SCHEMA, "vectors", "vec_idx").unwrap();
+        let page = storage.page(0).unwrap();
+
+        assert_eq!(&page[..16], HNSW_MAGIC);
+
+        let index_id = u64::from_le_bytes(page[16..24].try_into().unwrap());
+        assert_eq!(index_id, 42);
+
+        let dimensions = u16::from_le_bytes(page[32..34].try_into().unwrap());
+        assert_eq!(dimensions, 256);
+
+        let m = u16::from_le_bytes(page[34..36].try_into().unwrap());
+        assert_eq!(m, 32);
+
+        let ef_construction = u16::from_le_bytes(page[38..40].try_into().unwrap());
+        assert_eq!(ef_construction, 100);
     }
 }
