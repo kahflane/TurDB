@@ -162,6 +162,59 @@ pub struct Cursor<'a> {
     exhausted: bool,
 }
 
+pub struct BTreeReader<'a> {
+    storage: &'a MmapStorage,
+    root_page: u32,
+}
+
+impl<'a> BTreeReader<'a> {
+    pub fn new(storage: &'a MmapStorage, root_page: u32) -> Result<Self> {
+        ensure!(
+            root_page < storage.page_count(),
+            "root page {} out of bounds (page_count={})",
+            root_page,
+            storage.page_count()
+        );
+        Ok(Self { storage, root_page })
+    }
+
+    pub fn cursor_first(&self) -> Result<Cursor<'a>> {
+        let mut current_page = self.root_page;
+
+        loop {
+            let page_data = self.storage.page(current_page)?;
+            let header = PageHeader::from_bytes(page_data)?;
+
+            match header.page_type() {
+                PageType::BTreeLeaf => {
+                    let leaf = LeafNode::from_page(page_data)?;
+                    let exhausted = leaf.cell_count() == 0;
+                    return Ok(Cursor {
+                        storage: self.storage,
+                        root_page: self.root_page,
+                        current_page,
+                        current_index: 0,
+                        exhausted,
+                    });
+                }
+                PageType::BTreeInterior => {
+                    let interior = InteriorNode::from_page(page_data)?;
+                    if interior.cell_count() == 0 {
+                        current_page = interior.right_child();
+                    } else {
+                        current_page = interior.slot_at(0)?.child_page();
+                    }
+                }
+                _ => bail!(
+                    "unexpected page type {:?} during cursor_first at page {}",
+                    header.page_type(),
+                    current_page
+                ),
+            }
+        }
+    }
+}
+
 impl<'a> BTree<'a> {
     pub fn new(storage: &'a mut MmapStorage, root_page: u32) -> Result<Self> {
         ensure!(

@@ -102,4 +102,4 @@ pub use leaf::{
     extract_prefix, LeafNode, LeafNodeMut, SearchResult, Slot, LEAF_CONTENT_START,
     LEAF_HEADER_SIZE, SLOT_SIZE,
 };
-pub use tree::{BTree, Cursor, InsertResult, SearchHandle, MAX_TREE_DEPTH};
+pub use tree::{BTree, BTreeReader, Cursor, InsertResult, SearchHandle, MAX_TREE_DEPTH};
