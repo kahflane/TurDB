@@ -125,6 +125,15 @@ pub enum DistanceFunction {
     InnerProduct = 2,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[repr(u8)]
+pub enum QuantizationType {
+    #[default]
+    None = 0,
+    SQ8 = 1,
+    PQ = 2,
+}
+
 pub struct HnswIndex {
     dimensions: u16,
     m: u16,
@@ -132,6 +141,7 @@ pub struct HnswIndex {
     ef_construction: u16,
     ef_search: u16,
     distance_fn: DistanceFunction,
+    quantization: QuantizationType,
     entry_point: Option<u32>,
     max_level: u8,
     node_count: u64,
@@ -146,6 +156,7 @@ impl HnswIndex {
             ef_construction,
             ef_search,
             distance_fn: DistanceFunction::default(),
+            quantization: QuantizationType::default(),
             entry_point: None,
             max_level: 0,
             node_count: 0,
@@ -178,6 +189,10 @@ impl HnswIndex {
 
     pub fn distance_fn(&self) -> DistanceFunction {
         self.distance_fn
+    }
+
+    pub fn quantization(&self) -> QuantizationType {
+        self.quantization
     }
 
     pub fn entry_point(&self) -> Option<u32> {
@@ -234,5 +249,28 @@ mod tests {
         assert_eq!(index.node_count(), 0);
         assert_eq!(index.max_level(), 0);
         assert!(index.entry_point().is_none());
+    }
+
+    #[test]
+    fn quantization_type_variants() {
+        let none = QuantizationType::None;
+        let sq8 = QuantizationType::SQ8;
+        let pq = QuantizationType::PQ;
+
+        assert_eq!(none as u8, 0);
+        assert_eq!(sq8 as u8, 1);
+        assert_eq!(pq as u8, 2);
+    }
+
+    #[test]
+    fn quantization_type_default_is_none() {
+        let default = QuantizationType::default();
+        assert_eq!(default, QuantizationType::None);
+    }
+
+    #[test]
+    fn hnsw_index_has_quantization_type() {
+        let index = HnswIndex::with_defaults(128);
+        assert_eq!(index.quantization(), QuantizationType::None);
     }
 }
