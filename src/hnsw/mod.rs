@@ -174,6 +174,25 @@ impl Default for NodeId {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+pub enum VectorRef<'a> {
+    F32(&'a [f32]),
+    SQ8 {
+        min: f32,
+        scale: f32,
+        data: &'a [u8],
+    },
+}
+
+impl<'a> VectorRef<'a> {
+    pub fn dimension(&self) -> usize {
+        match self {
+            VectorRef::F32(data) => data.len(),
+            VectorRef::SQ8 { data, .. } => data.len(),
+        }
+    }
+}
+
 const MAX_LEVEL0_NEIGHBORS: usize = 32;
 const MAX_LEVEL_NEIGHBORS: usize = 16;
 
@@ -442,5 +461,51 @@ mod tests {
         assert_eq!(node.neighbors_at_level(2).len(), 1);
         assert_eq!(node.neighbors_at_level(1)[0], neighbor1);
         assert_eq!(node.neighbors_at_level(2)[0], neighbor2);
+    }
+
+    #[test]
+    fn vector_ref_f32_holds_slice() {
+        let data = [1.0f32, 2.0, 3.0, 4.0];
+        let vec_ref = VectorRef::F32(&data);
+
+        match vec_ref {
+            VectorRef::F32(slice) => assert_eq!(slice.len(), 4),
+            _ => panic!("expected F32 variant"),
+        }
+    }
+
+    #[test]
+    fn vector_ref_sq8_holds_quantized_data() {
+        let data = [10u8, 20, 30, 40];
+        let vec_ref = VectorRef::SQ8 {
+            min: 0.0,
+            scale: 0.1,
+            data: &data,
+        };
+
+        match vec_ref {
+            VectorRef::SQ8 { min, scale, data } => {
+                assert_eq!(min, 0.0);
+                assert_eq!(scale, 0.1);
+                assert_eq!(data.len(), 4);
+            }
+            _ => panic!("expected SQ8 variant"),
+        }
+    }
+
+    #[test]
+    fn vector_ref_dimension() {
+        let f32_data = [1.0f32, 2.0, 3.0];
+        let sq8_data = [10u8, 20, 30, 40, 50];
+
+        let f32_ref = VectorRef::F32(&f32_data);
+        let sq8_ref = VectorRef::SQ8 {
+            min: 0.0,
+            scale: 0.1,
+            data: &sq8_data,
+        };
+
+        assert_eq!(f32_ref.dimension(), 3);
+        assert_eq!(sq8_ref.dimension(), 5);
     }
 }
