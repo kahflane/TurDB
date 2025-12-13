@@ -1228,41 +1228,41 @@
     {
       "title": "SQL - Query Planner",
       "description": "Query planning with index selection",
-      "isCompleted": false,
+      "isCompleted": true,
       "priority": 20,
       "phase": 5,
       "tasks": [
         {
           "task": "Define PlanNode<'a> enum (Scan, IndexScan, Filter, etc.)",
-          "done": false
+          "done": true
         },
         {
           "task": "Define Planner<'a> with catalog and arena references",
-          "done": false
+          "done": true
         },
         {
           "task": "Implement plan_select() creating execution plan",
-          "done": false
+          "done": true
         },
         {
           "task": "Implement plan_insert() for INSERT plans",
-          "done": false
+          "done": true
         },
         {
           "task": "Implement plan_update() for UPDATE plans",
-          "done": false
+          "done": true
         },
         {
           "task": "Implement plan_delete() for DELETE plans",
-          "done": false
+          "done": true
         },
         {
           "task": "Implement index selection based on predicates",
-          "done": false
+          "done": true
         },
         {
           "task": "Implement join ordering optimization",
-          "done": false
+          "done": true
         }
       ]
     },

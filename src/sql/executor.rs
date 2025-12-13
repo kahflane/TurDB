@@ -64,20 +64,6 @@
 //! executor.close()?;
 //! ```
 //!
-//! ## Implementation Status
-//!
-//! | Operator | Status | Notes |
-//! |----------|--------|-------|
-//! | TableScan | ✅ | Full table scan via B-tree cursor |
-//! | IndexScan | 🔄 | Range scan with key encoding |
-//! | Filter | ✅ | Predicate evaluation |
-//! | Project | ✅ | Column projection |
-//! | NestedLoopJoin | 🔄 | Simple O(N×M) join |
-//! | GraceHashJoin | ⏳ | 16-partition hash join |
-//! | HashAggregate | ⏳ | With spill support |
-//! | Sort | ⏳ | External merge sort |
-//! | Limit | ✅ | Early termination |
-//!
 //! ## Performance Targets
 //!
 //! - Scan throughput: > 1M rows/sec

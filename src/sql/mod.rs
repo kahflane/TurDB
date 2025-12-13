@@ -8,9 +8,9 @@
 //!
 //! - `token`: Token and keyword definitions
 //! - `lexer`: Zero-copy SQL tokenizer
-//! - `parser`: Recursive descent parser (future)
-//! - `planner`: Query planning (future)
-//! - `executor`: Query execution (future)
+//! - `parser`: Recursive descent parser
+//! - `planner`: Query planning
+//! - `executor`: Query execution
 //!
 //! ## Design Philosophy
 //!
