@@ -1,0 +1,42 @@
+repos:
+  - repo: local
+    hooks:
+      - id: cargo-fmt
+        name: cargo fmt
+        entry: cargo fmt --all --
+        language: system
+        types: [rust]
+        pass_filenames: false
+
+      - id: cargo-clippy
+        name: cargo clippy
+        entry: cargo clippy --all-targets --all-features -- -D warnings
+        language: system
+        types: [rust]
+        pass_filenames: false
+
+      - id: lint-unsafe-safety
+        name: check SAFETY comments on unsafe
+        entry: ./scripts/lint-unsafe-safety.sh
+        language: script
+        types: [rust]
+
+      - id: lint-inline-comments
+        name: check inline comments
+        entry: ./scripts/lint-inline-comments.sh
+        language: script
+        types: [rust]
+
+      - id: lint-unwrap-panic
+        name: audit unwrap/panic usage
+        entry: ./scripts/lint-unwrap-panic.sh
+        language: script
+        types: [rust]
+
+      - id: cargo-test
+        name: cargo test
+        entry: cargo test
+        language: system
+        types: [rust]
+        pass_filenames: false
+        stages: [pre-push]

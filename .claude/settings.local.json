@@ -16,7 +16,13 @@
       "Skill(superpowers:requesting-code-review)",
       "Bash(git rev-parse:*)",
       "Bash(cargo check:*)",
-      "Bash(find:*)"
+      "Bash(find:*)",
+      "Bash(cat:*)",
+      "Bash(./scripts/lint-unsafe-safety.sh:*)",
+      "Bash(MIRIFLAGS=\"-Zmiri-disable-isolation\" cargo +nightly miri test:*)",
+      "Bash(./scripts/lint-inline-comments.sh:*)",
+      "Bash(./scripts/lint-unwrap-panic.sh:*)",
+      "Bash(cargo bench:*)"
     ]
   }
 }
