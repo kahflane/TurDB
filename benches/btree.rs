@@ -33,7 +33,6 @@ fn bench_insert(c: &mut Criterion) {
                         let value = format!("value{:08}", i);
                         btree.insert(key.as_bytes(), value.as_bytes()).unwrap();
                     }
-                    drop(btree);
                     (dir, storage)
                 },
             );
@@ -62,7 +61,6 @@ fn bench_insert(c: &mut Criterion) {
                         let value = format!("value{:08}", i);
                         btree.insert(key.as_bytes(), value.as_bytes()).unwrap();
                     }
-                    drop(btree);
                     (dir, storage)
                 },
             );
@@ -204,7 +202,6 @@ fn bench_delete(c: &mut Criterion) {
                         let key = format!("key{:08}", i);
                         btree.delete(key.as_bytes()).unwrap();
                     }
-                    drop(btree);
                     (dir, storage)
                 },
             );

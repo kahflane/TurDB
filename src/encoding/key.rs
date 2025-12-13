@@ -1150,7 +1150,7 @@ mod tests {
 
     #[test]
     fn encode_time_roundtrip() {
-        for &micros in &[0_i64, 3600_000_000, -3600_000_000] {
+        for &micros in &[0_i64, 3_600_000_000, -3_600_000_000] {
             let mut buf = Vec::new();
             encode_time(micros, &mut buf);
             assert_eq!(buf[0], type_prefix::TIME);
@@ -1179,7 +1179,7 @@ mod tests {
     #[test]
     fn encode_interval_roundtrip() {
         let mut buf = Vec::new();
-        encode_interval(12, 30, 3600_000_000, &mut buf);
+        encode_interval(12, 30, 3_600_000_000, &mut buf);
         assert_eq!(buf[0], type_prefix::INTERVAL);
         let (decoded, consumed) = decode_key(&buf).unwrap();
         assert_eq!(
@@ -1187,7 +1187,7 @@ mod tests {
             DecodedKey::Interval {
                 months: 12,
                 days: 30,
-                micros: 3600_000_000
+                micros: 3_600_000_000
             }
         );
         assert_eq!(consumed, 17);
@@ -1433,9 +1433,9 @@ mod tests {
     #[test]
     fn encode_value_dispatcher_float() {
         let mut buf = Vec::new();
-        encode_value(&Value::Float(3.14), &mut buf);
+        encode_value(&Value::Float(2.5), &mut buf);
         let (decoded, _) = decode_key(&buf).unwrap();
-        assert_eq!(decoded, DecodedKey::Float(3.14));
+        assert_eq!(decoded, DecodedKey::Float(2.5));
     }
 
     #[test]
