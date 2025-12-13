@@ -81,6 +81,7 @@
 
 pub mod btree;
 pub mod encoding;
+pub mod mvcc;
 pub mod records;
 pub mod schema;
 pub mod sql;
