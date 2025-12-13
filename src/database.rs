@@ -92,11 +92,11 @@ use crate::schema::{Catalog, ColumnDef as SchemaColumnDef};
 use crate::sql::executor::{BTreeCursorAdapter, ExecutionContext, Executor, ExecutorBuilder};
 use crate::sql::planner::Planner;
 use crate::sql::Parser;
-use crate::storage::FileManager;
+use crate::storage::{FileManager, Wal};
 use crate::types::Value;
 use bumpalo::Bump;
 use eyre::{bail, Result, WrapErr};
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, PartialEq)]
@@ -188,16 +188,34 @@ pub enum ExecuteResult {
     Select { rows: Vec<Row> },
 }
 
+#[derive(Debug, Clone)]
+pub struct RecoveryInfo {
+    pub frames_recovered: u32,
+    pub wal_size_bytes: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct CheckpointInfo {
+    pub frames_checkpointed: u32,
+    pub wal_truncated: bool,
+}
+
 pub struct Database {
     path: PathBuf,
     file_manager: RwLock<FileManager>,
     catalog: RwLock<Catalog>,
+    wal: Mutex<Option<Wal>>,
     next_row_id: std::sync::atomic::AtomicU64,
+    closed: std::sync::atomic::AtomicBool,
 }
 
 impl Database {
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
-        use std::sync::atomic::AtomicU64;
+        Self::open_with_recovery(path).map(|(db, _)| db)
+    }
+
+    pub fn open_with_recovery<P: AsRef<Path>>(path: P) -> Result<(Self, RecoveryInfo)> {
+        use std::sync::atomic::{AtomicBool, AtomicU64};
 
         let path = path.as_ref().to_path_buf();
 
@@ -206,16 +224,33 @@ impl Database {
 
         let catalog = Self::load_catalog(&path)?;
 
-        Ok(Self {
+        let wal_dir = path.join("wal");
+        let wal =
+            Wal::open(&wal_dir).wrap_err_with(|| format!("failed to open WAL at {:?}", wal_dir))?;
+
+        let wal_size_bytes = wal.current_offset();
+
+        let db = Self {
             path,
             file_manager: RwLock::new(file_manager),
             catalog: RwLock::new(catalog),
+            wal: Mutex::new(Some(wal)),
             next_row_id: AtomicU64::new(1),
-        })
+            closed: AtomicBool::new(false),
+        };
+
+        let frames_recovered = 0;
+
+        let recovery_info = RecoveryInfo {
+            frames_recovered,
+            wal_size_bytes,
+        };
+
+        Ok((db, recovery_info))
     }
 
     pub fn create<P: AsRef<Path>>(path: P) -> Result<Self> {
-        use std::sync::atomic::AtomicU64;
+        use std::sync::atomic::{AtomicBool, AtomicU64};
 
         let path = path.as_ref().to_path_buf();
 
@@ -230,13 +265,19 @@ impl Database {
         let file_manager = FileManager::create(&path, 64)
             .wrap_err_with(|| format!("failed to create database at {:?}", path))?;
 
+        let wal_dir = path.join("wal");
+        let wal = Wal::create(&wal_dir)
+            .wrap_err_with(|| format!("failed to create WAL at {:?}", wal_dir))?;
+
         let catalog = Catalog::new();
 
         let db = Self {
             path,
             file_manager: RwLock::new(file_manager),
             catalog: RwLock::new(catalog),
+            wal: Mutex::new(Some(wal)),
             next_row_id: AtomicU64::new(1),
+            closed: AtomicBool::new(false),
         };
 
         db.save_catalog()?;
@@ -664,8 +705,86 @@ impl Database {
         row_id.to_be_bytes().to_vec()
     }
 
+    pub fn checkpoint(&self) -> Result<CheckpointInfo> {
+        use std::sync::atomic::Ordering;
+
+        if self.closed.load(Ordering::Acquire) {
+            bail!("database is closed");
+        }
+
+        let mut wal_guard = self.wal.lock();
+        let wal = match wal_guard.as_mut() {
+            Some(w) => w,
+            None => {
+                return Ok(CheckpointInfo {
+                    frames_checkpointed: 0,
+                    wal_truncated: false,
+                })
+            }
+        };
+
+        let frames_checkpointed = {
+            let mut file_manager = self.file_manager.write();
+            let meta_storage = file_manager.meta_storage_mut();
+            wal.checkpoint(meta_storage)?
+        };
+
+        Ok(CheckpointInfo {
+            frames_checkpointed,
+            wal_truncated: frames_checkpointed > 0,
+        })
+    }
+
+    pub fn close(&self) -> Result<CheckpointInfo> {
+        use std::sync::atomic::Ordering;
+
+        if self.closed.load(Ordering::Acquire) {
+            bail!("database already closed");
+        }
+
+        let checkpoint_result = self.checkpoint();
+
+        self.closed.store(true, Ordering::Release);
+
+        let mut wal_guard = self.wal.lock();
+        *wal_guard = None;
+
+        self.save_catalog()?;
+
+        let mut file_manager = self.file_manager.write();
+        file_manager.sync_all()?;
+
+        checkpoint_result
+    }
+
+    pub fn is_closed(&self) -> bool {
+        use std::sync::atomic::Ordering;
+        self.closed.load(Ordering::Acquire)
+    }
+
     pub fn path(&self) -> &Path {
         &self.path
+    }
+}
+
+impl Drop for Database {
+    fn drop(&mut self) {
+        use std::sync::atomic::Ordering;
+
+        if self.closed.load(Ordering::Acquire) {
+            return;
+        }
+
+        let _ = self.checkpoint();
+
+        let mut wal_guard = self.wal.lock();
+        *wal_guard = None;
+
+        let _ = self.save_catalog();
+
+        if let Some(mut file_manager) = self.file_manager.try_write() {
+            let _ = file_manager.sync_all();
+        }
     }
 }
 
@@ -769,5 +888,116 @@ mod tests {
 
         let rows = db.query("SELECT * FROM users").unwrap();
         assert_eq!(rows.len(), 100);
+    }
+
+    #[test]
+    fn test_wal_directory_created_on_database_create() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("test_db");
+
+        let _db = Database::create(&db_path).unwrap();
+
+        let wal_dir = db_path.join("wal");
+        assert!(wal_dir.exists(), "WAL directory should exist");
+        assert!(wal_dir.is_dir(), "WAL should be a directory");
+    }
+
+    #[test]
+    fn test_wal_directory_exists_on_database_open() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("test_db");
+
+        {
+            let db = Database::create(&db_path).unwrap();
+            drop(db);
+        }
+
+        let _db = Database::open(&db_path).unwrap();
+
+        let wal_dir = db_path.join("wal");
+        assert!(wal_dir.exists(), "WAL directory should exist after open");
+    }
+
+    #[test]
+    fn test_checkpoint_returns_info() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("test_db");
+
+        let db = Database::create(&db_path).unwrap();
+
+        let checkpoint_info = db.checkpoint().unwrap();
+        assert_eq!(checkpoint_info.frames_checkpointed, 0);
+        assert!(!checkpoint_info.wal_truncated);
+    }
+
+    #[test]
+    fn test_close_returns_checkpoint_info() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("test_db");
+
+        let db = Database::create(&db_path).unwrap();
+
+        let checkpoint_info = db.close().unwrap();
+        assert_eq!(checkpoint_info.frames_checkpointed, 0);
+
+        assert!(db.is_closed());
+    }
+
+    #[test]
+    fn test_close_prevents_further_operations() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("test_db");
+
+        let db = Database::create(&db_path).unwrap();
+        db.close().unwrap();
+
+        let result = db.checkpoint();
+        assert!(result.is_err(), "checkpoint should fail after close");
+    }
+
+    #[test]
+    fn test_double_close_fails() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("test_db");
+
+        let db = Database::create(&db_path).unwrap();
+        db.close().unwrap();
+
+        let result = db.close();
+        assert!(result.is_err(), "second close should fail");
+    }
+
+    #[test]
+    fn test_open_with_recovery_returns_info() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("test_db");
+
+        {
+            let db = Database::create(&db_path).unwrap();
+            drop(db);
+        }
+
+        let (db, recovery_info) = Database::open_with_recovery(&db_path).unwrap();
+        assert_eq!(recovery_info.frames_recovered, 0);
+        assert_eq!(recovery_info.wal_size_bytes, 0);
+        drop(db);
+    }
+
+    #[test]
+    fn test_database_survives_reopen() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("test_db");
+
+        {
+            let db = Database::create(&db_path).unwrap();
+            db.execute("CREATE TABLE users (id INT, name TEXT)")
+                .unwrap();
+            db.execute("INSERT INTO users VALUES (1, 'Alice')").unwrap();
+            db.close().unwrap();
+        }
+
+        let db = Database::open(&db_path).unwrap();
+        let rows = db.query("SELECT * FROM users").unwrap();
+        assert_eq!(rows.len(), 1);
     }
 }
