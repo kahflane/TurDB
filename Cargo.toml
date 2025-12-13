@@ -35,6 +35,10 @@ harness = false
 name = "records"
 harness = false
 
+[[bench]]
+name = "database"
+harness = false
+
 [profile.release]
 opt-level = 3
 lto = "fat"
