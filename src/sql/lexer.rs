@@ -157,6 +157,7 @@ static KEYWORDS: phf::Map<&'static str, Keyword> = phf_map! {
     "SMALLINT" => Keyword::Smallint,
     "TINYINT" => Keyword::Tinyint,
     "REAL" => Keyword::Real,
+    "FLOAT" => Keyword::Float,
     "DOUBLE" => Keyword::Double,
     "DECIMAL" => Keyword::Decimal,
     "NUMERIC" => Keyword::Numeric,

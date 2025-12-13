@@ -4928,7 +4928,7 @@ impl<'a> Parser<'a> {
                 self.advance();
                 Ok(DataType::TinyInt)
             }
-            Token::Keyword(Keyword::Real) => {
+            Token::Keyword(Keyword::Real) | Token::Keyword(Keyword::Float) => {
                 self.advance();
                 Ok(DataType::Real)
             }

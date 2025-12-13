@@ -726,4 +726,48 @@ mod tests {
         let rows = db.query("SELECT * FROM users").unwrap();
         assert_eq!(rows.len(), 2);
     }
+
+    #[test]
+    fn test_four_column_insert() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("test_db");
+
+        let db = Database::create(&db_path).unwrap();
+
+        db.execute("CREATE TABLE users (id INT, name TEXT, age INT, score FLOAT)")
+            .unwrap();
+
+        db.execute("INSERT INTO users VALUES (1, 'Alice', 25, 95.5)")
+            .unwrap();
+        db.execute("INSERT INTO users VALUES (2, 'Bob', 30, 88.0)")
+            .unwrap();
+
+        let rows = db.query("SELECT * FROM users").unwrap();
+        assert_eq!(rows.len(), 2);
+    }
+
+    #[test]
+    fn test_many_inserts() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("test_db");
+
+        let db = Database::create(&db_path).unwrap();
+
+        db.execute("CREATE TABLE users (id INT, name TEXT, age INT, score FLOAT)")
+            .unwrap();
+
+        for i in 0..100 {
+            let sql = format!(
+                "INSERT INTO users VALUES ({}, 'user{}', {}, {})",
+                i,
+                i,
+                20 + (i % 60),
+                (i as f64) * 0.1
+            );
+            db.execute(&sql).unwrap();
+        }
+
+        let rows = db.query("SELECT * FROM users").unwrap();
+        assert_eq!(rows.len(), 100);
+    }
 }
