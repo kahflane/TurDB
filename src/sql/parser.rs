@@ -694,6 +694,301 @@ mod tests {
             ));
         }
     }
+
+    #[test]
+    fn parse_cte_simple() {
+        let arena = Bump::new();
+        let mut parser = Parser::new(
+            "WITH active_users AS (SELECT * FROM users WHERE active = true) SELECT * FROM active_users",
+            &arena,
+        );
+        let stmt = parser.parse_statement().unwrap();
+        if let Statement::Select(select) = stmt {
+            assert!(select.with.is_some());
+            let with = select.with.unwrap();
+            assert_eq!(with.ctes.len(), 1);
+            assert_eq!(with.ctes[0].name, "active_users");
+        } else {
+            panic!("Expected Select statement");
+        }
+    }
+
+    #[test]
+    fn parse_cte_recursive() {
+        let arena = Bump::new();
+        let mut parser = Parser::new(
+            "WITH RECURSIVE nums AS (SELECT 1 AS n UNION ALL SELECT n + 1 FROM nums WHERE n < 10) SELECT * FROM nums",
+            &arena,
+        );
+        let stmt = parser.parse_statement().unwrap();
+        if let Statement::Select(select) = stmt {
+            assert!(select.with.is_some());
+            let with = select.with.unwrap();
+            assert!(with.recursive);
+        } else {
+            panic!("Expected Select statement");
+        }
+    }
+
+    #[test]
+    fn parse_cte_multiple() {
+        let arena = Bump::new();
+        let mut parser = Parser::new(
+            "WITH a AS (SELECT 1), b AS (SELECT 2) SELECT * FROM a, b",
+            &arena,
+        );
+        let stmt = parser.parse_statement().unwrap();
+        if let Statement::Select(select) = stmt {
+            assert!(select.with.is_some());
+            let with = select.with.unwrap();
+            assert_eq!(with.ctes.len(), 2);
+            assert_eq!(with.ctes[0].name, "a");
+            assert_eq!(with.ctes[1].name, "b");
+        } else {
+            panic!("Expected Select statement");
+        }
+    }
+
+    #[test]
+    fn parse_window_function_over() {
+        let arena = Bump::new();
+        let mut parser = Parser::new(
+            "SELECT id, ROW_NUMBER() OVER (PARTITION BY dept ORDER BY salary DESC) AS rank FROM employees",
+            &arena,
+        );
+        let stmt = parser.parse_statement().unwrap();
+        assert!(matches!(stmt, Statement::Select(_)));
+    }
+
+    #[test]
+    fn parse_window_function_with_frame() {
+        let arena = Bump::new();
+        let mut parser = Parser::new(
+            "SELECT id, SUM(amount) OVER (PARTITION BY category ORDER BY date) FROM transactions",
+            &arena,
+        );
+        let stmt = parser.parse_statement().unwrap();
+        assert!(matches!(stmt, Statement::Select(_)));
+    }
+
+    #[test]
+    fn parse_union() {
+        let arena = Bump::new();
+        let mut parser = Parser::new(
+            "SELECT id FROM users UNION SELECT id FROM admins",
+            &arena,
+        );
+        let stmt = parser.parse_statement().unwrap();
+        if let Statement::Select(select) = stmt {
+            assert!(select.set_op.is_some());
+            let set_op = select.set_op.unwrap();
+            assert_eq!(set_op.op, SetOperator::Union);
+            assert!(!set_op.all);
+        } else {
+            panic!("Expected Select statement");
+        }
+    }
+
+    #[test]
+    fn parse_union_all() {
+        let arena = Bump::new();
+        let mut parser = Parser::new(
+            "SELECT id FROM users UNION ALL SELECT id FROM admins",
+            &arena,
+        );
+        let stmt = parser.parse_statement().unwrap();
+        if let Statement::Select(select) = stmt {
+            assert!(select.set_op.is_some());
+            let set_op = select.set_op.unwrap();
+            assert_eq!(set_op.op, SetOperator::Union);
+            assert!(set_op.all);
+        } else {
+            panic!("Expected Select statement");
+        }
+    }
+
+    #[test]
+    fn parse_intersect() {
+        let arena = Bump::new();
+        let mut parser = Parser::new(
+            "SELECT id FROM users INTERSECT SELECT id FROM premium_users",
+            &arena,
+        );
+        let stmt = parser.parse_statement().unwrap();
+        if let Statement::Select(select) = stmt {
+            assert!(select.set_op.is_some());
+            let set_op = select.set_op.unwrap();
+            assert_eq!(set_op.op, SetOperator::Intersect);
+        } else {
+            panic!("Expected Select statement");
+        }
+    }
+
+    #[test]
+    fn parse_except() {
+        let arena = Bump::new();
+        let mut parser = Parser::new(
+            "SELECT id FROM all_users EXCEPT SELECT id FROM banned_users",
+            &arena,
+        );
+        let stmt = parser.parse_statement().unwrap();
+        if let Statement::Select(select) = stmt {
+            assert!(select.set_op.is_some());
+            let set_op = select.set_op.unwrap();
+            assert_eq!(set_op.op, SetOperator::Except);
+        } else {
+            panic!("Expected Select statement");
+        }
+    }
+
+    #[test]
+    fn parse_complex_join_chain() {
+        let arena = Bump::new();
+        let mut parser = Parser::new(
+            "SELECT * FROM users u INNER JOIN orders o ON u.id = o.user_id LEFT JOIN products p ON o.product_id = p.id",
+            &arena,
+        );
+        let stmt = parser.parse_statement().unwrap();
+        assert!(matches!(stmt, Statement::Select(_)));
+    }
+
+    #[test]
+    fn parse_join_right_outer() {
+        let arena = Bump::new();
+        let mut parser = Parser::new(
+            "SELECT * FROM users u RIGHT OUTER JOIN orders o ON u.id = o.user_id",
+            &arena,
+        );
+        let stmt = parser.parse_statement().unwrap();
+        if let Statement::Select(select) = stmt {
+            if let Some(FromClause::Join(join)) = select.from {
+                assert_eq!(join.join_type, JoinType::Right);
+            } else {
+                panic!("Expected Join");
+            }
+        } else {
+            panic!("Expected Select statement");
+        }
+    }
+
+    #[test]
+    fn parse_join_full_outer() {
+        let arena = Bump::new();
+        let mut parser = Parser::new(
+            "SELECT * FROM users u FULL OUTER JOIN orders o ON u.id = o.user_id",
+            &arena,
+        );
+        let stmt = parser.parse_statement().unwrap();
+        if let Statement::Select(select) = stmt {
+            if let Some(FromClause::Join(join)) = select.from {
+                assert_eq!(join.join_type, JoinType::Full);
+            } else {
+                panic!("Expected Join");
+            }
+        } else {
+            panic!("Expected Select statement");
+        }
+    }
+
+    #[test]
+    fn parse_join_cross() {
+        let arena = Bump::new();
+        let mut parser = Parser::new("SELECT * FROM users CROSS JOIN products", &arena);
+        let stmt = parser.parse_statement().unwrap();
+        if let Statement::Select(select) = stmt {
+            if let Some(FromClause::Join(join)) = select.from {
+                assert_eq!(join.join_type, JoinType::Cross);
+            } else {
+                panic!("Expected Join");
+            }
+        } else {
+            panic!("Expected Select statement");
+        }
+    }
+
+    #[test]
+    fn parse_quoted_identifier() {
+        let arena = Bump::new();
+        let mut parser = Parser::new("SELECT \"Order\" FROM \"user-data\"", &arena);
+        let stmt = parser.parse_statement().unwrap();
+        assert!(matches!(stmt, Statement::Select(_)));
+    }
+
+    #[test]
+    fn parse_reserved_word_as_identifier() {
+        let arena = Bump::new();
+        let mut parser = Parser::new("SELECT \"select\" FROM \"from\"", &arena);
+        let stmt = parser.parse_statement().unwrap();
+        assert!(matches!(stmt, Statement::Select(_)));
+    }
+
+    #[test]
+    fn parse_derived_table() {
+        let arena = Bump::new();
+        let mut parser = Parser::new(
+            "SELECT * FROM (SELECT id, name FROM users WHERE active) AS active_users",
+            &arena,
+        );
+        let stmt = parser.parse_statement().unwrap();
+        if let Statement::Select(select) = stmt {
+            assert!(matches!(select.from, Some(FromClause::Subquery { .. })));
+        } else {
+            panic!("Expected Select statement");
+        }
+    }
+
+    #[test]
+    fn parse_nested_subquery() {
+        let arena = Bump::new();
+        let mut parser = Parser::new(
+            "SELECT * FROM users WHERE id IN (SELECT user_id FROM orders WHERE product_id IN (SELECT id FROM products WHERE price > 100))",
+            &arena,
+        );
+        let stmt = parser.parse_statement().unwrap();
+        assert!(matches!(stmt, Statement::Select(_)));
+    }
+
+    #[test]
+    fn parse_between_expression() {
+        let arena = Bump::new();
+        let mut parser = Parser::new("SELECT * FROM orders WHERE amount BETWEEN 100 AND 500", &arena);
+        let stmt = parser.parse_statement().unwrap();
+        if let Statement::Select(select) = stmt {
+            assert!(matches!(select.where_clause, Some(Expr::Between { .. })));
+        } else {
+            panic!("Expected Select statement");
+        }
+    }
+
+    #[test]
+    fn parse_like_expression() {
+        let arena = Bump::new();
+        let mut parser = Parser::new("SELECT * FROM users WHERE name LIKE 'John%'", &arena);
+        let stmt = parser.parse_statement().unwrap();
+        if let Statement::Select(select) = stmt {
+            assert!(matches!(select.where_clause, Some(Expr::Like { .. })));
+        } else {
+            panic!("Expected Select statement");
+        }
+    }
+
+    #[test]
+    fn parse_not_in_subquery() {
+        let arena = Bump::new();
+        let mut parser = Parser::new(
+            "SELECT * FROM users WHERE id NOT IN (SELECT user_id FROM banned)",
+            &arena,
+        );
+        let stmt = parser.parse_statement().unwrap();
+        if let Statement::Select(select) = stmt {
+            assert!(matches!(
+                select.where_clause,
+                Some(Expr::InSubquery { negated: true, .. })
+            ));
+        } else {
+            panic!("Expected Select statement");
+        }
+    }
 }
 
 pub struct Parser<'a> {
