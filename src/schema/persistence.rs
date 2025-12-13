@@ -117,7 +117,7 @@ impl CatalogPersistence {
     pub fn serialize(catalog: &Catalog) -> Result<Vec<u8>> {
         let mut buf = Vec::new();
 
-        for (_name, schema) in catalog.schemas() {
+        for schema in catalog.schemas().values() {
             buf.extend(schema.id().to_le_bytes());
 
             let name_bytes = schema.name().as_bytes();
@@ -133,7 +133,7 @@ impl CatalogPersistence {
             let table_count = schema.tables().len() as u32;
             buf.extend(table_count.to_le_bytes());
 
-            for (_table_name, table) in schema.tables() {
+            for table in schema.tables().values() {
                 Self::serialize_table(table, &mut buf)?;
             }
         }
@@ -282,7 +282,7 @@ impl CatalogPersistence {
             pos = new_pos;
 
             if let Some(existing_schema) = catalog.get_schema_mut(schema.name()) {
-                for (_table_name, table) in schema.tables() {
+                for table in schema.tables().values() {
                     existing_schema.add_table(table.clone());
                 }
             } else {
@@ -354,7 +354,7 @@ impl CatalogPersistence {
 
         let mut table = TableDef::new(table_id, name, columns);
 
-        ensure!(pos + 1 <= bytes.len(), "unexpected end of data reading has_primary_key");
+        ensure!(pos < bytes.len(), "unexpected end of data reading has_primary_key");
         let has_primary_key = bytes[pos] != 0;
         pos += 1;
 
@@ -405,7 +405,7 @@ impl CatalogPersistence {
             .to_string();
         pos += name_len;
 
-        ensure!(pos + 1 <= bytes.len(), "unexpected end of data reading data type");
+        ensure!(pos < bytes.len(), "unexpected end of data reading data type");
         let data_type = Self::deserialize_data_type(bytes[pos])?;
         pos += 1;
 
@@ -421,7 +421,7 @@ impl CatalogPersistence {
             column = column.with_constraint(constraint);
         }
 
-        ensure!(pos + 1 <= bytes.len(), "unexpected end of data reading has_default");
+        ensure!(pos < bytes.len(), "unexpected end of data reading has_default");
         let has_default = bytes[pos] != 0;
         pos += 1;
 
@@ -479,7 +479,7 @@ impl CatalogPersistence {
     }
 
     fn deserialize_constraint(bytes: &[u8], mut pos: usize) -> Result<(Constraint, usize)> {
-        ensure!(pos + 1 <= bytes.len(), "unexpected end of data reading constraint type");
+        ensure!(pos < bytes.len(), "unexpected end of data reading constraint type");
         let constraint_type = bytes[pos];
         pos += 1;
 
@@ -557,11 +557,11 @@ impl CatalogPersistence {
             columns.push(col_name);
         }
 
-        ensure!(pos + 1 <= bytes.len(), "unexpected end of data reading is_unique");
+        ensure!(pos < bytes.len(), "unexpected end of data reading is_unique");
         let is_unique = bytes[pos] != 0;
         pos += 1;
 
-        ensure!(pos + 1 <= bytes.len(), "unexpected end of data reading index type");
+        ensure!(pos < bytes.len(), "unexpected end of data reading index type");
         let index_type = match bytes[pos] {
             0 => IndexType::BTree,
             1 => IndexType::Hnsw,
