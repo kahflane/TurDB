@@ -101,15 +101,14 @@
 
 use crate::records::types::DataType;
 use crate::schema::{Catalog, ColumnDef, Constraint, IndexDef, IndexType, Schema, TableDef};
-use eyre::{bail, ensure, Result};
+use eyre::{bail, ensure, Result, WrapErr};
+use std::fs::File;
+use std::io::{Read, Write};
+use std::path::Path;
 
-#[allow(dead_code)]
 const MAGIC: &[u8; 16] = b"TurDB Rust v1\0\0\0";
-#[allow(dead_code)]
 const VERSION: u32 = 1;
-#[allow(dead_code)]
 const PAGE_SIZE: u32 = 16384;
-#[allow(dead_code)]
 const HEADER_SIZE: usize = 128;
 
 pub struct CatalogPersistence;
@@ -572,12 +571,106 @@ impl CatalogPersistence {
 
         Ok((IndexDef::new(name, columns, is_unique, index_type), pos))
     }
+
+    pub fn save(catalog: &Catalog, path: &Path) -> Result<()> {
+        let catalog_bytes = Self::serialize(catalog)
+            .wrap_err("failed to serialize catalog")?;
+
+        let mut file = File::create(path)
+            .wrap_err_with(|| format!("failed to create catalog file at '{}'", path.display()))?;
+
+        let mut header = vec![0u8; HEADER_SIZE];
+
+        header[0..16].copy_from_slice(MAGIC);
+        header[16..20].copy_from_slice(&VERSION.to_le_bytes());
+        header[20..24].copy_from_slice(&PAGE_SIZE.to_le_bytes());
+
+        let schema_count = catalog.schemas().len() as u64;
+        header[24..32].copy_from_slice(&schema_count.to_le_bytes());
+
+        let default_schema_id = catalog.get_schema(catalog.default_schema())
+            .map(|s| s.id() as u64)
+            .unwrap_or(0);
+        header[32..40].copy_from_slice(&default_schema_id.to_le_bytes());
+
+        header[40..48].copy_from_slice(&[0u8; 8]);
+        header[48..56].copy_from_slice(&[0u8; 8]);
+        header[56..64].copy_from_slice(&[0u8; 8]);
+
+        let catalog_offset = HEADER_SIZE as u64;
+        header[64..72].copy_from_slice(&catalog_offset.to_le_bytes());
+
+        let catalog_length = catalog_bytes.len() as u64;
+        header[72..80].copy_from_slice(&catalog_length.to_le_bytes());
+
+        file.write_all(&header)
+            .wrap_err("failed to write file header")?;
+
+        file.write_all(&catalog_bytes)
+            .wrap_err("failed to write catalog data")?;
+
+        file.sync_all()
+            .wrap_err("failed to sync catalog file to disk")?;
+
+        Ok(())
+    }
+
+    pub fn load(path: &Path, catalog: &mut Catalog) -> Result<()> {
+        let mut file = File::open(path)
+            .wrap_err_with(|| format!("failed to open catalog file at '{}'", path.display()))?;
+
+        let mut header = vec![0u8; HEADER_SIZE];
+        file.read_exact(&mut header)
+            .wrap_err("failed to read file header")?;
+
+        ensure!(
+            &header[0..16] == MAGIC,
+            "invalid magic bytes in catalog file at '{}'",
+            path.display()
+        );
+
+        let version = u32::from_le_bytes([header[16], header[17], header[18], header[19]]);
+        ensure!(
+            version == VERSION,
+            "unsupported catalog version {} (expected {})",
+            version,
+            VERSION
+        );
+
+        let catalog_offset = u64::from_le_bytes([
+            header[64], header[65], header[66], header[67],
+            header[68], header[69], header[70], header[71],
+        ]) as usize;
+
+        let catalog_length = u64::from_le_bytes([
+            header[72], header[73], header[74], header[75],
+            header[76], header[77], header[78], header[79],
+        ]) as usize;
+
+        ensure!(
+            catalog_offset == HEADER_SIZE,
+            "unexpected catalog offset: expected {}, got {}",
+            HEADER_SIZE,
+            catalog_offset
+        );
+
+        let mut catalog_bytes = vec![0u8; catalog_length];
+        file.read_exact(&mut catalog_bytes)
+            .wrap_err("failed to read catalog data")?;
+
+        Self::deserialize(&catalog_bytes, catalog)
+            .wrap_err("failed to deserialize catalog")?;
+
+        Ok(())
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::schema::Catalog;
+    use std::fs;
+    use tempfile::TempDir;
 
     #[test]
     fn test_serialize_empty_catalog() {
@@ -685,5 +778,56 @@ mod tests {
         assert_eq!(table.indexes().len(), 1);
         assert_eq!(table.indexes()[0].name(), "idx_users_email");
         assert!(table.indexes()[0].is_unique());
+    }
+
+    #[test]
+    fn test_save_and_load_catalog() {
+        let temp_dir = TempDir::new().unwrap();
+        let meta_path = temp_dir.path().join("turdb.meta");
+
+        let mut original = Catalog::new();
+
+        let columns = vec![
+            ColumnDef::new("id", DataType::Int8),
+            ColumnDef::new("name", DataType::Text),
+        ];
+
+        original.create_table("root", "users", columns).unwrap();
+
+        CatalogPersistence::save(&original, &meta_path).unwrap();
+
+        assert!(meta_path.exists());
+
+        let mut loaded = Catalog::new();
+        CatalogPersistence::load(&meta_path, &mut loaded).unwrap();
+
+        let table = loaded.get_table("root", "users").unwrap();
+        assert_eq!(table.name(), "users");
+        assert_eq!(table.columns().len(), 2);
+    }
+
+    #[test]
+    fn test_load_nonexistent_file() {
+        let temp_dir = TempDir::new().unwrap();
+        let meta_path = temp_dir.path().join("nonexistent.meta");
+
+        let mut catalog = Catalog::new();
+        let result = CatalogPersistence::load(&meta_path, &mut catalog);
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_save_creates_file_with_header() {
+        let temp_dir = TempDir::new().unwrap();
+        let meta_path = temp_dir.path().join("turdb.meta");
+
+        let catalog = Catalog::new();
+        CatalogPersistence::save(&catalog, &meta_path).unwrap();
+
+        let file_contents = fs::read(&meta_path).unwrap();
+
+        assert!(file_contents.len() >= HEADER_SIZE);
+        assert_eq!(&file_contents[0..16], MAGIC);
     }
 }

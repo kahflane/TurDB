@@ -904,7 +904,7 @@
     {
       "title": "Schema - Persistence",
       "description": "Persist catalog to turdb.meta file",
-      "isCompleted": false,
+      "isCompleted": true,
       "priority": 16,
       "phase": 4,
       "tasks": [
@@ -922,11 +922,11 @@
         },
         {
           "task": "Implement lazy loading (schema names only at startup)",
-          "done": false
+          "done": true
         },
         {
           "task": "Implement save() persisting catalog changes",
-          "done": false
+          "done": true
         }
       ]
     },
