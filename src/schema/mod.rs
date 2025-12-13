@@ -45,7 +45,7 @@
 //! ## File Layout
 //!
 //! Each schema maps to a directory on disk:
-//! ```
+//! ```text
 //! database_dir/
 //! ├── turdb.meta           # Catalog metadata
 //! ├── root/                # Default schema directory
