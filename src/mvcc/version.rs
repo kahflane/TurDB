@@ -148,6 +148,58 @@ impl<'a> VersionChainReader<'a> {
     pub fn is_reclaimable(&self, global_watermark: TxnId) -> bool {
         !self.current_header.is_locked() && self.current_header.txn_id < global_watermark
     }
+
+    pub fn find_visible_version<F, E>(
+        &self,
+        mut load_undo: F,
+    ) -> Result<Option<VisibleVersion<'a>>, E>
+    where
+        F: FnMut(u64, u16) -> Result<Option<(RecordHeader, &'a [u8])>, E>,
+    {
+        if matches!(self.visibility(), VisibilityResult::Visible) {
+            return Ok(Some(VisibleVersion {
+                header: self.current_header,
+                data: self.current_data,
+            }));
+        }
+
+        if matches!(self.visibility(), VisibilityResult::Deleted) {
+            return Ok(None);
+        }
+
+        let mut current_header = self.current_header;
+
+        while current_header.has_prev_version() {
+            let (page_id, offset) = RecordHeader::decode_ptr(current_header.prev_version);
+
+            match load_undo(page_id, offset)? {
+                Some((prev_header, prev_data)) => {
+                    let vis = prev_header.is_visible_to(self.read_ts);
+                    match vis {
+                        VisibilityResult::Visible => {
+                            return Ok(Some(VisibleVersion {
+                                header: prev_header,
+                                data: prev_data,
+                            }));
+                        }
+                        VisibilityResult::Deleted => return Ok(None),
+                        VisibilityResult::Invisible => {
+                            current_header = prev_header;
+                        }
+                    }
+                }
+                None => break,
+            }
+        }
+
+        Ok(None)
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct VisibleVersion<'a> {
+    pub header: RecordHeader,
+    pub data: &'a [u8],
 }
 
 pub struct VersionChainWriter {
@@ -464,5 +516,93 @@ mod tests {
         let reader = VersionChainReader::new(&record, 100);
 
         assert!(!reader.is_reclaimable(20));
+    }
+
+    #[test]
+    fn find_visible_version_returns_current_if_visible() {
+        let hdr = RecordHeader::new(50);
+        let record = make_record(&hdr, b"current_data");
+        let reader = VersionChainReader::new(&record, 100);
+
+        let load_undo = |_page: u64, _off: u16| -> Result<Option<(RecordHeader, &[u8])>, ()> {
+            panic!("should not load undo when current is visible");
+        };
+
+        let result = reader.find_visible_version(load_undo).unwrap();
+        assert!(result.is_some());
+        let visible = result.unwrap();
+        assert_eq!(visible.header.txn_id, 50);
+        assert_eq!(visible.data, b"current_data");
+    }
+
+    #[test]
+    fn find_visible_version_returns_none_if_deleted() {
+        let mut hdr = RecordHeader::new(50);
+        hdr.set_deleted(true);
+        let record = make_record(&hdr, b"deleted_data");
+        let reader = VersionChainReader::new(&record, 100);
+
+        let load_undo = |_page: u64, _off: u16| -> Result<Option<(RecordHeader, &[u8])>, ()> {
+            panic!("should not traverse chain for deleted record");
+        };
+
+        let result = reader.find_visible_version(load_undo).unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn find_visible_version_traverses_chain() {
+        let mut current_hdr = RecordHeader::new(150);
+        current_hdr.prev_version = RecordHeader::encode_ptr(1, 100);
+        let current_record = make_record(&current_hdr, b"new_data");
+        let reader = VersionChainReader::new(&current_record, 100);
+
+        static OLD_DATA: &[u8] = b"old_data";
+        let old_hdr = RecordHeader::new(50);
+
+        let load_undo = |page: u64, off: u16| -> Result<Option<(RecordHeader, &[u8])>, ()> {
+            assert_eq!(page, 1);
+            assert_eq!(off, 100);
+            Ok(Some((old_hdr, OLD_DATA)))
+        };
+
+        let result = reader.find_visible_version(load_undo).unwrap();
+        assert!(result.is_some());
+        let visible = result.unwrap();
+        assert_eq!(visible.header.txn_id, 50);
+        assert_eq!(visible.data, b"old_data");
+    }
+
+    #[test]
+    fn find_visible_version_returns_none_if_chain_exhausted() {
+        let mut current_hdr = RecordHeader::new(150);
+        current_hdr.prev_version = RecordHeader::encode_ptr(1, 100);
+        let current_record = make_record(&current_hdr, b"new_data");
+        let reader = VersionChainReader::new(&current_record, 10);
+
+        let old_hdr = RecordHeader::new(50);
+
+        let load_undo = |_page: u64, _off: u16| -> Result<Option<(RecordHeader, &[u8])>, ()> {
+            Ok(Some((old_hdr, b"old_data")))
+        };
+
+        let result = reader.find_visible_version(load_undo).unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn find_visible_version_handles_load_error() {
+        let mut current_hdr = RecordHeader::new(150);
+        current_hdr.prev_version = RecordHeader::encode_ptr(1, 100);
+        let current_record = make_record(&current_hdr, b"new_data");
+        let reader = VersionChainReader::new(&current_record, 100);
+
+        let load_undo = |_page: u64, _off: u16| -> Result<Option<(RecordHeader, &[u8])>, &str> {
+            Err("page not found")
+        };
+
+        let result = reader.find_visible_version(load_undo);
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err(), "page not found");
     }
 }

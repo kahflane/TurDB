@@ -92,7 +92,9 @@ pub mod version;
 pub use record_header::RecordHeader;
 pub use transaction::{Transaction, TransactionManager, TxnId, TxnState, MAX_CONCURRENT_TXNS};
 pub use undo_page::{UndoHeader, UndoPageReader, UndoPageWriter, UndoRecord};
-pub use version::{VersionChainReader, VersionChainWriter, VisibilityResult, WriteCheckResult};
+pub use version::{
+    VersionChainReader, VersionChainWriter, VisibilityResult, VisibleVersion, WriteCheckResult,
+};
 
 #[cfg(test)]
 mod tests {
