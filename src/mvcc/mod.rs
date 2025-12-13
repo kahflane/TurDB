@@ -448,4 +448,138 @@ mod tests {
         assert_eq!(calls[0], 101);
         assert_eq!(calls[1], 100);
     }
+
+    #[test]
+    fn concurrent_transactions_get_unique_ids() {
+        use std::sync::Arc;
+        use std::thread;
+
+        let mgr = Arc::new(TransactionManager::new());
+        let mut handles = vec![];
+
+        for _ in 0..10 {
+            let mgr_clone = Arc::clone(&mgr);
+            handles.push(thread::spawn(move || {
+                let txn = mgr_clone.begin_txn().unwrap();
+                let id = txn.id();
+                txn.commit();
+                id
+            }));
+        }
+
+        let mut ids: Vec<TxnId> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        ids.sort();
+        ids.dedup();
+        assert_eq!(ids.len(), 10);
+    }
+
+    #[test]
+    fn concurrent_transactions_get_unique_slots() {
+        use std::sync::Arc;
+        use std::thread;
+
+        let mgr = Arc::new(TransactionManager::new());
+        let mut handles = vec![];
+
+        for _ in 0..10 {
+            let mgr_clone = Arc::clone(&mgr);
+            handles.push(thread::spawn(move || {
+                let txn = mgr_clone.begin_txn().unwrap();
+                let slot = txn.slot_idx();
+                std::thread::sleep(std::time::Duration::from_millis(10));
+                txn.commit();
+                slot
+            }));
+        }
+
+        let slots: Vec<usize> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        let mut unique_slots = slots.clone();
+        unique_slots.sort();
+        unique_slots.dedup();
+        assert_eq!(unique_slots.len(), 10);
+    }
+
+    #[test]
+    fn concurrent_watermark_remains_consistent() {
+        use std::sync::Arc;
+        use std::thread;
+
+        let mgr = Arc::new(TransactionManager::new());
+
+        let txn1 = mgr.begin_txn().unwrap();
+        let txn1_id = txn1.id();
+        assert_eq!(mgr.get_global_watermark(), txn1_id);
+
+        let mgr_clone = Arc::clone(&mgr);
+        let handle = thread::spawn(move || {
+            let txn2 = mgr_clone.begin_txn().unwrap();
+            let wm = mgr_clone.get_global_watermark();
+            txn2.commit();
+            wm
+        });
+
+        let wm_from_thread = handle.join().unwrap();
+        assert_eq!(wm_from_thread, txn1_id);
+
+        assert_eq!(mgr.get_global_watermark(), txn1_id);
+        txn1.commit();
+        assert!(mgr.get_global_watermark() > txn1_id);
+    }
+
+    #[test]
+    fn slots_released_on_thread_panic() {
+        use std::sync::Arc;
+        use std::thread;
+
+        let mgr = Arc::new(TransactionManager::new());
+        let mgr_clone = Arc::clone(&mgr);
+
+        let handle = thread::spawn(move || {
+            let txn = mgr_clone.begin_txn().unwrap();
+            let _slot = txn.slot_idx();
+            panic!("simulated panic");
+        });
+
+        let _ = handle.join();
+
+        let txn = mgr.begin_txn().unwrap();
+        assert_eq!(txn.slot_idx(), 0);
+    }
+
+    #[test]
+    fn max_concurrent_enforced_across_threads() {
+        use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+        use std::sync::{Arc, Barrier};
+        use std::thread;
+
+        let mgr = Arc::new(TransactionManager::new());
+        let barrier = Arc::new(Barrier::new(MAX_CONCURRENT_TXNS + 5));
+        let success_count = Arc::new(AtomicUsize::new(0));
+        let mut handles = vec![];
+
+        for _ in 0..MAX_CONCURRENT_TXNS + 5 {
+            let mgr_clone = Arc::clone(&mgr);
+            let barrier_clone = Arc::clone(&barrier);
+            let success_clone = Arc::clone(&success_count);
+
+            handles.push(thread::spawn(move || {
+                barrier_clone.wait();
+
+                if let Ok(txn) = mgr_clone.begin_txn() {
+                    success_clone.fetch_add(1, AtomicOrdering::SeqCst);
+                    thread::sleep(std::time::Duration::from_millis(50));
+                    txn.commit();
+                }
+            }));
+        }
+
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        assert_eq!(
+            success_count.load(AtomicOrdering::SeqCst),
+            MAX_CONCURRENT_TXNS
+        );
+    }
 }
