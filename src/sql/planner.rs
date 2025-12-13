@@ -359,8 +359,182 @@ impl<'a> Planner<'a> {
         self.optimize_to_physical(&logical)
     }
 
-    fn plan_select(&self, _select: &crate::sql::ast::SelectStmt<'a>) -> Result<LogicalPlan<'a>> {
-        bail!("plan_select not yet implemented")
+    fn plan_select(&self, select: &crate::sql::ast::SelectStmt<'a>) -> Result<LogicalPlan<'a>> {
+        let mut current: &'a LogicalOperator<'a> = match select.from {
+            Some(from) => self.plan_from_clause(from)?,
+            None => bail!("SELECT without FROM clause not yet supported"),
+        };
+
+        if let Some(predicate) = select.where_clause {
+            let filter = self.arena.alloc(LogicalOperator::Filter(LogicalFilter {
+                input: current,
+                predicate,
+            }));
+            current = filter;
+        }
+
+        if !select.group_by.is_empty() {
+            let aggregates = self.extract_aggregates(select.columns);
+            let agg = self
+                .arena
+                .alloc(LogicalOperator::Aggregate(LogicalAggregate {
+                    input: current,
+                    group_by: select.group_by,
+                    aggregates,
+                }));
+            current = agg;
+
+            if let Some(having) = select.having {
+                let having_filter = self.arena.alloc(LogicalOperator::Filter(LogicalFilter {
+                    input: current,
+                    predicate: having,
+                }));
+                current = having_filter;
+            }
+        }
+
+        let (exprs, aliases) = self.extract_select_expressions(select.columns);
+        let project = self.arena.alloc(LogicalOperator::Project(LogicalProject {
+            input: current,
+            expressions: exprs,
+            aliases,
+        }));
+        current = project;
+
+        if !select.order_by.is_empty() {
+            let sort_keys = self.convert_order_by(select.order_by);
+            let sort = self.arena.alloc(LogicalOperator::Sort(LogicalSort {
+                input: current,
+                order_by: sort_keys,
+            }));
+            current = sort;
+        }
+
+        if select.limit.is_some() || select.offset.is_some() {
+            let limit_val = select.limit.and_then(|e| self.eval_const_u64(e));
+            let offset_val = select.offset.and_then(|e| self.eval_const_u64(e));
+
+            let limit_op = self.arena.alloc(LogicalOperator::Limit(LogicalLimit {
+                input: current,
+                limit: limit_val,
+                offset: offset_val,
+            }));
+            current = limit_op;
+        }
+
+        Ok(LogicalPlan { root: current })
+    }
+
+    fn plan_from_clause(
+        &self,
+        from: &'a crate::sql::ast::FromClause<'a>,
+    ) -> Result<&'a LogicalOperator<'a>> {
+        use crate::sql::ast::FromClause;
+
+        match from {
+            FromClause::Table(table_ref) => {
+                let scan = self.arena.alloc(LogicalOperator::Scan(LogicalScan {
+                    schema: table_ref.schema,
+                    table: table_ref.name,
+                    alias: table_ref.alias,
+                }));
+                Ok(scan)
+            }
+            FromClause::Join(join) => self.plan_join(join),
+            FromClause::Subquery { query: _, alias: _ } => {
+                bail!("subqueries in FROM clause not yet implemented")
+            }
+            FromClause::Lateral {
+                subquery: _,
+                alias: _,
+            } => {
+                bail!("LATERAL subqueries not yet implemented")
+            }
+        }
+    }
+
+    fn plan_join(
+        &self,
+        join: &'a crate::sql::ast::JoinClause<'a>,
+    ) -> Result<&'a LogicalOperator<'a>> {
+        let left = self.plan_from_clause(join.left)?;
+        let right = self.plan_from_clause(join.right)?;
+
+        let condition = match join.condition {
+            crate::sql::ast::JoinCondition::On(expr) => Some(expr),
+            crate::sql::ast::JoinCondition::Using(_) => {
+                bail!("USING clause in joins not yet implemented")
+            }
+            crate::sql::ast::JoinCondition::Natural => {
+                bail!("NATURAL joins not yet implemented")
+            }
+            crate::sql::ast::JoinCondition::None => None,
+        };
+
+        let join_op = self.arena.alloc(LogicalOperator::Join(LogicalJoin {
+            left,
+            right,
+            join_type: join.join_type,
+            condition,
+        }));
+
+        Ok(join_op)
+    }
+
+    fn extract_aggregates(
+        &self,
+        _columns: &'a [crate::sql::ast::SelectColumn<'a>],
+    ) -> &'a [&'a Expr<'a>] {
+        &[]
+    }
+
+    fn extract_select_expressions(
+        &self,
+        columns: &'a [crate::sql::ast::SelectColumn<'a>],
+    ) -> (&'a [&'a Expr<'a>], &'a [Option<&'a str>]) {
+        use crate::sql::ast::SelectColumn;
+
+        let mut exprs = bumpalo::collections::Vec::new_in(self.arena);
+        let mut aliases = bumpalo::collections::Vec::new_in(self.arena);
+
+        for col in columns {
+            match col {
+                SelectColumn::Expr { expr, alias } => {
+                    exprs.push(*expr);
+                    aliases.push(*alias);
+                }
+                SelectColumn::AllColumns => {}
+                SelectColumn::TableAllColumns(_) => {}
+            }
+        }
+
+        (exprs.into_bump_slice(), aliases.into_bump_slice())
+    }
+
+    fn convert_order_by(
+        &self,
+        order_by: &'a [crate::sql::ast::OrderByItem<'a>],
+    ) -> &'a [SortKey<'a>] {
+        use crate::sql::ast::{NullsOrder, OrderDirection};
+
+        let mut keys = bumpalo::collections::Vec::new_in(self.arena);
+
+        for item in order_by {
+            keys.push(SortKey {
+                expr: item.expr,
+                ascending: matches!(item.direction, OrderDirection::Asc),
+                nulls_first: matches!(item.nulls, NullsOrder::First),
+            });
+        }
+
+        keys.into_bump_slice()
+    }
+
+    fn eval_const_u64(&self, expr: &Expr<'a>) -> Option<u64> {
+        match expr {
+            Expr::Literal(crate::sql::ast::Literal::Integer(n)) => n.parse().ok(),
+            _ => None,
+        }
     }
 
     fn plan_insert(&self, _insert: &crate::sql::ast::InsertStmt<'a>) -> Result<LogicalPlan<'a>> {
@@ -665,5 +839,196 @@ mod tests {
         let stmt = Statement::Commit;
         let result = planner.create_physical_plan(&stmt);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn plan_select_simple_from_table() {
+        use crate::sql::ast::{Distinct, FromClause, SelectColumn, SelectStmt, TableRef};
+
+        let arena = Bump::new();
+        let catalog = Catalog::new();
+        let planner = Planner::new(&catalog, &arena);
+
+        let table_ref = TableRef {
+            schema: None,
+            name: "users",
+            alias: None,
+        };
+        let from = arena.alloc(FromClause::Table(table_ref));
+
+        let select = arena.alloc(SelectStmt {
+            with: None,
+            distinct: Distinct::All,
+            columns: &[SelectColumn::AllColumns],
+            from: Some(from),
+            where_clause: None,
+            group_by: &[],
+            having: None,
+            order_by: &[],
+            limit: None,
+            offset: None,
+            set_op: None,
+            for_clause: None,
+        });
+
+        let stmt = Statement::Select(select);
+        let result = planner.create_logical_plan(&stmt);
+        assert!(result.is_ok());
+
+        let plan = result.unwrap();
+        assert!(matches!(plan.root, LogicalOperator::Project(_)));
+
+        if let LogicalOperator::Project(project) = plan.root {
+            assert!(matches!(project.input, LogicalOperator::Scan(_)));
+            if let LogicalOperator::Scan(scan) = project.input {
+                assert_eq!(scan.table, "users");
+            }
+        }
+    }
+
+    #[test]
+    fn plan_select_with_where_clause() {
+        use crate::sql::ast::{Distinct, FromClause, Literal, SelectColumn, SelectStmt, TableRef};
+
+        let arena = Bump::new();
+        let catalog = Catalog::new();
+        let planner = Planner::new(&catalog, &arena);
+
+        let table_ref = TableRef {
+            schema: None,
+            name: "users",
+            alias: None,
+        };
+        let from = arena.alloc(FromClause::Table(table_ref));
+        let predicate = arena.alloc(Expr::Literal(Literal::Boolean(true)));
+
+        let select = arena.alloc(SelectStmt {
+            with: None,
+            distinct: Distinct::All,
+            columns: &[SelectColumn::AllColumns],
+            from: Some(from),
+            where_clause: Some(predicate),
+            group_by: &[],
+            having: None,
+            order_by: &[],
+            limit: None,
+            offset: None,
+            set_op: None,
+            for_clause: None,
+        });
+
+        let stmt = Statement::Select(select);
+        let result = planner.create_logical_plan(&stmt);
+        assert!(result.is_ok());
+
+        let plan = result.unwrap();
+        if let LogicalOperator::Project(project) = plan.root {
+            assert!(matches!(project.input, LogicalOperator::Filter(_)));
+        }
+    }
+
+    #[test]
+    fn plan_select_with_limit() {
+        use crate::sql::ast::{Distinct, FromClause, Literal, SelectColumn, SelectStmt, TableRef};
+
+        let arena = Bump::new();
+        let catalog = Catalog::new();
+        let planner = Planner::new(&catalog, &arena);
+
+        let table_ref = TableRef {
+            schema: None,
+            name: "users",
+            alias: None,
+        };
+        let from = arena.alloc(FromClause::Table(table_ref));
+        let limit_expr = arena.alloc(Expr::Literal(Literal::Integer("10")));
+
+        let select = arena.alloc(SelectStmt {
+            with: None,
+            distinct: Distinct::All,
+            columns: &[SelectColumn::AllColumns],
+            from: Some(from),
+            where_clause: None,
+            group_by: &[],
+            having: None,
+            order_by: &[],
+            limit: Some(limit_expr),
+            offset: None,
+            set_op: None,
+            for_clause: None,
+        });
+
+        let stmt = Statement::Select(select);
+        let result = planner.create_logical_plan(&stmt);
+        assert!(result.is_ok());
+
+        let plan = result.unwrap();
+        assert!(matches!(plan.root, LogicalOperator::Limit(_)));
+
+        if let LogicalOperator::Limit(limit) = plan.root {
+            assert_eq!(limit.limit, Some(10));
+        }
+    }
+
+    #[test]
+    fn plan_select_with_join() {
+        use crate::sql::ast::{
+            Distinct, FromClause, JoinClause, JoinCondition, Literal, SelectColumn, SelectStmt,
+            TableRef,
+        };
+
+        let arena = Bump::new();
+        let catalog = Catalog::new();
+        let planner = Planner::new(&catalog, &arena);
+
+        let left_table = TableRef {
+            schema: None,
+            name: "orders",
+            alias: None,
+        };
+        let left_from = arena.alloc(FromClause::Table(left_table));
+
+        let right_table = TableRef {
+            schema: None,
+            name: "customers",
+            alias: None,
+        };
+        let right_from = arena.alloc(FromClause::Table(right_table));
+
+        let condition = arena.alloc(Expr::Literal(Literal::Boolean(true)));
+        let join_clause = arena.alloc(JoinClause {
+            left: left_from,
+            join_type: JoinType::Inner,
+            right: right_from,
+            condition: JoinCondition::On(condition),
+        });
+        let from = arena.alloc(FromClause::Join(join_clause));
+
+        let select = arena.alloc(SelectStmt {
+            with: None,
+            distinct: Distinct::All,
+            columns: &[SelectColumn::AllColumns],
+            from: Some(from),
+            where_clause: None,
+            group_by: &[],
+            having: None,
+            order_by: &[],
+            limit: None,
+            offset: None,
+            set_op: None,
+            for_clause: None,
+        });
+
+        let stmt = Statement::Select(select);
+        let result = planner.create_logical_plan(&stmt);
+        assert!(result.is_ok());
+
+        let plan = result.unwrap();
+        if let LogicalOperator::Project(project) = plan.root {
+            assert!(matches!(project.input, LogicalOperator::Join(_)));
+            if let LogicalOperator::Join(join) = project.input {
+                assert_eq!(join.join_type, JoinType::Inner);
+            }
+        }
     }
 }
