@@ -989,6 +989,1270 @@ mod tests {
             panic!("Expected Select statement");
         }
     }
+
+    #[test]
+    fn parse_truncate_simple() {
+        let arena = Bump::new();
+        let mut parser = Parser::new("TRUNCATE TABLE users", &arena);
+        let stmt = parser.parse_statement().unwrap();
+        if let Statement::Truncate(truncate) = stmt {
+            assert_eq!(truncate.tables.len(), 1);
+            assert_eq!(truncate.tables[0].name, "users");
+        } else {
+            panic!("Expected Truncate statement");
+        }
+    }
+
+    #[test]
+    fn parse_truncate_cascade() {
+        let arena = Bump::new();
+        let mut parser = Parser::new("TRUNCATE TABLE users CASCADE", &arena);
+        let stmt = parser.parse_statement().unwrap();
+        if let Statement::Truncate(truncate) = stmt {
+            assert!(truncate.cascade);
+        } else {
+            panic!("Expected Truncate statement");
+        }
+    }
+
+    #[test]
+    fn parse_truncate_multiple_tables() {
+        let arena = Bump::new();
+        let mut parser = Parser::new("TRUNCATE TABLE users, orders, items", &arena);
+        let stmt = parser.parse_statement().unwrap();
+        if let Statement::Truncate(truncate) = stmt {
+            assert_eq!(truncate.tables.len(), 3);
+        } else {
+            panic!("Expected Truncate statement");
+        }
+    }
+
+    #[test]
+    fn parse_truncate_restart_identity() {
+        let arena = Bump::new();
+        let mut parser = Parser::new("TRUNCATE TABLE users RESTART IDENTITY", &arena);
+        let stmt = parser.parse_statement().unwrap();
+        if let Statement::Truncate(truncate) = stmt {
+            assert!(truncate.restart_identity);
+        } else {
+            panic!("Expected Truncate statement");
+        }
+    }
+
+    #[test]
+    fn parse_create_view_simple() {
+        let arena = Bump::new();
+        let mut parser = Parser::new(
+            "CREATE VIEW active_users AS SELECT * FROM users WHERE active = true",
+            &arena,
+        );
+        let stmt = parser.parse_statement().unwrap();
+        if let Statement::CreateView(view) = stmt {
+            assert_eq!(view.name, "active_users");
+            assert!(!view.or_replace);
+            assert!(!view.materialized);
+        } else {
+            panic!("Expected CreateView statement");
+        }
+    }
+
+    #[test]
+    fn parse_create_view_or_replace() {
+        let arena = Bump::new();
+        let mut parser = Parser::new("CREATE OR REPLACE VIEW v AS SELECT 1", &arena);
+        let stmt = parser.parse_statement().unwrap();
+        if let Statement::CreateView(view) = stmt {
+            assert!(view.or_replace);
+        } else {
+            panic!("Expected CreateView statement");
+        }
+    }
+
+    #[test]
+    fn parse_create_view_with_columns() {
+        let arena = Bump::new();
+        let mut parser = Parser::new("CREATE VIEW v (col1, col2) AS SELECT a, b FROM t", &arena);
+        let stmt = parser.parse_statement().unwrap();
+        if let Statement::CreateView(view) = stmt {
+            assert!(view.columns.is_some());
+            assert_eq!(view.columns.unwrap().len(), 2);
+        } else {
+            panic!("Expected CreateView statement");
+        }
+    }
+
+    #[test]
+    fn parse_create_materialized_view() {
+        let arena = Bump::new();
+        let mut parser = Parser::new("CREATE MATERIALIZED VIEW mv AS SELECT * FROM t", &arena);
+        let stmt = parser.parse_statement().unwrap();
+        if let Statement::CreateView(view) = stmt {
+            assert!(view.materialized);
+        } else {
+            panic!("Expected CreateView statement");
+        }
+    }
+
+    #[test]
+    fn parse_create_function_simple() {
+        let arena = Bump::new();
+        let mut parser = Parser::new(
+            "CREATE FUNCTION add_one(x INTEGER) RETURNS INTEGER AS $$ SELECT x + 1 $$ LANGUAGE SQL",
+            &arena,
+        );
+        let stmt = parser.parse_statement().unwrap();
+        if let Statement::CreateFunction(func) = stmt {
+            assert_eq!(func.name, "add_one");
+            assert_eq!(func.params.len(), 1);
+            assert!(matches!(func.return_type, DataType::Integer));
+        } else {
+            panic!("Expected CreateFunction statement");
+        }
+    }
+
+    #[test]
+    fn parse_create_function_or_replace() {
+        let arena = Bump::new();
+        let mut parser = Parser::new(
+            "CREATE OR REPLACE FUNCTION f() RETURNS INTEGER AS $$ SELECT 1 $$ LANGUAGE SQL",
+            &arena,
+        );
+        let stmt = parser.parse_statement().unwrap();
+        if let Statement::CreateFunction(func) = stmt {
+            assert!(func.or_replace);
+        } else {
+            panic!("Expected CreateFunction statement");
+        }
+    }
+
+    #[test]
+    fn parse_create_function_multiple_params() {
+        let arena = Bump::new();
+        let mut parser = Parser::new(
+            "CREATE FUNCTION concat_strings(a TEXT, b TEXT) RETURNS TEXT AS $$ SELECT a || b $$ LANGUAGE SQL",
+            &arena,
+        );
+        let stmt = parser.parse_statement().unwrap();
+        if let Statement::CreateFunction(func) = stmt {
+            assert_eq!(func.params.len(), 2);
+        } else {
+            panic!("Expected CreateFunction statement");
+        }
+    }
+
+    #[test]
+    fn parse_create_procedure_simple() {
+        let arena = Bump::new();
+        let mut parser = Parser::new(
+            "CREATE PROCEDURE insert_user(name TEXT) AS $$ INSERT INTO users VALUES (name) $$ LANGUAGE SQL",
+            &arena,
+        );
+        let stmt = parser.parse_statement().unwrap();
+        if let Statement::CreateProcedure(proc) = stmt {
+            assert_eq!(proc.name, "insert_user");
+            assert_eq!(proc.params.len(), 1);
+        } else {
+            panic!("Expected CreateProcedure statement");
+        }
+    }
+
+    #[test]
+    fn parse_create_procedure_or_replace() {
+        let arena = Bump::new();
+        let mut parser = Parser::new(
+            "CREATE OR REPLACE PROCEDURE p() AS $$ SELECT 1 $$ LANGUAGE SQL",
+            &arena,
+        );
+        let stmt = parser.parse_statement().unwrap();
+        if let Statement::CreateProcedure(proc) = stmt {
+            assert!(proc.or_replace);
+        } else {
+            panic!("Expected CreateProcedure statement");
+        }
+    }
+
+    #[test]
+    fn parse_create_procedure_multiple_params() {
+        let arena = Bump::new();
+        let mut parser = Parser::new(
+            "CREATE PROCEDURE update_user(id INTEGER, name TEXT, active BOOLEAN) AS $$ UPDATE users SET name = name, active = active WHERE id = id $$ LANGUAGE SQL",
+            &arena,
+        );
+        let stmt = parser.parse_statement().unwrap();
+        if let Statement::CreateProcedure(proc) = stmt {
+            assert_eq!(proc.params.len(), 3);
+        } else {
+            panic!("Expected CreateProcedure statement");
+        }
+    }
+
+    #[test]
+    fn parse_create_trigger_before_insert() {
+        let arena = Bump::new();
+        let mut parser = Parser::new(
+            "CREATE TRIGGER audit_insert BEFORE INSERT ON users FOR EACH ROW EXECUTE FUNCTION audit_log()",
+            &arena,
+        );
+        let stmt = parser.parse_statement().unwrap();
+        if let Statement::CreateTrigger(trigger) = stmt {
+            assert_eq!(trigger.name, "audit_insert");
+            assert_eq!(trigger.table, "users");
+            assert!(matches!(trigger.timing, TriggerTiming::Before));
+            assert!(trigger.events.contains(&TriggerEvent::Insert));
+        } else {
+            panic!("Expected CreateTrigger statement");
+        }
+    }
+
+    #[test]
+    fn parse_create_trigger_after_update() {
+        let arena = Bump::new();
+        let mut parser = Parser::new(
+            "CREATE TRIGGER log_update AFTER UPDATE ON orders FOR EACH ROW EXECUTE FUNCTION log_change()",
+            &arena,
+        );
+        let stmt = parser.parse_statement().unwrap();
+        if let Statement::CreateTrigger(trigger) = stmt {
+            assert!(matches!(trigger.timing, TriggerTiming::After));
+            assert!(trigger.events.contains(&TriggerEvent::Update));
+        } else {
+            panic!("Expected CreateTrigger statement");
+        }
+    }
+
+    #[test]
+    fn parse_create_trigger_multiple_events() {
+        let arena = Bump::new();
+        let mut parser = Parser::new(
+            "CREATE TRIGGER audit_all BEFORE INSERT OR UPDATE OR DELETE ON users FOR EACH ROW EXECUTE FUNCTION audit_log()",
+            &arena,
+        );
+        let stmt = parser.parse_statement().unwrap();
+        if let Statement::CreateTrigger(trigger) = stmt {
+            assert_eq!(trigger.events.len(), 3);
+        } else {
+            panic!("Expected CreateTrigger statement");
+        }
+    }
+
+    #[test]
+    fn parse_create_trigger_or_replace() {
+        let arena = Bump::new();
+        let mut parser = Parser::new(
+            "CREATE OR REPLACE TRIGGER my_trigger AFTER DELETE ON items FOR EACH ROW EXECUTE FUNCTION cleanup()",
+            &arena,
+        );
+        let stmt = parser.parse_statement().unwrap();
+        if let Statement::CreateTrigger(trigger) = stmt {
+            assert!(trigger.or_replace);
+        } else {
+            panic!("Expected CreateTrigger statement");
+        }
+    }
+
+    #[test]
+    fn parse_create_type_enum() {
+        let arena = Bump::new();
+        let mut parser = Parser::new(
+            "CREATE TYPE mood AS ENUM ('happy', 'sad', 'neutral')",
+            &arena,
+        );
+        let stmt = parser.parse_statement().unwrap();
+        if let Statement::CreateType(typ) = stmt {
+            assert_eq!(typ.name, "mood");
+            if let TypeDefinition::Enum(values) = typ.definition {
+                assert_eq!(values.len(), 3);
+            } else {
+                panic!("Expected Enum type definition");
+            }
+        } else {
+            panic!("Expected CreateType statement");
+        }
+    }
+
+    #[test]
+    fn parse_create_type_composite() {
+        let arena = Bump::new();
+        let mut parser = Parser::new(
+            "CREATE TYPE address AS (street TEXT, city TEXT, zip INTEGER)",
+            &arena,
+        );
+        let stmt = parser.parse_statement().unwrap();
+        if let Statement::CreateType(typ) = stmt {
+            assert_eq!(typ.name, "address");
+            if let TypeDefinition::Composite(fields) = typ.definition {
+                assert_eq!(fields.len(), 3);
+            } else {
+                panic!("Expected Composite type definition");
+            }
+        } else {
+            panic!("Expected CreateType statement");
+        }
+    }
+
+    #[test]
+    fn parse_create_type_domain() {
+        let arena = Bump::new();
+        let mut parser = Parser::new("CREATE DOMAIN email AS TEXT", &arena);
+        let stmt = parser.parse_statement().unwrap();
+        if let Statement::CreateType(typ) = stmt {
+            assert_eq!(typ.name, "email");
+            if let TypeDefinition::Domain(base_type) = typ.definition {
+                assert!(matches!(base_type, DataType::Text));
+            } else {
+                panic!("Expected Domain type definition");
+            }
+        } else {
+            panic!("Expected CreateType statement");
+        }
+    }
+
+    #[test]
+    fn parse_call_simple() {
+        let arena = Bump::new();
+        let mut parser = Parser::new("CALL process_data()", &arena);
+        let stmt = parser.parse_statement().unwrap();
+        if let Statement::Call(call) = stmt {
+            assert_eq!(call.name, "process_data");
+            assert!(call.args.is_empty());
+        } else {
+            panic!("Expected Call statement");
+        }
+    }
+
+    #[test]
+    fn parse_call_with_args() {
+        let arena = Bump::new();
+        let mut parser = Parser::new("CALL update_user(1, 'John', true)", &arena);
+        let stmt = parser.parse_statement().unwrap();
+        if let Statement::Call(call) = stmt {
+            assert_eq!(call.name, "update_user");
+            assert_eq!(call.args.len(), 3);
+        } else {
+            panic!("Expected Call statement");
+        }
+    }
+
+    #[test]
+    fn parse_call_schema_qualified() {
+        let arena = Bump::new();
+        let mut parser = Parser::new("CALL myschema.cleanup_old_data(30)", &arena);
+        let stmt = parser.parse_statement().unwrap();
+        if let Statement::Call(call) = stmt {
+            assert_eq!(call.schema, Some("myschema"));
+            assert_eq!(call.name, "cleanup_old_data");
+            assert_eq!(call.args.len(), 1);
+        } else {
+            panic!("Expected Call statement");
+        }
+    }
+
+    #[test]
+    fn parse_merge_basic() {
+        let arena = Bump::new();
+        let mut parser = Parser::new(
+            "MERGE INTO target t USING source s ON id = id WHEN MATCHED THEN UPDATE SET val = 1 WHEN NOT MATCHED THEN INSERT (id, val) VALUES (1, 2)",
+            &arena,
+        );
+        let stmt = parser.parse_statement().unwrap();
+        if let Statement::Merge(merge) = stmt {
+            assert_eq!(merge.target_table, "target");
+            assert_eq!(merge.target_alias, Some("t"));
+            assert_eq!(merge.clauses.len(), 2);
+        } else {
+            panic!("Expected Merge statement");
+        }
+    }
+
+    #[test]
+    fn parse_merge_delete() {
+        let arena = Bump::new();
+        let mut parser = Parser::new(
+            "MERGE INTO inventory USING shipments ON inventory.id = shipments.item_id WHEN MATCHED THEN DELETE",
+            &arena,
+        );
+        let stmt = parser.parse_statement().unwrap();
+        if let Statement::Merge(merge) = stmt {
+            assert_eq!(merge.clauses.len(), 1);
+            assert!(matches!(merge.clauses[0], MergeClause::MatchedDelete));
+        } else {
+            panic!("Expected Merge statement");
+        }
+    }
+
+    #[test]
+    fn parse_insert_on_conflict_do_nothing() {
+        let arena = Bump::new();
+        let mut parser = Parser::new(
+            "INSERT INTO users (id, name) VALUES (1, 'John') ON CONFLICT DO NOTHING",
+            &arena,
+        );
+        let stmt = parser.parse_statement().unwrap();
+        if let Statement::Insert(insert) = stmt {
+            assert!(insert.on_conflict.is_some());
+            if let Some(OnConflict {
+                action: OnConflictAction::DoNothing,
+                ..
+            }) = insert.on_conflict
+            {
+            } else {
+                panic!("Expected DoNothing action");
+            }
+        } else {
+            panic!("Expected Insert statement");
+        }
+    }
+
+    #[test]
+    fn parse_insert_on_conflict_do_update() {
+        let arena = Bump::new();
+        let mut parser = Parser::new(
+            "INSERT INTO users (id, name) VALUES (1, 'John') ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name",
+            &arena,
+        );
+        let stmt = parser.parse_statement().unwrap();
+        if let Statement::Insert(insert) = stmt {
+            assert!(insert.on_conflict.is_some());
+            if let Some(OnConflict {
+                action: OnConflictAction::DoUpdate(_),
+                ..
+            }) = insert.on_conflict
+            {
+            } else {
+                panic!("Expected DoUpdate action");
+            }
+        } else {
+            panic!("Expected Insert statement");
+        }
+    }
+
+    #[test]
+    fn parse_multiple_statements() {
+        let arena = Bump::new();
+        let mut parser = Parser::new("SELECT 1; SELECT 2; SELECT 3", &arena);
+        let result = parser.parse_statements();
+        assert_eq!(result.statements.len(), 3);
+        assert!(result.errors.is_empty());
+    }
+
+    #[test]
+    fn parse_statements_with_error_recovery() {
+        let arena = Bump::new();
+        let mut parser = Parser::new("SELECT 1; SELECT (1 + ; SELECT 3", &arena);
+        let result = parser.parse_statements();
+        assert_eq!(result.statements.len(), 2);
+        assert_eq!(result.errors.len(), 1);
+    }
+
+    #[test]
+    fn parse_statements_multiple_errors() {
+        let arena = Bump::new();
+        let mut parser = Parser::new("SELECT (1 +; INSERT INTO; SELECT 1", &arena);
+        let result = parser.parse_statements();
+        assert_eq!(result.statements.len(), 1);
+        assert_eq!(result.errors.len(), 2);
+    }
+
+    #[test]
+    fn parse_statements_recovery_at_semicolon() {
+        let arena = Bump::new();
+        let mut parser = Parser::new("SELECT (1 + ; SELECT 3", &arena);
+        let result = parser.parse_statements();
+        assert_eq!(result.statements.len(), 1);
+        assert_eq!(result.errors.len(), 1);
+    }
+
+    #[test]
+    fn parse_statements_error_includes_location() {
+        let arena = Bump::new();
+        let mut parser = Parser::new("SELECT 1;\nSELECT (1 +;", &arena);
+        let result = parser.parse_statements();
+        assert!(!result.errors.is_empty());
+        let err = &result.errors[0];
+        assert_eq!(err.line, 2);
+    }
+
+    #[test]
+    fn parse_select_with_recursive_cte() {
+        let arena = Bump::new();
+        let mut parser = Parser::new(
+            "WITH RECURSIVE cte AS (SELECT 1 UNION ALL SELECT n + 1 FROM cte WHERE n < 10) SELECT * FROM cte",
+            &arena,
+        );
+        let stmt = parser.parse_statement().unwrap();
+        if let Statement::Select(select) = stmt {
+            assert!(select.with.is_some());
+            let with = select.with.unwrap();
+            assert!(with.recursive);
+        } else {
+            panic!("Expected Select statement");
+        }
+    }
+
+    #[test]
+    fn parse_select_with_window_function() {
+        let arena = Bump::new();
+        let mut parser = Parser::new(
+            "SELECT id, ROW_NUMBER() OVER (PARTITION BY dept ORDER BY salary DESC) FROM employees",
+            &arena,
+        );
+        let stmt = parser.parse_statement().unwrap();
+        assert!(matches!(stmt, Statement::Select(_)));
+    }
+
+    #[test]
+    fn parse_select_with_subquery_in_from() {
+        let arena = Bump::new();
+        let mut parser = Parser::new(
+            "SELECT * FROM (SELECT id, name FROM users WHERE active = true) AS active_users",
+            &arena,
+        );
+        let stmt = parser.parse_statement().unwrap();
+        if let Statement::Select(select) = stmt {
+            assert!(select.from.is_some());
+        } else {
+            panic!("Expected Select statement");
+        }
+    }
+
+    #[test]
+    fn parse_select_with_exists_subquery() {
+        let arena = Bump::new();
+        let mut parser = Parser::new(
+            "SELECT * FROM users WHERE EXISTS (SELECT 1 FROM orders WHERE orders.user_id = users.id)",
+            &arena,
+        );
+        let stmt = parser.parse_statement().unwrap();
+        assert!(matches!(stmt, Statement::Select(_)));
+    }
+
+    #[test]
+    fn parse_insert_default_values() {
+        let arena = Bump::new();
+        let mut parser = Parser::new("INSERT INTO users DEFAULT VALUES", &arena);
+        let stmt = parser.parse_statement().unwrap();
+        if let Statement::Insert(insert) = stmt {
+            assert!(matches!(insert.source, InsertSource::Default));
+        } else {
+            panic!("Expected Insert statement");
+        }
+    }
+
+    #[test]
+    fn parse_insert_multiple_value_rows() {
+        let arena = Bump::new();
+        let mut parser = Parser::new(
+            "INSERT INTO users (name, email) VALUES ('Alice', 'alice@example.com'), ('Bob', 'bob@example.com')",
+            &arena,
+        );
+        let stmt = parser.parse_statement().unwrap();
+        if let Statement::Insert(insert) = stmt {
+            if let InsertSource::Values(rows) = &insert.source {
+                assert_eq!(rows.len(), 2);
+            } else {
+                panic!("Expected Values source");
+            }
+        } else {
+            panic!("Expected Insert statement");
+        }
+    }
+
+    #[test]
+    fn parse_insert_with_returning() {
+        let arena = Bump::new();
+        let mut parser = Parser::new(
+            "INSERT INTO users (name) VALUES ('Alice') RETURNING id, created_at",
+            &arena,
+        );
+        let stmt = parser.parse_statement().unwrap();
+        if let Statement::Insert(insert) = stmt {
+            assert!(insert.returning.is_some());
+            assert_eq!(insert.returning.unwrap().len(), 2);
+        } else {
+            panic!("Expected Insert statement");
+        }
+    }
+
+    #[test]
+    fn parse_update_with_from_clause() {
+        let arena = Bump::new();
+        let mut parser = Parser::new(
+            "UPDATE users SET status = 'active' FROM orders WHERE users.id = orders.user_id",
+            &arena,
+        );
+        let stmt = parser.parse_statement().unwrap();
+        if let Statement::Update(update) = stmt {
+            assert!(update.from.is_some());
+        } else {
+            panic!("Expected Update statement");
+        }
+    }
+
+    #[test]
+    fn parse_delete_with_using() {
+        let arena = Bump::new();
+        let mut parser = Parser::new(
+            "DELETE FROM users USING orders WHERE users.id = orders.user_id AND orders.status = 'cancelled'",
+            &arena,
+        );
+        let stmt = parser.parse_statement().unwrap();
+        if let Statement::Delete(delete) = stmt {
+            assert!(delete.using.is_some());
+        } else {
+            panic!("Expected Delete statement");
+        }
+    }
+
+    #[test]
+    fn parse_create_table_primary_key_constraint() {
+        let arena = Bump::new();
+        let mut parser = Parser::new(
+            "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT NOT NULL)",
+            &arena,
+        );
+        let stmt = parser.parse_statement().unwrap();
+        if let Statement::CreateTable(ct) = stmt {
+            assert_eq!(ct.columns.len(), 2);
+            assert!(ct.columns[0]
+                .constraints
+                .iter()
+                .any(|c| matches!(c, ColumnConstraint::PrimaryKey)));
+        } else {
+            panic!("Expected CreateTable statement");
+        }
+    }
+
+    #[test]
+    fn parse_create_table_foreign_key_constraint() {
+        let arena = Bump::new();
+        let mut parser = Parser::new(
+            "CREATE TABLE orders (id INTEGER PRIMARY KEY, user_id INTEGER REFERENCES users(id))",
+            &arena,
+        );
+        let stmt = parser.parse_statement().unwrap();
+        if let Statement::CreateTable(ct) = stmt {
+            assert_eq!(ct.columns.len(), 2);
+            assert!(ct.columns[1]
+                .constraints
+                .iter()
+                .any(|c| matches!(c, ColumnConstraint::References { .. })));
+        } else {
+            panic!("Expected CreateTable statement");
+        }
+    }
+
+    #[test]
+    fn parse_create_table_if_not_exists() {
+        let arena = Bump::new();
+        let mut parser = Parser::new("CREATE TABLE IF NOT EXISTS users (id INTEGER)", &arena);
+        let stmt = parser.parse_statement().unwrap();
+        if let Statement::CreateTable(ct) = stmt {
+            assert!(ct.if_not_exists);
+        } else {
+            panic!("Expected CreateTable statement");
+        }
+    }
+
+    #[test]
+    fn parse_create_unique_index() {
+        let arena = Bump::new();
+        let mut parser = Parser::new("CREATE UNIQUE INDEX idx_email ON users (email)", &arena);
+        let stmt = parser.parse_statement().unwrap();
+        if let Statement::CreateIndex(ci) = stmt {
+            assert!(ci.unique);
+            assert_eq!(ci.name, "idx_email");
+        } else {
+            panic!("Expected CreateIndex statement");
+        }
+    }
+
+    #[test]
+    fn parse_drop_table_if_exists() {
+        let arena = Bump::new();
+        let mut parser = Parser::new("DROP TABLE IF EXISTS users", &arena);
+        let stmt = parser.parse_statement().unwrap();
+        if let Statement::Drop(drop) = stmt {
+            assert!(matches!(drop.object_type, ObjectType::Table));
+            assert!(drop.if_exists);
+        } else {
+            panic!("Expected Drop statement");
+        }
+    }
+
+    #[test]
+    fn parse_truncate_with_cascade() {
+        let arena = Bump::new();
+        let mut parser = Parser::new("TRUNCATE TABLE orders CASCADE", &arena);
+        let stmt = parser.parse_statement().unwrap();
+        if let Statement::Truncate(truncate) = stmt {
+            assert!(truncate.cascade);
+        } else {
+            panic!("Expected Truncate statement");
+        }
+    }
+
+    #[test]
+    fn parse_create_view_column_list() {
+        let arena = Bump::new();
+        let mut parser = Parser::new(
+            "CREATE VIEW active_users (user_id, user_name) AS SELECT id, name FROM users WHERE active = true",
+            &arena,
+        );
+        let stmt = parser.parse_statement().unwrap();
+        if let Statement::CreateView(cv) = stmt {
+            assert!(cv.columns.is_some());
+            assert_eq!(cv.columns.unwrap().len(), 2);
+        } else {
+            panic!("Expected CreateView statement");
+        }
+    }
+
+    #[test]
+    fn parse_create_or_replace_view() {
+        let arena = Bump::new();
+        let mut parser = Parser::new("CREATE OR REPLACE VIEW v AS SELECT 1", &arena);
+        let stmt = parser.parse_statement().unwrap();
+        if let Statement::CreateView(cv) = stmt {
+            assert!(cv.or_replace);
+        } else {
+            panic!("Expected CreateView statement");
+        }
+    }
+
+    #[test]
+    fn parse_create_function_with_multiple_params() {
+        let arena = Bump::new();
+        let mut parser = Parser::new(
+            "CREATE FUNCTION add_nums(a INTEGER, b INTEGER) RETURNS INTEGER AS $$ SELECT a + b $$ LANGUAGE sql",
+            &arena,
+        );
+        let stmt = parser.parse_statement().unwrap();
+        if let Statement::CreateFunction(cf) = stmt {
+            assert_eq!(cf.params.len(), 2);
+            assert!(matches!(cf.return_type, DataType::Integer));
+        } else {
+            panic!("Expected CreateFunction statement");
+        }
+    }
+
+    #[test]
+    fn parse_create_procedure_with_params() {
+        let arena = Bump::new();
+        let mut parser = Parser::new(
+            "CREATE PROCEDURE log_event(event_name TEXT, event_data TEXT) AS $$ INSERT INTO logs (name, data) VALUES (event_name, event_data) $$ LANGUAGE sql",
+            &arena,
+        );
+        let stmt = parser.parse_statement().unwrap();
+        if let Statement::CreateProcedure(cp) = stmt {
+            assert_eq!(cp.params.len(), 2);
+        } else {
+            panic!("Expected CreateProcedure statement");
+        }
+    }
+
+    #[test]
+    fn parse_create_trigger_after_update_event() {
+        let arena = Bump::new();
+        let mut parser = Parser::new(
+            "CREATE TRIGGER audit_update AFTER UPDATE ON users FOR EACH ROW EXECUTE FUNCTION audit_changes()",
+            &arena,
+        );
+        let stmt = parser.parse_statement().unwrap();
+        if let Statement::CreateTrigger(ct) = stmt {
+            assert!(matches!(ct.timing, TriggerTiming::After));
+            assert!(ct.events.contains(&TriggerEvent::Update));
+        } else {
+            panic!("Expected CreateTrigger statement");
+        }
+    }
+
+    #[test]
+    fn parse_create_type_composite_fields() {
+        let arena = Bump::new();
+        let mut parser = Parser::new(
+            "CREATE TYPE address AS (street TEXT, city TEXT, zip_code TEXT)",
+            &arena,
+        );
+        let stmt = parser.parse_statement().unwrap();
+        if let Statement::CreateType(ct) = stmt {
+            if let TypeDefinition::Composite(fields) = ct.definition {
+                assert_eq!(fields.len(), 3);
+            } else {
+                panic!("Expected Composite type");
+            }
+        } else {
+            panic!("Expected CreateType statement");
+        }
+    }
+
+    #[test]
+    fn parse_call_with_expressions() {
+        let arena = Bump::new();
+        let mut parser = Parser::new("CALL process_data(1 + 2, 'test', true)", &arena);
+        let stmt = parser.parse_statement().unwrap();
+        if let Statement::Call(call) = stmt {
+            assert_eq!(call.args.len(), 3);
+        } else {
+            panic!("Expected Call statement");
+        }
+    }
+
+    #[test]
+    fn parse_merge_with_all_clauses() {
+        let arena = Bump::new();
+        let mut parser = Parser::new(
+            "MERGE INTO target t USING source s ON t.id = s.id \
+             WHEN MATCHED THEN UPDATE SET val = 1 \
+             WHEN MATCHED THEN DELETE \
+             WHEN NOT MATCHED THEN INSERT (id, val) VALUES (1, 2)",
+            &arena,
+        );
+        let stmt = parser.parse_statement().unwrap();
+        if let Statement::Merge(merge) = stmt {
+            assert_eq!(merge.clauses.len(), 3);
+        } else {
+            panic!("Expected Merge statement");
+        }
+    }
+
+    #[test]
+    fn parse_begin_transaction() {
+        let arena = Bump::new();
+        let mut parser = Parser::new("BEGIN TRANSACTION", &arena);
+        let stmt = parser.parse_statement().unwrap();
+        assert!(matches!(stmt, Statement::Begin(_)));
+    }
+
+    #[test]
+    fn parse_rollback_to_savepoint() {
+        let arena = Bump::new();
+        let mut parser = Parser::new("ROLLBACK TO SAVEPOINT sp1", &arena);
+        let stmt = parser.parse_statement().unwrap();
+        if let Statement::Rollback(rb) = stmt {
+            assert_eq!(rb.savepoint, Some("sp1"));
+        } else {
+            panic!("Expected Rollback statement");
+        }
+    }
+
+    #[test]
+    fn parse_explain_analyze() {
+        let arena = Bump::new();
+        let mut parser = Parser::new("EXPLAIN ANALYZE SELECT * FROM users", &arena);
+        let stmt = parser.parse_statement().unwrap();
+        if let Statement::Explain(explain) = stmt {
+            assert!(explain.analyze);
+        } else {
+            panic!("Expected Explain statement");
+        }
+    }
+
+    #[test]
+    fn parse_case_with_else() {
+        let arena = Bump::new();
+        let mut parser = Parser::new(
+            "SELECT CASE WHEN x > 0 THEN 'positive' WHEN x < 0 THEN 'negative' ELSE 'zero' END FROM t",
+            &arena,
+        );
+        let stmt = parser.parse_statement().unwrap();
+        assert!(matches!(stmt, Statement::Select(_)));
+    }
+
+    #[test]
+    fn parse_cast_to_type() {
+        let arena = Bump::new();
+        let mut parser = Parser::new("SELECT CAST(123 AS TEXT)", &arena);
+        let stmt = parser.parse_statement().unwrap();
+        assert!(matches!(stmt, Statement::Select(_)));
+    }
+
+    #[test]
+    fn parse_in_subquery() {
+        let arena = Bump::new();
+        let mut parser = Parser::new(
+            "SELECT * FROM t WHERE id IN (SELECT user_id FROM orders)",
+            &arena,
+        );
+        let stmt = parser.parse_statement().unwrap();
+        assert!(matches!(stmt, Statement::Select(_)));
+    }
+
+    #[test]
+    fn parse_array_subscript() {
+        let arena = Bump::new();
+        let mut parser = Parser::new("SELECT arr[1], arr[2:5] FROM t", &arena);
+        let stmt = parser.parse_statement().unwrap();
+        assert!(matches!(stmt, Statement::Select(_)));
+    }
+
+    #[test]
+    fn parse_qualified_column_reference() {
+        let arena = Bump::new();
+        let mut parser = Parser::new("SELECT schema.table.column FROM schema.table", &arena);
+        let stmt = parser.parse_statement().unwrap();
+        assert!(matches!(stmt, Statement::Select(_)));
+    }
+
+    #[test]
+    fn parse_null_safe_comparison() {
+        let arena = Bump::new();
+        let mut parser = Parser::new("SELECT * FROM t WHERE x IS NOT NULL", &arena);
+        let stmt = parser.parse_statement().unwrap();
+        assert!(matches!(stmt, Statement::Select(_)));
+    }
+
+    #[test]
+    fn parse_multiple_joins() {
+        let arena = Bump::new();
+        let mut parser = Parser::new(
+            "SELECT * FROM a JOIN b ON a.id = b.a_id LEFT JOIN c ON b.id = c.b_id",
+            &arena,
+        );
+        let stmt = parser.parse_statement().unwrap();
+        assert!(matches!(stmt, Statement::Select(_)));
+    }
+
+    #[test]
+    fn parse_update_qualified_column() {
+        let arena = Bump::new();
+        let mut parser = Parser::new("UPDATE users u SET u.name = 'test' WHERE u.id = 1", &arena);
+        let stmt = parser.parse_statement().unwrap();
+        if let Statement::Update(update) = stmt {
+            assert_eq!(update.assignments.len(), 1);
+            assert_eq!(update.assignments[0].column.table, Some("u"));
+            assert_eq!(update.assignments[0].column.column, "name");
+        } else {
+            panic!("Expected Update statement");
+        }
+    }
+
+    #[test]
+    fn parse_merge_qualified_column_in_update() {
+        let arena = Bump::new();
+        let mut parser = Parser::new(
+            "MERGE INTO target t USING source s ON t.id = s.id WHEN MATCHED THEN UPDATE SET t.val = s.val",
+            &arena,
+        );
+        let stmt = parser.parse_statement().unwrap();
+        if let Statement::Merge(merge) = stmt {
+            if let MergeClause::MatchedUpdate(assignments) = merge.clauses[0] {
+                assert_eq!(assignments[0].column.table, Some("t"));
+                assert_eq!(assignments[0].column.column, "val");
+            } else {
+                panic!("Expected MatchedUpdate clause");
+            }
+        } else {
+            panic!("Expected Merge statement");
+        }
+    }
+
+    #[test]
+    fn parse_lateral_subquery() {
+        let arena = Bump::new();
+        let mut parser = Parser::new(
+            "SELECT * FROM users u, LATERAL (SELECT * FROM orders o WHERE o.user_id = u.id) AS user_orders",
+            &arena,
+        );
+        let stmt = parser.parse_statement().unwrap();
+        if let Statement::Select(select) = stmt {
+            assert!(select.from.is_some());
+        } else {
+            panic!("Expected Select statement");
+        }
+    }
+
+    #[test]
+    fn parse_lateral_in_join() {
+        let arena = Bump::new();
+        let mut parser = Parser::new(
+            "SELECT * FROM users u CROSS JOIN LATERAL (SELECT * FROM orders o WHERE o.user_id = u.id) AS user_orders",
+            &arena,
+        );
+        let stmt = parser.parse_statement().unwrap();
+        assert!(matches!(stmt, Statement::Select(_)));
+    }
+
+    #[test]
+    fn parse_select_for_update() {
+        let arena = Bump::new();
+        let mut parser = Parser::new("SELECT * FROM users FOR UPDATE", &arena);
+        let stmt = parser.parse_statement().unwrap();
+        if let Statement::Select(select) = stmt {
+            assert!(select.for_clause.is_some());
+            let for_clause = select.for_clause.unwrap();
+            assert!(matches!(for_clause.lock_mode, LockMode::Update));
+        } else {
+            panic!("Expected Select statement");
+        }
+    }
+
+    #[test]
+    fn parse_select_for_share() {
+        let arena = Bump::new();
+        let mut parser = Parser::new("SELECT * FROM users FOR SHARE", &arena);
+        let stmt = parser.parse_statement().unwrap();
+        if let Statement::Select(select) = stmt {
+            assert!(select.for_clause.is_some());
+            let for_clause = select.for_clause.unwrap();
+            assert!(matches!(for_clause.lock_mode, LockMode::Share));
+        } else {
+            panic!("Expected Select statement");
+        }
+    }
+
+    #[test]
+    fn parse_select_for_update_nowait() {
+        let arena = Bump::new();
+        let mut parser = Parser::new("SELECT * FROM users FOR UPDATE NOWAIT", &arena);
+        let stmt = parser.parse_statement().unwrap();
+        if let Statement::Select(select) = stmt {
+            assert!(select.for_clause.is_some());
+            let for_clause = select.for_clause.unwrap();
+            assert!(matches!(for_clause.wait_policy, WaitPolicy::Nowait));
+        } else {
+            panic!("Expected Select statement");
+        }
+    }
+
+    #[test]
+    fn parse_select_for_update_skip_locked() {
+        let arena = Bump::new();
+        let mut parser = Parser::new("SELECT * FROM users FOR UPDATE SKIP LOCKED", &arena);
+        let stmt = parser.parse_statement().unwrap();
+        if let Statement::Select(select) = stmt {
+            assert!(select.for_clause.is_some());
+            let for_clause = select.for_clause.unwrap();
+            assert!(matches!(for_clause.wait_policy, WaitPolicy::SkipLocked));
+        } else {
+            panic!("Expected Select statement");
+        }
+    }
+
+    #[test]
+    fn parse_fetch_first_rows_only() {
+        let arena = Bump::new();
+        let mut parser = Parser::new("SELECT * FROM users FETCH FIRST 10 ROWS ONLY", &arena);
+        let stmt = parser.parse_statement().unwrap();
+        if let Statement::Select(select) = stmt {
+            assert!(select.limit.is_some());
+        } else {
+            panic!("Expected Select statement");
+        }
+    }
+
+    #[test]
+    fn parse_fetch_next_row_only() {
+        let arena = Bump::new();
+        let mut parser = Parser::new("SELECT * FROM users FETCH NEXT 1 ROW ONLY", &arena);
+        let stmt = parser.parse_statement().unwrap();
+        if let Statement::Select(select) = stmt {
+            assert!(select.limit.is_some());
+        } else {
+            panic!("Expected Select statement");
+        }
+    }
+
+    #[test]
+    fn parse_offset_rows_fetch_first() {
+        let arena = Bump::new();
+        let mut parser = Parser::new(
+            "SELECT * FROM users OFFSET 5 ROWS FETCH FIRST 10 ROWS ONLY",
+            &arena,
+        );
+        let stmt = parser.parse_statement().unwrap();
+        if let Statement::Select(select) = stmt {
+            assert!(select.offset.is_some());
+            assert!(select.limit.is_some());
+        } else {
+            panic!("Expected Select statement");
+        }
+    }
+
+    #[test]
+    fn parse_set_variable_equals() {
+        let arena = Bump::new();
+        let mut parser = Parser::new("SET work_mem = '64MB'", &arena);
+        let stmt = parser.parse_statement().unwrap();
+        if let Statement::Set(set) = stmt {
+            assert_eq!(set.name.to_uppercase(), "WORK_MEM");
+            assert_eq!(set.scope, SetScope::Session);
+        } else {
+            panic!("Expected Set statement");
+        }
+    }
+
+    #[test]
+    fn parse_set_variable_to() {
+        let arena = Bump::new();
+        let mut parser = Parser::new("SET search_path TO public, myschema", &arena);
+        let stmt = parser.parse_statement().unwrap();
+        if let Statement::Set(set) = stmt {
+            assert_eq!(set.name.to_uppercase(), "SEARCH_PATH");
+            assert_eq!(set.value.len(), 2);
+        } else {
+            panic!("Expected Set statement");
+        }
+    }
+
+    #[test]
+    fn parse_set_session_variable() {
+        let arena = Bump::new();
+        let mut parser = Parser::new("SET SESSION timezone = 'UTC'", &arena);
+        let stmt = parser.parse_statement().unwrap();
+        if let Statement::Set(set) = stmt {
+            assert_eq!(set.name.to_uppercase(), "TIMEZONE");
+            assert_eq!(set.scope, SetScope::Session);
+        } else {
+            panic!("Expected Set statement");
+        }
+    }
+
+    #[test]
+    fn parse_set_local_variable() {
+        let arena = Bump::new();
+        let mut parser = Parser::new("SET LOCAL statement_timeout = 5000", &arena);
+        let stmt = parser.parse_statement().unwrap();
+        if let Statement::Set(set) = stmt {
+            assert_eq!(set.name.to_uppercase(), "STATEMENT_TIMEOUT");
+            assert_eq!(set.scope, SetScope::Local);
+        } else {
+            panic!("Expected Set statement");
+        }
+    }
+
+    #[test]
+    fn parse_show_variable() {
+        let arena = Bump::new();
+        let mut parser = Parser::new("SHOW work_mem", &arena);
+        let stmt = parser.parse_statement().unwrap();
+        if let Statement::Show(show) = stmt {
+            assert!(show.name.is_some());
+            assert_eq!(show.name.unwrap().to_uppercase(), "WORK_MEM");
+        } else {
+            panic!("Expected Show statement");
+        }
+    }
+
+    #[test]
+    fn parse_show_all() {
+        let arena = Bump::new();
+        let mut parser = Parser::new("SHOW ALL", &arena);
+        let stmt = parser.parse_statement().unwrap();
+        if let Statement::Show(show) = stmt {
+            assert!(show.name.is_none());
+            assert!(show.all);
+        } else {
+            panic!("Expected Show statement");
+        }
+    }
+
+    #[test]
+    fn parse_reset_variable() {
+        let arena = Bump::new();
+        let mut parser = Parser::new("RESET work_mem", &arena);
+        let stmt = parser.parse_statement().unwrap();
+        if let Statement::Reset(reset) = stmt {
+            assert!(reset.name.is_some());
+            assert_eq!(reset.name.unwrap().to_uppercase(), "WORK_MEM");
+        } else {
+            panic!("Expected Reset statement");
+        }
+    }
+
+    #[test]
+    fn parse_reset_all() {
+        let arena = Bump::new();
+        let mut parser = Parser::new("RESET ALL", &arena);
+        let stmt = parser.parse_statement().unwrap();
+        if let Statement::Reset(reset) = stmt {
+            assert!(reset.name.is_none());
+            assert!(reset.all);
+        } else {
+            panic!("Expected Reset statement");
+        }
+    }
+
+    #[test]
+    fn parse_grant_select_on_table() {
+        let arena = Bump::new();
+        let mut parser = Parser::new("GRANT SELECT ON TABLE users TO admin", &arena);
+        let stmt = parser.parse_statement().unwrap();
+        if let Statement::Grant(grant) = stmt {
+            assert_eq!(grant.privileges.len(), 1);
+            assert!(matches!(grant.privileges[0], Privilege::Select));
+            assert!(grant.object_name.is_some());
+            assert_eq!(grant.grantees.len(), 1);
+        } else {
+            panic!("Expected Grant statement");
+        }
+    }
+
+    #[test]
+    fn parse_grant_multiple_privileges() {
+        let arena = Bump::new();
+        let mut parser = Parser::new(
+            "GRANT SELECT, INSERT, UPDATE ON users TO admin, moderator",
+            &arena,
+        );
+        let stmt = parser.parse_statement().unwrap();
+        if let Statement::Grant(grant) = stmt {
+            assert_eq!(grant.privileges.len(), 3);
+            assert_eq!(grant.grantees.len(), 2);
+        } else {
+            panic!("Expected Grant statement");
+        }
+    }
+
+    #[test]
+    fn parse_grant_all_privileges() {
+        let arena = Bump::new();
+        let mut parser = Parser::new("GRANT ALL PRIVILEGES ON users TO admin", &arena);
+        let stmt = parser.parse_statement().unwrap();
+        if let Statement::Grant(grant) = stmt {
+            assert_eq!(grant.privileges.len(), 1);
+            assert!(matches!(grant.privileges[0], Privilege::All));
+        } else {
+            panic!("Expected Grant statement");
+        }
+    }
+
+    #[test]
+    fn parse_grant_with_grant_option() {
+        let arena = Bump::new();
+        let mut parser = Parser::new("GRANT SELECT ON users TO admin WITH GRANT OPTION", &arena);
+        let stmt = parser.parse_statement().unwrap();
+        if let Statement::Grant(grant) = stmt {
+            assert!(grant.with_grant_option);
+        } else {
+            panic!("Expected Grant statement");
+        }
+    }
+
+    #[test]
+    fn parse_revoke_select_on_table() {
+        let arena = Bump::new();
+        let mut parser = Parser::new("REVOKE SELECT ON users FROM admin", &arena);
+        let stmt = parser.parse_statement().unwrap();
+        if let Statement::Revoke(revoke) = stmt {
+            assert_eq!(revoke.privileges.len(), 1);
+            assert!(matches!(revoke.privileges[0], Privilege::Select));
+            assert_eq!(revoke.grantees.len(), 1);
+        } else {
+            panic!("Expected Revoke statement");
+        }
+    }
+
+    #[test]
+    fn parse_revoke_cascade() {
+        let arena = Bump::new();
+        let mut parser = Parser::new("REVOKE ALL ON users FROM admin CASCADE", &arena);
+        let stmt = parser.parse_statement().unwrap();
+        if let Statement::Revoke(revoke) = stmt {
+            assert!(revoke.cascade);
+        } else {
+            panic!("Expected Revoke statement");
+        }
+    }
 }
 
 pub struct Parser<'a> {
@@ -1004,6 +2268,12 @@ pub struct ParseError<'a> {
     pub span: Span,
     pub line: u32,
     pub column: u32,
+}
+
+#[derive(Debug)]
+pub struct ParseResult<'a> {
+    pub statements: Vec<Statement<'a>>,
+    pub errors: Vec<ParseError<'a>>,
 }
 
 impl<'a> Parser<'a> {
@@ -1101,6 +2371,93 @@ impl<'a> Parser<'a> {
         });
     }
 
+    fn add_error_from_report(&mut self, err: eyre::Report) {
+        let message = self.arena.alloc_str(&err.to_string());
+        self.errors.push(ParseError {
+            message,
+            span: self.lexer.span(),
+            line: self.lexer.line(),
+            column: self.lexer.column(),
+        });
+    }
+
+    fn synchronize(&mut self) {
+        while !self.is_at_end() {
+            if matches!(self.current, Token::Semicolon) {
+                self.advance();
+                return;
+            }
+            match self.current {
+                Token::Keyword(Keyword::Select)
+                | Token::Keyword(Keyword::Insert)
+                | Token::Keyword(Keyword::Update)
+                | Token::Keyword(Keyword::Delete)
+                | Token::Keyword(Keyword::Create)
+                | Token::Keyword(Keyword::Drop)
+                | Token::Keyword(Keyword::Alter)
+                | Token::Keyword(Keyword::Truncate)
+                | Token::Keyword(Keyword::Begin)
+                | Token::Keyword(Keyword::Commit)
+                | Token::Keyword(Keyword::Rollback)
+                | Token::Keyword(Keyword::Explain)
+                | Token::Keyword(Keyword::Call)
+                | Token::Keyword(Keyword::Merge)
+                | Token::Keyword(Keyword::With) => return,
+                _ => {
+                    self.advance();
+                }
+            }
+        }
+    }
+
+    #[allow(dead_code)]
+    fn is_statement_start(&self) -> bool {
+        matches!(
+            self.current,
+            Token::Keyword(Keyword::Select)
+                | Token::Keyword(Keyword::Insert)
+                | Token::Keyword(Keyword::Update)
+                | Token::Keyword(Keyword::Delete)
+                | Token::Keyword(Keyword::Create)
+                | Token::Keyword(Keyword::Drop)
+                | Token::Keyword(Keyword::Alter)
+                | Token::Keyword(Keyword::Truncate)
+                | Token::Keyword(Keyword::Begin)
+                | Token::Keyword(Keyword::Commit)
+                | Token::Keyword(Keyword::Rollback)
+                | Token::Keyword(Keyword::Explain)
+                | Token::Keyword(Keyword::Call)
+                | Token::Keyword(Keyword::Merge)
+                | Token::Keyword(Keyword::With)
+        )
+    }
+
+    pub fn parse_statements(&mut self) -> ParseResult<'a> {
+        let mut statements = Vec::new();
+
+        while !self.is_at_end() {
+            while self.consume_token(&Token::Semicolon) {}
+            if self.is_at_end() {
+                break;
+            }
+
+            match self.parse_statement() {
+                Ok(stmt) => {
+                    statements.push(stmt);
+                }
+                Err(err) => {
+                    self.add_error_from_report(err);
+                    self.synchronize();
+                }
+            }
+        }
+
+        ParseResult {
+            statements,
+            errors: std::mem::take(&mut self.errors),
+        }
+    }
+
     pub fn parse_statement(&mut self) -> Result<Statement<'a>> {
         match self.peek() {
             Token::Keyword(Keyword::Select) | Token::Keyword(Keyword::With) => {
@@ -1123,6 +2480,10 @@ impl<'a> Parser<'a> {
             Token::Keyword(Keyword::Drop) => {
                 let drop = self.parse_drop()?;
                 Ok(Statement::Drop(self.arena.alloc(drop)))
+            }
+            Token::Keyword(Keyword::Truncate) => {
+                let truncate = self.parse_truncate()?;
+                Ok(Statement::Truncate(self.arena.alloc(truncate)))
             }
             Token::Keyword(Keyword::Alter) => self.parse_alter(),
             Token::Keyword(Keyword::Begin) => {
@@ -1148,6 +2509,34 @@ impl<'a> Parser<'a> {
             Token::Keyword(Keyword::Explain) => {
                 let explain = self.parse_explain()?;
                 Ok(Statement::Explain(self.arena.alloc(explain)))
+            }
+            Token::Keyword(Keyword::Call) => {
+                let call = self.parse_call()?;
+                Ok(Statement::Call(self.arena.alloc(call)))
+            }
+            Token::Keyword(Keyword::Merge) => {
+                let merge = self.parse_merge()?;
+                Ok(Statement::Merge(self.arena.alloc(merge)))
+            }
+            Token::Keyword(Keyword::Set) => {
+                let set = self.parse_set()?;
+                Ok(Statement::Set(self.arena.alloc(set)))
+            }
+            Token::Keyword(Keyword::Show) => {
+                let show = self.parse_show()?;
+                Ok(Statement::Show(self.arena.alloc(show)))
+            }
+            Token::Keyword(Keyword::Reset) => {
+                let reset = self.parse_reset()?;
+                Ok(Statement::Reset(self.arena.alloc(reset)))
+            }
+            Token::Keyword(Keyword::Grant) => {
+                let grant = self.parse_grant()?;
+                Ok(Statement::Grant(self.arena.alloc(grant)))
+            }
+            Token::Keyword(Keyword::Revoke) => {
+                let revoke = self.parse_revoke_stmt()?;
+                Ok(Statement::Revoke(self.arena.alloc(revoke)))
             }
             _ => bail!("unexpected token {:?} at start of statement", self.current),
         }
@@ -1203,19 +2592,34 @@ impl<'a> Parser<'a> {
             &[]
         };
 
-        let limit: Option<&Expr<'a>> = if self.consume_keyword(Keyword::Limit) {
+        let mut limit: Option<&Expr<'a>> = if self.consume_keyword(Keyword::Limit) {
             Some(self.arena.alloc(self.parse_expr(0)?))
         } else {
             None
         };
 
         let offset: Option<&Expr<'a>> = if self.consume_keyword(Keyword::Offset) {
-            Some(self.arena.alloc(self.parse_expr(0)?))
+            let expr = self.arena.alloc(self.parse_expr(0)?);
+            self.consume_keyword(Keyword::Rows);
+            self.consume_keyword(Keyword::Row);
+            Some(expr)
         } else {
             None
         };
 
+        if self.consume_keyword(Keyword::Fetch) {
+            self.consume_keyword(Keyword::First);
+            self.consume_keyword(Keyword::Next);
+            let count = self.arena.alloc(self.parse_expr(0)?);
+            self.consume_keyword(Keyword::Rows);
+            self.consume_keyword(Keyword::Row);
+            self.expect_keyword(Keyword::Only)?;
+            limit = Some(count);
+        }
+
         let set_op = self.parse_set_operation()?;
+
+        let for_clause = self.parse_for_clause()?;
 
         Ok(SelectStmt {
             with,
@@ -1229,7 +2633,62 @@ impl<'a> Parser<'a> {
             limit,
             offset,
             set_op,
+            for_clause,
         })
+    }
+
+    fn parse_for_clause(&mut self) -> Result<Option<&'a ForClause<'a>>> {
+        if !self.consume_keyword(Keyword::For) {
+            return Ok(None);
+        }
+
+        let lock_mode = if self.consume_keyword(Keyword::Update) {
+            LockMode::Update
+        } else if self.consume_keyword(Keyword::Share) {
+            LockMode::Share
+        } else if self.consume_keyword(Keyword::No) {
+            self.expect_keyword(Keyword::Key)?;
+            self.expect_keyword(Keyword::Update)?;
+            LockMode::NoKeyUpdate
+        } else if self.consume_keyword(Keyword::Key) {
+            self.expect_keyword(Keyword::Share)?;
+            LockMode::KeyShare
+        } else {
+            bail!(
+                "expected UPDATE, SHARE, NO KEY UPDATE, or KEY SHARE after FOR at line {} column {}",
+                self.lexer.line(),
+                self.lexer.column()
+            )
+        };
+
+        let tables = if self.consume_keyword(Keyword::Of) {
+            let mut table_list = Vec::new();
+            loop {
+                let table_name = self.expect_ident()?;
+                table_list.push(table_name);
+                if !self.consume_token(&Token::Comma) {
+                    break;
+                }
+            }
+            Some(self.arena.alloc_slice_copy(&table_list) as &[&str])
+        } else {
+            None
+        };
+
+        let wait_policy = if self.consume_keyword(Keyword::Nowait) {
+            WaitPolicy::Nowait
+        } else if self.consume_keyword(Keyword::Skip) {
+            self.expect_keyword(Keyword::Locked)?;
+            WaitPolicy::SkipLocked
+        } else {
+            WaitPolicy::Wait
+        };
+
+        Ok(Some(self.arena.alloc(ForClause {
+            lock_mode,
+            tables,
+            wait_policy,
+        })))
     }
 
     fn parse_with_clause(&mut self) -> Result<&'a WithClause<'a>> {
@@ -2251,7 +3710,30 @@ impl<'a> Parser<'a> {
     fn parse_assignments(&mut self) -> Result<&'a [Assignment<'a>]> {
         let mut assignments = Vec::new();
         loop {
-            let column = self.expect_ident()?;
+            let first = self.expect_ident()?;
+            let column = if self.consume_token(&Token::Dot) {
+                let second = self.expect_ident()?;
+                if self.consume_token(&Token::Dot) {
+                    let third = self.expect_ident()?;
+                    ColumnRef {
+                        schema: Some(first),
+                        table: Some(second),
+                        column: third,
+                    }
+                } else {
+                    ColumnRef {
+                        schema: None,
+                        table: Some(first),
+                        column: second,
+                    }
+                }
+            } else {
+                ColumnRef {
+                    schema: None,
+                    table: None,
+                    column: first,
+                }
+            };
             self.expect_token(&Token::Eq)?;
             let value = self.parse_expr(0)?;
             assignments.push(Assignment {
@@ -2319,6 +3801,13 @@ impl<'a> Parser<'a> {
     fn parse_create(&mut self) -> Result<Statement<'a>> {
         self.expect_keyword(Keyword::Create)?;
 
+        let or_replace = if self.consume_keyword(Keyword::Or) {
+            self.expect_keyword(Keyword::Replace)?;
+            true
+        } else {
+            false
+        };
+
         if self.consume_keyword(Keyword::Table) {
             let stmt = self.parse_create_table()?;
             Ok(Statement::CreateTable(self.arena.alloc(stmt)))
@@ -2332,8 +3821,30 @@ impl<'a> Parser<'a> {
         } else if self.consume_keyword(Keyword::Schema) {
             let stmt = self.parse_create_schema()?;
             Ok(Statement::CreateSchema(self.arena.alloc(stmt)))
+        } else if self.consume_keyword(Keyword::View) {
+            let stmt = self.parse_create_view(or_replace, false)?;
+            Ok(Statement::CreateView(self.arena.alloc(stmt)))
+        } else if self.consume_keyword(Keyword::Materialized) {
+            self.expect_keyword(Keyword::View)?;
+            let stmt = self.parse_create_view(or_replace, true)?;
+            Ok(Statement::CreateView(self.arena.alloc(stmt)))
+        } else if self.consume_keyword(Keyword::Function) {
+            let stmt = self.parse_create_function(or_replace)?;
+            Ok(Statement::CreateFunction(self.arena.alloc(stmt)))
+        } else if self.consume_keyword(Keyword::Procedure) {
+            let stmt = self.parse_create_procedure(or_replace)?;
+            Ok(Statement::CreateProcedure(self.arena.alloc(stmt)))
+        } else if self.consume_keyword(Keyword::Trigger) {
+            let stmt = self.parse_create_trigger(or_replace)?;
+            Ok(Statement::CreateTrigger(self.arena.alloc(stmt)))
+        } else if self.consume_keyword(Keyword::Type) {
+            let stmt = self.parse_create_type()?;
+            Ok(Statement::CreateType(self.arena.alloc(stmt)))
+        } else if self.consume_keyword(Keyword::Domain) {
+            let stmt = self.parse_create_domain()?;
+            Ok(Statement::CreateType(self.arena.alloc(stmt)))
         } else {
-            bail!("expected TABLE, INDEX, or SCHEMA after CREATE");
+            bail!("expected TABLE, INDEX, SCHEMA, VIEW, MATERIALIZED, FUNCTION, PROCEDURE, TRIGGER, TYPE, or DOMAIN after CREATE");
         }
     }
 
@@ -2625,6 +4136,394 @@ impl<'a> Parser<'a> {
         })
     }
 
+    fn parse_create_view(
+        &mut self,
+        or_replace: bool,
+        materialized: bool,
+    ) -> Result<CreateViewStmt<'a>> {
+        let name = self.expect_ident()?;
+        let (schema, view_name) = if self.consume_token(&Token::Dot) {
+            (Some(name), self.expect_ident()?)
+        } else {
+            (None, name)
+        };
+
+        let columns = if self.consume_token(&Token::LParen) {
+            let cols = self.parse_ident_list()?;
+            self.expect_token(&Token::RParen)?;
+            Some(cols)
+        } else {
+            None
+        };
+
+        self.expect_keyword(Keyword::As)?;
+        let query = self.parse_select()?;
+
+        let with_check_option = if self.consume_keyword(Keyword::With) {
+            self.consume_keyword(Keyword::Cascaded);
+            self.consume_keyword(Keyword::Local);
+            self.expect_keyword(Keyword::Check)?;
+            self.expect_keyword(Keyword::Option)?;
+            true
+        } else {
+            false
+        };
+
+        Ok(CreateViewStmt {
+            or_replace,
+            materialized,
+            schema,
+            name: view_name,
+            columns,
+            query: self.arena.alloc(query),
+            with_check_option,
+        })
+    }
+
+    fn parse_create_function(&mut self, or_replace: bool) -> Result<CreateFunctionStmt<'a>> {
+        let name = self.expect_ident()?;
+        let (schema, func_name) = if self.consume_token(&Token::Dot) {
+            (Some(name), self.expect_ident()?)
+        } else {
+            (None, name)
+        };
+
+        self.expect_token(&Token::LParen)?;
+        let mut params = Vec::new();
+        if !self.check_token(&Token::RParen) {
+            loop {
+                let param_name = self.expect_ident()?;
+                let data_type = self.parse_data_type()?;
+                params.push(FunctionParam {
+                    name: param_name,
+                    data_type,
+                });
+                if !self.consume_token(&Token::Comma) {
+                    break;
+                }
+            }
+        }
+        self.expect_token(&Token::RParen)?;
+
+        self.expect_keyword(Keyword::Returns)?;
+        let return_type = self.parse_data_type()?;
+
+        self.expect_keyword(Keyword::As)?;
+        let body = self.parse_function_body()?;
+
+        self.expect_keyword(Keyword::Language)?;
+        let language = self.expect_ident()?;
+
+        Ok(CreateFunctionStmt {
+            or_replace,
+            schema,
+            name: func_name,
+            params: self.arena.alloc_slice_copy(&params),
+            return_type,
+            body,
+            language,
+        })
+    }
+
+    fn parse_function_body(&mut self) -> Result<&'a str> {
+        match &self.current {
+            Token::String(s) => {
+                let body = *s;
+                self.advance();
+                Ok(body)
+            }
+            _ => bail!("expected function body (string or $$ ... $$)"),
+        }
+    }
+
+    fn parse_create_procedure(&mut self, or_replace: bool) -> Result<CreateProcedureStmt<'a>> {
+        let name = self.expect_ident()?;
+        let (schema, proc_name) = if self.consume_token(&Token::Dot) {
+            (Some(name), self.expect_ident()?)
+        } else {
+            (None, name)
+        };
+
+        self.expect_token(&Token::LParen)?;
+        let mut params = Vec::new();
+        if !self.check_token(&Token::RParen) {
+            loop {
+                let param_name = self.expect_ident()?;
+                let data_type = self.parse_data_type()?;
+                params.push(FunctionParam {
+                    name: param_name,
+                    data_type,
+                });
+                if !self.consume_token(&Token::Comma) {
+                    break;
+                }
+            }
+        }
+        self.expect_token(&Token::RParen)?;
+
+        self.expect_keyword(Keyword::As)?;
+        let body = self.parse_function_body()?;
+
+        self.expect_keyword(Keyword::Language)?;
+        let language = self.expect_ident()?;
+
+        Ok(CreateProcedureStmt {
+            or_replace,
+            schema,
+            name: proc_name,
+            params: self.arena.alloc_slice_copy(&params),
+            body,
+            language,
+        })
+    }
+
+    fn parse_create_trigger(&mut self, or_replace: bool) -> Result<CreateTriggerStmt<'a>> {
+        let name = self.expect_ident()?;
+
+        let timing = if self.consume_keyword(Keyword::Before) {
+            TriggerTiming::Before
+        } else if self.consume_keyword(Keyword::After) {
+            TriggerTiming::After
+        } else if self.consume_keyword(Keyword::Instead) {
+            self.expect_keyword(Keyword::Of)?;
+            TriggerTiming::InsteadOf
+        } else {
+            bail!("expected BEFORE, AFTER, or INSTEAD OF");
+        };
+
+        let mut events = Vec::new();
+        loop {
+            if self.consume_keyword(Keyword::Insert) {
+                events.push(TriggerEvent::Insert);
+            } else if self.consume_keyword(Keyword::Update) {
+                events.push(TriggerEvent::Update);
+            } else if self.consume_keyword(Keyword::Delete) {
+                events.push(TriggerEvent::Delete);
+            } else if self.consume_keyword(Keyword::Truncate) {
+                events.push(TriggerEvent::Truncate);
+            } else {
+                bail!("expected INSERT, UPDATE, DELETE, or TRUNCATE");
+            }
+            if !self.consume_keyword(Keyword::Or) {
+                break;
+            }
+        }
+
+        self.expect_keyword(Keyword::On)?;
+        let table = self.expect_ident()?;
+
+        let for_each_row = if self.consume_keyword(Keyword::For) {
+            self.expect_keyword(Keyword::Each)?;
+            self.consume_keyword(Keyword::Row);
+            self.consume_keyword(Keyword::Statement);
+            true
+        } else {
+            false
+        };
+
+        self.expect_keyword(Keyword::Execute)?;
+        self.consume_keyword(Keyword::Function);
+        self.consume_keyword(Keyword::Procedure);
+        let function_name = self.expect_ident()?;
+        self.expect_token(&Token::LParen)?;
+        self.expect_token(&Token::RParen)?;
+
+        Ok(CreateTriggerStmt {
+            or_replace,
+            name,
+            timing,
+            events: self.arena.alloc_slice_copy(&events),
+            table,
+            for_each_row,
+            function_name,
+        })
+    }
+
+    fn parse_create_type(&mut self) -> Result<CreateTypeStmt<'a>> {
+        let name = self.expect_ident()?;
+        let (schema, type_name) = if self.consume_token(&Token::Dot) {
+            (Some(name), self.expect_ident()?)
+        } else {
+            (None, name)
+        };
+
+        self.expect_keyword(Keyword::As)?;
+
+        let definition = if self.consume_keyword(Keyword::Enum) {
+            self.expect_token(&Token::LParen)?;
+            let mut values = Vec::new();
+            loop {
+                if let Token::String(s) = &self.current {
+                    values.push(*s);
+                    self.advance();
+                } else {
+                    bail!("expected string literal for enum value");
+                }
+                if !self.consume_token(&Token::Comma) {
+                    break;
+                }
+            }
+            self.expect_token(&Token::RParen)?;
+            TypeDefinition::Enum(self.arena.alloc_slice_copy(&values))
+        } else {
+            self.expect_token(&Token::LParen)?;
+            let mut fields = Vec::new();
+            loop {
+                let field_name = self.expect_ident()?;
+                let data_type = self.parse_data_type()?;
+                fields.push(TypeField {
+                    name: field_name,
+                    data_type,
+                });
+                if !self.consume_token(&Token::Comma) {
+                    break;
+                }
+            }
+            self.expect_token(&Token::RParen)?;
+            TypeDefinition::Composite(self.arena.alloc_slice_copy(&fields))
+        };
+
+        Ok(CreateTypeStmt {
+            schema,
+            name: type_name,
+            definition,
+        })
+    }
+
+    fn parse_create_domain(&mut self) -> Result<CreateTypeStmt<'a>> {
+        let name = self.expect_ident()?;
+        let (schema, type_name) = if self.consume_token(&Token::Dot) {
+            (Some(name), self.expect_ident()?)
+        } else {
+            (None, name)
+        };
+
+        self.expect_keyword(Keyword::As)?;
+        let base_type = self.parse_data_type()?;
+
+        Ok(CreateTypeStmt {
+            schema,
+            name: type_name,
+            definition: TypeDefinition::Domain(base_type),
+        })
+    }
+
+    fn parse_call(&mut self) -> Result<CallStmt<'a>> {
+        self.expect_keyword(Keyword::Call)?;
+        let name = self.expect_ident()?;
+        let (schema, proc_name) = if self.consume_token(&Token::Dot) {
+            (Some(name), self.expect_ident()?)
+        } else {
+            (None, name)
+        };
+
+        self.expect_token(&Token::LParen)?;
+        let mut args: Vec<&'a Expr<'a>> = Vec::new();
+        if !self.check_token(&Token::RParen) {
+            loop {
+                let expr = self.parse_expr(0)?;
+                let expr_ref: &'a Expr<'a> = self.arena.alloc(expr);
+                args.push(expr_ref);
+                if !self.consume_token(&Token::Comma) {
+                    break;
+                }
+            }
+        }
+        self.expect_token(&Token::RParen)?;
+
+        Ok(CallStmt {
+            schema,
+            name: proc_name,
+            args: self.arena.alloc_slice_copy(&args),
+        })
+    }
+
+    fn parse_merge(&mut self) -> Result<MergeStmt<'a>> {
+        self.expect_keyword(Keyword::Merge)?;
+        self.expect_keyword(Keyword::Into)?;
+
+        let target_table = self.expect_ident()?;
+        let target_alias = if !self.check_keyword(Keyword::Using) {
+            self.consume_keyword(Keyword::As);
+            if let Token::Ident(alias) = &self.current {
+                let a = *alias;
+                self.advance();
+                Some(a)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        self.expect_keyword(Keyword::Using)?;
+        let source_name = self.expect_ident()?;
+        let source_alias = if !self.check_keyword(Keyword::On) {
+            self.consume_keyword(Keyword::As);
+            if let Token::Ident(alias) = &self.current {
+                let a = *alias;
+                self.advance();
+                Some(a)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        let source = MergeSource::Table {
+            name: source_name,
+            alias: source_alias,
+        };
+
+        self.expect_keyword(Keyword::On)?;
+        let on_condition = self.parse_expr(0)?;
+        let on_condition_ref: &'a Expr<'a> = self.arena.alloc(on_condition);
+
+        let mut clauses = Vec::new();
+        while self.consume_keyword(Keyword::When) {
+            let is_not = self.consume_keyword(Keyword::Not);
+            self.expect_keyword(Keyword::Matched)?;
+            self.expect_keyword(Keyword::Then)?;
+
+            if is_not {
+                self.expect_keyword(Keyword::Insert)?;
+                let columns = if self.consume_token(&Token::LParen) {
+                    let cols = self.parse_ident_list()?;
+                    self.expect_token(&Token::RParen)?;
+                    Some(cols)
+                } else {
+                    None
+                };
+                self.expect_keyword(Keyword::Values)?;
+                self.expect_token(&Token::LParen)?;
+                let values = self.parse_expr_list()?;
+                self.expect_token(&Token::RParen)?;
+                let values_refs: Vec<&'a Expr<'a>> =
+                    values.iter().map(|e| *e as &'a Expr<'a>).collect();
+                clauses.push(MergeClause::NotMatchedInsert {
+                    columns,
+                    values: self.arena.alloc_slice_copy(&values_refs),
+                });
+            } else if self.consume_keyword(Keyword::Update) {
+                self.expect_keyword(Keyword::Set)?;
+                let assignments = self.parse_assignments()?;
+                clauses.push(MergeClause::MatchedUpdate(assignments));
+            } else if self.consume_keyword(Keyword::Delete) {
+                clauses.push(MergeClause::MatchedDelete);
+            } else {
+                bail!("expected UPDATE, DELETE, or INSERT in MERGE clause");
+            }
+        }
+
+        Ok(MergeStmt {
+            target_table,
+            target_alias,
+            source,
+            on_condition: on_condition_ref,
+            clauses: self.arena.alloc_slice_copy(&clauses),
+        })
+    }
+
     fn parse_drop(&mut self) -> Result<DropStmt<'a>> {
         self.expect_keyword(Keyword::Drop)?;
 
@@ -2679,6 +4578,38 @@ impl<'a> Parser<'a> {
             object_type,
             if_exists,
             names: self.arena.alloc_slice_copy(&names),
+            cascade,
+        })
+    }
+
+    fn parse_truncate(&mut self) -> Result<TruncateStmt<'a>> {
+        self.expect_keyword(Keyword::Truncate)?;
+        self.consume_keyword(Keyword::Table);
+
+        let mut tables = Vec::new();
+        loop {
+            let table = self.parse_table_name()?;
+            tables.push(table);
+            if !self.consume_token(&Token::Comma) {
+                break;
+            }
+        }
+
+        let restart_identity = if self.consume_keyword(Keyword::Restart) {
+            self.expect_keyword(Keyword::Identity)?;
+            true
+        } else {
+            self.consume_keyword(Keyword::Continue);
+            self.consume_keyword(Keyword::Identity);
+            false
+        };
+
+        let cascade = self.consume_keyword(Keyword::Cascade);
+        self.consume_keyword(Keyword::Restrict);
+
+        Ok(TruncateStmt {
+            tables: self.arena.alloc_slice_copy(&tables),
+            restart_identity,
             cascade,
         })
     }
@@ -3042,5 +4973,225 @@ impl<'a> Parser<'a> {
             format,
             statement: self.arena.alloc(statement),
         })
+    }
+
+    fn parse_set(&mut self) -> Result<SetStmt<'a>> {
+        self.expect_keyword(Keyword::Set)?;
+
+        let scope = if self.consume_keyword(Keyword::Session) {
+            SetScope::Session
+        } else if self.consume_keyword(Keyword::Local) {
+            SetScope::Local
+        } else if self.consume_keyword(Keyword::Global) {
+            SetScope::Global
+        } else {
+            SetScope::Session
+        };
+
+        let name = self.expect_ident()?;
+
+        if !self.consume_token(&Token::Eq) {
+            self.expect_keyword(Keyword::To)?;
+        }
+
+        let mut values = Vec::new();
+        loop {
+            let expr = self.parse_expr(0)?;
+            values.push(self.arena.alloc(expr) as &Expr<'a>);
+            if !self.consume_token(&Token::Comma) {
+                break;
+            }
+        }
+
+        let value = self.arena.alloc_slice_copy(&values);
+
+        Ok(SetStmt { scope, name, value })
+    }
+
+    fn parse_show(&mut self) -> Result<ShowStmt<'a>> {
+        self.expect_keyword(Keyword::Show)?;
+
+        if self.consume_keyword(Keyword::All) {
+            Ok(ShowStmt {
+                name: None,
+                all: true,
+            })
+        } else {
+            let name = self.expect_ident()?;
+            Ok(ShowStmt {
+                name: Some(name),
+                all: false,
+            })
+        }
+    }
+
+    fn parse_reset(&mut self) -> Result<ResetStmt<'a>> {
+        self.expect_keyword(Keyword::Reset)?;
+
+        if self.consume_keyword(Keyword::All) {
+            Ok(ResetStmt {
+                name: None,
+                all: true,
+            })
+        } else {
+            let name = self.expect_ident()?;
+            Ok(ResetStmt {
+                name: Some(name),
+                all: false,
+            })
+        }
+    }
+
+    fn parse_grant(&mut self) -> Result<GrantStmt<'a>> {
+        self.expect_keyword(Keyword::Grant)?;
+
+        let privileges = self.parse_privileges()?;
+
+        self.expect_keyword(Keyword::On)?;
+
+        let object_type = self.parse_object_type();
+
+        let object_name = if !self.check_keyword(Keyword::To) {
+            Some(self.parse_table_name()?)
+        } else {
+            None
+        };
+
+        self.expect_keyword(Keyword::To)?;
+
+        let grantees = self.parse_grantee_list()?;
+
+        let with_grant_option = if self.consume_keyword(Keyword::With) {
+            self.expect_keyword(Keyword::Grant)?;
+            self.expect_keyword(Keyword::Option)?;
+            true
+        } else {
+            false
+        };
+
+        Ok(GrantStmt {
+            privileges,
+            object_type,
+            object_name,
+            grantees,
+            with_grant_option,
+        })
+    }
+
+    fn parse_revoke_stmt(&mut self) -> Result<RevokeStmt<'a>> {
+        self.expect_keyword(Keyword::Revoke)?;
+
+        let privileges = self.parse_privileges()?;
+
+        self.expect_keyword(Keyword::On)?;
+
+        let object_type = self.parse_object_type();
+
+        let object_name = if !self.check_keyword(Keyword::From) {
+            Some(self.parse_table_name()?)
+        } else {
+            None
+        };
+
+        self.expect_keyword(Keyword::From)?;
+
+        let grantees = self.parse_grantee_list()?;
+
+        let cascade = self.consume_keyword(Keyword::Cascade);
+        self.consume_keyword(Keyword::Restrict);
+
+        Ok(RevokeStmt {
+            privileges,
+            object_type,
+            object_name,
+            grantees,
+            cascade,
+        })
+    }
+
+    fn parse_privileges(&mut self) -> Result<&'a [Privilege]> {
+        let mut privileges = Vec::new();
+
+        if self.consume_keyword(Keyword::All) {
+            self.consume_keyword(Keyword::Privileges);
+            privileges.push(Privilege::All);
+        } else {
+            loop {
+                let priv_kw = self.parse_privilege()?;
+                privileges.push(priv_kw);
+                if !self.consume_token(&Token::Comma) {
+                    break;
+                }
+            }
+        }
+
+        Ok(self.arena.alloc_slice_copy(&privileges))
+    }
+
+    fn parse_privilege(&mut self) -> Result<Privilege> {
+        if self.consume_keyword(Keyword::Select) {
+            Ok(Privilege::Select)
+        } else if self.consume_keyword(Keyword::Insert) {
+            Ok(Privilege::Insert)
+        } else if self.consume_keyword(Keyword::Update) {
+            Ok(Privilege::Update)
+        } else if self.consume_keyword(Keyword::Delete) {
+            Ok(Privilege::Delete)
+        } else if self.consume_keyword(Keyword::Truncate) {
+            Ok(Privilege::Truncate)
+        } else if self.consume_keyword(Keyword::References) {
+            Ok(Privilege::References)
+        } else if self.consume_keyword(Keyword::Trigger) {
+            Ok(Privilege::Trigger)
+        } else if self.consume_keyword(Keyword::Create) {
+            Ok(Privilege::Create)
+        } else if self.consume_keyword(Keyword::Execute) {
+            Ok(Privilege::Execute)
+        } else if self.consume_keyword(Keyword::Usage) {
+            Ok(Privilege::Usage)
+        } else if self.consume_keyword(Keyword::All) {
+            self.consume_keyword(Keyword::Privileges);
+            Ok(Privilege::All)
+        } else {
+            bail!("expected privilege keyword, found {:?}", self.current)
+        }
+    }
+
+    fn parse_object_type(&mut self) -> Option<ObjectType> {
+        if self.consume_keyword(Keyword::Table) {
+            Some(ObjectType::Table)
+        } else if self.consume_keyword(Keyword::Schema) {
+            Some(ObjectType::Schema)
+        } else if self.consume_keyword(Keyword::Database) {
+            Some(ObjectType::Database)
+        } else if self.consume_keyword(Keyword::Sequence) {
+            Some(ObjectType::Sequence)
+        } else if self.consume_keyword(Keyword::Function) {
+            Some(ObjectType::Function)
+        } else if self.consume_keyword(Keyword::Procedure) {
+            Some(ObjectType::Procedure)
+        } else if self.consume_keyword(Keyword::Type) {
+            Some(ObjectType::Type)
+        } else if self.consume_keyword(Keyword::Domain) {
+            Some(ObjectType::Domain)
+        } else if self.consume_keyword(Keyword::View) {
+            Some(ObjectType::View)
+        } else {
+            None
+        }
+    }
+
+    fn parse_grantee_list(&mut self) -> Result<&'a [&'a str]> {
+        let mut grantees = Vec::new();
+
+        loop {
+            let grantee = self.expect_ident()?;
+            grantees.push(grantee);
+            if !self.consume_token(&Token::Comma) {
+                break;
+            }
+        }
+
+        Ok(self.arena.alloc_slice_copy(&grantees))
     }
 }
