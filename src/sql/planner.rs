@@ -674,6 +674,10 @@ impl<'a> Planner<'a> {
                 Ok(physical)
             }
             LogicalOperator::Filter(filter) => {
+                if let Some(index_scan) = self.try_optimize_filter_to_index_scan(filter) {
+                    return Ok(index_scan);
+                }
+
                 let input = self.logical_to_physical(filter.input)?;
                 let physical = self.arena.alloc(PhysicalOperator::FilterExec(PhysicalFilterExec {
                     input,
@@ -790,6 +794,125 @@ impl<'a> Planner<'a> {
         }
 
         result.into_bump_slice()
+    }
+
+    fn try_optimize_filter_to_index_scan(
+        &self,
+        filter: &LogicalFilter<'a>,
+    ) -> Option<&'a PhysicalOperator<'a>> {
+        let scan = match filter.input {
+            LogicalOperator::Scan(s) => s,
+            _ => return None,
+        };
+
+        let table_name = if let Some(schema) = scan.schema {
+            let full_name = self
+                .arena
+                .alloc_str(&format!("{}.{}", schema, scan.table));
+            full_name
+        } else {
+            scan.table
+        };
+
+        let table_def = self.catalog.resolve_table(table_name).ok()?;
+
+        let filter_columns = self.extract_filter_columns(filter.predicate);
+        let best_index = self.select_best_index(table_def, &filter_columns)?;
+
+        let first_index_col = best_index.columns().first()?;
+        let bounds = self.extract_scan_bounds_for_column(filter.predicate, first_index_col);
+        let scan_type = self.bounds_to_scan_type(&bounds);
+
+        if scan_type == ScanBoundType::Full {
+            return None;
+        }
+
+        let key_range = match scan_type {
+            ScanBoundType::Point => ScanRange::PrefixScan {
+                prefix: &[],
+            },
+            ScanBoundType::Range => ScanRange::RangeScan {
+                start: None,
+                end: None,
+            },
+            ScanBoundType::Full => ScanRange::FullScan,
+        };
+
+        let residual = self.compute_residual_filter(filter.predicate, best_index.columns());
+
+        let index_scan =
+            self.arena
+                .alloc(PhysicalOperator::IndexScan(PhysicalIndexScan {
+                    schema: scan.schema,
+                    table: scan.table,
+                    index_name: best_index.name(),
+                    key_range,
+                    residual_filter: residual,
+                }));
+
+        Some(index_scan)
+    }
+
+    fn compute_residual_filter(
+        &self,
+        predicate: &'a Expr<'a>,
+        index_columns: &[String],
+    ) -> Option<&'a Expr<'a>> {
+        use crate::sql::ast::BinaryOperator;
+
+        match predicate {
+            Expr::BinaryOp { left, op, right } => match op {
+                BinaryOperator::And => {
+                    let left_residual = self.compute_residual_filter(left, index_columns);
+                    let right_residual = self.compute_residual_filter(right, index_columns);
+
+                    match (left_residual, right_residual) {
+                        (Some(l), Some(r)) => Some(self.arena.alloc(Expr::BinaryOp {
+                            left: l,
+                            op: BinaryOperator::And,
+                            right: r,
+                        })),
+                        (Some(l), None) => Some(l),
+                        (None, Some(r)) => Some(r),
+                        (None, None) => None,
+                    }
+                }
+                BinaryOperator::Eq
+                | BinaryOperator::Lt
+                | BinaryOperator::LtEq
+                | BinaryOperator::Gt
+                | BinaryOperator::GtEq => {
+                    if self.predicate_uses_index_column(predicate, index_columns) {
+                        None
+                    } else {
+                        Some(predicate)
+                    }
+                }
+                _ => Some(predicate),
+            },
+            Expr::Between { expr, .. } => {
+                if self.predicate_uses_index_column(expr, index_columns) {
+                    None
+                } else {
+                    Some(predicate)
+                }
+            }
+            _ => Some(predicate),
+        }
+    }
+
+    fn predicate_uses_index_column(&self, expr: &Expr<'a>, index_columns: &[String]) -> bool {
+        match expr {
+            Expr::Column(col_ref) => index_columns
+                .iter()
+                .any(|c| c.eq_ignore_ascii_case(col_ref.column)),
+            Expr::BinaryOp { left, right, .. } => {
+                self.predicate_uses_index_column(left, index_columns)
+                    || self.predicate_uses_index_column(right, index_columns)
+            }
+            Expr::Between { expr, .. } => self.predicate_uses_index_column(expr, index_columns),
+            _ => false,
+        }
     }
 
     pub fn extract_filter_columns(&self, expr: &Expr<'a>) -> Vec<&'a str> {
@@ -3286,5 +3409,146 @@ mod tests {
         } else {
             panic!("Expected BinaryOp");
         }
+    }
+
+    #[test]
+    fn optimize_filter_scan_with_index() {
+        use crate::records::types::DataType;
+        use crate::schema::table::{ColumnDef, IndexDef, IndexType, TableDef};
+        use crate::sql::ast::{BinaryOperator, ColumnRef, Literal};
+
+        let arena = Bump::new();
+        let mut catalog = Catalog::new();
+
+        let columns = vec![
+            ColumnDef::new("id", DataType::Int8),
+            ColumnDef::new("name", DataType::Text),
+        ];
+        let mut table = TableDef::new(1, "users", columns);
+        let index = IndexDef::new("idx_id", vec!["id"], true, IndexType::BTree);
+        table = table.with_index(index);
+
+        let schema = catalog.get_schema_mut("root").unwrap();
+        schema.add_table(table);
+
+        let planner = Planner::new(&catalog, &arena);
+
+        let scan = arena.alloc(LogicalOperator::Scan(LogicalScan {
+            schema: None,
+            table: "users",
+            alias: None,
+        }));
+
+        let id_col = arena.alloc(Expr::Column(ColumnRef {
+            schema: None,
+            table: None,
+            column: "id",
+        }));
+        let val = arena.alloc(Expr::Literal(Literal::Integer("42")));
+        let predicate = arena.alloc(Expr::BinaryOp {
+            left: id_col,
+            op: BinaryOperator::Eq,
+            right: val,
+        });
+
+        let filter = LogicalFilter {
+            input: scan,
+            predicate,
+        };
+
+        let result = planner.try_optimize_filter_to_index_scan(&filter);
+        assert!(result.is_some());
+
+        if let Some(PhysicalOperator::IndexScan(index_scan)) = result {
+            assert_eq!(index_scan.index_name, "idx_id");
+            assert_eq!(index_scan.table, "users");
+        } else {
+            panic!("Expected IndexScan");
+        }
+    }
+
+    #[test]
+    fn optimize_filter_scan_no_index_fallback() {
+        use crate::sql::ast::{BinaryOperator, ColumnRef, Literal};
+
+        let arena = Bump::new();
+        let catalog = Catalog::new();
+        let planner = Planner::new(&catalog, &arena);
+
+        let scan = arena.alloc(LogicalOperator::Scan(LogicalScan {
+            schema: None,
+            table: "nonexistent",
+            alias: None,
+        }));
+
+        let id_col = arena.alloc(Expr::Column(ColumnRef {
+            schema: None,
+            table: None,
+            column: "id",
+        }));
+        let val = arena.alloc(Expr::Literal(Literal::Integer("42")));
+        let predicate = arena.alloc(Expr::BinaryOp {
+            left: id_col,
+            op: BinaryOperator::Eq,
+            right: val,
+        });
+
+        let filter = LogicalFilter {
+            input: scan,
+            predicate,
+        };
+
+        let result = planner.try_optimize_filter_to_index_scan(&filter);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn compute_residual_filter_removes_indexed_predicate() {
+        use crate::sql::ast::{BinaryOperator, ColumnRef, Literal};
+
+        let arena = Bump::new();
+        let catalog = Catalog::new();
+        let planner = Planner::new(&catalog, &arena);
+
+        let id_col = arena.alloc(Expr::Column(ColumnRef {
+            schema: None,
+            table: None,
+            column: "id",
+        }));
+        let val = arena.alloc(Expr::Literal(Literal::Integer("42")));
+        let predicate = arena.alloc(Expr::BinaryOp {
+            left: id_col,
+            op: BinaryOperator::Eq,
+            right: val,
+        });
+
+        let index_columns = vec!["id".to_string()];
+        let residual = planner.compute_residual_filter(predicate, &index_columns);
+        assert!(residual.is_none());
+    }
+
+    #[test]
+    fn compute_residual_filter_keeps_non_indexed_predicate() {
+        use crate::sql::ast::{BinaryOperator, ColumnRef, Literal};
+
+        let arena = Bump::new();
+        let catalog = Catalog::new();
+        let planner = Planner::new(&catalog, &arena);
+
+        let name_col = arena.alloc(Expr::Column(ColumnRef {
+            schema: None,
+            table: None,
+            column: "name",
+        }));
+        let val = arena.alloc(Expr::Literal(Literal::String("John")));
+        let predicate = arena.alloc(Expr::BinaryOp {
+            left: name_col,
+            op: BinaryOperator::Eq,
+            right: val,
+        });
+
+        let index_columns = vec!["id".to_string()];
+        let residual = planner.compute_residual_filter(predicate, &index_columns);
+        assert!(residual.is_some());
     }
 }
