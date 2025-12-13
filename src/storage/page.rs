@@ -95,6 +95,7 @@ pub enum PageType {
     HnswMeta = 0x11,
     Overflow = 0x20,
     FreeList = 0x30,
+    Undo = 0x40,
 }
 
 impl PageType {
@@ -106,6 +107,7 @@ impl PageType {
             0x11 => PageType::HnswMeta,
             0x20 => PageType::Overflow,
             0x30 => PageType::FreeList,
+            0x40 => PageType::Undo,
             _ => PageType::Unknown,
         }
     }
@@ -306,6 +308,7 @@ mod tests {
         assert_eq!(PageType::from_byte(0x11), PageType::HnswMeta);
         assert_eq!(PageType::from_byte(0x20), PageType::Overflow);
         assert_eq!(PageType::from_byte(0x30), PageType::FreeList);
+        assert_eq!(PageType::from_byte(0x40), PageType::Undo);
         assert_eq!(PageType::from_byte(0xFF), PageType::Unknown);
     }
 
