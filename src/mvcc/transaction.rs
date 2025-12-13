@@ -140,6 +140,17 @@ impl TransactionManager {
     pub fn abort_txn(&self, slot_idx: usize) {
         self.active_slots[slot_idx].store(0, Ordering::SeqCst);
     }
+
+    pub fn get_global_watermark(&self) -> TxnId {
+        let mut min_ts = self.global_ts.load(Ordering::Relaxed);
+        for slot in &self.active_slots {
+            let ts = slot.load(Ordering::Relaxed);
+            if ts != 0 && ts < min_ts {
+                min_ts = ts;
+            }
+        }
+        min_ts
+    }
 }
 
 impl Default for TransactionManager {
