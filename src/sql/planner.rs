@@ -522,9 +522,38 @@ impl<'a> Planner<'a> {
 
     fn extract_aggregates(
         &self,
-        _columns: &'a [crate::sql::ast::SelectColumn<'a>],
+        columns: &'a [crate::sql::ast::SelectColumn<'a>],
     ) -> &'a [&'a Expr<'a>] {
-        &[]
+        use crate::sql::ast::SelectColumn;
+
+        let mut aggregates = bumpalo::collections::Vec::new_in(self.arena);
+
+        for col in columns {
+            if let SelectColumn::Expr { expr, .. } = col {
+                if self.is_aggregate_function(expr) {
+                    aggregates.push(*expr);
+                }
+            }
+        }
+
+        aggregates.into_bump_slice()
+    }
+
+    fn is_aggregate_function(&self, expr: &Expr<'a>) -> bool {
+        use crate::sql::ast::FunctionCall;
+
+        if let Expr::Function(FunctionCall { name, over, .. }) = expr {
+            if over.is_some() {
+                return false;
+            }
+            let func_name = name.name.to_ascii_lowercase();
+            matches!(
+                func_name.as_str(),
+                "count" | "sum" | "avg" | "min" | "max"
+            )
+        } else {
+            false
+        }
     }
 
     fn extract_select_expressions(
@@ -716,9 +745,51 @@ impl<'a> Planner<'a> {
 
     fn convert_aggregates_to_physical(
         &self,
-        _aggregates: &'a [&'a Expr<'a>],
+        aggregates: &'a [&'a Expr<'a>],
     ) -> &'a [AggregateExpr<'a>] {
-        &[]
+        use crate::sql::ast::{FunctionArgs, FunctionCall};
+
+        let mut result = bumpalo::collections::Vec::new_in(self.arena);
+
+        for expr in aggregates {
+            if let Expr::Function(FunctionCall {
+                name,
+                args,
+                distinct,
+                ..
+            }) = expr
+            {
+                let func_name = name.name.to_ascii_lowercase();
+                let function = match func_name.as_str() {
+                    "count" => AggregateFunction::Count,
+                    "sum" => AggregateFunction::Sum,
+                    "avg" => AggregateFunction::Avg,
+                    "min" => AggregateFunction::Min,
+                    "max" => AggregateFunction::Max,
+                    _ => continue,
+                };
+
+                let argument = match args {
+                    FunctionArgs::Star => None,
+                    FunctionArgs::None => None,
+                    FunctionArgs::Args(func_args) => {
+                        if func_args.is_empty() {
+                            None
+                        } else {
+                            Some(func_args[0].value)
+                        }
+                    }
+                };
+
+                result.push(AggregateExpr {
+                    function,
+                    argument,
+                    distinct: *distinct,
+                });
+            }
+        }
+
+        result.into_bump_slice()
     }
 
     pub fn extract_filter_columns(&self, expr: &Expr<'a>) -> Vec<&'a str> {
@@ -2237,5 +2308,323 @@ mod tests {
 
         let plan = physical.unwrap();
         assert!(matches!(plan.root, PhysicalOperator::HashAggregate(_)));
+    }
+
+    #[test]
+    fn extract_aggregates_count_star() {
+        use crate::sql::ast::{FunctionArgs, FunctionCall, FunctionName, SelectColumn};
+
+        let arena = Bump::new();
+        let catalog = Catalog::new();
+        let planner = Planner::new(&catalog, &arena);
+
+        let count_star = arena.alloc(Expr::Function(FunctionCall {
+            name: FunctionName {
+                schema: None,
+                name: "count",
+            },
+            args: FunctionArgs::Star,
+            distinct: false,
+            filter: None,
+            over: None,
+        }));
+
+        let columns: &[SelectColumn] = arena.alloc_slice_copy(&[SelectColumn::Expr {
+            expr: count_star,
+            alias: None,
+        }]);
+
+        let aggregates = planner.extract_aggregates(columns);
+        assert_eq!(aggregates.len(), 1);
+    }
+
+    #[test]
+    fn extract_aggregates_sum() {
+        use crate::sql::ast::{
+            ColumnRef, FunctionArg, FunctionArgs, FunctionCall, FunctionName, SelectColumn,
+        };
+
+        let arena = Bump::new();
+        let catalog = Catalog::new();
+        let planner = Planner::new(&catalog, &arena);
+
+        let col_expr = arena.alloc(Expr::Column(ColumnRef {
+            schema: None,
+            table: None,
+            column: "amount",
+        }));
+
+        let args: &[FunctionArg] = arena.alloc_slice_copy(&[FunctionArg {
+            name: None,
+            value: col_expr,
+        }]);
+
+        let sum_expr = arena.alloc(Expr::Function(FunctionCall {
+            name: FunctionName {
+                schema: None,
+                name: "sum",
+            },
+            args: FunctionArgs::Args(args),
+            distinct: false,
+            filter: None,
+            over: None,
+        }));
+
+        let columns: &[SelectColumn] = arena.alloc_slice_copy(&[SelectColumn::Expr {
+            expr: sum_expr,
+            alias: None,
+        }]);
+
+        let aggregates = planner.extract_aggregates(columns);
+        assert_eq!(aggregates.len(), 1);
+    }
+
+    #[test]
+    fn extract_aggregates_multiple() {
+        use crate::sql::ast::{
+            ColumnRef, FunctionArg, FunctionArgs, FunctionCall, FunctionName, SelectColumn,
+        };
+
+        let arena = Bump::new();
+        let catalog = Catalog::new();
+        let planner = Planner::new(&catalog, &arena);
+
+        let count_star = arena.alloc(Expr::Function(FunctionCall {
+            name: FunctionName {
+                schema: None,
+                name: "count",
+            },
+            args: FunctionArgs::Star,
+            distinct: false,
+            filter: None,
+            over: None,
+        }));
+
+        let col_expr = arena.alloc(Expr::Column(ColumnRef {
+            schema: None,
+            table: None,
+            column: "price",
+        }));
+
+        let args: &[FunctionArg] = arena.alloc_slice_copy(&[FunctionArg {
+            name: None,
+            value: col_expr,
+        }]);
+
+        let avg_expr = arena.alloc(Expr::Function(FunctionCall {
+            name: FunctionName {
+                schema: None,
+                name: "avg",
+            },
+            args: FunctionArgs::Args(args),
+            distinct: false,
+            filter: None,
+            over: None,
+        }));
+
+        let columns: &[SelectColumn] = arena.alloc_slice_copy(&[
+            SelectColumn::Expr {
+                expr: count_star,
+                alias: None,
+            },
+            SelectColumn::Expr {
+                expr: avg_expr,
+                alias: None,
+            },
+        ]);
+
+        let aggregates = planner.extract_aggregates(columns);
+        assert_eq!(aggregates.len(), 2);
+    }
+
+    #[test]
+    fn extract_aggregates_non_aggregate_ignored() {
+        use crate::sql::ast::{ColumnRef, Literal, SelectColumn};
+
+        let arena = Bump::new();
+        let catalog = Catalog::new();
+        let planner = Planner::new(&catalog, &arena);
+
+        let col_expr = arena.alloc(Expr::Column(ColumnRef {
+            schema: None,
+            table: None,
+            column: "name",
+        }));
+
+        let lit_expr = arena.alloc(Expr::Literal(Literal::Integer("42")));
+
+        let columns: &[SelectColumn] = arena.alloc_slice_copy(&[
+            SelectColumn::Expr {
+                expr: col_expr,
+                alias: None,
+            },
+            SelectColumn::Expr {
+                expr: lit_expr,
+                alias: None,
+            },
+        ]);
+
+        let aggregates = planner.extract_aggregates(columns);
+        assert_eq!(aggregates.len(), 0);
+    }
+
+    #[test]
+    fn convert_aggregates_count_star() {
+        use crate::sql::ast::{FunctionArgs, FunctionCall, FunctionName};
+
+        let arena = Bump::new();
+        let catalog = Catalog::new();
+        let planner = Planner::new(&catalog, &arena);
+
+        let count_star = arena.alloc(Expr::Function(FunctionCall {
+            name: FunctionName {
+                schema: None,
+                name: "count",
+            },
+            args: FunctionArgs::Star,
+            distinct: false,
+            filter: None,
+            over: None,
+        }));
+
+        let exprs: &[&Expr] = arena.alloc_slice_copy(&[count_star as &Expr]);
+        let aggregates = planner.convert_aggregates_to_physical(exprs);
+
+        assert_eq!(aggregates.len(), 1);
+        assert_eq!(aggregates[0].function, AggregateFunction::Count);
+        assert!(aggregates[0].argument.is_none());
+        assert!(!aggregates[0].distinct);
+    }
+
+    #[test]
+    fn convert_aggregates_sum_with_column() {
+        use crate::sql::ast::{
+            ColumnRef, FunctionArg, FunctionArgs, FunctionCall, FunctionName,
+        };
+
+        let arena = Bump::new();
+        let catalog = Catalog::new();
+        let planner = Planner::new(&catalog, &arena);
+
+        let col_expr = arena.alloc(Expr::Column(ColumnRef {
+            schema: None,
+            table: None,
+            column: "amount",
+        }));
+
+        let args: &[FunctionArg] = arena.alloc_slice_copy(&[FunctionArg {
+            name: None,
+            value: col_expr,
+        }]);
+
+        let sum_expr = arena.alloc(Expr::Function(FunctionCall {
+            name: FunctionName {
+                schema: None,
+                name: "sum",
+            },
+            args: FunctionArgs::Args(args),
+            distinct: false,
+            filter: None,
+            over: None,
+        }));
+
+        let exprs: &[&Expr] = arena.alloc_slice_copy(&[sum_expr as &Expr]);
+        let aggregates = planner.convert_aggregates_to_physical(exprs);
+
+        assert_eq!(aggregates.len(), 1);
+        assert_eq!(aggregates[0].function, AggregateFunction::Sum);
+        assert!(aggregates[0].argument.is_some());
+    }
+
+    #[test]
+    fn convert_aggregates_distinct_count() {
+        use crate::sql::ast::{
+            ColumnRef, FunctionArg, FunctionArgs, FunctionCall, FunctionName,
+        };
+
+        let arena = Bump::new();
+        let catalog = Catalog::new();
+        let planner = Planner::new(&catalog, &arena);
+
+        let col_expr = arena.alloc(Expr::Column(ColumnRef {
+            schema: None,
+            table: None,
+            column: "user_id",
+        }));
+
+        let args: &[FunctionArg] = arena.alloc_slice_copy(&[FunctionArg {
+            name: None,
+            value: col_expr,
+        }]);
+
+        let count_distinct = arena.alloc(Expr::Function(FunctionCall {
+            name: FunctionName {
+                schema: None,
+                name: "COUNT",
+            },
+            args: FunctionArgs::Args(args),
+            distinct: true,
+            filter: None,
+            over: None,
+        }));
+
+        let exprs: &[&Expr] = arena.alloc_slice_copy(&[count_distinct as &Expr]);
+        let aggregates = planner.convert_aggregates_to_physical(exprs);
+
+        assert_eq!(aggregates.len(), 1);
+        assert_eq!(aggregates[0].function, AggregateFunction::Count);
+        assert!(aggregates[0].distinct);
+    }
+
+    #[test]
+    fn convert_aggregates_all_functions() {
+        use crate::sql::ast::{
+            ColumnRef, FunctionArg, FunctionArgs, FunctionCall, FunctionName,
+        };
+
+        let arena = Bump::new();
+        let catalog = Catalog::new();
+        let planner = Planner::new(&catalog, &arena);
+
+        let make_agg = |name: &'static str| {
+            let col = arena.alloc(Expr::Column(ColumnRef {
+                schema: None,
+                table: None,
+                column: "val",
+            }));
+            let args: &[FunctionArg] = arena.alloc_slice_copy(&[FunctionArg {
+                name: None,
+                value: col,
+            }]);
+            arena.alloc(Expr::Function(FunctionCall {
+                name: FunctionName { schema: None, name },
+                args: FunctionArgs::Args(args),
+                distinct: false,
+                filter: None,
+                over: None,
+            }))
+        };
+
+        let count = make_agg("count");
+        let sum = make_agg("sum");
+        let avg = make_agg("avg");
+        let min = make_agg("min");
+        let max = make_agg("max");
+
+        let exprs: &[&Expr] = arena.alloc_slice_copy(&[
+            count as &Expr,
+            sum as &Expr,
+            avg as &Expr,
+            min as &Expr,
+            max as &Expr,
+        ]);
+        let aggregates = planner.convert_aggregates_to_physical(exprs);
+
+        assert_eq!(aggregates.len(), 5);
+        assert_eq!(aggregates[0].function, AggregateFunction::Count);
+        assert_eq!(aggregates[1].function, AggregateFunction::Sum);
+        assert_eq!(aggregates[2].function, AggregateFunction::Avg);
+        assert_eq!(aggregates[3].function, AggregateFunction::Min);
+        assert_eq!(aggregates[4].function, AggregateFunction::Max);
     }
 }
