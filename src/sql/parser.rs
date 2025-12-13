@@ -796,6 +796,7 @@ impl<'a> Parser<'a> {
         &self.errors
     }
 
+    #[allow(dead_code)]
     fn add_error(&mut self, message: &'a str) {
         self.errors.push(ParseError {
             message,
@@ -868,9 +869,8 @@ impl<'a> Parser<'a> {
 
         let distinct = if self.consume_keyword(Keyword::Distinct) {
             Distinct::Distinct
-        } else if self.consume_keyword(Keyword::All) {
-            Distinct::All
         } else {
+            self.consume_keyword(Keyword::All);
             Distinct::All
         };
 
@@ -1070,21 +1070,17 @@ impl<'a> Parser<'a> {
     fn parse_from_clause(&mut self) -> Result<&'a FromClause<'a>> {
         let mut left = self.parse_table_ref()?;
 
-        loop {
-            if let Some(join_type) = self.parse_join_type() {
-                let right = self.parse_table_ref()?;
-                let condition = self.parse_join_condition()?;
+        while let Some(join_type) = self.parse_join_type() {
+            let right = self.parse_table_ref()?;
+            let condition = self.parse_join_condition()?;
 
-                let join = self.arena.alloc(JoinClause {
-                    left,
-                    join_type,
-                    right,
-                    condition,
-                });
-                left = self.arena.alloc(FromClause::Join(join));
-            } else {
-                break;
-            }
+            let join = self.arena.alloc(JoinClause {
+                left,
+                join_type,
+                right,
+                condition,
+            });
+            left = self.arena.alloc(FromClause::Join(join));
         }
 
         Ok(left)
@@ -1157,11 +1153,10 @@ impl<'a> Parser<'a> {
         } else if self.consume_keyword(Keyword::Join) {
             Some(JoinType::Inner)
         } else if self.consume_keyword(Keyword::Natural) {
-            if self.consume_keyword(Keyword::Left) {
-                self.consume_keyword(Keyword::Outer);
-            } else if self.consume_keyword(Keyword::Right) {
-                self.consume_keyword(Keyword::Outer);
-            } else if self.consume_keyword(Keyword::Full) {
+            let has_direction = self.consume_keyword(Keyword::Left)
+                || self.consume_keyword(Keyword::Right)
+                || self.consume_keyword(Keyword::Full);
+            if has_direction {
                 self.consume_keyword(Keyword::Outer);
             }
             self.consume_keyword(Keyword::Join);
