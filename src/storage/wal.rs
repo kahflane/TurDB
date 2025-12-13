@@ -148,6 +148,7 @@ use std::path::{Path, PathBuf};
 use std::io::{Write, Read, Seek, SeekFrom};
 use parking_lot::{Mutex, RwLock};
 use hashbrown::HashMap;
+use memmap2::Mmap;
 
 use super::PAGE_SIZE;
 
@@ -156,6 +157,7 @@ pub struct Wal {
     dir: PathBuf,
     current_segment: Mutex<WalSegment>,
     page_index: RwLock<HashMap<u32, u64>>,
+    read_mmap: RwLock<Option<Mmap>>,
 }
 
 impl Wal {
@@ -170,6 +172,7 @@ impl Wal {
             dir: dir.to_path_buf(),
             current_segment: Mutex::new(segment),
             page_index: RwLock::new(HashMap::new()),
+            read_mmap: RwLock::new(None),
         })
     }
 
@@ -208,6 +211,7 @@ impl Wal {
             dir: dir.to_path_buf(),
             current_segment: Mutex::new(segment),
             page_index: RwLock::new(page_index),
+            read_mmap: RwLock::new(None),
         })
     }
 
@@ -264,6 +268,10 @@ impl Wal {
 
         let mut index = self.page_index.write();
         index.clear();
+        drop(index);
+
+        let mut mmap = self.read_mmap.write();
+        *mmap = None;
 
         Ok(())
     }
@@ -280,17 +288,44 @@ impl Wal {
         };
         drop(index);
 
-        let segment_path = self.dir.join("wal.000001");
-        let mut segment = WalSegment::open(&segment_path, 1)?;
+        let mut mmap_guard = self.read_mmap.write();
+        if mmap_guard.is_none() {
+            let segment_path = self.dir.join("wal.000001");
+            if !segment_path.exists() {
+                return Ok(None);
+            }
+            let file = File::open(&segment_path)
+                .wrap_err_with(|| format!("failed to open WAL segment for reading at {:?}", segment_path))?;
 
-        segment.file
-            .seek(SeekFrom::Start(offset))
-            .wrap_err_with(|| format!("failed to seek to offset {} in WAL", offset))?;
+            let mmap = unsafe {
+                Mmap::map(&file)
+                    .wrap_err_with(|| format!("failed to mmap WAL segment at {:?}", segment_path))?
+            };
+            *mmap_guard = Some(mmap);
+        }
 
-        let (_, page_data) = segment.read_frame()
-            .wrap_err_with(|| format!("failed to read frame at offset {} for page {}", offset, page_no))?;
+        let mmap = mmap_guard.as_ref().unwrap();
 
-        Ok(Some(page_data))
+        let frame_start = offset as usize;
+        ensure!(
+            frame_start + WAL_FRAME_HEADER_SIZE + PAGE_SIZE <= mmap.len(),
+            "WAL frame at offset {} extends beyond file size {}",
+            offset,
+            mmap.len()
+        );
+
+        let header_bytes = &mmap[frame_start..frame_start + WAL_FRAME_HEADER_SIZE];
+        let header = WalFrameHeader::read_from_bytes(header_bytes)
+            .map_err(|e| eyre::eyre!("invalid WAL frame header at offset {}: {:?}", offset, e))?;
+
+        let data_start = frame_start + WAL_FRAME_HEADER_SIZE;
+        let page_data = &mmap[data_start..data_start + PAGE_SIZE];
+
+        if !validate_checksum(&header, page_data) {
+            bail!("invalid checksum in WAL frame at offset {} for page {}", offset, page_no);
+        }
+
+        Ok(Some(page_data.to_vec()))
     }
 
     pub fn write_frame(&mut self, header: &WalFrameHeader, page_data: &[u8]) -> Result<()> {
@@ -305,18 +340,19 @@ impl Wal {
         let mut header_with_checksum = *header;
         header_with_checksum.checksum = checksum;
 
-        let current_offset = {
-            let segment = self.current_segment.lock();
-            segment.offset()
-        };
-
-        let mut segment = self.current_segment.lock();
-        segment.write_frame(&header_with_checksum, page_data)?;
-
-        drop(segment);
+        let current_offset;
+        {
+            let mut segment = self.current_segment.lock();
+            current_offset = segment.offset();
+            segment.write_frame(&header_with_checksum, page_data)?;
+        }
 
         let mut index = self.page_index.write();
         index.insert(header.page_no, current_offset);
+        drop(index);
+
+        let mut mmap = self.read_mmap.write();
+        *mmap = None;
 
         Ok(())
     }
