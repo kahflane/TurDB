@@ -2,7 +2,7 @@
 name = "turdb"
 version = "0.1.0"
 edition = "2021"
-description = "High-performance embedded database with SQLite-inspired row storage and native vector search"
+description = "High-performance embedded database with row storage and native vector search"
 license = "MIT"
 
 [dependencies]
