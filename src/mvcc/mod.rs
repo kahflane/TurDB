@@ -90,7 +90,10 @@ pub mod undo_page;
 pub mod version;
 
 pub use record_header::RecordHeader;
-pub use transaction::{Transaction, TransactionManager, TxnId, TxnState, MAX_CONCURRENT_TXNS};
+pub use transaction::{
+    PageId, TableId, Transaction, TransactionManager, TxnId, TxnState, WriteEntry, WriteKey,
+    MAX_CONCURRENT_TXNS,
+};
 pub use undo_page::{UndoHeader, UndoPageReader, UndoPageWriter, UndoRecord};
 pub use version::{
     VersionChainReader, VersionChainWriter, VisibilityResult, VisibleVersion, WriteCheckResult,
@@ -333,5 +336,116 @@ mod tests {
         assert_eq!(mgr.get_global_watermark(), 1);
         txn1.commit();
         assert!(mgr.get_global_watermark() > 3);
+    }
+
+    #[test]
+    fn transaction_write_entries_starts_empty() {
+        let mgr = TransactionManager::new();
+        let txn = Transaction::new(&mgr, 1, 0);
+        assert!(txn.write_entries().is_empty());
+    }
+
+    #[test]
+    fn transaction_can_add_write_entry() {
+        use crate::mvcc::transaction::WriteEntry;
+        let mgr = TransactionManager::new();
+        let mut txn = Transaction::new(&mgr, 1, 0);
+
+        txn.add_write_entry(WriteEntry {
+            table_id: 1,
+            key: b"key1".to_vec(),
+            page_id: 100,
+            offset: 50,
+            undo_page_id: Some(200),
+            undo_offset: Some(60),
+            is_insert: false,
+        });
+
+        assert_eq!(txn.write_entries().len(), 1);
+        assert_eq!(txn.write_entries()[0].page_id, 100);
+    }
+
+    #[test]
+    fn commit_with_finalize_calls_callback_for_each_entry() {
+        use crate::mvcc::transaction::WriteEntry;
+        use std::cell::RefCell;
+
+        let mgr = TransactionManager::new();
+        let mut txn = mgr.begin_txn().unwrap();
+
+        txn.add_write_entry(WriteEntry {
+            table_id: 1,
+            key: b"key1".to_vec(),
+            page_id: 100,
+            offset: 50,
+            undo_page_id: None,
+            undo_offset: None,
+            is_insert: true,
+        });
+        txn.add_write_entry(WriteEntry {
+            table_id: 1,
+            key: b"key2".to_vec(),
+            page_id: 101,
+            offset: 60,
+            undo_page_id: None,
+            undo_offset: None,
+            is_insert: true,
+        });
+
+        let finalized = RefCell::new(Vec::new());
+
+        let commit_ts = txn
+            .commit_with_finalize(|entry, ts| -> Result<(), ()> {
+                finalized.borrow_mut().push((entry.page_id, ts));
+                Ok(())
+            })
+            .unwrap();
+
+        let calls = finalized.borrow();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].0, 100);
+        assert_eq!(calls[1].0, 101);
+        assert_eq!(calls[0].1, commit_ts);
+    }
+
+    #[test]
+    fn rollback_with_undo_calls_callback_in_reverse() {
+        use crate::mvcc::transaction::WriteEntry;
+        use std::cell::RefCell;
+
+        let mgr = TransactionManager::new();
+        let mut txn = mgr.begin_txn().unwrap();
+
+        txn.add_write_entry(WriteEntry {
+            table_id: 1,
+            key: b"key1".to_vec(),
+            page_id: 100,
+            offset: 50,
+            undo_page_id: Some(200),
+            undo_offset: Some(10),
+            is_insert: false,
+        });
+        txn.add_write_entry(WriteEntry {
+            table_id: 1,
+            key: b"key2".to_vec(),
+            page_id: 101,
+            offset: 60,
+            undo_page_id: Some(200),
+            undo_offset: Some(20),
+            is_insert: false,
+        });
+
+        let undone = RefCell::new(Vec::new());
+
+        txn.rollback_with_undo(|entry| -> Result<(), ()> {
+            undone.borrow_mut().push(entry.page_id);
+            Ok(())
+        })
+        .unwrap();
+
+        let calls = undone.borrow();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0], 101);
+        assert_eq!(calls[1], 100);
     }
 }
