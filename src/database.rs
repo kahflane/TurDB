@@ -421,6 +421,39 @@ impl Database {
             }
         }
 
+        fn find_projections<'a>(
+            op: &'a crate::sql::planner::PhysicalOperator<'a>,
+            table_def: &crate::schema::TableDef,
+        ) -> Option<Vec<usize>> {
+            use crate::sql::planner::PhysicalOperator;
+            use crate::sql::ast::Expr;
+
+            match op {
+                PhysicalOperator::ProjectExec(project) => {
+                    let mut indices = Vec::new();
+                    for expr in project.expressions.iter() {
+                        if let Expr::Column(col_ref) = expr {
+                            for (idx, col) in table_def.columns().iter().enumerate() {
+                                if col.name().eq_ignore_ascii_case(col_ref.column) {
+                                    indices.push(idx);
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    if indices.is_empty() || indices.len() != project.expressions.len() {
+                        None
+                    } else {
+                        Some(indices)
+                    }
+                }
+                PhysicalOperator::FilterExec(filter) => find_projections(filter.input, table_def),
+                PhysicalOperator::LimitExec(limit) => find_projections(limit.input, table_def),
+                PhysicalOperator::SortExec(sort) => find_projections(sort.input, table_def),
+                _ => None,
+            }
+        }
+
         let table_scan = find_table_scan(physical_plan.root);
 
         let rows = if let Some(scan) = table_scan {
@@ -433,6 +466,8 @@ impl Database {
 
             let column_types: Vec<_> = table_def.columns().iter().map(|c| c.data_type()).collect();
 
+            let projections = find_projections(physical_plan.root, table_def);
+
             let storage = file_manager
                 .table_data_mut(schema_name, table_name)
                 .wrap_err_with(|| {
@@ -443,8 +478,13 @@ impl Database {
                 })?;
 
             let root_page = 1u32;
-            let source = BTreeCursorAdapter::from_btree_scan(storage, root_page, column_types)
-                .wrap_err("failed to create table scan")?;
+            let source = BTreeCursorAdapter::from_btree_scan_with_projections(
+                storage,
+                root_page,
+                column_types,
+                projections,
+            )
+            .wrap_err("failed to create table scan")?;
 
             let ctx = ExecutionContext::new(&arena);
             let builder = ExecutorBuilder::new(&ctx);
