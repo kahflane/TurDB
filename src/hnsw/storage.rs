@@ -87,9 +87,7 @@ use zerocopy::{
     FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned,
 };
 
-use crate::storage::{
-    MmapStorage, PageHeader, PageType, FILE_HEADER_SIZE, HNSW_MAGIC, PAGE_SIZE,
-};
+use crate::storage::{MmapStorage, PageHeader, PageType, FILE_HEADER_SIZE, HNSW_MAGIC, PAGE_SIZE};
 
 use super::{DistanceFunction, NodeId, QuantizationType};
 
@@ -530,7 +528,9 @@ impl<'a> HnswPageRef<'a> {
         }
 
         let offset = self.slot_offset(slot_index);
-        Some(SlotEntry::decode(&self.data[offset..offset + HNSW_SLOT_SIZE]))
+        Some(SlotEntry::decode(
+            &self.data[offset..offset + HNSW_SLOT_SIZE],
+        ))
     }
 
     pub fn read_node_data(&self, slot_index: u16) -> Result<&[u8]> {
@@ -588,10 +588,8 @@ impl<'a> HnswPage<'a> {
 
     fn hnsw_header_mut(&mut self) -> &mut HnswPageHeader {
         let offset = size_of::<PageHeader>();
-        HnswPageHeader::mut_from_bytes(
-            &mut self.data[offset..offset + size_of::<HnswPageHeader>()],
-        )
-        .unwrap()
+        HnswPageHeader::mut_from_bytes(&mut self.data[offset..offset + size_of::<HnswPageHeader>()])
+            .unwrap()
     }
 
     pub fn slot_count(&self) -> u16 {
@@ -616,7 +614,9 @@ impl<'a> HnswPage<'a> {
         }
 
         let offset = self.slot_offset(slot_index);
-        Some(SlotEntry::decode(&self.data[offset..offset + HNSW_SLOT_SIZE]))
+        Some(SlotEntry::decode(
+            &self.data[offset..offset + HNSW_SLOT_SIZE],
+        ))
     }
 
     pub fn can_fit(&self, data_size: usize) -> bool {
@@ -625,7 +625,10 @@ impl<'a> HnswPage<'a> {
     }
 
     pub fn allocate_slot(&mut self, data_size: u16) -> Result<u16> {
-        ensure!(self.can_fit(data_size as usize), "insufficient space in page");
+        ensure!(
+            self.can_fit(data_size as usize),
+            "insufficient space in page"
+        );
 
         let header = self.hnsw_header_mut();
         let slot_index = header.slot_count();

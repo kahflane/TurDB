@@ -582,10 +582,7 @@ impl<'a> Planner<'a> {
                 return false;
             }
             let func_name = name.name.to_ascii_lowercase();
-            matches!(
-                func_name.as_str(),
-                "count" | "sum" | "avg" | "min" | "max"
-            )
+            matches!(func_name.as_str(), "count" | "sum" | "avg" | "min" | "max")
         } else {
             false
         }
@@ -647,9 +644,7 @@ impl<'a> Planner<'a> {
             table
         };
 
-        self.catalog
-            .resolve_table(table_name)
-            .map(|_| ())
+        self.catalog.resolve_table(table_name).map(|_| ())
     }
 
     fn plan_insert(&self, insert: &crate::sql::ast::InsertStmt<'a>) -> Result<LogicalPlan<'a>> {
@@ -951,10 +946,7 @@ impl<'a> Planner<'a> {
         Ok((self.arena.alloc_str(func_name), data_type))
     }
 
-    fn logical_to_physical(
-        &self,
-        op: &'a LogicalOperator<'a>,
-    ) -> Result<&'a PhysicalOperator<'a>> {
+    fn logical_to_physical(&self, op: &'a LogicalOperator<'a>) -> Result<&'a PhysicalOperator<'a>> {
         match op {
             LogicalOperator::Scan(scan) => {
                 let table_name = if let Some(schema) = scan.schema {
@@ -964,13 +956,15 @@ impl<'a> Planner<'a> {
                 };
                 let table_def = self.catalog.resolve_table(table_name).ok();
 
-                let physical = self.arena.alloc(PhysicalOperator::TableScan(PhysicalTableScan {
-                    schema: scan.schema,
-                    table: scan.table,
-                    alias: scan.alias,
-                    post_scan_filter: None,
-                    table_def,
-                }));
+                let physical = self
+                    .arena
+                    .alloc(PhysicalOperator::TableScan(PhysicalTableScan {
+                        schema: scan.schema,
+                        table: scan.table,
+                        alias: scan.alias,
+                        post_scan_filter: None,
+                        table_def,
+                    }));
                 Ok(physical)
             }
             LogicalOperator::Filter(filter) => {
@@ -979,19 +973,23 @@ impl<'a> Planner<'a> {
                 }
 
                 let input = self.logical_to_physical(filter.input)?;
-                let physical = self.arena.alloc(PhysicalOperator::FilterExec(PhysicalFilterExec {
-                    input,
-                    predicate: filter.predicate,
-                }));
+                let physical = self
+                    .arena
+                    .alloc(PhysicalOperator::FilterExec(PhysicalFilterExec {
+                        input,
+                        predicate: filter.predicate,
+                    }));
                 Ok(physical)
             }
             LogicalOperator::Project(project) => {
                 let input = self.logical_to_physical(project.input)?;
-                let physical = self.arena.alloc(PhysicalOperator::ProjectExec(PhysicalProjectExec {
-                    input,
-                    expressions: project.expressions,
-                    aliases: project.aliases,
-                }));
+                let physical =
+                    self.arena
+                        .alloc(PhysicalOperator::ProjectExec(PhysicalProjectExec {
+                            input,
+                            expressions: project.expressions,
+                            aliases: project.aliases,
+                        }));
                 Ok(physical)
             }
             LogicalOperator::Join(join) => {
@@ -1025,42 +1023,54 @@ impl<'a> Planner<'a> {
             }
             LogicalOperator::Sort(sort) => {
                 let input = self.logical_to_physical(sort.input)?;
-                let physical = self.arena.alloc(PhysicalOperator::SortExec(PhysicalSortExec {
-                    input,
-                    order_by: sort.order_by,
-                }));
+                let physical = self
+                    .arena
+                    .alloc(PhysicalOperator::SortExec(PhysicalSortExec {
+                        input,
+                        order_by: sort.order_by,
+                    }));
                 Ok(physical)
             }
             LogicalOperator::Limit(limit) => {
                 let input = self.logical_to_physical(limit.input)?;
-                let physical = self.arena.alloc(PhysicalOperator::LimitExec(PhysicalLimitExec {
-                    input,
-                    limit: limit.limit,
-                    offset: limit.offset,
-                }));
+                let physical = self
+                    .arena
+                    .alloc(PhysicalOperator::LimitExec(PhysicalLimitExec {
+                        input,
+                        limit: limit.limit,
+                        offset: limit.offset,
+                    }));
                 Ok(physical)
             }
             LogicalOperator::Aggregate(agg) => {
                 let input = self.logical_to_physical(agg.input)?;
                 let aggregates = self.convert_aggregates_to_physical(agg.aggregates);
-                let physical = self.arena.alloc(PhysicalOperator::HashAggregate(PhysicalHashAggregate {
-                    input,
-                    group_by: agg.group_by,
-                    aggregates,
-                }));
+                let physical =
+                    self.arena
+                        .alloc(PhysicalOperator::HashAggregate(PhysicalHashAggregate {
+                            input,
+                            group_by: agg.group_by,
+                            aggregates,
+                        }));
                 Ok(physical)
             }
             LogicalOperator::Values(_) => {
                 bail!("Values operator cannot be directly converted to physical - only valid as INSERT source")
             }
             LogicalOperator::Insert(_) => {
-                bail!("Insert operator cannot be converted to physical plan - DML handled separately")
+                bail!(
+                    "Insert operator cannot be converted to physical plan - DML handled separately"
+                )
             }
             LogicalOperator::Update(_) => {
-                bail!("Update operator cannot be converted to physical plan - DML handled separately")
+                bail!(
+                    "Update operator cannot be converted to physical plan - DML handled separately"
+                )
             }
             LogicalOperator::Delete(_) => {
-                bail!("Delete operator cannot be converted to physical plan - DML handled separately")
+                bail!(
+                    "Delete operator cannot be converted to physical plan - DML handled separately"
+                )
             }
         }
     }
@@ -1124,9 +1134,7 @@ impl<'a> Planner<'a> {
         };
 
         let table_name = if let Some(schema) = scan.schema {
-            let full_name = self
-                .arena
-                .alloc_str(&format!("{}.{}", schema, scan.table));
+            let full_name = self.arena.alloc_str(&format!("{}.{}", schema, scan.table));
             full_name
         } else {
             scan.table
@@ -1153,15 +1161,15 @@ impl<'a> Planner<'a> {
 
         let residual = self.compute_residual_filter(filter.predicate, best_index.columns());
 
-        let index_scan =
-            self.arena
-                .alloc(PhysicalOperator::IndexScan(PhysicalIndexScan {
-                    schema: scan.schema,
-                    table: scan.table,
-                    index_name: best_index.name(),
-                    key_range,
-                    residual_filter: residual,
-                }));
+        let index_scan = self
+            .arena
+            .alloc(PhysicalOperator::IndexScan(PhysicalIndexScan {
+                schema: scan.schema,
+                table: scan.table,
+                index_name: best_index.name(),
+                key_range,
+                residual_filter: residual,
+            }));
 
         Some(index_scan)
     }
@@ -1243,28 +1251,28 @@ impl<'a> Planner<'a> {
             Expr::Column(col_ref) => {
                 columns.push(col_ref.column);
             }
-            Expr::BinaryOp { left, op, right } => {
-                match op {
-                    crate::sql::ast::BinaryOperator::And | crate::sql::ast::BinaryOperator::Or => {
-                        self.collect_columns_from_expr(left, columns);
-                        self.collect_columns_from_expr(right, columns);
-                    }
-                    crate::sql::ast::BinaryOperator::Eq
-                    | crate::sql::ast::BinaryOperator::NotEq
-                    | crate::sql::ast::BinaryOperator::Lt
-                    | crate::sql::ast::BinaryOperator::LtEq
-                    | crate::sql::ast::BinaryOperator::Gt
-                    | crate::sql::ast::BinaryOperator::GtEq => {
-                        self.collect_columns_from_expr(left, columns);
-                        self.collect_columns_from_expr(right, columns);
-                    }
-                    _ => {}
+            Expr::BinaryOp { left, op, right } => match op {
+                crate::sql::ast::BinaryOperator::And | crate::sql::ast::BinaryOperator::Or => {
+                    self.collect_columns_from_expr(left, columns);
+                    self.collect_columns_from_expr(right, columns);
                 }
-            }
+                crate::sql::ast::BinaryOperator::Eq
+                | crate::sql::ast::BinaryOperator::NotEq
+                | crate::sql::ast::BinaryOperator::Lt
+                | crate::sql::ast::BinaryOperator::LtEq
+                | crate::sql::ast::BinaryOperator::Gt
+                | crate::sql::ast::BinaryOperator::GtEq => {
+                    self.collect_columns_from_expr(left, columns);
+                    self.collect_columns_from_expr(right, columns);
+                }
+                _ => {}
+            },
             Expr::IsNull { expr, .. } => {
                 self.collect_columns_from_expr(expr, columns);
             }
-            Expr::Between { expr, low, high, .. } => {
+            Expr::Between {
+                expr, low, high, ..
+            } => {
                 self.collect_columns_from_expr(expr, columns);
                 self.collect_columns_from_expr(low, columns);
                 self.collect_columns_from_expr(high, columns);
@@ -1312,7 +1320,9 @@ impl<'a> Planner<'a> {
         candidates.into_iter().min_by(|a, b| {
             let cost_a = self.estimate_index_access_cost(a, filter_columns);
             let cost_b = self.estimate_index_access_cost(b, filter_columns);
-            cost_a.partial_cmp(&cost_b).unwrap_or(std::cmp::Ordering::Equal)
+            cost_a
+                .partial_cmp(&cost_b)
+                .unwrap_or(std::cmp::Ordering::Equal)
         })
     }
 
@@ -1368,7 +1378,9 @@ impl<'a> Planner<'a> {
         let base_selectivity = if matched_columns == 1 {
             EQUALITY_SELECTIVITY
         } else {
-            EQUALITY_SELECTIVITY.powf(matched_columns as f64).max(UNIQUE_SELECTIVITY)
+            EQUALITY_SELECTIVITY
+                .powf(matched_columns as f64)
+                .max(UNIQUE_SELECTIVITY)
         };
 
         if index.is_unique() {
@@ -1520,80 +1532,78 @@ impl<'a> Planner<'a> {
         use crate::sql::ast::BinaryOperator;
 
         match expr {
-            Expr::BinaryOp { left, op, right } => {
-                match op {
-                    BinaryOperator::And => {
-                        self.collect_bounds_from_expr(left, target_column, bounds);
-                        self.collect_bounds_from_expr(right, target_column, bounds);
-                    }
-                    BinaryOperator::Eq => {
-                        if self.expr_references_column(left, target_column) {
-                            bounds.point_value = Some(ColumnBound {
-                                value: right,
-                                inclusive: true,
-                            });
-                        } else if self.expr_references_column(right, target_column) {
-                            bounds.point_value = Some(ColumnBound {
-                                value: left,
-                                inclusive: true,
-                            });
-                        }
-                    }
-                    BinaryOperator::Lt => {
-                        if self.expr_references_column(left, target_column) {
-                            bounds.upper = Some(ColumnBound {
-                                value: right,
-                                inclusive: false,
-                            });
-                        } else if self.expr_references_column(right, target_column) {
-                            bounds.lower = Some(ColumnBound {
-                                value: left,
-                                inclusive: false,
-                            });
-                        }
-                    }
-                    BinaryOperator::LtEq => {
-                        if self.expr_references_column(left, target_column) {
-                            bounds.upper = Some(ColumnBound {
-                                value: right,
-                                inclusive: true,
-                            });
-                        } else if self.expr_references_column(right, target_column) {
-                            bounds.lower = Some(ColumnBound {
-                                value: left,
-                                inclusive: true,
-                            });
-                        }
-                    }
-                    BinaryOperator::Gt => {
-                        if self.expr_references_column(left, target_column) {
-                            bounds.lower = Some(ColumnBound {
-                                value: right,
-                                inclusive: false,
-                            });
-                        } else if self.expr_references_column(right, target_column) {
-                            bounds.upper = Some(ColumnBound {
-                                value: left,
-                                inclusive: false,
-                            });
-                        }
-                    }
-                    BinaryOperator::GtEq => {
-                        if self.expr_references_column(left, target_column) {
-                            bounds.lower = Some(ColumnBound {
-                                value: right,
-                                inclusive: true,
-                            });
-                        } else if self.expr_references_column(right, target_column) {
-                            bounds.upper = Some(ColumnBound {
-                                value: left,
-                                inclusive: true,
-                            });
-                        }
-                    }
-                    _ => {}
+            Expr::BinaryOp { left, op, right } => match op {
+                BinaryOperator::And => {
+                    self.collect_bounds_from_expr(left, target_column, bounds);
+                    self.collect_bounds_from_expr(right, target_column, bounds);
                 }
-            }
+                BinaryOperator::Eq => {
+                    if self.expr_references_column(left, target_column) {
+                        bounds.point_value = Some(ColumnBound {
+                            value: right,
+                            inclusive: true,
+                        });
+                    } else if self.expr_references_column(right, target_column) {
+                        bounds.point_value = Some(ColumnBound {
+                            value: left,
+                            inclusive: true,
+                        });
+                    }
+                }
+                BinaryOperator::Lt => {
+                    if self.expr_references_column(left, target_column) {
+                        bounds.upper = Some(ColumnBound {
+                            value: right,
+                            inclusive: false,
+                        });
+                    } else if self.expr_references_column(right, target_column) {
+                        bounds.lower = Some(ColumnBound {
+                            value: left,
+                            inclusive: false,
+                        });
+                    }
+                }
+                BinaryOperator::LtEq => {
+                    if self.expr_references_column(left, target_column) {
+                        bounds.upper = Some(ColumnBound {
+                            value: right,
+                            inclusive: true,
+                        });
+                    } else if self.expr_references_column(right, target_column) {
+                        bounds.lower = Some(ColumnBound {
+                            value: left,
+                            inclusive: true,
+                        });
+                    }
+                }
+                BinaryOperator::Gt => {
+                    if self.expr_references_column(left, target_column) {
+                        bounds.lower = Some(ColumnBound {
+                            value: right,
+                            inclusive: false,
+                        });
+                    } else if self.expr_references_column(right, target_column) {
+                        bounds.upper = Some(ColumnBound {
+                            value: left,
+                            inclusive: false,
+                        });
+                    }
+                }
+                BinaryOperator::GtEq => {
+                    if self.expr_references_column(left, target_column) {
+                        bounds.lower = Some(ColumnBound {
+                            value: right,
+                            inclusive: true,
+                        });
+                    } else if self.expr_references_column(right, target_column) {
+                        bounds.upper = Some(ColumnBound {
+                            value: left,
+                            inclusive: true,
+                        });
+                    }
+                }
+                _ => {}
+            },
             Expr::Between {
                 expr: between_expr,
                 negated,
@@ -1739,18 +1749,19 @@ impl<'a> Planner<'a> {
         }
 
         if bounds.lower.is_some() || bounds.upper.is_some() {
-            let start = bounds.lower.and_then(|b| self.encode_literal_to_bytes(b.value));
-            let end = bounds.upper.and_then(|b| self.encode_literal_to_bytes(b.value));
+            let start = bounds
+                .lower
+                .and_then(|b| self.encode_literal_to_bytes(b.value));
+            let end = bounds
+                .upper
+                .and_then(|b| self.encode_literal_to_bytes(b.value));
             return ScanRange::RangeScan { start, end };
         }
 
         ScanRange::FullScan
     }
 
-    pub fn extract_equi_join_keys(
-        &self,
-        condition: Option<&'a Expr<'a>>,
-    ) -> &'a [EquiJoinKey<'a>] {
+    pub fn extract_equi_join_keys(&self, condition: Option<&'a Expr<'a>>) -> &'a [EquiJoinKey<'a>] {
         let condition = match condition {
             Some(c) => c,
             None => return &[],
@@ -1824,13 +1835,11 @@ impl<'a> Planner<'a> {
                     let right_non_equi = self.collect_non_equi_conditions(right);
 
                     match (left_non_equi, right_non_equi) {
-                        (Some(l), Some(r)) => {
-                            Some(self.arena.alloc(Expr::BinaryOp {
-                                left: l,
-                                op: BinaryOperator::And,
-                                right: r,
-                            }))
-                        }
+                        (Some(l), Some(r)) => Some(self.arena.alloc(Expr::BinaryOp {
+                            left: l,
+                            op: BinaryOperator::And,
+                            right: r,
+                        })),
                         (Some(l), None) => Some(l),
                         (None, Some(r)) => Some(r),
                         (None, None) => None,
@@ -1897,7 +1906,9 @@ mod tests {
             ColumnDef::new("email", DataType::Text),
             ColumnDef::new("active", DataType::Bool),
         ];
-        catalog.create_table("root", "users", users_columns).unwrap();
+        catalog
+            .create_table("root", "users", users_columns)
+            .unwrap();
 
         let orders_columns = vec![
             ColumnDef::new("id", DataType::Int8),
@@ -1906,14 +1917,18 @@ mod tests {
             ColumnDef::new("quantity", DataType::Int4),
             ColumnDef::new("total", DataType::Float8),
         ];
-        catalog.create_table("root", "orders", orders_columns).unwrap();
+        catalog
+            .create_table("root", "orders", orders_columns)
+            .unwrap();
 
         let products_columns = vec![
             ColumnDef::new("id", DataType::Int8),
             ColumnDef::new("name", DataType::Text),
             ColumnDef::new("price", DataType::Float8),
         ];
-        catalog.create_table("root", "products", products_columns).unwrap();
+        catalog
+            .create_table("root", "products", products_columns)
+            .unwrap();
 
         catalog
     }
@@ -2505,7 +2520,9 @@ mod tests {
 
     #[test]
     fn plan_insert_select() {
-        use crate::sql::ast::{Distinct, FromClause, InsertStmt, SelectColumn, SelectStmt, TableRef};
+        use crate::sql::ast::{
+            Distinct, FromClause, InsertStmt, SelectColumn, SelectStmt, TableRef,
+        };
 
         let arena = Bump::new();
         let catalog = create_test_catalog();
@@ -2844,7 +2861,12 @@ mod tests {
 
         let table = TableDef::new(1, "users", vec![])
             .with_index(IndexDef::new("idx_id", vec!["id"], true, IndexType::BTree))
-            .with_index(IndexDef::new("idx_email", vec!["email"], true, IndexType::BTree));
+            .with_index(IndexDef::new(
+                "idx_email",
+                vec!["email"],
+                true,
+                IndexType::BTree,
+            ));
 
         let filter_columns: Vec<&str> = vec!["id"];
         let candidates = planner.find_applicable_indexes(&table, &filter_columns);
@@ -2886,7 +2908,12 @@ mod tests {
 
         let table = TableDef::new(1, "users", vec![])
             .with_index(IndexDef::new("idx_id", vec!["id"], true, IndexType::BTree))
-            .with_index(IndexDef::new("idx_id_nonunique", vec!["id"], false, IndexType::BTree));
+            .with_index(IndexDef::new(
+                "idx_id_nonunique",
+                vec!["id"],
+                false,
+                IndexType::BTree,
+            ));
 
         let filter_columns: Vec<&str> = vec!["id"];
         let best = planner.select_best_index(&table, &filter_columns);
@@ -3604,9 +3631,7 @@ mod tests {
 
     #[test]
     fn convert_aggregates_sum_with_column() {
-        use crate::sql::ast::{
-            ColumnRef, FunctionArg, FunctionArgs, FunctionCall, FunctionName,
-        };
+        use crate::sql::ast::{ColumnRef, FunctionArg, FunctionArgs, FunctionCall, FunctionName};
 
         let arena = Bump::new();
         let catalog = Catalog::new();
@@ -3644,9 +3669,7 @@ mod tests {
 
     #[test]
     fn convert_aggregates_distinct_count() {
-        use crate::sql::ast::{
-            ColumnRef, FunctionArg, FunctionArgs, FunctionCall, FunctionName,
-        };
+        use crate::sql::ast::{ColumnRef, FunctionArg, FunctionArgs, FunctionCall, FunctionName};
 
         let arena = Bump::new();
         let catalog = Catalog::new();
@@ -3684,9 +3707,7 @@ mod tests {
 
     #[test]
     fn convert_aggregates_all_functions() {
-        use crate::sql::ast::{
-            ColumnRef, FunctionArg, FunctionArgs, FunctionCall, FunctionName,
-        };
+        use crate::sql::ast::{ColumnRef, FunctionArg, FunctionArgs, FunctionCall, FunctionName};
 
         let arena = Bump::new();
         let catalog = Catalog::new();
@@ -4489,10 +4510,14 @@ mod tests {
         let name_col = schema.get_column("name").expect("name column should exist");
         assert_eq!(name_col.data_type, DataType::Text);
 
-        let email_col = schema.get_column("email").expect("email column should exist");
+        let email_col = schema
+            .get_column("email")
+            .expect("email column should exist");
         assert_eq!(email_col.data_type, DataType::Text);
 
-        let active_col = schema.get_column("active").expect("active column should exist");
+        let active_col = schema
+            .get_column("active")
+            .expect("active column should exist");
         assert_eq!(active_col.data_type, DataType::Bool);
     }
 
@@ -4658,10 +4683,7 @@ mod tests {
         if let Some(PhysicalOperator::IndexScan(index_scan)) = result {
             match index_scan.key_range {
                 ScanRange::RangeScan { start, end: _ } => {
-                    assert!(
-                        start.is_some(),
-                        "RangeScan should have encoded start bound"
-                    );
+                    assert!(start.is_some(), "RangeScan should have encoded start bound");
                     let start_bytes = start.unwrap();
                     assert!(
                         !start_bytes.is_empty(),
