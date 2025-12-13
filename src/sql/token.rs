@@ -570,6 +570,7 @@ pub enum Keyword {
     Unknown,
     Unnest,
     Year,
+    Pragma,
 }
 
 impl Keyword {
@@ -984,6 +985,7 @@ impl Keyword {
             Keyword::Unknown => "UNKNOWN",
             Keyword::Unnest => "UNNEST",
             Keyword::Year => "YEAR",
+            Keyword::Pragma => "PRAGMA",
         }
     }
 }

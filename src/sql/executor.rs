@@ -198,7 +198,10 @@ impl SimpleDecoder {
         }
     }
 
-    pub fn with_projections(column_types: Vec<crate::records::types::DataType>, projections: Vec<usize>) -> Self {
+    pub fn with_projections(
+        column_types: Vec<crate::records::types::DataType>,
+        projections: Vec<usize>,
+    ) -> Self {
         use crate::records::types::ColumnDef;
         let column_defs: Vec<ColumnDef> = column_types
             .iter()
@@ -221,13 +224,24 @@ impl RecordDecoder for SimpleDecoder {
 }
 
 impl SimpleDecoder {
-    fn decode_columns_vec(&self, _key: &[u8], value: &[u8], columns: &[usize]) -> Result<Vec<Value<'static>>> {
+    fn decode_columns_vec(
+        &self,
+        _key: &[u8],
+        value: &[u8],
+        columns: &[usize],
+    ) -> Result<Vec<Value<'static>>> {
         let mut output = Vec::with_capacity(columns.len());
         self.decode_columns_into(_key, value, columns, &mut output)?;
         Ok(output)
     }
 
-    fn decode_columns_into(&self, _key: &[u8], value: &[u8], columns: &[usize], output: &mut Vec<Value<'static>>) -> Result<()> {
+    fn decode_columns_into(
+        &self,
+        _key: &[u8],
+        value: &[u8],
+        columns: &[usize],
+        output: &mut Vec<Value<'static>>,
+    ) -> Result<()> {
         use crate::records::types::DataType;
         use crate::records::RecordView;
 
@@ -264,7 +278,12 @@ impl SimpleDecoder {
         Ok(())
     }
 
-    pub fn decode_into(&self, _key: &[u8], value: &[u8], output: &mut Vec<Value<'static>>) -> Result<()> {
+    pub fn decode_into(
+        &self,
+        _key: &[u8],
+        value: &[u8],
+        output: &mut Vec<Value<'static>>,
+    ) -> Result<()> {
         self.decode_columns_into(_key, value, &self.decode_columns, output)
     }
 }
@@ -343,7 +362,14 @@ impl BTreeCursorAdapter {
         end_key: Option<&[u8]>,
         column_types: Vec<crate::records::types::DataType>,
     ) -> Result<Self> {
-        Self::from_btree_range_scan_with_projections(storage, root_page, start_key, end_key, column_types, None)
+        Self::from_btree_range_scan_with_projections(
+            storage,
+            root_page,
+            start_key,
+            end_key,
+            column_types,
+            None,
+        )
     }
 
     pub fn from_btree_range_scan_with_projections(
@@ -411,14 +437,18 @@ impl RowSource for BTreeCursorAdapter {
 }
 
 pub struct StreamingBTreeSource<'storage> {
-    cursor: crate::btree::Cursor<'storage>,
+    cursor: crate::btree::Cursor<'storage, crate::storage::MmapStorage>,
     decoder: SimpleDecoder,
     started: bool,
     row_buffer: Vec<Value<'static>>,
 }
 
 impl<'storage> StreamingBTreeSource<'storage> {
-    pub fn new(cursor: crate::btree::Cursor<'storage>, decoder: SimpleDecoder, column_count: usize) -> Self {
+    pub fn new(
+        cursor: crate::btree::Cursor<'storage, crate::storage::MmapStorage>,
+        decoder: SimpleDecoder,
+        column_count: usize,
+    ) -> Self {
         Self {
             cursor,
             decoder,
@@ -446,7 +476,10 @@ impl<'storage> StreamingBTreeSource<'storage> {
         let reader = BTreeReader::new(storage, root_page)?;
         let cursor = reader.cursor_first()?;
 
-        let output_count = projections.as_ref().map(|p| p.len()).unwrap_or(column_types.len());
+        let output_count = projections
+            .as_ref()
+            .map(|p| p.len())
+            .unwrap_or(column_types.len());
         let decoder = match projections {
             Some(proj) => SimpleDecoder::with_projections(column_types, proj),
             None => SimpleDecoder::new(column_types),

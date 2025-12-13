@@ -126,6 +126,18 @@ impl Catalog {
         table_name: &str,
         columns: Vec<ColumnDef>,
     ) -> Result<TableId> {
+        let table_id = self.next_table_id;
+        self.next_table_id += 1;
+        self.create_table_with_id(schema_name, table_name, columns, table_id)
+    }
+
+    pub fn create_table_with_id(
+        &mut self,
+        schema_name: &str,
+        table_name: &str,
+        columns: Vec<ColumnDef>,
+        table_id: TableId,
+    ) -> Result<TableId> {
         let schema_name = if schema_name.is_empty() {
             &self.default_schema
         } else {
@@ -143,9 +155,6 @@ impl Catalog {
             table_name,
             schema_name
         );
-
-        let table_id = self.next_table_id;
-        self.next_table_id += 1;
 
         let table = TableDef::new(table_id, table_name, columns);
         schema.add_table(table);

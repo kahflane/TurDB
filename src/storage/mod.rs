@@ -87,20 +87,65 @@
 mod cache;
 mod file_manager;
 mod freelist;
+mod headers;
 mod mmap;
 mod page;
 mod wal;
+mod wal_storage;
 
 pub use cache::{PageCache, PageKey, PageRef};
 pub use file_manager::{
     FileKey, FileManager, LruFileCache, TableFiles, DEFAULT_MAX_OPEN_FILES, DEFAULT_SCHEMA,
-    HNSW_FILE_EXTENSION, HNSW_MAGIC, INDEX_FILE_EXTENSION, INDEX_MAGIC, META_FILE_NAME, META_MAGIC,
-    MIN_MAX_OPEN_FILES, TABLE_FILE_EXTENSION, TABLE_MAGIC,
+    HNSW_FILE_EXTENSION, HNSW_MAGIC, INDEX_FILE_EXTENSION, MIN_MAX_OPEN_FILES,
+    TABLE_FILE_EXTENSION,
 };
 pub use freelist::{Freelist, TrunkHeader, TRUNK_HEADER_SIZE, TRUNK_MAX_ENTRIES};
+pub use headers::{
+    IndexFileHeader, MetaFileHeader, TableFileHeader, CURRENT_VERSION, DEFAULT_PAGE_SIZE,
+    INDEX_MAGIC, INDEX_TYPE_BTREE, INDEX_TYPE_HASH, META_MAGIC, TABLE_MAGIC,
+};
 pub use mmap::MmapStorage;
 pub use page::{validate_page, PageHeader, PageType};
 pub use wal::{Wal, WalFrameHeader, WalSegment};
+pub use wal_storage::WalStorage;
+
+use eyre::Result;
+
+pub trait Storage {
+    fn page(&self, page_no: u32) -> Result<&[u8]>;
+    fn page_mut(&mut self, page_no: u32) -> Result<&mut [u8]>;
+    fn grow(&mut self, new_page_count: u32) -> Result<()>;
+    fn page_count(&self) -> u32;
+    fn sync(&self) -> Result<()>;
+
+    fn prefetch_pages(&self, _start_page: u32, _count: u32) {}
+}
+
+impl Storage for MmapStorage {
+    fn page(&self, page_no: u32) -> Result<&[u8]> {
+        MmapStorage::page(self, page_no)
+    }
+
+    fn page_mut(&mut self, page_no: u32) -> Result<&mut [u8]> {
+        MmapStorage::page_mut(self, page_no)
+    }
+
+    fn grow(&mut self, new_page_count: u32) -> Result<()> {
+        MmapStorage::grow(self, new_page_count)
+    }
+
+    fn page_count(&self) -> u32 {
+        MmapStorage::page_count(self)
+    }
+
+    fn sync(&self) -> Result<()> {
+        MmapStorage::sync(self)
+    }
+
+    fn prefetch_pages(&self, start_page: u32, count: u32) {
+        MmapStorage::prefetch_pages(self, start_page, count)
+    }
+}
 
 pub const PAGE_SIZE: usize = 16384;
 pub const PAGE_HEADER_SIZE: usize = 16;

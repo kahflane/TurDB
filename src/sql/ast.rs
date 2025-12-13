@@ -109,6 +109,7 @@ pub enum Statement<'a> {
     Reset(&'a ResetStmt<'a>),
     Grant(&'a GrantStmt<'a>),
     Revoke(&'a RevokeStmt<'a>),
+    Pragma(&'a PragmaStmt<'a>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -703,6 +704,12 @@ pub enum SetScope {
     Session,
     Local,
     Global,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PragmaStmt<'a> {
+    pub name: &'a str,
+    pub value: Option<&'a str>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]

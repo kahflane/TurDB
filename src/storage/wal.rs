@@ -168,7 +168,7 @@ impl Wal {
         use std::time::SystemTime;
         let nanos = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
-            .unwrap() // INVARIANT: system time is always after UNIX epoch on any reasonable system
+            .unwrap()
             .as_nanos();
         (nanos as u32) ^ ((nanos >> 32) as u32)
     }
@@ -272,6 +272,16 @@ impl Wal {
         let mut frames_applied = 0;
 
         while let Ok((header, page_data)) = segment.read_frame() {
+            if header.page_no >= storage.page_count() {
+                let required_pages = header.db_size.max(header.page_no + 1);
+                storage.grow(required_pages).wrap_err_with(|| {
+                    format!(
+                        "failed to grow storage to {} pages during WAL recovery",
+                        required_pages
+                    )
+                })?;
+            }
+
             let page_mut = storage.page_mut(header.page_no).wrap_err_with(|| {
                 format!("failed to get page {} for WAL recovery", header.page_no)
             })?;
@@ -357,7 +367,7 @@ impl Wal {
             *mmap_guard = Some((segment_num, mmap));
         }
 
-        let (_seg, mmap) = mmap_guard.as_ref().unwrap(); // INVARIANT: just set to Some above
+        let (_seg, mmap) = mmap_guard.as_ref().unwrap();
 
         let frame_start = offset as usize;
         ensure!(

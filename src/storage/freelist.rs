@@ -67,7 +67,7 @@
 use eyre::{ensure, Result};
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
-use super::{PAGE_HEADER_SIZE, PAGE_SIZE};
+use super::{Storage, PAGE_HEADER_SIZE, PAGE_SIZE};
 
 pub const TRUNK_HEADER_SIZE: usize = 8;
 pub const TRUNK_MAX_ENTRIES: usize = (PAGE_SIZE - PAGE_HEADER_SIZE - TRUNK_HEADER_SIZE) / 4;
@@ -199,7 +199,7 @@ impl Freelist {
         self.free_count = free_count;
     }
 
-    pub fn allocate(&mut self, storage: &mut super::MmapStorage) -> Result<Option<u32>> {
+    pub fn allocate<S: Storage>(&mut self, storage: &mut S) -> Result<Option<u32>> {
         if self.is_empty() {
             return Ok(None);
         }
@@ -252,7 +252,7 @@ impl Freelist {
         Ok(Some(page_no))
     }
 
-    pub fn release(&mut self, storage: &mut super::MmapStorage, page_no: u32) -> Result<()> {
+    pub fn release<S: Storage>(&mut self, storage: &mut S, page_no: u32) -> Result<()> {
         if self.head_page == 0 {
             self.initialize_trunk(storage, page_no)?;
             return Ok(());
@@ -298,7 +298,7 @@ impl Freelist {
         Ok(())
     }
 
-    fn create_new_trunk(&mut self, storage: &mut super::MmapStorage, page_no: u32) -> Result<()> {
+    fn create_new_trunk<S: Storage>(&mut self, storage: &mut S, page_no: u32) -> Result<()> {
         let old_head = self.head_page;
 
         let page_data = storage.page_mut(page_no)?;
@@ -320,7 +320,7 @@ impl Freelist {
         storage.sync()
     }
 
-    fn initialize_trunk(&mut self, storage: &mut super::MmapStorage, page_no: u32) -> Result<()> {
+    fn initialize_trunk<S: Storage>(&mut self, storage: &mut S, page_no: u32) -> Result<()> {
         let page_data = storage.page_mut(page_no)?;
 
         let header = super::PageHeader::new(super::PageType::FreeList);
