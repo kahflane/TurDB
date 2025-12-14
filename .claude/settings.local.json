@@ -32,7 +32,8 @@
       "Bash(RUST_BACKTRACE=1 cargo test:*)",
       "Bash(cloc:*)",
       "Bash(cargo clean:*)",
-      "Bash(ls:*)"
+      "Bash(ls:*)",
+      "Bash(tee:*)"
     ]
   }
 }
