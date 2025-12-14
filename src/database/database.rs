@@ -439,6 +439,8 @@ impl Database {
             );
         }
 
+        let mut unique_columns: Vec<(String, bool)> = Vec::new();
+
         let columns: Vec<SchemaColumnDef> = create
             .columns
             .iter()
@@ -456,10 +458,12 @@ impl Database {
                         }
                         ColumnConstraint::Unique => {
                             column = column.with_constraint(SchemaConstraint::Unique);
+                            unique_columns.push((col.name.to_string(), false));
                         }
                         ColumnConstraint::PrimaryKey => {
                             column = column.with_constraint(SchemaConstraint::PrimaryKey);
                             column = column.with_constraint(SchemaConstraint::NotNull);
+                            unique_columns.push((col.name.to_string(), true));
                         }
                         ColumnConstraint::Default(expr) => {
                             if let Some(default_str) = Self::expr_to_default_string(expr) {
@@ -503,6 +507,46 @@ impl Database {
         let storage = file_manager.table_data_mut(schema_name, table_name)?;
         storage.grow(2)?;
         crate::btree::BTree::create(storage, 1)?;
+
+        for (col_name, is_primary_key) in &unique_columns {
+            let index_name = if *is_primary_key {
+                format!("{}_pkey", col_name)
+            } else {
+                format!("{}_key", col_name)
+            };
+
+            let index_id = self.allocate_index_id();
+            file_manager.create_index(
+                schema_name,
+                table_name,
+                &index_name,
+                index_id,
+                table_id,
+                1,
+                true,
+            )?;
+
+            let index_storage = file_manager.index_data_mut(schema_name, table_name, &index_name)?;
+            index_storage.grow(2)?;
+            crate::btree::BTree::create(index_storage, 1)?;
+
+            let index_def = crate::schema::table::IndexDef::new(
+                index_name.clone(),
+                vec![col_name.clone()],
+                true,
+                crate::schema::table::IndexType::BTree,
+            );
+
+            let mut catalog_guard = self.catalog.write();
+            let catalog = catalog_guard.as_mut().unwrap();
+            if let Some(schema) = catalog.get_schema_mut(schema_name) {
+                if let Some(table) = schema.get_table(table_name) {
+                    let table_with_index = table.clone().with_index(index_def);
+                    schema.remove_table(table_name);
+                    schema.add_table(table_with_index);
+                }
+            }
+        }
 
         self.save_catalog()?;
         self.save_meta()?;
@@ -615,6 +659,7 @@ impl Database {
         use crate::btree::BTree;
         use crate::constraints::ConstraintValidator;
         use crate::database::owned_value::create_record_schema;
+        use crate::schema::table::Constraint;
         use std::sync::atomic::Ordering;
 
         self.ensure_catalog()?;
@@ -635,20 +680,25 @@ impl Database {
         let columns = table_def.columns().to_vec();
         let table_def_for_validator = table_def.clone();
 
-        let schema = create_record_schema(&columns);
+        let unique_columns: Vec<(usize, String, bool)> = columns
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, col)| {
+                let is_pk = col.has_constraint(&Constraint::PrimaryKey);
+                let is_unique = col.has_constraint(&Constraint::Unique);
+                if is_pk || is_unique {
+                    let index_name = if is_pk {
+                        format!("{}_pkey", col.name())
+                    } else {
+                        format!("{}_key", col.name())
+                    };
+                    Some((idx, index_name, is_pk))
+                } else {
+                    None
+                }
+            })
+            .collect();
 
-        let rows = match &insert.source {
-            crate::sql::ast::InsertSource::Values(values) => values,
-            _ => bail!("only VALUES insert supported"),
-        };
-
-        let root_page = 1u32;
-
-        let column_types: Vec<crate::records::types::DataType> =
-            columns.iter().map(|c| c.data_type()).collect();
-        let validator = ConstraintValidator::new(&table_def_for_validator);
-
-        use crate::schema::table::Constraint;
         let fk_constraints: Vec<(usize, String, String)> = columns
             .iter()
             .enumerate()
@@ -663,24 +713,57 @@ impl Database {
             })
             .collect();
 
-        if !fk_constraints.is_empty() {
-            let catalog_guard = self.catalog.read();
-            let catalog = catalog_guard.as_ref().unwrap();
+        let schema = create_record_schema(&columns);
 
-            let mut file_manager_guard = self.file_manager.write();
-            let file_manager = file_manager_guard.as_mut().unwrap();
+        let rows = match &insert.source {
+            crate::sql::ast::InsertSource::Values(values) => values,
+            _ => bail!("only VALUES insert supported"),
+        };
 
-            for row_exprs in rows.iter() {
-                let parsed_values: Vec<OwnedValue> = row_exprs
-                    .iter()
-                    .zip(column_types.iter())
-                    .map(|(expr, data_type)| {
-                        Database::eval_literal_with_type(expr, Some(data_type))
-                    })
-                    .collect::<Result<Vec<_>>>()?;
+        let root_page = 1u32;
+
+        let column_types: Vec<crate::records::types::DataType> =
+            columns.iter().map(|c| c.data_type()).collect();
+        let validator = ConstraintValidator::new(&table_def_for_validator);
+
+        drop(catalog_guard);
+
+        let mut file_manager_guard = self.file_manager.write();
+        let file_manager = file_manager_guard.as_mut().unwrap();
+
+        let mut count = 0;
+
+        for row_exprs in rows.iter() {
+            let mut values: Vec<OwnedValue> = row_exprs
+                .iter()
+                .zip(column_types.iter())
+                .map(|(expr, data_type)| Database::eval_literal_with_type(expr, Some(data_type)))
+                .collect::<Result<Vec<_>>>()?;
+
+            validator.validate_insert(&mut values)?;
+
+            for (col_idx, col) in columns.iter().enumerate() {
+                for constraint in col.constraints() {
+                    if let Constraint::Check(expr_str) = constraint {
+                        let col_value = values.get(col_idx);
+                        if !Database::evaluate_check_expression(expr_str, col.name(), col_value) {
+                            bail!(
+                                "CHECK constraint violated on column '{}' in table '{}': {}",
+                                col.name(),
+                                table_name,
+                                expr_str
+                            );
+                        }
+                    }
+                }
+            }
+
+            if !fk_constraints.is_empty() {
+                let catalog_guard = self.catalog.read();
+                let catalog = catalog_guard.as_ref().unwrap();
 
                 for (col_idx, fk_table, fk_column) in &fk_constraints {
-                    if let Some(value) = parsed_values.get(*col_idx) {
+                    if let Some(value) = values.get(*col_idx) {
                         if value.is_null() {
                             continue;
                         }
@@ -736,135 +819,121 @@ impl Database {
                 }
             }
 
-            drop(file_manager_guard);
-        }
+            for (col_idx, index_name, is_pk) in &unique_columns {
+                if let Some(value) = values.get(*col_idx) {
+                    if value.is_null() {
+                        continue;
+                    }
 
-        let mut file_manager_guard = self.file_manager.write();
-        let file_manager = file_manager_guard.as_mut().unwrap();
-        let storage = file_manager.table_data_mut(schema_name, table_name)?;
+                    if file_manager.index_exists(schema_name, table_name, index_name) {
+                        let index_storage =
+                            file_manager.index_data_mut(schema_name, table_name, index_name)?;
+                        let index_btree = BTree::new(index_storage, root_page)?;
 
-        fn insert_rows<'a, S: crate::storage::Storage>(
-            btree: &mut BTree<'_, S>,
-            rows: &[&[&crate::sql::ast::Expr<'a>]],
-            schema: &crate::records::Schema,
-            column_types: &[crate::records::types::DataType],
-            next_row_id: &std::sync::atomic::AtomicU64,
-            validator: &ConstraintValidator<'_>,
-            columns: &[SchemaColumnDef],
-        ) -> Result<usize> {
-            use crate::records::RecordView;
-            use crate::schema::table::Constraint;
+                        let mut key_buf = Vec::with_capacity(64);
+                        Self::encode_value_as_key(value, &mut key_buf);
 
-            let unique_col_indices: Vec<usize> = columns
-                .iter()
-                .enumerate()
-                .filter(|(_, col)| {
-                    col.has_constraint(&Constraint::Unique)
-                        || col.has_constraint(&Constraint::PrimaryKey)
-                })
-                .map(|(idx, _)| idx)
-                .collect();
-
-            let mut count = 0;
-            for row_exprs in rows.iter() {
-                let mut values: Vec<OwnedValue> = row_exprs
-                    .iter()
-                    .zip(column_types.iter())
-                    .map(|(expr, data_type)| {
-                        Database::eval_literal_with_type(expr, Some(data_type))
-                    })
-                    .collect::<Result<Vec<_>>>()?;
-                validator.validate_insert(&mut values)?;
-
-                for (col_idx, col) in columns.iter().enumerate() {
-                    for constraint in col.constraints() {
-                        if let Constraint::Check(expr_str) = constraint {
-                            let col_value = values.get(col_idx);
-                            if !Database::evaluate_check_expression(
-                                expr_str,
-                                col.name(),
-                                col_value,
-                            ) {
-                                bail!(
-                                    "CHECK constraint violated on column '{}' in table '{}': {}",
-                                    col.name(),
-                                    validator.table().name(),
-                                    expr_str
-                                );
-                            }
+                        if index_btree.search(&key_buf)?.is_some() {
+                            let constraint_type = if *is_pk { "PRIMARY KEY" } else { "UNIQUE" };
+                            bail!(
+                                "{} constraint violated on column '{}' in table '{}': value already exists",
+                                constraint_type,
+                                columns[*col_idx].name(),
+                                table_name
+                            );
                         }
                     }
                 }
-
-                if !unique_col_indices.is_empty() {
-                    let mut cursor = btree.cursor_first()?;
-                    while cursor.valid() {
-                        let existing_value = cursor.value()?;
-                        let existing_record = RecordView::new(existing_value, schema)?;
-                        let existing_values =
-                            OwnedValue::extract_row_from_record(&existing_record, columns)?;
-
-                        for &col_idx in &unique_col_indices {
-                            let new_val = values.get(col_idx);
-                            let existing_val = existing_values.get(col_idx);
-
-                            if let (Some(new_v), Some(existing_v)) = (new_val, existing_val) {
-                                if !new_v.is_null() && !existing_v.is_null() && new_v == existing_v {
-                                    let col_name = &columns[col_idx].name();
-                                    let constraint_type =
-                                        if columns[col_idx].has_constraint(&Constraint::PrimaryKey) {
-                                            "PRIMARY KEY"
-                                        } else {
-                                            "UNIQUE"
-                                        };
-                                    bail!(
-                                        "{} constraint violated on column '{}' in table '{}': value already exists",
-                                        constraint_type,
-                                        col_name,
-                                        validator.table().name()
-                                    );
-                                }
-                            }
-                        }
-                        cursor.advance()?;
-                    }
-                }
-
-                let record_data = OwnedValue::build_record_from_values(&values, schema)?;
-                let row_id = next_row_id.fetch_add(1, Ordering::Relaxed);
-                let key = Database::generate_row_key(row_id);
-                btree.insert(&key, &record_data)?;
-                count += 1;
             }
-            Ok(count)
+
+            let table_storage = file_manager.table_data_mut(schema_name, table_name)?;
+            let row_id = self.next_row_id.fetch_add(1, Ordering::Relaxed);
+            let row_key = Self::generate_row_key(row_id);
+            let record_data = OwnedValue::build_record_from_values(&values, &schema)?;
+
+            if wal_enabled {
+                let mut wal_storage = WalStorage::new(table_storage, &self.dirty_pages);
+                let mut btree = BTree::new(&mut wal_storage, root_page)?;
+                btree.insert(&row_key, &record_data)?;
+            } else {
+                let mut btree = BTree::new(table_storage, root_page)?;
+                btree.insert(&row_key, &record_data)?;
+            }
+
+            for (col_idx, index_name, _) in &unique_columns {
+                if let Some(value) = values.get(*col_idx) {
+                    if value.is_null() {
+                        continue;
+                    }
+
+                    if file_manager.index_exists(schema_name, table_name, index_name) {
+                        let index_storage =
+                            file_manager.index_data_mut(schema_name, table_name, index_name)?;
+
+                        let mut key_buf = Vec::with_capacity(64);
+                        Self::encode_value_as_key(value, &mut key_buf);
+
+                        let row_id_bytes = row_id.to_be_bytes();
+
+                        let mut index_btree = BTree::new(index_storage, root_page)?;
+                        index_btree.insert(&key_buf, &row_id_bytes)?;
+                    }
+                }
+            }
+
+            count += 1;
         }
 
-        let rows_affected = if wal_enabled {
-            let mut wal_storage = WalStorage::new(storage, &self.dirty_pages);
-            let mut btree = BTree::new(&mut wal_storage, root_page)?;
-            insert_rows(
-                &mut btree,
-                rows,
-                &schema,
-                &column_types,
-                &self.next_row_id,
-                &validator,
-                &columns,
-            )?
-        } else {
-            let mut btree = BTree::new(storage, root_page)?;
-            insert_rows(
-                &mut btree,
-                rows,
-                &schema,
-                &column_types,
-                &self.next_row_id,
-                &validator,
-                &columns,
-            )?
-        };
+        Ok(ExecuteResult::Insert {
+            rows_affected: count,
+        })
+    }
 
-        Ok(ExecuteResult::Insert { rows_affected })
+    fn encode_value_as_key(value: &OwnedValue, buf: &mut Vec<u8>) {
+        use crate::encoding::key;
+
+        match value {
+            OwnedValue::Null => key::encode_null(buf),
+            OwnedValue::Bool(b) => key::encode_bool(*b, buf),
+            OwnedValue::Int(n) => key::encode_int(*n, buf),
+            OwnedValue::Float(f) => key::encode_float(*f, buf),
+            OwnedValue::Text(s) => key::encode_text(s, buf),
+            OwnedValue::Blob(b) => key::encode_blob(b, buf),
+            OwnedValue::Uuid(u) => key::encode_uuid(u, buf),
+            OwnedValue::Jsonb(j) => key::encode_blob(j, buf),
+            OwnedValue::Vector(v) => {
+                for f in v {
+                    key::encode_float(*f as f64, buf);
+                }
+            }
+            OwnedValue::Date(days) => key::encode_date(*days, buf),
+            OwnedValue::Time(micros) => key::encode_time(*micros, buf),
+            OwnedValue::Timestamp(micros) => key::encode_timestamp(*micros, buf),
+            OwnedValue::TimestampTz(micros, tz_offset_mins) => {
+                key::encode_timestamptz(*micros, *tz_offset_mins as i16, buf)
+            }
+            OwnedValue::Interval(micros, days, months) => {
+                key::encode_interval(*months, *days, *micros, buf)
+            }
+            OwnedValue::MacAddr(m) => key::encode_blob(m, buf),
+            OwnedValue::Inet4(a) => key::encode_blob(a, buf),
+            OwnedValue::Inet6(a) => key::encode_blob(a, buf),
+            OwnedValue::Point(x, y) => {
+                key::encode_float(*x, buf);
+                key::encode_float(*y, buf);
+            }
+            OwnedValue::Box((x1, y1), (x2, y2)) => {
+                key::encode_float(*x1, buf);
+                key::encode_float(*y1, buf);
+                key::encode_float(*x2, buf);
+                key::encode_float(*y2, buf);
+            }
+            OwnedValue::Circle((x, y), r) => {
+                key::encode_float(*x, buf);
+                key::encode_float(*y, buf);
+                key::encode_float(*r, buf);
+            }
+        }
     }
 
     fn execute_update(
