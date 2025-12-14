@@ -45,20 +45,20 @@
 //! }
 //! ```
 
+pub mod adapter;
 pub mod ast;
+pub mod builder;
+pub mod context;
+pub mod decoder;
 pub mod executor;
+pub mod expr;
 pub mod lexer;
 pub mod parser;
 pub mod planner;
-pub mod token;
-pub mod decoder;
-pub mod builder;
-pub mod state;
-pub mod util;
 pub mod predicate;
-pub mod expr;
-pub mod context;
-pub mod adapter;
+pub mod state;
+pub mod token;
+pub mod util;
 
 pub use ast::*;
 pub use lexer::Lexer;

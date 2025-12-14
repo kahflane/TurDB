@@ -1,7 +1,7 @@
-use std::borrow::Cow;
-use bumpalo::Bump;
 use crate::sql::executor::ExecutorRow;
 use crate::types::Value;
+use bumpalo::Bump;
+use std::borrow::Cow;
 
 pub fn allocate_value_to_arena<'a>(v: Value<'_>, arena: &'a Bump) -> Value<'a> {
     match v {

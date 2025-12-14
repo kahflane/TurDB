@@ -1,4 +1,4 @@
-use crate::sql::executor::{ExecutorRow};
+use crate::sql::executor::ExecutorRow;
 use crate::types::Value;
 
 pub struct ExprEvaluator {

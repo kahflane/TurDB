@@ -203,6 +203,59 @@ impl<'a> RecordBuilder<'a> {
         Ok(())
     }
 
+    pub fn set_char(&mut self, col_idx: usize, text: &str) -> Result<()> {
+        let col = self
+            .schema
+            .column(col_idx)
+            .ok_or_else(|| eyre::eyre!("column {} not found", col_idx))?;
+        let max_len = col
+            .char_length()
+            .ok_or_else(|| eyre::eyre!("CHAR column {} has no length constraint", col_idx))?
+            as usize;
+
+        let char_count = text.chars().count();
+        if char_count > max_len {
+            eyre::bail!(
+                "value length {} exceeds CHAR({}) limit for column {}",
+                char_count,
+                max_len,
+                col_idx
+            );
+        }
+
+        let padded: String = if char_count < max_len {
+            let padding = max_len - char_count;
+            let mut s = text.to_string();
+            s.extend(std::iter::repeat_n(' ', padding));
+            s
+        } else {
+            text.to_string()
+        };
+
+        self.set_blob(col_idx, padded.as_bytes())
+    }
+
+    pub fn set_varchar(&mut self, col_idx: usize, text: &str) -> Result<()> {
+        let col = self
+            .schema
+            .column(col_idx)
+            .ok_or_else(|| eyre::eyre!("column {} not found", col_idx))?;
+
+        if let Some(max_len) = col.char_length() {
+            let char_count = text.chars().count();
+            if char_count > max_len as usize {
+                eyre::bail!(
+                    "value length {} exceeds VARCHAR({}) limit for column {}",
+                    char_count,
+                    max_len,
+                    col_idx
+                );
+            }
+        }
+
+        self.set_blob(col_idx, text.as_bytes())
+    }
+
     pub fn set_jsonb(&mut self, col_idx: usize, jsonb: &JsonbBuilder) -> Result<()> {
         self.clear_null(col_idx);
         let var_idx = self

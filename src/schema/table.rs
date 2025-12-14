@@ -134,22 +134,22 @@ impl ColumnDef {
         self.constraints.iter().any(|c| {
             std::mem::discriminant(c) == std::mem::discriminant(constraint)
                 && match (c, constraint) {
-                (Constraint::NotNull, Constraint::NotNull) => true,
-                (Constraint::PrimaryKey, Constraint::PrimaryKey) => true,
-                (Constraint::Unique, Constraint::Unique) => true,
-                (
-                    Constraint::ForeignKey {
-                        table: t1,
-                        column: c1,
-                    },
-                    Constraint::ForeignKey {
-                        table: t2,
-                        column: c2,
-                    },
-                ) => t1 == t2 && c1 == c2,
-                (Constraint::Check(e1), Constraint::Check(e2)) => e1 == e2,
-                _ => false,
-            }
+                    (Constraint::NotNull, Constraint::NotNull) => true,
+                    (Constraint::PrimaryKey, Constraint::PrimaryKey) => true,
+                    (Constraint::Unique, Constraint::Unique) => true,
+                    (
+                        Constraint::ForeignKey {
+                            table: t1,
+                            column: c1,
+                        },
+                        Constraint::ForeignKey {
+                            table: t2,
+                            column: c2,
+                        },
+                    ) => t1 == t2 && c1 == c2,
+                    (Constraint::Check(e1), Constraint::Check(e2)) => e1 == e2,
+                    _ => false,
+                }
         })
     }
 

@@ -1,6 +1,6 @@
-use std::borrow::Cow;
 use crate::sql::executor::ExecutorRow;
 use crate::types::Value;
+use std::borrow::Cow;
 
 pub struct CompiledPredicate<'a> {
     expr: &'a crate::sql::ast::Expr<'a>,
@@ -87,32 +87,26 @@ impl<'a> CompiledPredicate<'a> {
         use crate::sql::ast::BinaryOperator;
 
         match op {
-            BinaryOperator::Plus => self.eval_arithmetic_op(left, right, |a, b| a + b, |a, b| a + b),
+            BinaryOperator::Plus => {
+                self.eval_arithmetic_op(left, right, |a, b| a + b, |a, b| a + b)
+            }
             BinaryOperator::Minus => {
                 self.eval_arithmetic_op(left, right, |a, b| a - b, |a, b| a - b)
             }
             BinaryOperator::Multiply => {
                 self.eval_arithmetic_op(left, right, |a, b| a * b, |a, b| a * b)
             }
-            BinaryOperator::Divide => {
-                match (left, right) {
-                    (Value::Int(a), Value::Int(b)) if *b != 0 => Some(Value::Int(a / b)),
-                    (Value::Int(a), Value::Float(b)) if *b != 0.0 => {
-                        Some(Value::Float(*a as f64 / b))
-                    }
-                    (Value::Float(a), Value::Int(b)) if *b != 0 => {
-                        Some(Value::Float(a / *b as f64))
-                    }
-                    (Value::Float(a), Value::Float(b)) if *b != 0.0 => Some(Value::Float(a / b)),
-                    _ => None,
-                }
-            }
+            BinaryOperator::Divide => match (left, right) {
+                (Value::Int(a), Value::Int(b)) if *b != 0 => Some(Value::Int(a / b)),
+                (Value::Int(a), Value::Float(b)) if *b != 0.0 => Some(Value::Float(*a as f64 / b)),
+                (Value::Float(a), Value::Int(b)) if *b != 0 => Some(Value::Float(a / *b as f64)),
+                (Value::Float(a), Value::Float(b)) if *b != 0.0 => Some(Value::Float(a / b)),
+                _ => None,
+            },
             BinaryOperator::Modulo => match (left, right) {
                 (Value::Int(a), Value::Int(b)) if *b != 0 => Some(Value::Int(a % b)),
                 (Value::Float(a), Value::Float(b)) if *b != 0.0 => Some(Value::Float(a % b)),
-                (Value::Int(a), Value::Float(b)) if *b != 0.0 => {
-                    Some(Value::Float(*a as f64 % b))
-                }
+                (Value::Int(a), Value::Float(b)) if *b != 0.0 => Some(Value::Float(*a as f64 % b)),
                 (Value::Float(a), Value::Int(b)) if *b != 0 => Some(Value::Float(a % *b as f64)),
                 _ => None,
             },
@@ -360,7 +354,11 @@ impl<'a> CompiledPredicate<'a> {
         Some(Value::Float(sum.sqrt() as f64))
     }
 
-    fn eval_vector_cosine_distance(&self, left: &Value<'a>, right: &Value<'a>) -> Option<Value<'a>> {
+    fn eval_vector_cosine_distance(
+        &self,
+        left: &Value<'a>,
+        right: &Value<'a>,
+    ) -> Option<Value<'a>> {
         let (vec1, vec2) = match (left, right) {
             (Value::Vector(v1), Value::Vector(v2)) if v1.len() == v2.len() => {
                 (v1.as_ref(), v2.as_ref())

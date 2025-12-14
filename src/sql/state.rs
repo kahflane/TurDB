@@ -1,8 +1,8 @@
-use bumpalo::Bump;
 use crate::sql::adapter::BTreeCursorAdapter;
 use crate::sql::executor::{AggregateFunction, DynamicExecutor, ExecutorRow, RowSource, SortKey};
 use crate::sql::predicate::CompiledPredicate;
 use crate::types::Value;
+use bumpalo::Bump;
 
 pub struct LimitState<'a, S: RowSource> {
     pub child: Box<DynamicExecutor<'a, S>>,

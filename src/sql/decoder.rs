@@ -1,5 +1,5 @@
-use std::borrow::Cow;
 use crate::types::Value;
+use std::borrow::Cow;
 
 pub trait RecordDecoder {
     fn decode(&self, key: &[u8], value: &[u8]) -> eyre::Result<Vec<Value<'static>>>;
@@ -101,7 +101,7 @@ impl SimpleDecoder {
                 DataType::Bool => Value::Int(if view.get_bool(idx)? { 1 } else { 0 }),
                 DataType::Text | DataType::Varchar | DataType::Char => {
                     Value::Text(Cow::Owned(view.get_text(idx)?.to_string()))
-                },
+                }
                 DataType::Blob => Value::Blob(Cow::Owned(view.get_blob(idx)?.to_vec())),
                 DataType::Uuid => Value::Uuid(*view.get_uuid(idx)?),
                 DataType::Vector => Value::Vector(Cow::Owned(view.get_vector(idx)?.to_vec())),
