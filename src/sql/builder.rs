@@ -1,0 +1,321 @@
+use crate::sql::adapter::BTreeCursorAdapter;
+use crate::sql::context::ExecutionContext;
+use crate::sql::executor::{AggregateFunction, DynamicExecutor, RowSource, SortKey, TableScanExecutor};
+use crate::sql::predicate::CompiledPredicate;
+use crate::sql::state::{GraceHashJoinState, HashAggregateState, IndexScanState, LimitState, NestedLoopJoinState, SortState};
+
+pub struct ExecutorBuilder<'a> {
+    ctx: &'a ExecutionContext<'a>,
+}
+
+impl<'a> ExecutorBuilder<'a> {
+    pub fn new(ctx: &'a ExecutionContext<'a>) -> Self {
+        Self { ctx }
+    }
+
+    pub fn build_with_source<S: RowSource>(
+        &self,
+        plan: &crate::sql::planner::PhysicalPlan<'a>,
+        source: S,
+    ) -> eyre::Result<DynamicExecutor<'a, S>> {
+        let column_map: Vec<(String, usize)> = plan
+            .output_schema
+            .columns
+            .iter()
+            .enumerate()
+            .map(|(idx, col)| (col.name.to_string(), idx))
+            .collect();
+
+        self.build_operator(plan.root, source, &column_map)
+    }
+
+    fn build_operator<S: RowSource>(
+        &self,
+        op: &'a crate::sql::planner::PhysicalOperator<'a>,
+        source: S,
+        column_map: &[(String, usize)],
+    ) -> eyre::Result<DynamicExecutor<'a, S>> {
+        use crate::sql::planner::PhysicalOperator;
+
+        match op {
+            PhysicalOperator::TableScan(_) => Ok(DynamicExecutor::TableScan(
+                TableScanExecutor::new(source, self.ctx.arena),
+            )),
+            PhysicalOperator::FilterExec(filter) => {
+                let child = self.build_operator(filter.input, source, column_map)?;
+                let predicate = CompiledPredicate::new(filter.predicate, column_map.to_vec());
+                Ok(DynamicExecutor::Filter(Box::new(child), predicate))
+            }
+            PhysicalOperator::ProjectExec(project) => {
+                let child = self.build_operator(project.input, source, column_map)?;
+                let projections: Vec<usize> = (0..project.expressions.len()).collect();
+                #[cfg(test)]
+                eprintln!(
+                    "DEBUG ProjectExec: expressions.len() = {}, projections = {:?}",
+                    project.expressions.len(),
+                    projections
+                );
+                Ok(DynamicExecutor::Project(
+                    Box::new(child),
+                    projections,
+                    self.ctx.arena,
+                ))
+            }
+            PhysicalOperator::LimitExec(limit) => {
+                let child = self.build_operator(limit.input, source, column_map)?;
+                Ok(DynamicExecutor::Limit(LimitState {
+                    child: Box::new(child),
+                    limit: limit.limit,
+                    offset: limit.offset,
+                    skipped: 0,
+                    returned: 0,
+                }))
+            }
+            PhysicalOperator::SortExec(sort) => {
+                let child = self.build_operator(sort.input, source, column_map)?;
+                let sort_keys: Vec<SortKey> = sort
+                    .order_by
+                    .iter()
+                    .enumerate()
+                    .map(|(idx, key)| SortKey {
+                        column: idx,
+                        ascending: key.ascending,
+                    })
+                    .collect();
+                Ok(DynamicExecutor::Sort(SortState {
+                    child: Box::new(child),
+                    sort_keys,
+                    arena: self.ctx.arena,
+                    rows: Vec::new(),
+                    iter_idx: 0,
+                    sorted: false,
+                }))
+            }
+            PhysicalOperator::IndexScan(_) => {
+                eyre::bail!(
+                    "IndexScan requires explicit BTreeCursorAdapter - use build_index_scan instead"
+                )
+            }
+            PhysicalOperator::HashAggregate(agg) => {
+                let child = self.build_operator(agg.input, source, column_map)?;
+                let group_by_indices: Vec<usize> = agg
+                    .group_by
+                    .iter()
+                    .filter_map(|expr| {
+                        if let crate::sql::ast::Expr::Column(col) = expr {
+                            column_map
+                                .iter()
+                                .find(|(n, _)| n.eq_ignore_ascii_case(col.column))
+                                .map(|(_, i)| *i)
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+                let agg_funcs: Vec<AggregateFunction> = agg
+                    .aggregates
+                    .iter()
+                    .map(|agg_expr| {
+                        let column_idx = agg_expr
+                            .argument
+                            .and_then(|arg| {
+                                if let crate::sql::ast::Expr::Column(col) = arg {
+                                    column_map
+                                        .iter()
+                                        .find(|(n, _)| n.eq_ignore_ascii_case(col.column))
+                                        .map(|(_, i)| *i)
+                                } else {
+                                    None
+                                }
+                            })
+                            .unwrap_or(0);
+                        match agg_expr.function {
+                            crate::sql::planner::AggregateFunction::Count => {
+                                AggregateFunction::Count {
+                                    distinct: agg_expr.distinct,
+                                }
+                            }
+                            crate::sql::planner::AggregateFunction::Sum => {
+                                AggregateFunction::Sum { column: column_idx }
+                            }
+                            crate::sql::planner::AggregateFunction::Avg => {
+                                AggregateFunction::Avg { column: column_idx }
+                            }
+                            crate::sql::planner::AggregateFunction::Min => {
+                                AggregateFunction::Min { column: column_idx }
+                            }
+                            crate::sql::planner::AggregateFunction::Max => {
+                                AggregateFunction::Max { column: column_idx }
+                            }
+                        }
+                    })
+                    .collect();
+                Ok(DynamicExecutor::HashAggregate(HashAggregateState {
+                    child: Box::new(child),
+                    group_by: group_by_indices,
+                    aggregates: agg_funcs,
+                    arena: self.ctx.arena,
+                    groups: hashbrown::HashMap::new(),
+                    result_iter: None,
+                    computed: false,
+                }))
+            }
+            PhysicalOperator::SortedAggregate(agg) => {
+                let child = self.build_operator(agg.input, source, column_map)?;
+                let group_by_indices: Vec<usize> = agg
+                    .group_by
+                    .iter()
+                    .filter_map(|expr| {
+                        if let crate::sql::ast::Expr::Column(col) = expr {
+                            column_map
+                                .iter()
+                                .find(|(n, _)| n.eq_ignore_ascii_case(col.column))
+                                .map(|(_, i)| *i)
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+                let agg_funcs: Vec<AggregateFunction> = agg
+                    .aggregates
+                    .iter()
+                    .map(|agg_expr| {
+                        let column_idx = agg_expr
+                            .argument
+                            .and_then(|arg| {
+                                if let crate::sql::ast::Expr::Column(col) = arg {
+                                    column_map
+                                        .iter()
+                                        .find(|(n, _)| n.eq_ignore_ascii_case(col.column))
+                                        .map(|(_, i)| *i)
+                                } else {
+                                    None
+                                }
+                            })
+                            .unwrap_or(0);
+                        match agg_expr.function {
+                            crate::sql::planner::AggregateFunction::Count => {
+                                AggregateFunction::Count {
+                                    distinct: agg_expr.distinct,
+                                }
+                            }
+                            crate::sql::planner::AggregateFunction::Sum => {
+                                AggregateFunction::Sum { column: column_idx }
+                            }
+                            crate::sql::planner::AggregateFunction::Avg => {
+                                AggregateFunction::Avg { column: column_idx }
+                            }
+                            crate::sql::planner::AggregateFunction::Min => {
+                                AggregateFunction::Min { column: column_idx }
+                            }
+                            crate::sql::planner::AggregateFunction::Max => {
+                                AggregateFunction::Max { column: column_idx }
+                            }
+                        }
+                    })
+                    .collect();
+                Ok(DynamicExecutor::HashAggregate(HashAggregateState {
+                    child: Box::new(child),
+                    group_by: group_by_indices,
+                    aggregates: agg_funcs,
+                    arena: self.ctx.arena,
+                    groups: hashbrown::HashMap::new(),
+                    result_iter: None,
+                    computed: false,
+                }))
+            }
+            PhysicalOperator::NestedLoopJoin(_) => {
+                eyre::bail!(
+                    "NestedLoopJoin requires two sources - use build_nested_loop_join instead"
+                )
+            }
+            PhysicalOperator::GraceHashJoin(_) => {
+                eyre::bail!(
+                    "GraceHashJoin requires two sources - use build_grace_hash_join instead"
+                )
+            }
+        }
+    }
+
+    pub fn build_index_scan(
+        &self,
+        index_scan: &'a crate::sql::planner::PhysicalIndexScan<'a>,
+        adapter: BTreeCursorAdapter,
+        column_map: &[(String, usize)],
+    ) -> eyre::Result<IndexScanState<'a>> {
+        let residual_filter = index_scan
+            .residual_filter
+            .map(|expr| CompiledPredicate::new(expr, column_map.to_vec()));
+
+        Ok(IndexScanState::new(
+            adapter,
+            self.ctx.arena,
+            residual_filter,
+        ))
+    }
+
+    pub fn build_nested_loop_join<S: RowSource>(
+        &self,
+        left: DynamicExecutor<'a, S>,
+        right: DynamicExecutor<'a, S>,
+        condition: Option<&'a crate::sql::ast::Expr<'a>>,
+        column_map: &[(String, usize)],
+    ) -> NestedLoopJoinState<'a, S> {
+        let compiled_condition =
+            condition.map(|expr| CompiledPredicate::new(expr, column_map.to_vec()));
+        NestedLoopJoinState {
+            left: Box::new(left),
+            right: Box::new(right),
+            condition: compiled_condition,
+            arena: self.ctx.arena,
+            current_left_row: None,
+            right_rows: Vec::new(),
+            right_index: 0,
+            materialized: false,
+        }
+    }
+
+    pub fn build_grace_hash_join<S: RowSource>(
+        &self,
+        left: DynamicExecutor<'a, S>,
+        right: DynamicExecutor<'a, S>,
+        left_key_indices: Vec<usize>,
+        right_key_indices: Vec<usize>,
+        num_partitions: usize,
+    ) -> GraceHashJoinState<'a, S> {
+        GraceHashJoinState {
+            left: Box::new(left),
+            right: Box::new(right),
+            left_key_indices,
+            right_key_indices,
+            arena: self.ctx.arena,
+            num_partitions,
+            left_partitions: (0..num_partitions).map(|_| Vec::new()).collect(),
+            right_partitions: (0..num_partitions).map(|_| Vec::new()).collect(),
+            current_partition: 0,
+            partition_hash_table: hashbrown::HashMap::new(),
+            partition_build_rows: Vec::new(),
+            current_probe_idx: 0,
+            current_match_idx: 0,
+            current_matches: Vec::new(),
+            partitioned: false,
+        }
+    }
+
+    pub fn build_hash_aggregate<S: RowSource>(
+        &self,
+        child: DynamicExecutor<'a, S>,
+        group_by: Vec<usize>,
+        aggregates: Vec<AggregateFunction>,
+    ) -> HashAggregateState<'a, S> {
+        HashAggregateState {
+            child: Box::new(child),
+            group_by,
+            aggregates,
+            arena: self.ctx.arena,
+            groups: hashbrown::HashMap::new(),
+            result_iter: None,
+            computed: false,
+        }
+    }
+}

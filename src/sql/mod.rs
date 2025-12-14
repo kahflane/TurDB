@@ -51,6 +51,14 @@ pub mod lexer;
 pub mod parser;
 pub mod planner;
 pub mod token;
+pub mod decoder;
+pub mod builder;
+pub mod state;
+pub mod util;
+pub mod predicate;
+pub mod expr;
+pub mod context;
+pub mod adapter;
 
 pub use ast::*;
 pub use lexer::Lexer;
