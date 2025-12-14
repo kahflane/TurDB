@@ -694,9 +694,7 @@ impl<'a> Lexer<'a> {
     fn scan_identifier_or_keyword(&mut self) -> Token<'a> {
         let start = self.pos;
 
-        if (self.current() == b'x' || self.current() == b'X')
-            && self.peek_char() == Some(b'\'')
-        {
+        if (self.current() == b'x' || self.current() == b'X') && self.peek_char() == Some(b'\'') {
             return self.scan_hex_string_literal();
         }
 

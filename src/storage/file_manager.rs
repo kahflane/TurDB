@@ -119,9 +119,9 @@ pub const META_FILE_NAME: &str = "turdb.meta";
 
 pub const HNSW_MAGIC: &[u8; 16] = b"TurDB HNSW\x00\x00\x00\x00\x00\x00";
 
+pub use super::headers::META_MAGIC;
 #[cfg(test)]
 pub use super::headers::{INDEX_MAGIC, TABLE_MAGIC};
-pub use super::headers::META_MAGIC;
 
 pub const DEFAULT_SCHEMA: &str = "root";
 
@@ -491,8 +491,14 @@ impl FileManager {
 
         let mut storage = MmapStorage::create(&index_path, 1)?;
 
-        let header =
-            IndexFileHeader::new(index_id, table_id, 1, key_column_count, is_unique, INDEX_TYPE_BTREE);
+        let header = IndexFileHeader::new(
+            index_id,
+            table_id,
+            1,
+            key_column_count,
+            is_unique,
+            INDEX_TYPE_BTREE,
+        );
         let page = storage.page_mut(0)?;
         page[..128].copy_from_slice(header.as_bytes());
 

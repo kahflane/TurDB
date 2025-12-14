@@ -38,8 +38,43 @@ impl<'a> From<&Value<'a>> for OwnedValue {
             Value::Blob(b) => OwnedValue::Blob(b.to_vec()),
             Value::Vector(v) => OwnedValue::Vector(v.to_vec()),
             Value::Uuid(u) => OwnedValue::Uuid(*u),
+            Value::MacAddr(m) => OwnedValue::MacAddr(*m),
+            Value::Inet4(ip) => OwnedValue::Inet4(*ip),
+            Value::Inet6(ip) => OwnedValue::Inet6(*ip),
             Value::Jsonb(b) => OwnedValue::Jsonb(b.to_vec()),
+            Value::TimestampTz {
+                micros,
+                offset_secs,
+            } => OwnedValue::TimestampTz(*micros, *offset_secs),
+            Value::Interval {
+                micros,
+                days,
+                months,
+            } => OwnedValue::Interval(*micros, *days, *months),
+            Value::Point { x, y } => OwnedValue::Point(*x, *y),
+            Value::GeoBox { low, high } => OwnedValue::Box(*low, *high),
+            Value::Circle { center, radius } => OwnedValue::Circle(*center, *radius),
+            Value::Enum { type_id, ordinal } => {
+                OwnedValue::Int(((*type_id as i64) << 16) | (*ordinal as i64))
+            }
+            Value::Decimal { digits, scale } => OwnedValue::Text(format_decimal(*digits, *scale)),
         }
+    }
+}
+
+fn format_decimal(digits: i128, scale: i16) -> String {
+    if scale <= 0 {
+        format!("{}", digits)
+    } else {
+        let divisor = 10i128.pow(scale as u32);
+        let int_part = digits / divisor;
+        let frac_part = (digits % divisor).abs();
+        format!(
+            "{}.{:0>width$}",
+            int_part,
+            frac_part,
+            width = scale as usize
+        )
     }
 }
 
@@ -58,17 +93,19 @@ impl OwnedValue {
             OwnedValue::Timestamp(ts) => Value::Int(*ts),
             OwnedValue::TimestampTz(ts, _tz) => Value::Int(*ts),
             OwnedValue::Uuid(u) => Value::Uuid(*u),
-            OwnedValue::MacAddr(m) => Value::Blob(Cow::Borrowed(m.as_slice())),
-            OwnedValue::Inet4(ip) => Value::Blob(Cow::Borrowed(ip.as_slice())),
-            OwnedValue::Inet6(ip) => Value::Blob(Cow::Borrowed(ip.as_slice())),
+            OwnedValue::MacAddr(m) => Value::MacAddr(*m),
+            OwnedValue::Inet4(ip) => Value::Inet4(*ip),
+            OwnedValue::Inet6(ip) => Value::Inet6(*ip),
             OwnedValue::Interval(micros, _days, _months) => Value::Int(*micros),
             OwnedValue::Point(x, y) => Value::Text(Cow::Owned(format!("({},{})", x, y))),
-            OwnedValue::Box(p1, p2) => {
-                Value::Text(Cow::Owned(format!("(({},{}),({},{}))", p1.0, p1.1, p2.0, p2.1)))
-            }
-            OwnedValue::Circle(center, radius) => {
-                Value::Text(Cow::Owned(format!("<({},{}),{}>", center.0, center.1, radius)))
-            }
+            OwnedValue::Box(p1, p2) => Value::Text(Cow::Owned(format!(
+                "(({},{}),({},{}))",
+                p1.0, p1.1, p2.0, p2.1
+            ))),
+            OwnedValue::Circle(center, radius) => Value::Text(Cow::Owned(format!(
+                "<({},{}),{}>",
+                center.0, center.1, radius
+            ))),
             OwnedValue::Jsonb(data) => Value::Jsonb(Cow::Borrowed(data.as_slice())),
         }
     }
@@ -171,15 +208,18 @@ impl OwnedValue {
                 .get_decimal_opt(col_idx)?
                 .map(|d| OwnedValue::Text(format!("{}", d.digits())))
                 .unwrap_or(OwnedValue::Null),
-            DataType::Int4Range | DataType::Int8Range | DataType::DateRange | DataType::TimestampRange => {
-                record
-                    .get_blob_opt(col_idx)?
-                    .map(|b| OwnedValue::Blob(b.to_vec()))
-                    .unwrap_or(OwnedValue::Null)
-            }
+            DataType::Int4Range
+            | DataType::Int8Range
+            | DataType::DateRange
+            | DataType::TimestampRange => record
+                .get_blob_opt(col_idx)?
+                .map(|b| OwnedValue::Blob(b.to_vec()))
+                .unwrap_or(OwnedValue::Null),
             DataType::Enum => record
                 .get_enum_opt(col_idx)?
-                .map(|(type_id, variant)| OwnedValue::Int(((type_id as i64) << 16) | (variant as i64)))
+                .map(|(type_id, variant)| {
+                    OwnedValue::Int(((type_id as i64) << 16) | (variant as i64))
+                })
                 .unwrap_or(OwnedValue::Null),
             DataType::Composite | DataType::Array => record
                 .get_blob_opt(col_idx)?

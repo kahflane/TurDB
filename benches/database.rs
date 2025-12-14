@@ -542,72 +542,64 @@ fn bench_insert_wal_comparison(c: &mut Criterion) {
     for count in [100, 1000, 10000].iter() {
         group.throughput(Throughput::Elements(*count as u64));
 
-        group.bench_with_input(
-            BenchmarkId::new("turdb_wal", count),
-            count,
-            |b, &count| {
-                b.iter_with_setup(
-                    || {
-                        let dir = tempdir().unwrap();
-                        let db_path = dir.path().join("bench_db");
-                        let db = Database::create(&db_path).unwrap();
-                        db.execute("PRAGMA WAL=ON").unwrap();
-                        db.execute("CREATE TABLE users (id INT, name TEXT, age INT)")
-                            .unwrap();
-                        (dir, db)
-                    },
-                    |(_dir, db)| {
-                        for i in 0..count {
-                            let sql = format!(
-                                "INSERT INTO users VALUES ({}, 'user{}', {})",
-                                i,
-                                i,
-                                20 + (i % 60)
-                            );
-                            db.execute(&sql).unwrap();
-                        }
-                        db
-                    },
-                );
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("turdb_wal", count), count, |b, &count| {
+            b.iter_with_setup(
+                || {
+                    let dir = tempdir().unwrap();
+                    let db_path = dir.path().join("bench_db");
+                    let db = Database::create(&db_path).unwrap();
+                    db.execute("PRAGMA WAL=ON").unwrap();
+                    db.execute("CREATE TABLE users (id INT, name TEXT, age INT)")
+                        .unwrap();
+                    (dir, db)
+                },
+                |(_dir, db)| {
+                    for i in 0..count {
+                        let sql = format!(
+                            "INSERT INTO users VALUES ({}, 'user{}', {})",
+                            i,
+                            i,
+                            20 + (i % 60)
+                        );
+                        db.execute(&sql).unwrap();
+                    }
+                    db
+                },
+            );
+        });
 
-        group.bench_with_input(
-            BenchmarkId::new("sqlite_wal", count),
-            count,
-            |b, &count| {
-                b.iter_with_setup(
-                    || {
-                        let dir = tempdir().unwrap();
-                        let db_path = dir.path().join("sqlite_bench.db");
-                        let conn = Connection::open(&db_path).unwrap();
-                        conn.execute_batch(
-                            "PRAGMA journal_mode=WAL;
+        group.bench_with_input(BenchmarkId::new("sqlite_wal", count), count, |b, &count| {
+            b.iter_with_setup(
+                || {
+                    let dir = tempdir().unwrap();
+                    let db_path = dir.path().join("sqlite_bench.db");
+                    let conn = Connection::open(&db_path).unwrap();
+                    conn.execute_batch(
+                        "PRAGMA journal_mode=WAL;
                              PRAGMA synchronous=NORMAL;
                              PRAGMA mmap_size=268435456;
                              PRAGMA cache_size=-65536;",
-                        )
-                        .unwrap();
+                    )
+                    .unwrap();
+                    conn.execute(
+                        "CREATE TABLE users (id INTEGER, name TEXT, age INTEGER)",
+                        [],
+                    )
+                    .unwrap();
+                    (dir, conn)
+                },
+                |(_dir, conn)| {
+                    for i in 0..count {
                         conn.execute(
-                            "CREATE TABLE users (id INTEGER, name TEXT, age INTEGER)",
-                            [],
+                            "INSERT INTO users VALUES (?1, ?2, ?3)",
+                            params![i as i64, format!("user{}", i), 20 + (i % 60) as i64],
                         )
                         .unwrap();
-                        (dir, conn)
-                    },
-                    |(_dir, conn)| {
-                        for i in 0..count {
-                            conn.execute(
-                                "INSERT INTO users VALUES (?1, ?2, ?3)",
-                                params![i as i64, format!("user{}", i), 20 + (i % 60) as i64],
-                            )
-                            .unwrap();
-                        }
-                        conn
-                    },
-                );
-            },
-        );
+                    }
+                    conn
+                },
+            );
+        });
     }
 
     group.finish();
