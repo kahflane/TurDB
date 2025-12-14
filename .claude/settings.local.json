@@ -29,7 +29,10 @@
       "Bash(git -C:*)",
       "Bash(sort:*)",
       "Bash(git grep:*)",
-      "Bash(RUST_BACKTRACE=1 cargo test:*)"
+      "Bash(RUST_BACKTRACE=1 cargo test:*)",
+      "Bash(cloc:*)",
+      "Bash(cargo clean:*)",
+      "Bash(ls:*)"
     ]
   }
 }

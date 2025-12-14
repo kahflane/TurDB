@@ -79,8 +79,8 @@
 //! - `sql`: Lexer, parser, planner, executor
 //! - `transaction`: MVCC and WAL
 
-pub mod btree;
 pub mod database;
+pub mod btree;
 pub mod encoding;
 pub mod hnsw;
 pub mod mvcc;
@@ -90,4 +90,4 @@ pub mod sql;
 pub mod storage;
 pub mod types;
 
-pub use database::{Database, ExecuteResult, OwnedValue, Row};
+pub use database::{Database, Row, OwnedValue, CheckpointInfo, RecoveryInfo, ExecuteResult};
