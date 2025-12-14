@@ -75,6 +75,298 @@ use bumpalo::Bump;
 use eyre::Result;
 use std::borrow::Cow;
 
+fn allocate_value_to_arena<'a>(v: Value<'_>, arena: &'a Bump) -> Value<'a> {
+    match v {
+        Value::Null => Value::Null,
+        Value::Int(i) => Value::Int(i),
+        Value::Float(f) => Value::Float(f),
+        Value::Text(s) => Value::Text(Cow::Borrowed(arena.alloc_str(&s))),
+        Value::Blob(b) => Value::Blob(Cow::Borrowed(arena.alloc_slice_copy(&b))),
+        Value::Vector(v) => Value::Vector(Cow::Borrowed(arena.alloc_slice_copy(&v))),
+        Value::Uuid(u) => Value::Uuid(u),
+        Value::MacAddr(m) => Value::MacAddr(m),
+        Value::Inet4(ip) => Value::Inet4(ip),
+        Value::Inet6(ip) => Value::Inet6(ip),
+        Value::Jsonb(b) => Value::Jsonb(Cow::Borrowed(arena.alloc_slice_copy(&b))),
+        Value::TimestampTz {
+            micros,
+            offset_secs,
+        } => Value::TimestampTz {
+            micros,
+            offset_secs,
+        },
+        Value::Interval {
+            micros,
+            days,
+            months,
+        } => Value::Interval {
+            micros,
+            days,
+            months,
+        },
+        Value::Point { x, y } => Value::Point { x, y },
+        Value::GeoBox { low, high } => Value::GeoBox { low, high },
+        Value::Circle { center, radius } => Value::Circle { center, radius },
+        Value::Enum { type_id, ordinal } => Value::Enum { type_id, ordinal },
+        Value::Decimal { digits, scale } => Value::Decimal { digits, scale },
+    }
+}
+
+fn clone_value_ref_to_arena<'a>(v: &Value<'_>, arena: &'a Bump) -> Value<'a> {
+    match v {
+        Value::Null => Value::Null,
+        Value::Int(i) => Value::Int(*i),
+        Value::Float(f) => Value::Float(*f),
+        Value::Text(s) => Value::Text(Cow::Borrowed(arena.alloc_str(s))),
+        Value::Blob(b) => Value::Blob(Cow::Borrowed(arena.alloc_slice_copy(b))),
+        Value::Vector(v) => Value::Vector(Cow::Borrowed(arena.alloc_slice_copy(v))),
+        Value::Uuid(u) => Value::Uuid(*u),
+        Value::MacAddr(m) => Value::MacAddr(*m),
+        Value::Inet4(ip) => Value::Inet4(*ip),
+        Value::Inet6(ip) => Value::Inet6(*ip),
+        Value::Jsonb(b) => Value::Jsonb(Cow::Borrowed(arena.alloc_slice_copy(b))),
+        Value::TimestampTz {
+            micros,
+            offset_secs,
+        } => Value::TimestampTz {
+            micros: *micros,
+            offset_secs: *offset_secs,
+        },
+        Value::Interval {
+            micros,
+            days,
+            months,
+        } => Value::Interval {
+            micros: *micros,
+            days: *days,
+            months: *months,
+        },
+        Value::Point { x, y } => Value::Point { x: *x, y: *y },
+        Value::GeoBox { low, high } => Value::GeoBox {
+            low: *low,
+            high: *high,
+        },
+        Value::Circle { center, radius } => Value::Circle {
+            center: *center,
+            radius: *radius,
+        },
+        Value::Enum { type_id, ordinal } => Value::Enum {
+            type_id: *type_id,
+            ordinal: *ordinal,
+        },
+        Value::Decimal { digits, scale } => Value::Decimal {
+            digits: *digits,
+            scale: *scale,
+        },
+    }
+}
+
+fn clone_value_owned(v: &Value<'_>) -> Value<'static> {
+    match v {
+        Value::Null => Value::Null,
+        Value::Int(i) => Value::Int(*i),
+        Value::Float(f) => Value::Float(*f),
+        Value::Text(s) => Value::Text(Cow::Owned(s.to_string())),
+        Value::Blob(b) => Value::Blob(Cow::Owned(b.to_vec())),
+        Value::Vector(v) => Value::Vector(Cow::Owned(v.to_vec())),
+        Value::Uuid(u) => Value::Uuid(*u),
+        Value::MacAddr(m) => Value::MacAddr(*m),
+        Value::Inet4(ip) => Value::Inet4(*ip),
+        Value::Inet6(ip) => Value::Inet6(*ip),
+        Value::Jsonb(b) => Value::Jsonb(Cow::Owned(b.to_vec())),
+        Value::TimestampTz {
+            micros,
+            offset_secs,
+        } => Value::TimestampTz {
+            micros: *micros,
+            offset_secs: *offset_secs,
+        },
+        Value::Interval {
+            micros,
+            days,
+            months,
+        } => Value::Interval {
+            micros: *micros,
+            days: *days,
+            months: *months,
+        },
+        Value::Point { x, y } => Value::Point { x: *x, y: *y },
+        Value::GeoBox { low, high } => Value::GeoBox {
+            low: *low,
+            high: *high,
+        },
+        Value::Circle { center, radius } => Value::Circle {
+            center: *center,
+            radius: *radius,
+        },
+        Value::Enum { type_id, ordinal } => Value::Enum {
+            type_id: *type_id,
+            ordinal: *ordinal,
+        },
+        Value::Decimal { digits, scale } => Value::Decimal {
+            digits: *digits,
+            scale: *scale,
+        },
+    }
+}
+
+fn encode_value_to_key(v: &Value<'_>, key: &mut Vec<u8>) {
+    match v {
+        Value::Null => key.push(0),
+        Value::Int(i) => {
+            key.push(1);
+            key.extend(i.to_be_bytes());
+        }
+        Value::Float(f) => {
+            key.push(2);
+            key.extend(f.to_bits().to_be_bytes());
+        }
+        Value::Text(s) => {
+            key.push(3);
+            key.extend(s.as_bytes());
+            key.push(0);
+        }
+        Value::Blob(b) => {
+            key.push(4);
+            key.extend(b.iter());
+            key.push(0);
+        }
+        Value::Vector(v) => {
+            key.push(5);
+            for f in v.iter() {
+                key.extend(f.to_bits().to_be_bytes());
+            }
+        }
+        Value::Uuid(u) => {
+            key.push(6);
+            key.extend(u.iter());
+        }
+        Value::MacAddr(m) => {
+            key.push(7);
+            key.extend(m.iter());
+        }
+        Value::Inet4(ip) => {
+            key.push(8);
+            key.extend(ip.iter());
+        }
+        Value::Inet6(ip) => {
+            key.push(9);
+            key.extend(ip.iter());
+        }
+        Value::Jsonb(b) => {
+            key.push(10);
+            key.extend(b.iter());
+            key.push(0);
+        }
+        Value::TimestampTz {
+            micros,
+            offset_secs,
+        } => {
+            key.push(11);
+            key.extend(micros.to_be_bytes());
+            key.extend(offset_secs.to_be_bytes());
+        }
+        Value::Interval {
+            micros,
+            days,
+            months,
+        } => {
+            key.push(12);
+            key.extend(micros.to_be_bytes());
+            key.extend(days.to_be_bytes());
+            key.extend(months.to_be_bytes());
+        }
+        Value::Point { x, y } => {
+            key.push(13);
+            key.extend(x.to_bits().to_be_bytes());
+            key.extend(y.to_bits().to_be_bytes());
+        }
+        Value::GeoBox { low, high } => {
+            key.push(14);
+            key.extend(low.0.to_bits().to_be_bytes());
+            key.extend(low.1.to_bits().to_be_bytes());
+            key.extend(high.0.to_bits().to_be_bytes());
+            key.extend(high.1.to_bits().to_be_bytes());
+        }
+        Value::Circle { center, radius } => {
+            key.push(15);
+            key.extend(center.0.to_bits().to_be_bytes());
+            key.extend(center.1.to_bits().to_be_bytes());
+            key.extend(radius.to_bits().to_be_bytes());
+        }
+        Value::Enum { type_id, ordinal } => {
+            key.push(16);
+            key.extend(type_id.to_be_bytes());
+            key.extend(ordinal.to_be_bytes());
+        }
+        Value::Decimal { digits, scale } => {
+            key.push(17);
+            key.extend(digits.to_be_bytes());
+            key.extend(scale.to_be_bytes());
+        }
+    }
+}
+
+fn hash_value<H: std::hash::Hasher>(v: &Value<'_>, hasher: &mut H) {
+    use std::hash::Hash;
+    match v {
+        Value::Null => 0u8.hash(hasher),
+        Value::Int(i) => i.hash(hasher),
+        Value::Float(f) => f.to_bits().hash(hasher),
+        Value::Text(s) => s.hash(hasher),
+        Value::Blob(b) => b.hash(hasher),
+        Value::Vector(v) => {
+            for f in v.iter() {
+                f.to_bits().hash(hasher);
+            }
+        }
+        Value::Uuid(u) => u.hash(hasher),
+        Value::MacAddr(m) => m.hash(hasher),
+        Value::Inet4(ip) => ip.hash(hasher),
+        Value::Inet6(ip) => ip.hash(hasher),
+        Value::Jsonb(b) => b.hash(hasher),
+        Value::TimestampTz {
+            micros,
+            offset_secs,
+        } => {
+            micros.hash(hasher);
+            offset_secs.hash(hasher);
+        }
+        Value::Interval {
+            micros,
+            days,
+            months,
+        } => {
+            micros.hash(hasher);
+            days.hash(hasher);
+            months.hash(hasher);
+        }
+        Value::Point { x, y } => {
+            x.to_bits().hash(hasher);
+            y.to_bits().hash(hasher);
+        }
+        Value::GeoBox { low, high } => {
+            low.0.to_bits().hash(hasher);
+            low.1.to_bits().hash(hasher);
+            high.0.to_bits().hash(hasher);
+            high.1.to_bits().hash(hasher);
+        }
+        Value::Circle { center, radius } => {
+            center.0.to_bits().hash(hasher);
+            center.1.to_bits().hash(hasher);
+            radius.to_bits().hash(hasher);
+        }
+        Value::Enum { type_id, ordinal } => {
+            type_id.hash(hasher);
+            ordinal.hash(hasher);
+        }
+        Value::Decimal { digits, scale } => {
+            digits.hash(hasher);
+            scale.hash(hasher);
+        }
+    }
+}
+
 pub struct ExecutorRow<'a> {
     pub values: &'a [Value<'a>],
 }
@@ -110,10 +402,46 @@ impl<'a> ExecutorRow<'a> {
                 Value::Vector(Cow::Borrowed(floats))
             }
             Value::Uuid(u) => Value::Uuid(*u),
+            Value::MacAddr(m) => Value::MacAddr(*m),
+            Value::Inet4(ip) => Value::Inet4(*ip),
+            Value::Inet6(ip) => Value::Inet6(*ip),
             Value::Jsonb(b) => {
                 let bytes = arena.alloc_slice_copy(b);
                 Value::Jsonb(Cow::Borrowed(bytes))
             }
+            Value::TimestampTz {
+                micros,
+                offset_secs,
+            } => Value::TimestampTz {
+                micros: *micros,
+                offset_secs: *offset_secs,
+            },
+            Value::Interval {
+                micros,
+                days,
+                months,
+            } => Value::Interval {
+                micros: *micros,
+                days: *days,
+                months: *months,
+            },
+            Value::Point { x, y } => Value::Point { x: *x, y: *y },
+            Value::GeoBox { low, high } => Value::GeoBox {
+                low: *low,
+                high: *high,
+            },
+            Value::Circle { center, radius } => Value::Circle {
+                center: *center,
+                radius: *radius,
+            },
+            Value::Enum { type_id, ordinal } => Value::Enum {
+                type_id: *type_id,
+                ordinal: *ordinal,
+            },
+            Value::Decimal { digits, scale } => Value::Decimal {
+                digits: *digits,
+                scale: *scale,
+            },
         }
     }
 }
@@ -281,6 +609,50 @@ impl SimpleDecoder {
                 DataType::Jsonb => {
                     let jsonb_view = view.get_jsonb(idx)?;
                     Value::Jsonb(Cow::Owned(jsonb_view.data().to_vec()))
+                }
+                DataType::Date => Value::Int(view.get_date(idx)? as i64),
+                DataType::Time => Value::Int(view.get_time(idx)?),
+                DataType::Timestamp => Value::Int(view.get_timestamp(idx)?),
+                DataType::MacAddr => Value::MacAddr(*view.get_macaddr(idx)?),
+                DataType::Inet4 => Value::Inet4(*view.get_inet4(idx)?),
+                DataType::Inet6 => Value::Inet6(*view.get_inet6(idx)?),
+                DataType::TimestampTz => {
+                    let (micros, offset_secs) = view.get_timestamptz(idx)?;
+                    Value::TimestampTz {
+                        micros,
+                        offset_secs,
+                    }
+                }
+                DataType::Interval => {
+                    let (micros, days, months) = view.get_interval(idx)?;
+                    Value::Interval {
+                        micros,
+                        days,
+                        months,
+                    }
+                }
+                DataType::Point => {
+                    let (x, y) = view.get_point(idx)?;
+                    Value::Point { x, y }
+                }
+                DataType::Box => {
+                    let (low, high) = view.get_box(idx)?;
+                    Value::GeoBox { low, high }
+                }
+                DataType::Circle => {
+                    let (center, radius) = view.get_circle(idx)?;
+                    Value::Circle { center, radius }
+                }
+                DataType::Enum => {
+                    let (type_id, ordinal) = view.get_enum(idx)?;
+                    Value::Enum { type_id, ordinal }
+                }
+                DataType::Decimal => {
+                    let dec = view.get_decimal(idx)?;
+                    Value::Decimal {
+                        digits: dec.digits(),
+                        scale: dec.scale(),
+                    }
                 }
                 _ => Value::Null,
             };
@@ -551,38 +923,11 @@ impl<'a, S: RowSource> Executor<'a> for TableScanExecutor<'a, S> {
         let row_data = self.source.next_row()?;
         match row_data {
             Some(values) => {
-                let allocated: &'a [Value<'a>] =
-                    self.arena
-                        .alloc_slice_fill_iter(values.into_iter().map(|v| match v {
-                            Value::Null => Value::Null,
-                            Value::Int(i) => Value::Int(i),
-                            Value::Float(f) => Value::Float(f),
-                            Value::Text(Cow::Owned(s)) => {
-                                Value::Text(Cow::Borrowed(self.arena.alloc_str(&s)))
-                            }
-                            Value::Text(Cow::Borrowed(s)) => {
-                                Value::Text(Cow::Borrowed(self.arena.alloc_str(s)))
-                            }
-                            Value::Blob(Cow::Owned(b)) => {
-                                Value::Blob(Cow::Borrowed(self.arena.alloc_slice_copy(&b)))
-                            }
-                            Value::Blob(Cow::Borrowed(b)) => {
-                                Value::Blob(Cow::Borrowed(self.arena.alloc_slice_copy(b)))
-                            }
-                            Value::Vector(Cow::Owned(v)) => {
-                                Value::Vector(Cow::Borrowed(self.arena.alloc_slice_copy(&v)))
-                            }
-                            Value::Vector(Cow::Borrowed(v)) => {
-                                Value::Vector(Cow::Borrowed(self.arena.alloc_slice_copy(v)))
-                            }
-                            Value::Uuid(u) => Value::Uuid(u),
-                            Value::Jsonb(Cow::Owned(b)) => {
-                                Value::Jsonb(Cow::Borrowed(self.arena.alloc_slice_copy(&b)))
-                            }
-                            Value::Jsonb(Cow::Borrowed(b)) => {
-                                Value::Jsonb(Cow::Borrowed(self.arena.alloc_slice_copy(b)))
-                            }
-                        }));
+                let allocated: &'a [Value<'a>] = self.arena.alloc_slice_fill_iter(
+                    values
+                        .into_iter()
+                        .map(|v| allocate_value_to_arena(v, self.arena)),
+                );
                 Ok(Some(ExecutorRow::new(allocated)))
             }
             None => Ok(None),
@@ -931,25 +1276,12 @@ where
 
     fn hash_keys(row: &[Value<'static>], key_indices: &[usize]) -> u64 {
         use std::collections::hash_map::DefaultHasher;
-        use std::hash::{Hash, Hasher};
+        use std::hash::Hasher;
 
         let mut hasher = DefaultHasher::new();
         for &idx in key_indices {
             if let Some(val) = row.get(idx) {
-                match val {
-                    Value::Null => 0u8.hash(&mut hasher),
-                    Value::Int(i) => i.hash(&mut hasher),
-                    Value::Float(f) => f.to_bits().hash(&mut hasher),
-                    Value::Text(s) => s.hash(&mut hasher),
-                    Value::Blob(b) => b.hash(&mut hasher),
-                    Value::Vector(v) => {
-                        for f in v.iter() {
-                            f.to_bits().hash(&mut hasher);
-                        }
-                    }
-                    Value::Uuid(u) => u.hash(&mut hasher),
-                    Value::Jsonb(b) => b.hash(&mut hasher),
-                }
+                hash_value(val, &mut hasher);
             }
         }
         hasher.finish()
@@ -999,16 +1331,7 @@ where
         let combined: Vec<Value<'a>> = left
             .iter()
             .chain(right.iter())
-            .map(|v| match v {
-                Value::Null => Value::Null,
-                Value::Int(i) => Value::Int(*i),
-                Value::Float(f) => Value::Float(*f),
-                Value::Text(s) => Value::Text(Cow::Owned(s.to_string())),
-                Value::Blob(b) => Value::Blob(Cow::Owned(b.to_vec())),
-                Value::Vector(v) => Value::Vector(Cow::Owned(v.to_vec())),
-                Value::Uuid(u) => Value::Uuid(*u),
-                Value::Jsonb(b) => Value::Jsonb(Cow::Owned(b.to_vec())),
-            })
+            .map(clone_value_owned)
             .collect();
         let slice = self.arena.alloc_slice_fill_iter(combined);
         ExecutorRow::new(slice)
@@ -1042,40 +1365,14 @@ where
     fn next(&mut self) -> Result<Option<ExecutorRow<'a>>> {
         if !self.partitioned {
             while let Some(row) = self.left.next()? {
-                let owned: Vec<Value<'static>> = row
-                    .values
-                    .iter()
-                    .map(|v| match v {
-                        Value::Null => Value::Null,
-                        Value::Int(i) => Value::Int(*i),
-                        Value::Float(f) => Value::Float(*f),
-                        Value::Text(s) => Value::Text(Cow::Owned(s.to_string())),
-                        Value::Blob(b) => Value::Blob(Cow::Owned(b.to_vec())),
-                        Value::Vector(v) => Value::Vector(Cow::Owned(v.to_vec())),
-                        Value::Uuid(u) => Value::Uuid(*u),
-                        Value::Jsonb(b) => Value::Jsonb(Cow::Owned(b.to_vec())),
-                    })
-                    .collect();
+                let owned: Vec<Value<'static>> = row.values.iter().map(clone_value_owned).collect();
                 let hash = Self::hash_keys(&owned, &self.left_key_indices);
                 let partition = (hash as usize) % self.num_partitions;
                 self.left_partitions[partition].push(owned);
             }
 
             while let Some(row) = self.right.next()? {
-                let owned: Vec<Value<'static>> = row
-                    .values
-                    .iter()
-                    .map(|v| match v {
-                        Value::Null => Value::Null,
-                        Value::Int(i) => Value::Int(*i),
-                        Value::Float(f) => Value::Float(*f),
-                        Value::Text(s) => Value::Text(Cow::Owned(s.to_string())),
-                        Value::Blob(b) => Value::Blob(Cow::Owned(b.to_vec())),
-                        Value::Vector(v) => Value::Vector(Cow::Owned(v.to_vec())),
-                        Value::Uuid(u) => Value::Uuid(*u),
-                        Value::Jsonb(b) => Value::Jsonb(Cow::Owned(b.to_vec())),
-                    })
-                    .collect();
+                let owned: Vec<Value<'static>> = row.values.iter().map(clone_value_owned).collect();
                 let hash = Self::hash_keys(&owned, &self.right_key_indices);
                 let partition = (hash as usize) % self.num_partitions;
                 self.right_partitions[partition].push(owned);
@@ -1325,42 +1622,7 @@ where
         let mut key = Vec::new();
         for &col in &self.group_by {
             if let Some(val) = row.get(col) {
-                match val {
-                    Value::Null => key.push(0),
-                    Value::Int(i) => {
-                        key.push(1);
-                        key.extend(i.to_be_bytes());
-                    }
-                    Value::Float(f) => {
-                        key.push(2);
-                        key.extend(f.to_bits().to_be_bytes());
-                    }
-                    Value::Text(s) => {
-                        key.push(3);
-                        key.extend(s.as_bytes());
-                        key.push(0);
-                    }
-                    Value::Blob(b) => {
-                        key.push(4);
-                        key.extend(b.iter());
-                        key.push(0);
-                    }
-                    Value::Vector(v) => {
-                        key.push(5);
-                        for f in v.iter() {
-                            key.extend(f.to_bits().to_be_bytes());
-                        }
-                    }
-                    Value::Uuid(u) => {
-                        key.push(6);
-                        key.extend(u.iter());
-                    }
-                    Value::Jsonb(b) => {
-                        key.push(7);
-                        key.extend(b.iter());
-                        key.push(0);
-                    }
-                }
+                encode_value_to_key(val, &mut key);
             }
         }
         key
@@ -1369,20 +1631,7 @@ where
     fn extract_group_values(&self, row: &ExecutorRow) -> Vec<Value<'static>> {
         self.group_by
             .iter()
-            .map(|&col| {
-                row.get(col)
-                    .map(|v| match v {
-                        Value::Null => Value::Null,
-                        Value::Int(i) => Value::Int(*i),
-                        Value::Float(f) => Value::Float(*f),
-                        Value::Text(s) => Value::Text(Cow::Owned(s.to_string())),
-                        Value::Blob(b) => Value::Blob(Cow::Owned(b.to_vec())),
-                        Value::Vector(v) => Value::Vector(Cow::Owned(v.to_vec())),
-                        Value::Uuid(u) => Value::Uuid(*u),
-                        Value::Jsonb(b) => Value::Jsonb(Cow::Owned(b.to_vec())),
-                    })
-                    .unwrap_or(Value::Null)
-            })
+            .map(|&col| row.get(col).map(clone_value_owned).unwrap_or(Value::Null))
             .collect()
     }
 }
@@ -1438,72 +1687,12 @@ where
                     Vec::with_capacity(group_values.len() + self.aggregates.len());
 
                 for val in group_values {
-                    let arena_val = match val {
-                        Value::Null => Value::Null,
-                        Value::Int(i) => Value::Int(i),
-                        Value::Float(f) => Value::Float(f),
-                        Value::Text(Cow::Owned(s)) => {
-                            Value::Text(Cow::Borrowed(self.arena.alloc_str(&s)))
-                        }
-                        Value::Text(Cow::Borrowed(s)) => {
-                            Value::Text(Cow::Borrowed(self.arena.alloc_str(s)))
-                        }
-                        Value::Blob(Cow::Owned(b)) => {
-                            Value::Blob(Cow::Borrowed(self.arena.alloc_slice_copy(&b)))
-                        }
-                        Value::Blob(Cow::Borrowed(b)) => {
-                            Value::Blob(Cow::Borrowed(self.arena.alloc_slice_copy(b)))
-                        }
-                        Value::Vector(Cow::Owned(v)) => {
-                            Value::Vector(Cow::Borrowed(self.arena.alloc_slice_copy(&v)))
-                        }
-                        Value::Vector(Cow::Borrowed(v)) => {
-                            Value::Vector(Cow::Borrowed(self.arena.alloc_slice_copy(v)))
-                        }
-                        Value::Uuid(u) => Value::Uuid(u),
-                        Value::Jsonb(Cow::Owned(b)) => {
-                            Value::Jsonb(Cow::Borrowed(self.arena.alloc_slice_copy(&b)))
-                        }
-                        Value::Jsonb(Cow::Borrowed(b)) => {
-                            Value::Jsonb(Cow::Borrowed(self.arena.alloc_slice_copy(b)))
-                        }
-                    };
-                    values.push(arena_val);
+                    values.push(allocate_value_to_arena(val, self.arena));
                 }
 
                 for (state, func) in states.iter().zip(&self.aggregates) {
                     let agg_val = state.finalize(func);
-                    let arena_val = match agg_val {
-                        Value::Null => Value::Null,
-                        Value::Int(i) => Value::Int(i),
-                        Value::Float(f) => Value::Float(f),
-                        Value::Text(Cow::Owned(s)) => {
-                            Value::Text(Cow::Borrowed(self.arena.alloc_str(&s)))
-                        }
-                        Value::Text(Cow::Borrowed(s)) => {
-                            Value::Text(Cow::Borrowed(self.arena.alloc_str(s)))
-                        }
-                        Value::Blob(Cow::Owned(b)) => {
-                            Value::Blob(Cow::Borrowed(self.arena.alloc_slice_copy(&b)))
-                        }
-                        Value::Blob(Cow::Borrowed(b)) => {
-                            Value::Blob(Cow::Borrowed(self.arena.alloc_slice_copy(b)))
-                        }
-                        Value::Vector(Cow::Owned(v)) => {
-                            Value::Vector(Cow::Borrowed(self.arena.alloc_slice_copy(&v)))
-                        }
-                        Value::Vector(Cow::Borrowed(v)) => {
-                            Value::Vector(Cow::Borrowed(self.arena.alloc_slice_copy(v)))
-                        }
-                        Value::Uuid(u) => Value::Uuid(u),
-                        Value::Jsonb(Cow::Owned(b)) => {
-                            Value::Jsonb(Cow::Borrowed(self.arena.alloc_slice_copy(&b)))
-                        }
-                        Value::Jsonb(Cow::Borrowed(b)) => {
-                            Value::Jsonb(Cow::Borrowed(self.arena.alloc_slice_copy(b)))
-                        }
-                    };
-                    values.push(arena_val);
+                    values.push(allocate_value_to_arena(agg_val, self.arena));
                 }
 
                 let allocated = self.arena.alloc_slice_fill_iter(values);
@@ -1581,20 +1770,8 @@ where
     fn next(&mut self) -> Result<Option<ExecutorRow<'a>>> {
         if !self.materialized {
             while let Some(row) = self.child.next()? {
-                let owned_values: Vec<Value<'static>> = row
-                    .values
-                    .iter()
-                    .map(|v| match v {
-                        Value::Null => Value::Null,
-                        Value::Int(i) => Value::Int(*i),
-                        Value::Float(f) => Value::Float(*f),
-                        Value::Text(s) => Value::Text(Cow::Owned(s.to_string())),
-                        Value::Blob(b) => Value::Blob(Cow::Owned(b.to_vec())),
-                        Value::Vector(v) => Value::Vector(Cow::Owned(v.to_vec())),
-                        Value::Uuid(u) => Value::Uuid(*u),
-                        Value::Jsonb(b) => Value::Jsonb(Cow::Owned(b.to_vec())),
-                    })
-                    .collect();
+                let owned_values: Vec<Value<'static>> =
+                    row.values.iter().map(clone_value_owned).collect();
                 self.rows.push(owned_values);
             }
 
@@ -1620,36 +1797,7 @@ where
             if let Some(values) = iter.next() {
                 let arena_values: Vec<Value<'a>> = values
                     .into_iter()
-                    .map(|v| match v {
-                        Value::Null => Value::Null,
-                        Value::Int(i) => Value::Int(i),
-                        Value::Float(f) => Value::Float(f),
-                        Value::Text(Cow::Owned(s)) => {
-                            Value::Text(Cow::Borrowed(self.arena.alloc_str(&s)))
-                        }
-                        Value::Text(Cow::Borrowed(s)) => {
-                            Value::Text(Cow::Borrowed(self.arena.alloc_str(s)))
-                        }
-                        Value::Blob(Cow::Owned(b)) => {
-                            Value::Blob(Cow::Borrowed(self.arena.alloc_slice_copy(&b)))
-                        }
-                        Value::Blob(Cow::Borrowed(b)) => {
-                            Value::Blob(Cow::Borrowed(self.arena.alloc_slice_copy(b)))
-                        }
-                        Value::Vector(Cow::Owned(v)) => {
-                            Value::Vector(Cow::Borrowed(self.arena.alloc_slice_copy(&v)))
-                        }
-                        Value::Vector(Cow::Borrowed(v)) => {
-                            Value::Vector(Cow::Borrowed(self.arena.alloc_slice_copy(v)))
-                        }
-                        Value::Uuid(u) => Value::Uuid(u),
-                        Value::Jsonb(Cow::Owned(b)) => {
-                            Value::Jsonb(Cow::Borrowed(self.arena.alloc_slice_copy(&b)))
-                        }
-                        Value::Jsonb(Cow::Borrowed(b)) => {
-                            Value::Jsonb(Cow::Borrowed(self.arena.alloc_slice_copy(b)))
-                        }
-                    })
+                    .map(|v| allocate_value_to_arena(v, self.arena))
                     .collect();
 
                 let allocated = self.arena.alloc_slice_fill_iter(arena_values);
@@ -1898,20 +2046,8 @@ impl<'a, S: RowSource> Executor<'a> for DynamicExecutor<'a, S> {
                     state.right.open()?;
                     state.right_rows.clear();
                     while let Some(row) = state.right.next()? {
-                        let owned: Vec<Value<'static>> = row
-                            .values
-                            .iter()
-                            .map(|v| match v {
-                                Value::Null => Value::Null,
-                                Value::Int(i) => Value::Int(*i),
-                                Value::Float(f) => Value::Float(*f),
-                                Value::Text(s) => Value::Text(Cow::Owned(s.to_string())),
-                                Value::Blob(b) => Value::Blob(Cow::Owned(b.to_vec())),
-                                Value::Vector(v) => Value::Vector(Cow::Owned(v.to_vec())),
-                                Value::Uuid(u) => Value::Uuid(*u),
-                                Value::Jsonb(b) => Value::Jsonb(Cow::Owned(b.to_vec())),
-                            })
-                            .collect();
+                        let owned: Vec<Value<'static>> =
+                            row.values.iter().map(clone_value_owned).collect();
                         state.right_rows.push(owned);
                     }
                     state.right.close()?;
@@ -1927,20 +2063,8 @@ impl<'a, S: RowSource> Executor<'a> for DynamicExecutor<'a, S> {
                     while let Some(row) = state.left.next()? {
                         let hash = hash_keys(&row, &state.left_key_indices);
                         let partition = (hash as usize) % state.num_partitions;
-                        let owned: Vec<Value<'static>> = row
-                            .values
-                            .iter()
-                            .map(|v| match v {
-                                Value::Null => Value::Null,
-                                Value::Int(i) => Value::Int(*i),
-                                Value::Float(f) => Value::Float(*f),
-                                Value::Text(s) => Value::Text(Cow::Owned(s.to_string())),
-                                Value::Blob(b) => Value::Blob(Cow::Owned(b.to_vec())),
-                                Value::Vector(v) => Value::Vector(Cow::Owned(v.to_vec())),
-                                Value::Uuid(u) => Value::Uuid(*u),
-                                Value::Jsonb(b) => Value::Jsonb(Cow::Owned(b.to_vec())),
-                            })
-                            .collect();
+                        let owned: Vec<Value<'static>> =
+                            row.values.iter().map(clone_value_owned).collect();
                         state.left_partitions[partition].push(owned);
                     }
                     state.left.close()?;
@@ -1949,20 +2073,8 @@ impl<'a, S: RowSource> Executor<'a> for DynamicExecutor<'a, S> {
                     while let Some(row) = state.right.next()? {
                         let hash = hash_keys(&row, &state.right_key_indices);
                         let partition = (hash as usize) % state.num_partitions;
-                        let owned: Vec<Value<'static>> = row
-                            .values
-                            .iter()
-                            .map(|v| match v {
-                                Value::Null => Value::Null,
-                                Value::Int(i) => Value::Int(*i),
-                                Value::Float(f) => Value::Float(*f),
-                                Value::Text(s) => Value::Text(Cow::Owned(s.to_string())),
-                                Value::Blob(b) => Value::Blob(Cow::Owned(b.to_vec())),
-                                Value::Vector(v) => Value::Vector(Cow::Owned(v.to_vec())),
-                                Value::Uuid(u) => Value::Uuid(*u),
-                                Value::Jsonb(b) => Value::Jsonb(Cow::Owned(b.to_vec())),
-                            })
-                            .collect();
+                        let owned: Vec<Value<'static>> =
+                            row.values.iter().map(clone_value_owned).collect();
                         state.right_partitions[partition].push(owned);
                     }
                     state.right.close()?;
@@ -1992,16 +2104,9 @@ impl<'a, S: RowSource> Executor<'a> for DynamicExecutor<'a, S> {
                 match state.source.next_row()? {
                     Some(row_data) => {
                         let values: &'a [Value<'a>] = state.arena.alloc_slice_fill_iter(
-                            row_data.into_iter().map(|v| match v {
-                                Value::Null => Value::Null,
-                                Value::Int(i) => Value::Int(i),
-                                Value::Float(f) => Value::Float(f),
-                                Value::Text(s) => Value::Text(Cow::Owned(s.into_owned())),
-                                Value::Blob(b) => Value::Blob(Cow::Owned(b.into_owned())),
-                                Value::Vector(v) => Value::Vector(Cow::Owned(v.into_owned())),
-                                Value::Uuid(u) => Value::Uuid(u),
-                                Value::Jsonb(b) => Value::Jsonb(Cow::Owned(b.into_owned())),
-                            }),
+                            row_data
+                                .into_iter()
+                                .map(|v| allocate_value_to_arena(v, state.arena)),
                         );
                         let row = ExecutorRow::new(values);
                         if let Some(ref filter) = state.residual_filter {
@@ -2062,20 +2167,8 @@ impl<'a, S: RowSource> Executor<'a> for DynamicExecutor<'a, S> {
             DynamicExecutor::Sort(state) => {
                 if !state.sorted {
                     while let Some(row) = state.child.next()? {
-                        let owned: Vec<Value<'static>> = row
-                            .values
-                            .iter()
-                            .map(|v| match v {
-                                Value::Null => Value::Null,
-                                Value::Int(i) => Value::Int(*i),
-                                Value::Float(f) => Value::Float(*f),
-                                Value::Text(s) => Value::Text(Cow::Owned(s.to_string())),
-                                Value::Blob(b) => Value::Blob(Cow::Owned(b.to_vec())),
-                                Value::Vector(v) => Value::Vector(Cow::Owned(v.to_vec())),
-                                Value::Uuid(u) => Value::Uuid(*u),
-                                Value::Jsonb(b) => Value::Jsonb(Cow::Owned(b.to_vec())),
-                            })
-                            .collect();
+                        let owned: Vec<Value<'static>> =
+                            row.values.iter().map(clone_value_owned).collect();
                         state.rows.push(owned);
                     }
 
@@ -2100,22 +2193,7 @@ impl<'a, S: RowSource> Executor<'a> for DynamicExecutor<'a, S> {
                     state.iter_idx += 1;
                     let arena_values: Vec<Value<'a>> = values
                         .iter()
-                        .map(|v| match v {
-                            Value::Null => Value::Null,
-                            Value::Int(i) => Value::Int(*i),
-                            Value::Float(f) => Value::Float(*f),
-                            Value::Text(s) => Value::Text(Cow::Borrowed(state.arena.alloc_str(s))),
-                            Value::Blob(b) => {
-                                Value::Blob(Cow::Borrowed(state.arena.alloc_slice_copy(b)))
-                            }
-                            Value::Vector(v) => {
-                                Value::Vector(Cow::Borrowed(state.arena.alloc_slice_copy(v)))
-                            }
-                            Value::Uuid(u) => Value::Uuid(*u),
-                            Value::Jsonb(b) => {
-                                Value::Jsonb(Cow::Borrowed(state.arena.alloc_slice_copy(b)))
-                            }
-                        })
+                        .map(|v| clone_value_ref_to_arena(v, state.arena))
                         .collect();
                     let allocated = state.arena.alloc_slice_fill_iter(arena_values);
                     return Ok(Some(ExecutorRow::new(allocated)));
@@ -2126,20 +2204,8 @@ impl<'a, S: RowSource> Executor<'a> for DynamicExecutor<'a, S> {
                 if state.current_left_row.is_none() {
                     match state.left.next()? {
                         Some(row) => {
-                            let owned: Vec<Value<'static>> = row
-                                .values
-                                .iter()
-                                .map(|v| match v {
-                                    Value::Null => Value::Null,
-                                    Value::Int(i) => Value::Int(*i),
-                                    Value::Float(f) => Value::Float(*f),
-                                    Value::Text(s) => Value::Text(Cow::Owned(s.to_string())),
-                                    Value::Blob(b) => Value::Blob(Cow::Owned(b.to_vec())),
-                                    Value::Vector(v) => Value::Vector(Cow::Owned(v.to_vec())),
-                                    Value::Uuid(u) => Value::Uuid(*u),
-                                    Value::Jsonb(b) => Value::Jsonb(Cow::Owned(b.to_vec())),
-                                })
-                                .collect();
+                            let owned: Vec<Value<'static>> =
+                                row.values.iter().map(clone_value_owned).collect();
                             state.current_left_row = Some(owned);
                             state.right_index = 0;
                         }
@@ -2148,57 +2214,16 @@ impl<'a, S: RowSource> Executor<'a> for DynamicExecutor<'a, S> {
                 }
 
                 let left_row = state.current_left_row.as_ref().unwrap();
-                let left_col_count = left_row.len();
 
                 while state.right_index < state.right_rows.len() {
                     let right_row = &state.right_rows[state.right_index];
                     state.right_index += 1;
 
                     let should_join = if let Some(ref cond) = state.condition {
-                        let combined_len = left_row.len() + right_row.len();
-                        let combined: Vec<Value<'a>> = (0..combined_len)
-                            .map(|i| {
-                                if i < left_row.len() {
-                                    match &left_row[i] {
-                                        Value::Null => Value::Null,
-                                        Value::Int(n) => Value::Int(*n),
-                                        Value::Float(f) => Value::Float(*f),
-                                        Value::Text(s) => {
-                                            Value::Text(Cow::Borrowed(state.arena.alloc_str(s)))
-                                        }
-                                        Value::Blob(b) => Value::Blob(Cow::Borrowed(
-                                            state.arena.alloc_slice_copy(b),
-                                        )),
-                                        Value::Vector(v) => Value::Vector(Cow::Borrowed(
-                                            state.arena.alloc_slice_copy(v),
-                                        )),
-                                        Value::Uuid(u) => Value::Uuid(*u),
-                                        Value::Jsonb(b) => Value::Jsonb(Cow::Borrowed(
-                                            state.arena.alloc_slice_copy(b),
-                                        )),
-                                    }
-                                } else {
-                                    let r = &right_row[i - left_row.len()];
-                                    match r {
-                                        Value::Null => Value::Null,
-                                        Value::Int(n) => Value::Int(*n),
-                                        Value::Float(f) => Value::Float(*f),
-                                        Value::Text(s) => {
-                                            Value::Text(Cow::Borrowed(state.arena.alloc_str(s)))
-                                        }
-                                        Value::Blob(b) => Value::Blob(Cow::Borrowed(
-                                            state.arena.alloc_slice_copy(b),
-                                        )),
-                                        Value::Vector(v) => Value::Vector(Cow::Borrowed(
-                                            state.arena.alloc_slice_copy(v),
-                                        )),
-                                        Value::Uuid(u) => Value::Uuid(*u),
-                                        Value::Jsonb(b) => Value::Jsonb(Cow::Borrowed(
-                                            state.arena.alloc_slice_copy(b),
-                                        )),
-                                    }
-                                }
-                            })
+                        let combined: Vec<Value<'a>> = left_row
+                            .iter()
+                            .chain(right_row.iter())
+                            .map(|v| clone_value_ref_to_arena(v, state.arena))
                             .collect();
                         let allocated = state.arena.alloc_slice_fill_iter(combined);
                         let temp_row = ExecutorRow::new(allocated);
@@ -2208,50 +2233,10 @@ impl<'a, S: RowSource> Executor<'a> for DynamicExecutor<'a, S> {
                     };
 
                     if should_join {
-                        let combined_len = left_col_count + right_row.len();
-                        let combined: Vec<Value<'a>> = (0..combined_len)
-                            .map(|i| {
-                                if i < left_col_count {
-                                    match &left_row[i] {
-                                        Value::Null => Value::Null,
-                                        Value::Int(n) => Value::Int(*n),
-                                        Value::Float(f) => Value::Float(*f),
-                                        Value::Text(s) => {
-                                            Value::Text(Cow::Borrowed(state.arena.alloc_str(s)))
-                                        }
-                                        Value::Blob(b) => Value::Blob(Cow::Borrowed(
-                                            state.arena.alloc_slice_copy(b),
-                                        )),
-                                        Value::Vector(v) => Value::Vector(Cow::Borrowed(
-                                            state.arena.alloc_slice_copy(v),
-                                        )),
-                                        Value::Uuid(u) => Value::Uuid(*u),
-                                        Value::Jsonb(b) => Value::Jsonb(Cow::Borrowed(
-                                            state.arena.alloc_slice_copy(b),
-                                        )),
-                                    }
-                                } else {
-                                    let r = &right_row[i - left_col_count];
-                                    match r {
-                                        Value::Null => Value::Null,
-                                        Value::Int(n) => Value::Int(*n),
-                                        Value::Float(f) => Value::Float(*f),
-                                        Value::Text(s) => {
-                                            Value::Text(Cow::Borrowed(state.arena.alloc_str(s)))
-                                        }
-                                        Value::Blob(b) => Value::Blob(Cow::Borrowed(
-                                            state.arena.alloc_slice_copy(b),
-                                        )),
-                                        Value::Vector(v) => Value::Vector(Cow::Borrowed(
-                                            state.arena.alloc_slice_copy(v),
-                                        )),
-                                        Value::Uuid(u) => Value::Uuid(*u),
-                                        Value::Jsonb(b) => Value::Jsonb(Cow::Borrowed(
-                                            state.arena.alloc_slice_copy(b),
-                                        )),
-                                    }
-                                }
-                            })
+                        let combined: Vec<Value<'a>> = left_row
+                            .iter()
+                            .chain(right_row.iter())
+                            .map(|v| clone_value_ref_to_arena(v, state.arena))
                             .collect();
                         let allocated = state.arena.alloc_slice_fill_iter(combined);
                         return Ok(Some(ExecutorRow::new(allocated)));
@@ -2267,50 +2252,10 @@ impl<'a, S: RowSource> Executor<'a> for DynamicExecutor<'a, S> {
                     let probe_row = &state.right_partitions[state.current_partition]
                         [state.current_probe_idx - 1];
 
-                    let combined_len = build_row.len() + probe_row.len();
-                    let combined: Vec<Value<'a>> = (0..combined_len)
-                        .map(|i| {
-                            if i < build_row.len() {
-                                match &build_row[i] {
-                                    Value::Null => Value::Null,
-                                    Value::Int(n) => Value::Int(*n),
-                                    Value::Float(f) => Value::Float(*f),
-                                    Value::Text(s) => {
-                                        Value::Text(Cow::Borrowed(state.arena.alloc_str(s)))
-                                    }
-                                    Value::Blob(b) => {
-                                        Value::Blob(Cow::Borrowed(state.arena.alloc_slice_copy(b)))
-                                    }
-                                    Value::Vector(v) => Value::Vector(Cow::Borrowed(
-                                        state.arena.alloc_slice_copy(v),
-                                    )),
-                                    Value::Uuid(u) => Value::Uuid(*u),
-                                    Value::Jsonb(b) => {
-                                        Value::Jsonb(Cow::Borrowed(state.arena.alloc_slice_copy(b)))
-                                    }
-                                }
-                            } else {
-                                let r = &probe_row[i - build_row.len()];
-                                match r {
-                                    Value::Null => Value::Null,
-                                    Value::Int(n) => Value::Int(*n),
-                                    Value::Float(f) => Value::Float(*f),
-                                    Value::Text(s) => {
-                                        Value::Text(Cow::Borrowed(state.arena.alloc_str(s)))
-                                    }
-                                    Value::Blob(b) => {
-                                        Value::Blob(Cow::Borrowed(state.arena.alloc_slice_copy(b)))
-                                    }
-                                    Value::Vector(v) => Value::Vector(Cow::Borrowed(
-                                        state.arena.alloc_slice_copy(v),
-                                    )),
-                                    Value::Uuid(u) => Value::Uuid(*u),
-                                    Value::Jsonb(b) => {
-                                        Value::Jsonb(Cow::Borrowed(state.arena.alloc_slice_copy(b)))
-                                    }
-                                }
-                            }
-                        })
+                    let combined: Vec<Value<'a>> = build_row
+                        .iter()
+                        .chain(probe_row.iter())
+                        .map(|v| clone_value_ref_to_arena(v, state.arena))
                         .collect();
                     let allocated = state.arena.alloc_slice_fill_iter(combined);
                     return Ok(Some(ExecutorRow::new(allocated)));
@@ -2368,20 +2313,7 @@ impl<'a, S: RowSource> Executor<'a> for DynamicExecutor<'a, S> {
                         let group_values: Vec<Value<'static>> = state
                             .group_by
                             .iter()
-                            .map(|&col| {
-                                row.get(col)
-                                    .map(|v| match v {
-                                        Value::Null => Value::Null,
-                                        Value::Int(i) => Value::Int(*i),
-                                        Value::Float(f) => Value::Float(*f),
-                                        Value::Text(s) => Value::Text(Cow::Owned(s.to_string())),
-                                        Value::Blob(b) => Value::Blob(Cow::Owned(b.to_vec())),
-                                        Value::Vector(v) => Value::Vector(Cow::Owned(v.to_vec())),
-                                        Value::Uuid(u) => Value::Uuid(*u),
-                                        Value::Jsonb(b) => Value::Jsonb(Cow::Owned(b.to_vec())),
-                                    })
-                                    .unwrap_or(Value::Null)
-                            })
+                            .map(|&col| row.get(col).map(clone_value_owned).unwrap_or(Value::Null))
                             .collect();
 
                         let entry = state.groups.entry(group_key).or_insert_with(|| {
@@ -2408,24 +2340,7 @@ impl<'a, S: RowSource> Executor<'a> for DynamicExecutor<'a, S> {
                     if let Some((group_vals, agg_states)) = iter.next() {
                         let mut result_values: Vec<Value<'a>> = group_vals
                             .into_iter()
-                            .map(|v| match v {
-                                Value::Null => Value::Null,
-                                Value::Int(i) => Value::Int(i),
-                                Value::Float(f) => Value::Float(f),
-                                Value::Text(s) => {
-                                    Value::Text(Cow::Borrowed(state.arena.alloc_str(&s)))
-                                }
-                                Value::Blob(b) => {
-                                    Value::Blob(Cow::Borrowed(state.arena.alloc_slice_copy(&b)))
-                                }
-                                Value::Vector(v) => {
-                                    Value::Vector(Cow::Borrowed(state.arena.alloc_slice_copy(&v)))
-                                }
-                                Value::Uuid(u) => Value::Uuid(u),
-                                Value::Jsonb(b) => {
-                                    Value::Jsonb(Cow::Borrowed(state.arena.alloc_slice_copy(&b)))
-                                }
-                            })
+                            .map(|v| allocate_value_to_arena(v, state.arena))
                             .collect();
 
                         for (idx, agg_state) in agg_states.iter().enumerate() {
@@ -2476,25 +2391,12 @@ fn compare_values_for_sort(a: &Value, b: &Value) -> std::cmp::Ordering {
 
 fn hash_keys<'a>(row: &ExecutorRow<'a>, key_indices: &[usize]) -> u64 {
     use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
+    use std::hash::Hasher;
 
     let mut hasher = DefaultHasher::new();
     for &idx in key_indices {
         if let Some(val) = row.get(idx) {
-            match val {
-                Value::Null => 0u8.hash(&mut hasher),
-                Value::Int(i) => i.hash(&mut hasher),
-                Value::Float(f) => f.to_bits().hash(&mut hasher),
-                Value::Text(s) => s.hash(&mut hasher),
-                Value::Blob(b) => b.hash(&mut hasher),
-                Value::Vector(v) => {
-                    for f in v.iter() {
-                        f.to_bits().hash(&mut hasher);
-                    }
-                }
-                Value::Uuid(u) => u.hash(&mut hasher),
-                Value::Jsonb(b) => b.hash(&mut hasher),
-            }
+            hash_value(val, &mut hasher);
         }
     }
     hasher.finish()
@@ -2502,25 +2404,12 @@ fn hash_keys<'a>(row: &ExecutorRow<'a>, key_indices: &[usize]) -> u64 {
 
 fn hash_keys_static(row: &[Value<'static>], key_indices: &[usize]) -> u64 {
     use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
+    use std::hash::Hasher;
 
     let mut hasher = DefaultHasher::new();
     for &idx in key_indices {
         if let Some(val) = row.get(idx) {
-            match val {
-                Value::Null => 0u8.hash(&mut hasher),
-                Value::Int(i) => i.hash(&mut hasher),
-                Value::Float(f) => f.to_bits().hash(&mut hasher),
-                Value::Text(s) => s.hash(&mut hasher),
-                Value::Blob(b) => b.hash(&mut hasher),
-                Value::Vector(v) => {
-                    for f in v.iter() {
-                        f.to_bits().hash(&mut hasher);
-                    }
-                }
-                Value::Uuid(u) => u.hash(&mut hasher),
-                Value::Jsonb(b) => b.hash(&mut hasher),
-            }
+            hash_value(val, &mut hasher);
         }
     }
     hasher.finish()
@@ -2557,42 +2446,7 @@ fn compute_group_key_for_dynamic(row: &ExecutorRow, group_by: &[usize]) -> Vec<u
     let mut key = Vec::new();
     for &col in group_by {
         if let Some(val) = row.get(col) {
-            match val {
-                Value::Null => key.push(0),
-                Value::Int(i) => {
-                    key.push(1);
-                    key.extend(i.to_be_bytes());
-                }
-                Value::Float(f) => {
-                    key.push(2);
-                    key.extend(f.to_bits().to_be_bytes());
-                }
-                Value::Text(s) => {
-                    key.push(3);
-                    key.extend(s.as_bytes());
-                    key.push(0);
-                }
-                Value::Blob(b) => {
-                    key.push(4);
-                    key.extend(b.iter());
-                    key.push(0);
-                }
-                Value::Vector(v) => {
-                    key.push(5);
-                    for f in v.iter() {
-                        key.extend(f.to_bits().to_be_bytes());
-                    }
-                }
-                Value::Uuid(u) => {
-                    key.push(6);
-                    key.extend(u.iter());
-                }
-                Value::Jsonb(b) => {
-                    key.push(7);
-                    key.extend(b.iter());
-                    key.push(0);
-                }
-            }
+            encode_value_to_key(val, &mut key);
         }
     }
     key
@@ -2644,7 +2498,11 @@ impl<'a> ExecutorBuilder<'a> {
                 let child = self.build_operator(project.input, source, column_map)?;
                 let projections: Vec<usize> = (0..project.expressions.len()).collect();
                 #[cfg(test)]
-                eprintln!("DEBUG ProjectExec: expressions.len() = {}, projections = {:?}", project.expressions.len(), projections);
+                eprintln!(
+                    "DEBUG ProjectExec: expressions.len() = {}, projections = {:?}",
+                    project.expressions.len(),
+                    projections
+                );
                 Ok(DynamicExecutor::Project(
                     Box::new(child),
                     projections,
@@ -4508,5 +4366,326 @@ mod tests {
         assert_eq!(results.len(), 2);
         assert_eq!(results[0], ("a".to_string(), 30));
         assert_eq!(results[1], ("b".to_string(), 30));
+    }
+
+    #[test]
+    fn decoder_decodes_date_type() {
+        use crate::records::types::{ColumnDef, DataType};
+        use crate::records::{RecordBuilder, Schema};
+
+        let column_defs = vec![ColumnDef::new("created_at", DataType::Date)];
+        let schema = Schema::new(column_defs);
+
+        let mut builder = RecordBuilder::new(&schema);
+        builder.set_date(0, 19000).unwrap();
+        let record = builder.build().unwrap();
+
+        let decoder = SimpleDecoder::new(vec![DataType::Date]);
+        let result = decoder.decode(&[], &record).unwrap();
+
+        assert_eq!(result.len(), 1);
+        match &result[0] {
+            Value::Int(days) => assert_eq!(*days, 19000),
+            other => panic!("expected Value::Int for Date, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn decoder_decodes_time_type() {
+        use crate::records::types::{ColumnDef, DataType};
+        use crate::records::{RecordBuilder, Schema};
+
+        let column_defs = vec![ColumnDef::new("event_time", DataType::Time)];
+        let schema = Schema::new(column_defs);
+
+        let mut builder = RecordBuilder::new(&schema);
+        builder.set_time(0, 43200000000).unwrap();
+        let record = builder.build().unwrap();
+
+        let decoder = SimpleDecoder::new(vec![DataType::Time]);
+        let result = decoder.decode(&[], &record).unwrap();
+
+        assert_eq!(result.len(), 1);
+        match &result[0] {
+            Value::Int(micros) => assert_eq!(*micros, 43200000000),
+            other => panic!("expected Value::Int for Time, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn decoder_decodes_timestamp_type() {
+        use crate::records::types::{ColumnDef, DataType};
+        use crate::records::{RecordBuilder, Schema};
+
+        let column_defs = vec![ColumnDef::new("updated_at", DataType::Timestamp)];
+        let schema = Schema::new(column_defs);
+
+        let mut builder = RecordBuilder::new(&schema);
+        builder.set_timestamp(0, 1702500000000000).unwrap();
+        let record = builder.build().unwrap();
+
+        let decoder = SimpleDecoder::new(vec![DataType::Timestamp]);
+        let result = decoder.decode(&[], &record).unwrap();
+
+        assert_eq!(result.len(), 1);
+        match &result[0] {
+            Value::Int(micros) => assert_eq!(*micros, 1702500000000000),
+            other => panic!("expected Value::Int for Timestamp, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn decoder_decodes_macaddr_type() {
+        use crate::records::types::{ColumnDef, DataType};
+        use crate::records::{RecordBuilder, Schema};
+
+        let column_defs = vec![ColumnDef::new("mac", DataType::MacAddr)];
+        let schema = Schema::new(column_defs);
+
+        let mut builder = RecordBuilder::new(&schema);
+        builder
+            .set_macaddr(0, &[0x00, 0x1A, 0x2B, 0x3C, 0x4D, 0x5E])
+            .unwrap();
+        let record = builder.build().unwrap();
+
+        let decoder = SimpleDecoder::new(vec![DataType::MacAddr]);
+        let result = decoder.decode(&[], &record).unwrap();
+
+        assert_eq!(result.len(), 1);
+        match &result[0] {
+            Value::MacAddr(m) => assert_eq!(m, &[0x00, 0x1A, 0x2B, 0x3C, 0x4D, 0x5E]),
+            other => panic!("expected Value::MacAddr for MacAddr, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn decoder_decodes_inet4_type() {
+        use crate::records::types::{ColumnDef, DataType};
+        use crate::records::{RecordBuilder, Schema};
+
+        let column_defs = vec![ColumnDef::new("ip", DataType::Inet4)];
+        let schema = Schema::new(column_defs);
+
+        let mut builder = RecordBuilder::new(&schema);
+        builder.set_inet4(0, &[192, 168, 1, 1]).unwrap();
+        let record = builder.build().unwrap();
+
+        let decoder = SimpleDecoder::new(vec![DataType::Inet4]);
+        let result = decoder.decode(&[], &record).unwrap();
+
+        assert_eq!(result.len(), 1);
+        match &result[0] {
+            Value::Inet4(ip) => assert_eq!(ip, &[192, 168, 1, 1]),
+            other => panic!("expected Value::Inet4 for Inet4, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn decoder_decodes_inet6_type() {
+        use crate::records::types::{ColumnDef, DataType};
+        use crate::records::{RecordBuilder, Schema};
+
+        let column_defs = vec![ColumnDef::new("ip6", DataType::Inet6)];
+        let schema = Schema::new(column_defs);
+
+        let mut builder = RecordBuilder::new(&schema);
+        let ipv6: [u8; 16] = [0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
+        builder.set_inet6(0, &ipv6).unwrap();
+        let record = builder.build().unwrap();
+
+        let decoder = SimpleDecoder::new(vec![DataType::Inet6]);
+        let result = decoder.decode(&[], &record).unwrap();
+
+        assert_eq!(result.len(), 1);
+        match &result[0] {
+            Value::Inet6(ip) => assert_eq!(ip, &ipv6),
+            other => panic!("expected Value::Inet6 for Inet6, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn decoder_decodes_timestamptz_type() {
+        use crate::records::types::{ColumnDef, DataType};
+        use crate::records::{RecordBuilder, Schema};
+
+        let column_defs = vec![ColumnDef::new("ts", DataType::TimestampTz)];
+        let schema = Schema::new(column_defs);
+
+        let mut builder = RecordBuilder::new(&schema);
+        builder.set_timestamptz(0, 1702500000000000, 3600).unwrap();
+        let record = builder.build().unwrap();
+
+        let decoder = SimpleDecoder::new(vec![DataType::TimestampTz]);
+        let result = decoder.decode(&[], &record).unwrap();
+
+        assert_eq!(result.len(), 1);
+        match &result[0] {
+            Value::TimestampTz {
+                micros,
+                offset_secs,
+            } => {
+                assert_eq!(*micros, 1702500000000000);
+                assert_eq!(*offset_secs, 3600);
+            }
+            other => panic!("expected Value::TimestampTz, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn decoder_decodes_interval_type() {
+        use crate::records::types::{ColumnDef, DataType};
+        use crate::records::{RecordBuilder, Schema};
+
+        let column_defs = vec![ColumnDef::new("duration", DataType::Interval)];
+        let schema = Schema::new(column_defs);
+
+        let mut builder = RecordBuilder::new(&schema);
+        builder.set_interval(0, 3600000000, 5, 2).unwrap();
+        let record = builder.build().unwrap();
+
+        let decoder = SimpleDecoder::new(vec![DataType::Interval]);
+        let result = decoder.decode(&[], &record).unwrap();
+
+        assert_eq!(result.len(), 1);
+        match &result[0] {
+            Value::Interval {
+                micros,
+                days,
+                months,
+            } => {
+                assert_eq!(*micros, 3600000000);
+                assert_eq!(*days, 5);
+                assert_eq!(*months, 2);
+            }
+            other => panic!("expected Value::Interval, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn decoder_decodes_point_type() {
+        use crate::records::types::{ColumnDef, DataType};
+        use crate::records::{RecordBuilder, Schema};
+
+        let column_defs = vec![ColumnDef::new("location", DataType::Point)];
+        let schema = Schema::new(column_defs);
+
+        let mut builder = RecordBuilder::new(&schema);
+        builder.set_point(0, 1.5, 2.5).unwrap();
+        let record = builder.build().unwrap();
+
+        let decoder = SimpleDecoder::new(vec![DataType::Point]);
+        let result = decoder.decode(&[], &record).unwrap();
+
+        assert_eq!(result.len(), 1);
+        match &result[0] {
+            Value::Point { x, y } => {
+                assert!((x - 1.5).abs() < 0.001);
+                assert!((y - 2.5).abs() < 0.001);
+            }
+            other => panic!("expected Value::Point, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn decoder_decodes_box_type() {
+        use crate::records::types::{ColumnDef, DataType};
+        use crate::records::{RecordBuilder, Schema};
+
+        let column_defs = vec![ColumnDef::new("bounds", DataType::Box)];
+        let schema = Schema::new(column_defs);
+
+        let mut builder = RecordBuilder::new(&schema);
+        builder.set_box(0, (0.0, 0.0), (10.0, 10.0)).unwrap();
+        let record = builder.build().unwrap();
+
+        let decoder = SimpleDecoder::new(vec![DataType::Box]);
+        let result = decoder.decode(&[], &record).unwrap();
+
+        assert_eq!(result.len(), 1);
+        match &result[0] {
+            Value::GeoBox { low, high } => {
+                assert!((low.0 - 0.0).abs() < 0.001);
+                assert!((low.1 - 0.0).abs() < 0.001);
+                assert!((high.0 - 10.0).abs() < 0.001);
+                assert!((high.1 - 10.0).abs() < 0.001);
+            }
+            other => panic!("expected Value::GeoBox, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn decoder_decodes_circle_type() {
+        use crate::records::types::{ColumnDef, DataType};
+        use crate::records::{RecordBuilder, Schema};
+
+        let column_defs = vec![ColumnDef::new("area", DataType::Circle)];
+        let schema = Schema::new(column_defs);
+
+        let mut builder = RecordBuilder::new(&schema);
+        builder.set_circle(0, (5.0, 5.0), 3.0).unwrap();
+        let record = builder.build().unwrap();
+
+        let decoder = SimpleDecoder::new(vec![DataType::Circle]);
+        let result = decoder.decode(&[], &record).unwrap();
+
+        assert_eq!(result.len(), 1);
+        match &result[0] {
+            Value::Circle { center, radius } => {
+                assert!((center.0 - 5.0).abs() < 0.001);
+                assert!((center.1 - 5.0).abs() < 0.001);
+                assert!((radius - 3.0).abs() < 0.001);
+            }
+            other => panic!("expected Value::Circle, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn decoder_decodes_enum_type() {
+        use crate::records::types::{ColumnDef, DataType};
+        use crate::records::{RecordBuilder, Schema};
+
+        let column_defs = vec![ColumnDef::new("status", DataType::Enum)];
+        let schema = Schema::new(column_defs);
+
+        let mut builder = RecordBuilder::new(&schema);
+        builder.set_enum(0, 1, 2).unwrap();
+        let record = builder.build().unwrap();
+
+        let decoder = SimpleDecoder::new(vec![DataType::Enum]);
+        let result = decoder.decode(&[], &record).unwrap();
+
+        assert_eq!(result.len(), 1);
+        match &result[0] {
+            Value::Enum { type_id, ordinal } => {
+                assert_eq!(*type_id, 1);
+                assert_eq!(*ordinal, 2);
+            }
+            other => panic!("expected Value::Enum, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn decoder_decodes_decimal_type() {
+        use crate::records::types::{ColumnDef, DataType};
+        use crate::records::{RecordBuilder, Schema};
+
+        let column_defs = vec![ColumnDef::new("price", DataType::Decimal)];
+        let schema = Schema::new(column_defs);
+
+        let mut builder = RecordBuilder::new(&schema);
+        builder.set_decimal(0, 12345, 2, false).unwrap();
+        let record = builder.build().unwrap();
+
+        let decoder = SimpleDecoder::new(vec![DataType::Decimal]);
+        let result = decoder.decode(&[], &record).unwrap();
+
+        assert_eq!(result.len(), 1);
+        match &result[0] {
+            Value::Decimal { digits, scale } => {
+                assert_eq!(*digits, 12345);
+                assert_eq!(*scale, 2);
+            }
+            other => panic!("expected Value::Decimal, got {:?}", other),
+        }
     }
 }

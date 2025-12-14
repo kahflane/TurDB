@@ -1,3 +1,6 @@
+use crate::database::owned_value::OwnedValue;
+use crate::database::row::Row;
+use crate::database::{CheckpointInfo, ExecuteResult, RecoveryInfo};
 use crate::schema::{Catalog, ColumnDef as SchemaColumnDef};
 use crate::sql::executor::{ExecutionContext, Executor, ExecutorBuilder, StreamingBTreeSource};
 use crate::sql::planner::Planner;
@@ -8,9 +11,6 @@ use eyre::{bail, ensure, Result, WrapErr};
 use hashbrown::HashSet;
 use parking_lot::{Mutex, RwLock};
 use std::path::{Path, PathBuf};
-use crate::database::owned_value::OwnedValue;
-use crate::database::{CheckpointInfo, ExecuteResult, RecoveryInfo};
-use crate::database::row::Row;
 
 pub struct Database {
     path: PathBuf,
@@ -347,7 +347,7 @@ impl Database {
                 column_types,
                 projections,
             )
-                .wrap_err("failed to create table scan")?;
+            .wrap_err("failed to create table scan")?;
 
             let ctx = ExecutionContext::new(&arena);
             let builder = ExecutorBuilder::new(&ctx);
@@ -359,7 +359,10 @@ impl Database {
             executor.open()?;
             while let Some(row) = executor.next()? {
                 #[cfg(test)]
-                eprintln!("DEBUG query: row from executor has {} values", row.values.len());
+                eprintln!(
+                    "DEBUG query: row from executor has {} values",
+                    row.values.len()
+                );
                 let owned: Vec<OwnedValue> = row.values.iter().map(OwnedValue::from).collect();
                 rows.push(Row::new(owned));
             }
@@ -599,7 +602,6 @@ impl Database {
         };
 
         let root_page = 1u32;
-        let rows_affected;
 
         let column_types: Vec<crate::records::types::DataType> =
             columns.iter().map(|c| c.data_type()).collect();
@@ -629,16 +631,14 @@ impl Database {
             Ok(count)
         }
 
-        if wal_enabled {
+        let rows_affected = if wal_enabled {
             let mut wal_storage = WalStorage::new(storage, &self.dirty_pages);
             let mut btree = BTree::new(&mut wal_storage, root_page)?;
-            rows_affected =
-                insert_rows(&mut btree, rows, &schema, &column_types, &self.next_row_id)?;
+            insert_rows(&mut btree, rows, &schema, &column_types, &self.next_row_id)?
         } else {
             let mut btree = BTree::new(storage, root_page)?;
-            rows_affected =
-                insert_rows(&mut btree, rows, &schema, &column_types, &self.next_row_id)?;
-        }
+            insert_rows(&mut btree, rows, &schema, &column_types, &self.next_row_id)?
+        };
 
         Ok(ExecuteResult::Insert { rows_affected })
     }
@@ -944,14 +944,12 @@ impl Database {
                         .wrap_err_with(|| format!("failed to parse float: {}", s))?;
                     Ok(OwnedValue::Float(f))
                 }
-                Literal::String(s) => {
-                    match target_type {
-                        Some(DataType::Uuid) => Self::parse_uuid_string(s),
-                        Some(DataType::Jsonb) => Self::parse_json_string(s),
-                        Some(DataType::Vector) => Self::parse_vector_string(s),
-                        _ => Ok(OwnedValue::Text(s.to_string())),
-                    }
-                }
+                Literal::String(s) => match target_type {
+                    Some(DataType::Uuid) => Self::parse_uuid_string(s),
+                    Some(DataType::Jsonb) => Self::parse_json_string(s),
+                    Some(DataType::Vector) => Self::parse_vector_string(s),
+                    _ => Ok(OwnedValue::Text(s.to_string())),
+                },
                 Literal::Boolean(b) => Ok(OwnedValue::Bool(*b)),
                 Literal::HexNumber(s) => Self::parse_hex_to_blob(s),
                 Literal::BinaryNumber(s) => Self::parse_binary_to_blob(s),
@@ -1061,8 +1059,8 @@ impl Database {
                         if hex.len() != 4 {
                             bail!("invalid unicode escape in JSON string");
                         }
-                        let cp = u32::from_str_radix(&hex, 16)
-                            .wrap_err("invalid unicode escape")?;
+                        let cp =
+                            u32::from_str_radix(&hex, 16).wrap_err("invalid unicode escape")?;
                         if let Some(ch) = char::from_u32(cp) {
                             result.push(ch);
                         } else {
@@ -1224,7 +1222,7 @@ impl Database {
     }
 
     fn parse_hex_to_blob(s: &str) -> Result<OwnedValue> {
-        if s.len() % 2 != 0 {
+        if !s.len().is_multiple_of(2) {
             bail!("hex string must have even length, got {}", s.len());
         }
 
@@ -1240,7 +1238,7 @@ impl Database {
     }
 
     fn parse_binary_to_blob(s: &str) -> Result<OwnedValue> {
-        if s.len() % 8 != 0 {
+        if !s.len().is_multiple_of(8) {
             let bytes: Vec<u8> = (0..s.len())
                 .step_by(8)
                 .map(|i| {
