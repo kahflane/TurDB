@@ -70,15 +70,22 @@
 //! - Point lookup: < 1µs (cached)
 //! - Join performance: Depends on algorithm selection
 
+use crate::sql::adapter::BTreeCursorAdapter;
+use crate::sql::decoder::SimpleDecoder;
+use crate::sql::predicate::CompiledPredicate;
+use crate::sql::state::{
+    AggregateState, GraceHashJoinState, HashAggregateState, IndexScanState, LimitState,
+    NestedLoopJoinState, SortState,
+};
+use crate::sql::util::{
+    allocate_value_to_arena, clone_value_owned, clone_value_ref_to_arena, compare_values_for_sort,
+    compute_group_key_for_dynamic, encode_value_to_key, hash_keys, hash_keys_static, hash_value,
+    keys_match_static,
+};
 use crate::types::Value;
 use bumpalo::Bump;
 use eyre::Result;
 use std::borrow::Cow;
-use crate::sql::adapter::BTreeCursorAdapter;
-use crate::sql::decoder::{SimpleDecoder};
-use crate::sql::predicate::CompiledPredicate;
-use crate::sql::state::{AggregateState, GraceHashJoinState, HashAggregateState, IndexScanState, LimitState, NestedLoopJoinState, SortState};
-use crate::sql::util::{allocate_value_to_arena, clone_value_owned, clone_value_ref_to_arena, compare_values_for_sort, compute_group_key_for_dynamic, encode_value_to_key, hash_keys, hash_keys_static, hash_value, keys_match_static};
 
 pub struct ExecutorRow<'a> {
     pub values: &'a [Value<'a>],
@@ -169,7 +176,6 @@ pub trait RowSource {
     fn reset(&mut self) -> Result<()>;
     fn next_row(&mut self) -> Result<Option<Vec<Value<'static>>>>;
 }
-
 
 impl RowSource for BTreeCursorAdapter {
     fn reset(&mut self) -> Result<()> {
@@ -1429,16 +1435,14 @@ impl<'a, S: RowSource> Executor<'a> for DynamicExecutor<'a, S> {
     }
 }
 
-
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::borrow::Cow;
     use crate::sql::builder::ExecutorBuilder;
     use crate::sql::context::ExecutionContext;
     use crate::sql::decoder::RecordDecoder;
     use crate::sql::expr::ExprEvaluator;
+    use std::borrow::Cow;
 
     struct MockRowSource {
         rows: Vec<Vec<Value<'static>>>,
@@ -3277,10 +3281,7 @@ mod tests {
         let values: &[Value] = arena.alloc_slice_fill_iter([Value::Int(15)]);
         let row = ExecutorRow::new(values);
 
-        assert!(
-            predicate.evaluate(&row),
-            "15 + 1 = 16 > 10 should be true"
-        );
+        assert!(predicate.evaluate(&row), "15 + 1 = 16 > 10 should be true");
 
         let values_false: &[Value] = arena.alloc_slice_fill_iter([Value::Int(5)]);
         let row_false = ExecutorRow::new(values_false);
@@ -3323,10 +3324,7 @@ mod tests {
         let values: &[Value] = arena.alloc_slice_fill_iter([Value::Int(8)]);
         let row = ExecutorRow::new(values);
 
-        assert!(
-            predicate.evaluate(&row),
-            "8 - 5 = 3 == 3 should be true"
-        );
+        assert!(predicate.evaluate(&row), "8 - 5 = 3 == 3 should be true");
     }
 
     #[test]
@@ -3361,10 +3359,7 @@ mod tests {
         let values: &[Value] = arena.alloc_slice_fill_iter([Value::Int(5)]);
         let row = ExecutorRow::new(values);
 
-        assert!(
-            predicate.evaluate(&row),
-            "5 * 2 = 10 < 20 should be true"
-        );
+        assert!(predicate.evaluate(&row), "5 * 2 = 10 < 20 should be true");
 
         let values_false: &[Value] = arena.alloc_slice_fill_iter([Value::Int(15)]);
         let row_false = ExecutorRow::new(values_false);
@@ -3407,10 +3402,7 @@ mod tests {
         let values: &[Value] = arena.alloc_slice_fill_iter([Value::Int(10)]);
         let row = ExecutorRow::new(values);
 
-        assert!(
-            predicate.evaluate(&row),
-            "10 / 2 = 5 == 5 should be true"
-        );
+        assert!(predicate.evaluate(&row), "10 / 2 = 5 == 5 should be true");
     }
 
     #[test]
@@ -3445,10 +3437,7 @@ mod tests {
         let values: &[Value] = arena.alloc_slice_fill_iter([Value::Int(10)]);
         let row = ExecutorRow::new(values);
 
-        assert!(
-            predicate.evaluate(&row),
-            "10 % 3 = 1 == 1 should be true"
-        );
+        assert!(predicate.evaluate(&row), "10 % 3 = 1 == 1 should be true");
     }
 
     #[test]
@@ -3559,10 +3548,7 @@ mod tests {
         let values: &[Value] = arena.alloc_slice_fill_iter([Value::Int(0x35)]);
         let row = ExecutorRow::new(values);
 
-        assert!(
-            predicate.evaluate(&row),
-            "0x35 & 0xF = 5 should be true"
-        );
+        assert!(predicate.evaluate(&row), "0x35 & 0xF = 5 should be true");
     }
 
     #[test]
@@ -3673,10 +3659,7 @@ mod tests {
         let values: &[Value] = arena.alloc_slice_fill_iter([Value::Int(1)]);
         let row = ExecutorRow::new(values);
 
-        assert!(
-            predicate.evaluate(&row),
-            "1 << 4 = 16 should be true"
-        );
+        assert!(predicate.evaluate(&row), "1 << 4 = 16 should be true");
     }
 
     #[test]
@@ -3711,10 +3694,7 @@ mod tests {
         let values: &[Value] = arena.alloc_slice_fill_iter([Value::Int(16)]);
         let row = ExecutorRow::new(values);
 
-        assert!(
-            predicate.evaluate(&row),
-            "16 >> 2 = 4 should be true"
-        );
+        assert!(predicate.evaluate(&row), "16 >> 2 = 4 should be true");
     }
 
     #[test]
@@ -3749,10 +3729,7 @@ mod tests {
         let values: &[Value] = arena.alloc_slice_fill_iter([Value::Int(2)]);
         let row = ExecutorRow::new(values);
 
-        assert!(
-            predicate.evaluate(&row),
-            "2 ^ 3 = 8 should be true"
-        );
+        assert!(predicate.evaluate(&row), "2 ^ 3 = 8 should be true");
     }
 
     #[test]
@@ -3785,9 +3762,8 @@ mod tests {
         let predicate = CompiledPredicate::new(expr, column_map);
 
         let json_data = br#"{"name":"Alice","age":30}"#;
-        let values: &[Value] = arena.alloc_slice_fill_iter([Value::Jsonb(Cow::Borrowed(
-            json_data.as_slice(),
-        ))]);
+        let values: &[Value] =
+            arena.alloc_slice_fill_iter([Value::Jsonb(Cow::Borrowed(json_data.as_slice()))]);
         let row = ExecutorRow::new(values);
 
         assert!(
@@ -3826,15 +3802,11 @@ mod tests {
         let predicate = CompiledPredicate::new(expr, column_map);
 
         let json_data = br#"["a","b","c"]"#;
-        let values: &[Value] = arena.alloc_slice_fill_iter([Value::Jsonb(Cow::Borrowed(
-            json_data.as_slice(),
-        ))]);
+        let values: &[Value] =
+            arena.alloc_slice_fill_iter([Value::Jsonb(Cow::Borrowed(json_data.as_slice()))]);
         let row = ExecutorRow::new(values);
 
-        assert!(
-            predicate.evaluate(&row),
-            "data->>1 = 'b' should be true"
-        );
+        assert!(predicate.evaluate(&row), "data->>1 = 'b' should be true");
     }
 
     #[test]
@@ -3867,10 +3839,7 @@ mod tests {
             right: threshold,
         });
 
-        let column_map = vec![
-            ("embedding".to_string(), 0),
-            ("query_vec".to_string(), 1),
-        ];
+        let column_map = vec![("embedding".to_string(), 0), ("query_vec".to_string(), 1)];
         let predicate = CompiledPredicate::new(expr, column_map);
 
         let vec1: &[f32] = &[1.0, 2.0, 3.0];
@@ -3917,10 +3886,7 @@ mod tests {
             right: threshold,
         });
 
-        let column_map = vec![
-            ("embedding".to_string(), 0),
-            ("query_vec".to_string(), 1),
-        ];
+        let column_map = vec![("embedding".to_string(), 0), ("query_vec".to_string(), 1)];
         let predicate = CompiledPredicate::new(expr, column_map);
 
         let vec1: &[f32] = &[1.0, 0.0, 0.0];
@@ -3967,10 +3933,7 @@ mod tests {
             right: threshold,
         });
 
-        let column_map = vec![
-            ("embedding".to_string(), 0),
-            ("query_vec".to_string(), 1),
-        ];
+        let column_map = vec![("embedding".to_string(), 0), ("query_vec".to_string(), 1)];
         let predicate = CompiledPredicate::new(expr, column_map);
 
         let vec1: &[f32] = &[1.0, 2.0, 3.0];
