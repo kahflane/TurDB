@@ -2,8 +2,11 @@ use crate::database::owned_value::OwnedValue;
 use crate::database::row::Row;
 use crate::database::{CheckpointInfo, ExecuteResult, RecoveryInfo};
 use crate::schema::{Catalog, ColumnDef as SchemaColumnDef};
+use crate::sql::builder::ExecutorBuilder;
+use crate::sql::context::ExecutionContext;
 use crate::sql::executor::{Executor, StreamingBTreeSource};
 use crate::sql::planner::Planner;
+use crate::sql::predicate::CompiledPredicate;
 use crate::sql::Parser;
 use crate::storage::{FileManager, Wal, WalStorage};
 use bumpalo::Bump;
@@ -11,9 +14,6 @@ use eyre::{bail, ensure, Result, WrapErr};
 use hashbrown::HashSet;
 use parking_lot::{Mutex, RwLock};
 use std::path::{Path, PathBuf};
-use crate::sql::builder::ExecutorBuilder;
-use crate::sql::context::ExecutionContext;
-use crate::sql::predicate::CompiledPredicate;
 
 pub struct Database {
     path: PathBuf,
@@ -611,7 +611,7 @@ impl Database {
         let column_types: Vec<crate::records::types::DataType> =
             columns.iter().map(|c| c.data_type()).collect();
         let validator = ConstraintValidator::new(&table_def_for_validator);
-        
+
         fn insert_rows<'a, S: crate::storage::Storage>(
             btree: &mut BTree<'_, S>,
             rows: &[&[&crate::sql::ast::Expr<'a>]],

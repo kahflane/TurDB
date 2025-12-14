@@ -190,6 +190,14 @@ impl<'a> RecordView<'a> {
             .map_err(|e| eyre::eyre!("invalid UTF-8 in text column {}: {}", col_idx, e))
     }
 
+    pub fn get_char(&self, col_idx: usize) -> Result<&'a str> {
+        self.get_text(col_idx)
+    }
+
+    pub fn get_varchar(&self, col_idx: usize) -> Result<&'a str> {
+        self.get_text(col_idx)
+    }
+
     pub fn get_blob(&self, col_idx: usize) -> Result<&'a [u8]> {
         let (start, end) = self.get_var_bounds(col_idx)?;
         Ok(&self.data[start..end])

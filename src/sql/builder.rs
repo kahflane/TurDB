@@ -1,8 +1,13 @@
 use crate::sql::adapter::BTreeCursorAdapter;
 use crate::sql::context::ExecutionContext;
-use crate::sql::executor::{AggregateFunction, DynamicExecutor, RowSource, SortKey, TableScanExecutor};
+use crate::sql::executor::{
+    AggregateFunction, DynamicExecutor, RowSource, SortKey, TableScanExecutor,
+};
 use crate::sql::predicate::CompiledPredicate;
-use crate::sql::state::{GraceHashJoinState, HashAggregateState, IndexScanState, LimitState, NestedLoopJoinState, SortState};
+use crate::sql::state::{
+    GraceHashJoinState, HashAggregateState, IndexScanState, LimitState, NestedLoopJoinState,
+    SortState,
+};
 
 pub struct ExecutorBuilder<'a> {
     ctx: &'a ExecutionContext<'a>,
