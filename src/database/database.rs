@@ -571,6 +571,7 @@ impl Database {
         _arena: &Bump,
     ) -> Result<ExecuteResult> {
         use crate::btree::BTree;
+        use crate::constraints::ConstraintValidator;
         use crate::database::owned_value::create_record_schema;
         use std::sync::atomic::Ordering;
 
@@ -590,6 +591,7 @@ impl Database {
 
         let table_def = catalog.resolve_table(table_name)?;
         let columns = table_def.columns().to_vec();
+        let table_def_for_validator = table_def.clone();
 
         drop(catalog_guard);
 
@@ -608,23 +610,26 @@ impl Database {
 
         let column_types: Vec<crate::records::types::DataType> =
             columns.iter().map(|c| c.data_type()).collect();
-
+        let validator = ConstraintValidator::new(&table_def_for_validator);
+        
         fn insert_rows<'a, S: crate::storage::Storage>(
             btree: &mut BTree<'_, S>,
             rows: &[&[&crate::sql::ast::Expr<'a>]],
             schema: &crate::records::Schema,
             column_types: &[crate::records::types::DataType],
             next_row_id: &std::sync::atomic::AtomicU64,
+            validator: &ConstraintValidator<'_>,
         ) -> Result<usize> {
             let mut count = 0;
             for row_exprs in rows.iter() {
-                let values: Vec<OwnedValue> = row_exprs
+                let mut values: Vec<OwnedValue> = row_exprs
                     .iter()
                     .zip(column_types.iter())
                     .map(|(expr, data_type)| {
                         Database::eval_literal_with_type(expr, Some(data_type))
                     })
                     .collect::<Result<Vec<_>>>()?;
+                validator.validate_insert(&mut values)?;
                 let record_data = OwnedValue::build_record_from_values(&values, schema)?;
                 let row_id = next_row_id.fetch_add(1, Ordering::Relaxed);
                 let key = Database::generate_row_key(row_id);
@@ -637,10 +642,24 @@ impl Database {
         let rows_affected = if wal_enabled {
             let mut wal_storage = WalStorage::new(storage, &self.dirty_pages);
             let mut btree = BTree::new(&mut wal_storage, root_page)?;
-            insert_rows(&mut btree, rows, &schema, &column_types, &self.next_row_id)?
+            insert_rows(
+                &mut btree,
+                rows,
+                &schema,
+                &column_types,
+                &self.next_row_id,
+                &validator,
+            )?
         } else {
             let mut btree = BTree::new(storage, root_page)?;
-            insert_rows(&mut btree, rows, &schema, &column_types, &self.next_row_id)?
+            insert_rows(
+                &mut btree,
+                rows,
+                &schema,
+                &column_types,
+                &self.next_row_id,
+                &validator,
+            )?
         };
 
         Ok(ExecuteResult::Insert { rows_affected })
@@ -666,7 +685,7 @@ impl Database {
         let schema_name = update.table.schema.unwrap_or("root");
         let table_name = update.table.name;
 
-        let table_def = catalog.resolve_table(table_name)?;
+        let table_def = catalog.resolve_table(table_name)?.clone();
         let columns = table_def.columns().to_vec();
 
         drop(catalog_guard);
@@ -722,6 +741,10 @@ impl Database {
                     let new_value = Self::eval_literal(value_expr)?;
                     row_values[*col_idx] = new_value;
                 }
+
+                let validator = crate::constraints::ConstraintValidator::new(&table_def);
+                validator.validate_update(&row_values)?;
+
                 rows_to_update.push((key.to_vec(), row_values));
             }
 

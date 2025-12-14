@@ -99,7 +99,9 @@ impl SimpleDecoder {
                 DataType::Float4 => Value::Float(view.get_float4(idx)? as f64),
                 DataType::Float8 => Value::Float(view.get_float8(idx)?),
                 DataType::Bool => Value::Int(if view.get_bool(idx)? { 1 } else { 0 }),
-                DataType::Text => Value::Text(Cow::Owned(view.get_text(idx)?.to_string())),
+                DataType::Text | DataType::Varchar | DataType::Char => {
+                    Value::Text(Cow::Owned(view.get_text(idx)?.to_string()))
+                },
                 DataType::Blob => Value::Blob(Cow::Owned(view.get_blob(idx)?.to_vec())),
                 DataType::Uuid => Value::Uuid(*view.get_uuid(idx)?),
                 DataType::Vector => Value::Vector(Cow::Owned(view.get_vector(idx)?.to_vec())),
