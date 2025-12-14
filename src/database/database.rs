@@ -2,7 +2,7 @@ use crate::database::owned_value::OwnedValue;
 use crate::database::row::Row;
 use crate::database::{CheckpointInfo, ExecuteResult, RecoveryInfo};
 use crate::schema::{Catalog, ColumnDef as SchemaColumnDef};
-use crate::sql::executor::{ExecutionContext, Executor, ExecutorBuilder, StreamingBTreeSource};
+use crate::sql::executor::{Executor, StreamingBTreeSource};
 use crate::sql::planner::Planner;
 use crate::sql::Parser;
 use crate::storage::{FileManager, Wal, WalStorage};
@@ -11,6 +11,9 @@ use eyre::{bail, ensure, Result, WrapErr};
 use hashbrown::HashSet;
 use parking_lot::{Mutex, RwLock};
 use std::path::{Path, PathBuf};
+use crate::sql::builder::ExecutorBuilder;
+use crate::sql::context::ExecutionContext;
+use crate::sql::predicate::CompiledPredicate;
 
 pub struct Database {
     path: PathBuf,
@@ -653,7 +656,6 @@ impl Database {
             create_column_map, create_record_schema, owned_values_to_values,
         };
         use crate::records::RecordView;
-        use crate::sql::executor::CompiledPredicate;
 
         self.ensure_catalog()?;
         self.ensure_file_manager()?;
@@ -749,7 +751,6 @@ impl Database {
             create_column_map, create_record_schema, owned_values_to_values,
         };
         use crate::records::RecordView;
-        use crate::sql::executor::CompiledPredicate;
 
         self.ensure_catalog()?;
         self.ensure_file_manager()?;
