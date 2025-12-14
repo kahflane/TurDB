@@ -57,7 +57,7 @@ fn create_sqlite_connection(dir: &tempfile::TempDir) -> Connection {
          PRAGMA cache_size=-65536;
          PRAGMA temp_store=MEMORY;",
     )
-    .unwrap();
+        .unwrap();
 
     conn
 }
@@ -70,7 +70,7 @@ fn create_sqlite_test_database(row_count: usize) -> (tempfile::TempDir, Connecti
         "CREATE TABLE users (id INTEGER, name TEXT, age INTEGER, score REAL)",
         [],
     )
-    .unwrap();
+        .unwrap();
 
     for i in 0..row_count {
         conn.execute(
@@ -82,7 +82,7 @@ fn create_sqlite_test_database(row_count: usize) -> (tempfile::TempDir, Connecti
                 (i as f64) * 0.1
             ],
         )
-        .unwrap();
+            .unwrap();
     }
 
     (dir, conn)
@@ -128,7 +128,7 @@ fn bench_insert_comparison(c: &mut Criterion) {
                         "CREATE TABLE users (id INTEGER, name TEXT, age INTEGER)",
                         [],
                     )
-                    .unwrap();
+                        .unwrap();
                     (dir, conn)
                 },
                 |(_dir, conn)| {
@@ -137,7 +137,7 @@ fn bench_insert_comparison(c: &mut Criterion) {
                             "INSERT INTO users VALUES (?1, ?2, ?3)",
                             params![i as i64, format!("user{}", i), 20 + (i % 60) as i64],
                         )
-                        .unwrap();
+                            .unwrap();
                     }
                     conn
                 },
@@ -191,7 +191,7 @@ fn bench_insert_prepared_comparison(c: &mut Criterion) {
                             "CREATE TABLE users (id INTEGER, name TEXT, age INTEGER)",
                             [],
                         )
-                        .unwrap();
+                            .unwrap();
                         (dir, conn)
                     },
                     |(_dir, conn)| {
@@ -205,7 +205,7 @@ fn bench_insert_prepared_comparison(c: &mut Criterion) {
                                     format!("user{}", i),
                                     20 + (i % 60) as i64
                                 ])
-                                .unwrap();
+                                    .unwrap();
                             }
                         }
                         conn
@@ -390,7 +390,7 @@ fn bench_large_text_comparison(c: &mut Criterion) {
                 "INSERT INTO docs VALUES (?1, ?2)",
                 params![counter as i64, &large_text],
             )
-            .unwrap();
+                .unwrap();
             counter += 1;
         });
     });
@@ -422,7 +422,7 @@ fn bench_large_text_comparison(c: &mut Criterion) {
                 "INSERT INTO docs VALUES (?1, ?2)",
                 params![i as i64, &large_text],
             )
-            .unwrap();
+                .unwrap();
         }
 
         b.iter(|| {
@@ -474,7 +474,7 @@ fn bench_lifecycle_comparison(c: &mut Criterion) {
                      PRAGMA synchronous=OFF;
                      PRAGMA mmap_size=268435456;",
                 )
-                .unwrap();
+                    .unwrap();
                 (dir, conn)
             },
         );
@@ -509,7 +509,7 @@ fn bench_lifecycle_comparison(c: &mut Criterion) {
                  PRAGMA synchronous=OFF;
                  PRAGMA mmap_size=268435456;",
             )
-            .unwrap();
+                .unwrap();
             conn.execute("CREATE TABLE test (id INTEGER, value TEXT)", [])
                 .unwrap();
             for i in 0..100 {
@@ -517,7 +517,7 @@ fn bench_lifecycle_comparison(c: &mut Criterion) {
                     "INSERT INTO test VALUES (?1, ?2)",
                     params![i as i64, format!("val{}", i)],
                 )
-                .unwrap();
+                    .unwrap();
             }
         }
 
@@ -528,7 +528,7 @@ fn bench_lifecycle_comparison(c: &mut Criterion) {
                  PRAGMA synchronous=OFF;
                  PRAGMA mmap_size=268435456;",
             )
-            .unwrap();
+                .unwrap();
             black_box(conn)
         });
     });
@@ -580,12 +580,12 @@ fn bench_insert_wal_comparison(c: &mut Criterion) {
                              PRAGMA mmap_size=268435456;
                              PRAGMA cache_size=-65536;",
                     )
-                    .unwrap();
+                        .unwrap();
                     conn.execute(
                         "CREATE TABLE users (id INTEGER, name TEXT, age INTEGER)",
                         [],
                     )
-                    .unwrap();
+                        .unwrap();
                     (dir, conn)
                 },
                 |(_dir, conn)| {
@@ -594,13 +594,347 @@ fn bench_insert_wal_comparison(c: &mut Criterion) {
                             "INSERT INTO users VALUES (?1, ?2, ?3)",
                             params![i as i64, format!("user{}", i), 20 + (i % 60) as i64],
                         )
-                        .unwrap();
+                            .unwrap();
                     }
                     conn
                 },
             );
         });
     }
+
+    group.finish();
+}
+
+fn bench_unique_constraint_comparison(c: &mut Criterion) {
+    let mut group = c.benchmark_group("unique_constraint_comparison");
+
+    for count in [100, 1000].iter() {
+        group.throughput(Throughput::Elements(*count as u64));
+
+        group.bench_with_input(
+            BenchmarkId::new("turdb_unique", count),
+            count,
+            |b, &count| {
+                b.iter_with_setup(
+                    || {
+                        let dir = tempdir().unwrap();
+                        let db_path = dir.path().join("bench_db");
+                        let db = Database::create(&db_path).unwrap();
+                        db.execute("CREATE TABLE users (id INT PRIMARY KEY, name TEXT, email TEXT UNIQUE)")
+                            .unwrap();
+                        (dir, db)
+                    },
+                    |(_dir, db)| {
+                        for i in 0..count {
+                            let sql = format!(
+                                "INSERT INTO users VALUES ({}, 'user{}', 'user{}@example.com')",
+                                i, i, i
+                            );
+                            db.execute(&sql).unwrap();
+                        }
+                        db
+                    },
+                );
+            },
+        );
+
+        group.bench_with_input(
+            BenchmarkId::new("sqlite_unique", count),
+            count,
+            |b, &count| {
+                b.iter_with_setup(
+                    || {
+                        let dir = tempdir().unwrap();
+                        let conn = create_sqlite_connection(&dir);
+                        conn.execute(
+                            "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, email TEXT UNIQUE)",
+                            [],
+                        )
+                            .unwrap();
+                        (dir, conn)
+                    },
+                    |(_dir, conn)| {
+                        for i in 0..count {
+                            conn.execute(
+                                "INSERT INTO users VALUES (?1, ?2, ?3)",
+                                params![
+                                    i as i64,
+                                    format!("user{}", i),
+                                    format!("user{}@example.com", i)
+                                ],
+                            )
+                                .unwrap();
+                        }
+                        conn
+                    },
+                );
+            },
+        );
+
+        group.bench_with_input(
+            BenchmarkId::new("turdb_no_constraint", count),
+            count,
+            |b, &count| {
+                b.iter_with_setup(
+                    || {
+                        let dir = tempdir().unwrap();
+                        let db_path = dir.path().join("bench_db");
+                        let db = Database::create(&db_path).unwrap();
+                        db.execute("CREATE TABLE users (id INT, name TEXT, email TEXT)")
+                            .unwrap();
+                        (dir, db)
+                    },
+                    |(_dir, db)| {
+                        for i in 0..count {
+                            let sql = format!(
+                                "INSERT INTO users VALUES ({}, 'user{}', 'user{}@example.com')",
+                                i, i, i
+                            );
+                            db.execute(&sql).unwrap();
+                        }
+                        db
+                    },
+                );
+            },
+        );
+    }
+
+    group.finish();
+}
+
+fn bench_check_constraint_comparison(c: &mut Criterion) {
+    let mut group = c.benchmark_group("check_constraint_comparison");
+
+    for count in [100, 1000].iter() {
+        group.throughput(Throughput::Elements(*count as u64));
+
+        group.bench_with_input(
+            BenchmarkId::new("turdb_check", count),
+            count,
+            |b, &count| {
+                b.iter_with_setup(
+                    || {
+                        let dir = tempdir().unwrap();
+                        let db_path = dir.path().join("bench_db");
+                        let db = Database::create(&db_path).unwrap();
+                        db.execute(
+                            "CREATE TABLE products (id INT, price INT CHECK (price >= 0), qty INT CHECK (qty >= 0))",
+                        )
+                            .unwrap();
+                        (dir, db)
+                    },
+                    |(_dir, db)| {
+                        for i in 0..count {
+                            let sql = format!("INSERT INTO products VALUES ({}, {}, {})", i, i * 10, i);
+                            db.execute(&sql).unwrap();
+                        }
+                        db
+                    },
+                );
+            },
+        );
+
+        group.bench_with_input(
+            BenchmarkId::new("sqlite_check", count),
+            count,
+            |b, &count| {
+                b.iter_with_setup(
+                    || {
+                        let dir = tempdir().unwrap();
+                        let conn = create_sqlite_connection(&dir);
+                        conn.execute(
+                            "CREATE TABLE products (id INTEGER, price INTEGER CHECK (price >= 0), qty INTEGER CHECK (qty >= 0))",
+                            [],
+                        )
+                            .unwrap();
+                        (dir, conn)
+                    },
+                    |(_dir, conn)| {
+                        for i in 0..count {
+                            conn.execute(
+                                "INSERT INTO products VALUES (?1, ?2, ?3)",
+                                params![i as i64, (i * 10) as i64, i as i64],
+                            )
+                                .unwrap();
+                        }
+                        conn
+                    },
+                );
+            },
+        );
+    }
+
+    group.finish();
+}
+
+fn bench_foreign_key_insert_comparison(c: &mut Criterion) {
+    let mut group = c.benchmark_group("foreign_key_insert_comparison");
+
+    for count in [100, 500].iter() {
+        group.throughput(Throughput::Elements(*count as u64));
+
+        group.bench_with_input(
+            BenchmarkId::new("turdb_fk", count),
+            count,
+            |b, &count| {
+                b.iter_with_setup(
+                    || {
+                        let dir = tempdir().unwrap();
+                        let db_path = dir.path().join("bench_db");
+                        let db = Database::create(&db_path).unwrap();
+                        db.execute("CREATE TABLE categories (id INT PRIMARY KEY, name TEXT)")
+                            .unwrap();
+                        db.execute(
+                            "CREATE TABLE products (id INT, cat_id INT REFERENCES categories(id), name TEXT)",
+                        )
+                            .unwrap();
+                        for i in 0..10 {
+                            db.execute(&format!("INSERT INTO categories VALUES ({}, 'cat{}')", i, i))
+                                .unwrap();
+                        }
+                        (dir, db)
+                    },
+                    |(_dir, db)| {
+                        for i in 0..count {
+                            let cat_id = i % 10;
+                            let sql = format!(
+                                "INSERT INTO products VALUES ({}, {}, 'product{}')",
+                                i, cat_id, i
+                            );
+                            db.execute(&sql).unwrap();
+                        }
+                        db
+                    },
+                );
+            },
+        );
+
+        group.bench_with_input(
+            BenchmarkId::new("sqlite_fk", count),
+            count,
+            |b, &count| {
+                b.iter_with_setup(
+                    || {
+                        let dir = tempdir().unwrap();
+                        let conn = create_sqlite_connection(&dir);
+                        conn.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
+                        conn.execute(
+                            "CREATE TABLE categories (id INTEGER PRIMARY KEY, name TEXT)",
+                            [],
+                        )
+                            .unwrap();
+                        conn.execute(
+                            "CREATE TABLE products (id INTEGER, cat_id INTEGER REFERENCES categories(id), name TEXT)",
+                            [],
+                        )
+                            .unwrap();
+                        for i in 0..10 {
+                            conn.execute(
+                                "INSERT INTO categories VALUES (?1, ?2)",
+                                params![i as i64, format!("cat{}", i)],
+                            )
+                                .unwrap();
+                        }
+                        (dir, conn)
+                    },
+                    |(_dir, conn)| {
+                        for i in 0..count {
+                            let cat_id = i % 10;
+                            conn.execute(
+                                "INSERT INTO products VALUES (?1, ?2, ?3)",
+                                params![i as i64, cat_id as i64, format!("product{}", i)],
+                            )
+                                .unwrap();
+                        }
+                        conn
+                    },
+                );
+            },
+        );
+    }
+
+    group.finish();
+}
+
+fn bench_foreign_key_delete_comparison(c: &mut Criterion) {
+    let mut group = c.benchmark_group("foreign_key_delete_comparison");
+
+    group.bench_function("turdb_fk_delete_unreferenced", |b| {
+        b.iter_with_setup(
+            || {
+                let dir = tempdir().unwrap();
+                let db_path = dir.path().join("bench_db");
+                let db = Database::create(&db_path).unwrap();
+                db.execute("CREATE TABLE categories (id INT PRIMARY KEY, name TEXT)")
+                    .unwrap();
+                db.execute(
+                    "CREATE TABLE products (id INT, cat_id INT REFERENCES categories(id), name TEXT)",
+                )
+                    .unwrap();
+                for i in 0..100 {
+                    db.execute(&format!("INSERT INTO categories VALUES ({}, 'cat{}')", i, i))
+                        .unwrap();
+                }
+                for i in 0..50 {
+                    db.execute(&format!(
+                        "INSERT INTO products VALUES ({}, {}, 'product{}')",
+                        i, i, i
+                    ))
+                        .unwrap();
+                }
+                (dir, db)
+            },
+            |(_dir, db)| {
+                for del_id in 50..100 {
+                    db.execute(&format!("DELETE FROM categories WHERE id = {}", del_id))
+                        .unwrap();
+                }
+                db
+            },
+        );
+    });
+
+    group.bench_function("sqlite_fk_delete_unreferenced", |b| {
+        b.iter_with_setup(
+            || {
+                let dir = tempdir().unwrap();
+                let conn = create_sqlite_connection(&dir);
+                conn.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
+                conn.execute(
+                    "CREATE TABLE categories (id INTEGER PRIMARY KEY, name TEXT)",
+                    [],
+                )
+                    .unwrap();
+                conn.execute(
+                    "CREATE TABLE products (id INTEGER, cat_id INTEGER REFERENCES categories(id), name TEXT)",
+                    [],
+                )
+                    .unwrap();
+                for i in 0..100 {
+                    conn.execute(
+                        "INSERT INTO categories VALUES (?1, ?2)",
+                        params![i as i64, format!("cat{}", i)],
+                    )
+                        .unwrap();
+                }
+                for i in 0..50 {
+                    conn.execute(
+                        "INSERT INTO products VALUES (?1, ?2, ?3)",
+                        params![i as i64, i as i64, format!("product{}", i)],
+                    )
+                        .unwrap();
+                }
+                (dir, conn)
+            },
+            |(_dir, conn)| {
+                for del_id in 50i64..100 {
+                    conn.execute("DELETE FROM categories WHERE id = ?1", params![del_id])
+                        .unwrap();
+                }
+                conn
+            },
+        );
+    });
 
     group.finish();
 }
@@ -615,6 +949,10 @@ criterion_group!(
     bench_mixed_workload_comparison,
     bench_large_text_comparison,
     bench_lifecycle_comparison,
+    bench_unique_constraint_comparison,
+    bench_check_constraint_comparison,
+    bench_foreign_key_insert_comparison,
+    bench_foreign_key_delete_comparison,
 );
 
 criterion_main!(benches);
