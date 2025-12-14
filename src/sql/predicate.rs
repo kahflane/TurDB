@@ -1,6 +1,6 @@
-use std::borrow::Cow;
 use crate::sql::executor::ExecutorRow;
 use crate::types::Value;
+use std::borrow::Cow;
 
 pub struct CompiledPredicate<'a> {
     expr: &'a crate::sql::ast::Expr<'a>,
@@ -87,32 +87,26 @@ impl<'a> CompiledPredicate<'a> {
         use crate::sql::ast::BinaryOperator;
 
         match op {
-            BinaryOperator::Plus => self.eval_arithmetic_op(left, right, |a, b| a + b, |a, b| a + b),
+            BinaryOperator::Plus => {
+                self.eval_arithmetic_op(left, right, |a, b| a + b, |a, b| a + b)
+            }
             BinaryOperator::Minus => {
                 self.eval_arithmetic_op(left, right, |a, b| a - b, |a, b| a - b)
             }
             BinaryOperator::Multiply => {
                 self.eval_arithmetic_op(left, right, |a, b| a * b, |a, b| a * b)
             }
-            BinaryOperator::Divide => {
-                match (left, right) {
-                    (Value::Int(a), Value::Int(b)) if *b != 0 => Some(Value::Int(a / b)),
-                    (Value::Int(a), Value::Float(b)) if *b != 0.0 => {
-                        Some(Value::Float(*a as f64 / b))
-                    }
-                    (Value::Float(a), Value::Int(b)) if *b != 0 => {
-                        Some(Value::Float(a / *b as f64))
-                    }
-                    (Value::Float(a), Value::Float(b)) if *b != 0.0 => Some(Value::Float(a / b)),
-                    _ => None,
-                }
-            }
+            BinaryOperator::Divide => match (left, right) {
+                (Value::Int(a), Value::Int(b)) if *b != 0 => Some(Value::Int(a / b)),
+                (Value::Int(a), Value::Float(b)) if *b != 0.0 => Some(Value::Float(*a as f64 / b)),
+                (Value::Float(a), Value::Int(b)) if *b != 0 => Some(Value::Float(a / *b as f64)),
+                (Value::Float(a), Value::Float(b)) if *b != 0.0 => Some(Value::Float(a / b)),
+                _ => None,
+            },
             BinaryOperator::Modulo => match (left, right) {
                 (Value::Int(a), Value::Int(b)) if *b != 0 => Some(Value::Int(a % b)),
                 (Value::Float(a), Value::Float(b)) if *b != 0.0 => Some(Value::Float(a % b)),
-                (Value::Int(a), Value::Float(b)) if *b != 0.0 => {
-                    Some(Value::Float(*a as f64 % b))
-                }
+                (Value::Int(a), Value::Float(b)) if *b != 0.0 => Some(Value::Float(*a as f64 % b)),
                 (Value::Float(a), Value::Int(b)) if *b != 0 => Some(Value::Float(a % *b as f64)),
                 _ => None,
             },
@@ -168,6 +162,41 @@ impl<'a> CompiledPredicate<'a> {
             BinaryOperator::VectorL2Distance => self.eval_vector_l2_distance(left, right),
             BinaryOperator::VectorCosineDistance => self.eval_vector_cosine_distance(left, right),
             BinaryOperator::VectorInnerProduct => self.eval_vector_inner_product(left, right),
+            BinaryOperator::JsonContains => Some(Value::Int(
+                if self.eval_json_contains(left, right).unwrap_or(false) {
+                    1
+                } else {
+                    0
+                },
+            )),
+            BinaryOperator::JsonContainedBy => Some(Value::Int(
+                if self.eval_json_contained_by(left, right).unwrap_or(false) {
+                    1
+                } else {
+                    0
+                },
+            )),
+            BinaryOperator::ArrayContains => Some(Value::Int(
+                if self.eval_array_contains(left, right).unwrap_or(false) {
+                    1
+                } else {
+                    0
+                },
+            )),
+            BinaryOperator::ArrayContainedBy => Some(Value::Int(
+                if self.eval_array_contained_by(left, right).unwrap_or(false) {
+                    1
+                } else {
+                    0
+                },
+            )),
+            BinaryOperator::ArrayOverlaps => Some(Value::Int(
+                if self.eval_array_overlaps(left, right).unwrap_or(false) {
+                    1
+                } else {
+                    0
+                },
+            )),
             _ => None,
         }
     }
@@ -332,15 +361,401 @@ impl<'a> CompiledPredicate<'a> {
     fn eval_json_path_extract(
         &self,
         json_val: &Value<'a>,
-        _path: &Value<'a>,
-        _as_text: bool,
+        path: &Value<'a>,
+        as_text: bool,
     ) -> Option<Value<'a>> {
-        let _json_bytes = match json_val {
+        let json_bytes = match json_val {
             Value::Jsonb(bytes) => bytes.as_ref(),
             Value::Text(s) => s.as_bytes(),
             _ => return None,
         };
+
+        let path_str = match path {
+            Value::Text(s) => s.as_ref(),
+            _ => return None,
+        };
+
+        let path_elements = self.parse_json_path(path_str)?;
+        let json_str = std::str::from_utf8(json_bytes).ok()?;
+
+        self.traverse_json_path(json_str, &path_elements, as_text)
+    }
+
+    fn parse_json_path(&self, path: &str) -> Option<Vec<String>> {
+        let path = path.trim();
+        if !path.starts_with('{') || !path.ends_with('}') {
+            return None;
+        }
+
+        let inner = &path[1..path.len() - 1];
+        if inner.is_empty() {
+            return Some(vec![]);
+        }
+
+        Some(inner.split(',').map(|s| s.trim().to_string()).collect())
+    }
+
+    fn traverse_json_path(&self, json: &str, path: &[String], as_text: bool) -> Option<Value<'a>> {
+        let mut current = json.trim().to_string();
+
+        for key in path {
+            current = self.extract_at_key_or_index(&current, key)?;
+        }
+
+        let (value, _) = self.parse_json_value(&current)?;
+
+        if as_text {
+            match &value {
+                Value::Text(s) => Some(Value::Text(Cow::Owned(s.to_string()))),
+                Value::Int(n) => Some(Value::Text(Cow::Owned(n.to_string()))),
+                Value::Float(f) => Some(Value::Text(Cow::Owned(f.to_string()))),
+                Value::Null => Some(Value::Null),
+                Value::Jsonb(bytes) => Some(Value::Text(Cow::Owned(
+                    String::from_utf8_lossy(bytes).to_string(),
+                ))),
+                _ => None,
+            }
+        } else {
+            Some(value)
+        }
+    }
+
+    fn extract_at_key_or_index(&self, json: &str, key: &str) -> Option<String> {
+        let json = json.trim();
+
+        if let Ok(index) = key.parse::<usize>() {
+            self.extract_array_element(json, index)
+        } else {
+            self.extract_object_key(json, key)
+        }
+    }
+
+    fn extract_object_key(&self, json: &str, key: &str) -> Option<String> {
+        let json = json.trim();
+        if !json.starts_with('{') {
+            return None;
+        }
+
+        let search_key = format!("\"{}\":", key);
+        let key_pos = json.find(&search_key)?;
+        let value_start = key_pos + search_key.len();
+        let rest = json[value_start..].trim_start();
+
+        let (_, len) = self.parse_json_value(rest)?;
+        Some(rest[..len].to_string())
+    }
+
+    fn extract_array_element(&self, json: &str, index: usize) -> Option<String> {
+        let json = json.trim();
+        if !json.starts_with('[') {
+            return None;
+        }
+
+        let inner = &json[1..json.len().saturating_sub(1)];
+        let mut current_idx = 0;
+        let mut depth = 0;
+        let mut start = 0;
+        let mut in_string = false;
+        let mut escape_next = false;
+
+        for (i, c) in inner.char_indices() {
+            if escape_next {
+                escape_next = false;
+                continue;
+            }
+
+            match c {
+                '\\' if in_string => escape_next = true,
+                '"' => in_string = !in_string,
+                '[' | '{' if !in_string => depth += 1,
+                ']' | '}' if !in_string => depth -= 1,
+                ',' if depth == 0 && !in_string => {
+                    if current_idx == index {
+                        return Some(inner[start..i].trim().to_string());
+                    }
+                    current_idx += 1;
+                    start = i + 1;
+                }
+                _ => {}
+            }
+        }
+
+        if current_idx == index {
+            return Some(inner[start..].trim().to_string());
+        }
+
         None
+    }
+
+    fn eval_json_contains(&self, left: &Value<'a>, right: &Value<'a>) -> Option<bool> {
+        let left_bytes = match left {
+            Value::Jsonb(bytes) => bytes.as_ref(),
+            Value::Text(s) => s.as_bytes(),
+            _ => return None,
+        };
+        let right_bytes = match right {
+            Value::Jsonb(bytes) => bytes.as_ref(),
+            Value::Text(s) => s.as_bytes(),
+            _ => return None,
+        };
+
+        let left_str = std::str::from_utf8(left_bytes).ok()?;
+        let right_str = std::str::from_utf8(right_bytes).ok()?;
+
+        Some(self.json_contains_impl(left_str.trim(), right_str.trim()))
+    }
+
+    fn eval_json_contained_by(&self, left: &Value<'a>, right: &Value<'a>) -> Option<bool> {
+        self.eval_json_contains(right, left)
+    }
+
+    fn json_contains_impl(&self, container: &str, contained: &str) -> bool {
+        let container = container.trim();
+        let contained = contained.trim();
+
+        if container.starts_with('{') && contained.starts_with('{') {
+            self.object_contains_object(container, contained)
+        } else if container.starts_with('[') && contained.starts_with('[') {
+            self.array_contains_array(container, contained)
+        } else {
+            self.json_values_equal(container, contained)
+        }
+    }
+
+    fn object_contains_object(&self, container: &str, contained: &str) -> bool {
+        let container_pairs = self.parse_object_pairs(container);
+        let contained_pairs = self.parse_object_pairs(contained);
+
+        for (key, value) in &contained_pairs {
+            let found = container_pairs
+                .iter()
+                .any(|(k, v)| k == key && self.json_contains_impl(v, value));
+            if !found {
+                return false;
+            }
+        }
+        true
+    }
+
+    fn array_contains_array(&self, container: &str, contained: &str) -> bool {
+        let container_elements = self.parse_array_elements(container);
+        let contained_elements = self.parse_array_elements(contained);
+
+        for elem in &contained_elements {
+            let found = container_elements
+                .iter()
+                .any(|c| self.json_contains_impl(c, elem));
+            if !found {
+                return false;
+            }
+        }
+        true
+    }
+
+    fn json_values_equal(&self, a: &str, b: &str) -> bool {
+        let a = a.trim();
+        let b = b.trim();
+
+        if a == b {
+            return true;
+        }
+
+        let a_parsed = self.parse_json_value(a);
+        let b_parsed = self.parse_json_value(b);
+
+        match (a_parsed, b_parsed) {
+            (Some((Value::Int(x), _)), Some((Value::Int(y), _))) => x == y,
+            (Some((Value::Float(x), _)), Some((Value::Float(y), _))) => {
+                (x - y).abs() < f64::EPSILON
+            }
+            (Some((Value::Int(x), _)), Some((Value::Float(y), _))) => {
+                ((x as f64) - y).abs() < f64::EPSILON
+            }
+            (Some((Value::Float(x), _)), Some((Value::Int(y), _))) => {
+                (x - (y as f64)).abs() < f64::EPSILON
+            }
+            (Some((Value::Text(x), _)), Some((Value::Text(y), _))) => x == y,
+            (Some((Value::Null, _)), Some((Value::Null, _))) => true,
+            _ => false,
+        }
+    }
+
+    fn parse_object_pairs(&self, json: &str) -> Vec<(String, String)> {
+        let json = json.trim();
+        if !json.starts_with('{') || !json.ends_with('}') {
+            return vec![];
+        }
+
+        let inner = &json[1..json.len() - 1];
+        let mut pairs = Vec::new();
+        let mut depth = 0;
+        let mut in_string = false;
+        let mut escape_next = false;
+        let mut start = 0;
+
+        for (i, c) in inner.char_indices() {
+            if escape_next {
+                escape_next = false;
+                continue;
+            }
+
+            match c {
+                '\\' if in_string => escape_next = true,
+                '"' => in_string = !in_string,
+                '[' | '{' if !in_string => depth += 1,
+                ']' | '}' if !in_string => depth -= 1,
+                ',' if depth == 0 && !in_string => {
+                    if let Some(pair) = self.parse_key_value(&inner[start..i]) {
+                        pairs.push(pair);
+                    }
+                    start = i + 1;
+                }
+                _ => {}
+            }
+        }
+
+        if start < inner.len() {
+            if let Some(pair) = self.parse_key_value(&inner[start..]) {
+                pairs.push(pair);
+            }
+        }
+
+        pairs
+    }
+
+    fn parse_key_value(&self, s: &str) -> Option<(String, String)> {
+        let s = s.trim();
+        let colon_pos = s.find(':')?;
+        let key = s[..colon_pos].trim();
+        let value = s[colon_pos + 1..].trim();
+
+        let key = if key.starts_with('"') && key.ends_with('"') {
+            &key[1..key.len() - 1]
+        } else {
+            key
+        };
+
+        Some((key.to_string(), value.to_string()))
+    }
+
+    fn parse_array_elements(&self, json: &str) -> Vec<String> {
+        let json = json.trim();
+        if !json.starts_with('[') || !json.ends_with(']') {
+            return vec![];
+        }
+
+        let inner = &json[1..json.len() - 1];
+        let mut elements = Vec::new();
+        let mut depth = 0;
+        let mut in_string = false;
+        let mut escape_next = false;
+        let mut start = 0;
+
+        for (i, c) in inner.char_indices() {
+            if escape_next {
+                escape_next = false;
+                continue;
+            }
+
+            match c {
+                '\\' if in_string => escape_next = true,
+                '"' => in_string = !in_string,
+                '[' | '{' if !in_string => depth += 1,
+                ']' | '}' if !in_string => depth -= 1,
+                ',' if depth == 0 && !in_string => {
+                    let elem = inner[start..i].trim();
+                    if !elem.is_empty() {
+                        elements.push(elem.to_string());
+                    }
+                    start = i + 1;
+                }
+                _ => {}
+            }
+        }
+
+        if start < inner.len() {
+            let elem = inner[start..].trim();
+            if !elem.is_empty() {
+                elements.push(elem.to_string());
+            }
+        }
+
+        elements
+    }
+
+    fn eval_array_contains(&self, left: &Value<'a>, right: &Value<'a>) -> Option<bool> {
+        let left_bytes = match left {
+            Value::Jsonb(bytes) => bytes.as_ref(),
+            Value::Text(s) => s.as_bytes(),
+            _ => return None,
+        };
+        let right_bytes = match right {
+            Value::Jsonb(bytes) => bytes.as_ref(),
+            Value::Text(s) => s.as_bytes(),
+            _ => return None,
+        };
+
+        let left_str = std::str::from_utf8(left_bytes).ok()?;
+        let right_str = std::str::from_utf8(right_bytes).ok()?;
+
+        let left_elements = self.parse_array_elements(left_str.trim());
+        let right_elements = self.parse_array_elements(right_str.trim());
+
+        if left_elements.is_empty() && !left_str.trim().starts_with('[') {
+            return None;
+        }
+        if right_elements.is_empty() && !right_str.trim().starts_with('[') {
+            return None;
+        }
+
+        for elem in &right_elements {
+            let found = left_elements
+                .iter()
+                .any(|l| self.json_values_equal(l, elem));
+            if !found {
+                return Some(false);
+            }
+        }
+        Some(true)
+    }
+
+    fn eval_array_contained_by(&self, left: &Value<'a>, right: &Value<'a>) -> Option<bool> {
+        self.eval_array_contains(right, left)
+    }
+
+    fn eval_array_overlaps(&self, left: &Value<'a>, right: &Value<'a>) -> Option<bool> {
+        let left_bytes = match left {
+            Value::Jsonb(bytes) => bytes.as_ref(),
+            Value::Text(s) => s.as_bytes(),
+            _ => return None,
+        };
+        let right_bytes = match right {
+            Value::Jsonb(bytes) => bytes.as_ref(),
+            Value::Text(s) => s.as_bytes(),
+            _ => return None,
+        };
+
+        let left_str = std::str::from_utf8(left_bytes).ok()?;
+        let right_str = std::str::from_utf8(right_bytes).ok()?;
+
+        let left_elements = self.parse_array_elements(left_str.trim());
+        let right_elements = self.parse_array_elements(right_str.trim());
+
+        if left_elements.is_empty() && !left_str.trim().starts_with('[') {
+            return None;
+        }
+        if right_elements.is_empty() && !right_str.trim().starts_with('[') {
+            return None;
+        }
+
+        for left_elem in &left_elements {
+            for right_elem in &right_elements {
+                if self.json_values_equal(left_elem, right_elem) {
+                    return Some(true);
+                }
+            }
+        }
+        Some(false)
     }
 
     fn eval_vector_l2_distance(&self, left: &Value<'a>, right: &Value<'a>) -> Option<Value<'a>> {
@@ -360,7 +775,11 @@ impl<'a> CompiledPredicate<'a> {
         Some(Value::Float(sum.sqrt() as f64))
     }
 
-    fn eval_vector_cosine_distance(&self, left: &Value<'a>, right: &Value<'a>) -> Option<Value<'a>> {
+    fn eval_vector_cosine_distance(
+        &self,
+        left: &Value<'a>,
+        right: &Value<'a>,
+    ) -> Option<Value<'a>> {
         let (vec1, vec2) = match (left, right) {
             (Value::Vector(v1), Value::Vector(v2)) if v1.len() == v2.len() => {
                 (v1.as_ref(), v2.as_ref())
@@ -451,5 +870,250 @@ impl<'a> CompiledPredicate<'a> {
             (Some(Ordering::Equal), BinaryOperator::GtEq) => true,
             _ => false,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::borrow::Cow;
+
+    fn make_json_value<'a>(json: &str) -> Value<'a> {
+        Value::Jsonb(Cow::Owned(json.as_bytes().to_vec()))
+    }
+
+    fn make_text_value<'a>(s: &str) -> Value<'a> {
+        Value::Text(Cow::Owned(s.to_string()))
+    }
+
+    fn make_predicate<'a>() -> CompiledPredicate<'a> {
+        static DUMMY_EXPR: crate::sql::ast::Expr =
+            crate::sql::ast::Expr::Literal(crate::sql::ast::Literal::Null);
+        CompiledPredicate {
+            expr: &DUMMY_EXPR,
+            column_map: vec![],
+        }
+    }
+
+    #[test]
+    fn json_path_extract_single_key() {
+        let json = make_json_value(r#"{"name": "Alice", "age": 30}"#);
+        let path = make_text_value("{name}");
+
+        let predicate = make_predicate();
+        let result = predicate.eval_json_path_extract(&json, &path, false);
+
+        assert!(result.is_some());
+        match result.unwrap() {
+            Value::Text(s) => assert_eq!(s.as_ref(), "Alice"),
+            _ => panic!("Expected Text value"),
+        }
+    }
+
+    #[test]
+    fn json_path_extract_nested_key() {
+        let json = make_json_value(r#"{"user": {"profile": {"name": "Bob"}}}"#);
+        let path = make_text_value("{user,profile,name}");
+
+        let predicate = make_predicate();
+        let result = predicate.eval_json_path_extract(&json, &path, false);
+
+        assert!(result.is_some());
+        match result.unwrap() {
+            Value::Text(s) => assert_eq!(s.as_ref(), "Bob"),
+            _ => panic!("Expected Text value"),
+        }
+    }
+
+    #[test]
+    fn json_path_extract_returns_object() {
+        let json = make_json_value(r#"{"user": {"profile": {"name": "Bob"}}}"#);
+        let path = make_text_value("{user,profile}");
+
+        let predicate = make_predicate();
+        let result = predicate.eval_json_path_extract(&json, &path, false);
+
+        assert!(result.is_some());
+        match result.unwrap() {
+            Value::Jsonb(bytes) => {
+                let s = std::str::from_utf8(bytes.as_ref()).unwrap();
+                assert!(s.contains("name"));
+                assert!(s.contains("Bob"));
+            }
+            _ => panic!("Expected Jsonb value"),
+        }
+    }
+
+    #[test]
+    fn json_path_extract_text_returns_string() {
+        let json = make_json_value(r#"{"user": {"name": "Charlie"}}"#);
+        let path = make_text_value("{user,name}");
+
+        let predicate = make_predicate();
+        let result = predicate.eval_json_path_extract(&json, &path, true);
+
+        assert!(result.is_some());
+        match result.unwrap() {
+            Value::Text(s) => assert_eq!(s.as_ref(), "Charlie"),
+            _ => panic!("Expected Text value"),
+        }
+    }
+
+    #[test]
+    fn json_path_extract_array_index() {
+        let json = make_json_value(r#"{"items": [{"id": 1}, {"id": 2}]}"#);
+        let path = make_text_value("{items,0,id}");
+
+        let predicate = make_predicate();
+        let result = predicate.eval_json_path_extract(&json, &path, false);
+
+        assert!(result.is_some());
+        match result.unwrap() {
+            Value::Int(n) => assert_eq!(n, 1),
+            _ => panic!("Expected Int value"),
+        }
+    }
+
+    #[test]
+    fn json_path_extract_invalid_path_returns_none() {
+        let json = make_json_value(r#"{"name": "Alice"}"#);
+        let path = make_text_value("{nonexistent}");
+
+        let predicate = make_predicate();
+        let result = predicate.eval_json_path_extract(&json, &path, false);
+
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn json_contains_object_contains_subset() {
+        let left = make_json_value(r#"{"a": 1, "b": 2, "c": 3}"#);
+        let right = make_json_value(r#"{"a": 1}"#);
+
+        let predicate = make_predicate();
+        let result = predicate.eval_json_contains(&left, &right);
+
+        assert!(result.unwrap_or(false));
+    }
+
+    #[test]
+    fn json_contains_object_not_contains_different_value() {
+        let left = make_json_value(r#"{"a": 1, "b": 2}"#);
+        let right = make_json_value(r#"{"a": 2}"#);
+
+        let predicate = make_predicate();
+        let result = predicate.eval_json_contains(&left, &right);
+
+        assert!(!result.unwrap_or(true));
+    }
+
+    #[test]
+    fn json_contains_array_contains_subset() {
+        let left = make_json_value(r#"[1, 2, 3, 4]"#);
+        let right = make_json_value(r#"[2, 4]"#);
+
+        let predicate = make_predicate();
+        let result = predicate.eval_json_contains(&left, &right);
+
+        assert!(result.unwrap_or(false));
+    }
+
+    #[test]
+    fn json_contains_nested_object() {
+        let left = make_json_value(r#"{"user": {"name": "Alice", "age": 30}}"#);
+        let right = make_json_value(r#"{"user": {"name": "Alice"}}"#);
+
+        let predicate = make_predicate();
+        let result = predicate.eval_json_contains(&left, &right);
+
+        assert!(result.unwrap_or(false));
+    }
+
+    #[test]
+    fn json_contained_by_subset_in_superset() {
+        let left = make_json_value(r#"{"a": 1}"#);
+        let right = make_json_value(r#"{"a": 1, "b": 2, "c": 3}"#);
+
+        let predicate = make_predicate();
+        let result = predicate.eval_json_contained_by(&left, &right);
+
+        assert!(result.unwrap_or(false));
+    }
+
+    #[test]
+    fn json_contained_by_not_when_missing_key() {
+        let left = make_json_value(r#"{"a": 1, "d": 4}"#);
+        let right = make_json_value(r#"{"a": 1, "b": 2}"#);
+
+        let predicate = make_predicate();
+        let result = predicate.eval_json_contained_by(&left, &right);
+
+        assert!(!result.unwrap_or(true));
+    }
+
+    #[test]
+    fn array_contains_subset() {
+        let left = make_json_value(r#"[1, 2, 3, 4, 5]"#);
+        let right = make_json_value(r#"[2, 4]"#);
+
+        let predicate = make_predicate();
+        let result = predicate.eval_array_contains(&left, &right);
+
+        assert!(result.unwrap_or(false));
+    }
+
+    #[test]
+    fn array_contains_not_when_missing() {
+        let left = make_json_value(r#"[1, 2, 3]"#);
+        let right = make_json_value(r#"[2, 4]"#);
+
+        let predicate = make_predicate();
+        let result = predicate.eval_array_contains(&left, &right);
+
+        assert!(!result.unwrap_or(true));
+    }
+
+    #[test]
+    fn array_contained_by_subset() {
+        let left = make_json_value(r#"[2, 4]"#);
+        let right = make_json_value(r#"[1, 2, 3, 4, 5]"#);
+
+        let predicate = make_predicate();
+        let result = predicate.eval_array_contained_by(&left, &right);
+
+        assert!(result.unwrap_or(false));
+    }
+
+    #[test]
+    fn array_overlaps_when_common_element() {
+        let left = make_json_value(r#"[1, 2, 3]"#);
+        let right = make_json_value(r#"[3, 4, 5]"#);
+
+        let predicate = make_predicate();
+        let result = predicate.eval_array_overlaps(&left, &right);
+
+        assert!(result.unwrap_or(false));
+    }
+
+    #[test]
+    fn array_overlaps_not_when_disjoint() {
+        let left = make_json_value(r#"[1, 2, 3]"#);
+        let right = make_json_value(r#"[4, 5, 6]"#);
+
+        let predicate = make_predicate();
+        let result = predicate.eval_array_overlaps(&left, &right);
+
+        assert!(!result.unwrap_or(true));
+    }
+
+    #[test]
+    fn array_contains_with_strings() {
+        let left = make_json_value(r#"["apple", "banana", "cherry"]"#);
+        let right = make_json_value(r#"["banana"]"#);
+
+        let predicate = make_predicate();
+        let result = predicate.eval_array_contains(&left, &right);
+
+        assert!(result.unwrap_or(false));
     }
 }
