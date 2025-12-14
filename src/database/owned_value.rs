@@ -79,6 +79,10 @@ fn format_decimal(digits: i128, scale: i16) -> String {
 }
 
 impl OwnedValue {
+    pub fn is_null(&self) -> bool {
+        matches!(self, OwnedValue::Null)
+    }
+
     pub fn to_value(&self) -> Value<'_> {
         match self {
             OwnedValue::Null => Value::Null,
@@ -136,7 +140,7 @@ impl OwnedValue {
                 .get_float4_opt(col_idx)?
                 .map(|f| OwnedValue::Float(f as f64))
                 .unwrap_or(OwnedValue::Null),
-            DataType::Text => record
+            DataType::Text | DataType::Varchar | DataType::Char => record
                 .get_text_opt(col_idx)?
                 .map(|s| OwnedValue::Text(s.to_string()))
                 .unwrap_or(OwnedValue::Null),

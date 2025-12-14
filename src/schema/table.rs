@@ -89,6 +89,7 @@ pub struct ColumnDef {
     data_type: DataType,
     constraints: Vec<Constraint>,
     default_value: Option<String>,
+    max_length: Option<u32>,
 }
 
 impl ColumnDef {
@@ -98,6 +99,7 @@ impl ColumnDef {
             data_type,
             constraints: Vec::new(),
             default_value: None,
+            max_length: None,
         }
     }
 
@@ -108,6 +110,11 @@ impl ColumnDef {
 
     pub fn with_default(mut self, default: impl Into<String>) -> Self {
         self.default_value = Some(default.into());
+        self
+    }
+
+    pub fn with_max_length(mut self, max_length: u32) -> Self {
+        self.max_length = Some(max_length);
         self
     }
 
@@ -127,22 +134,22 @@ impl ColumnDef {
         self.constraints.iter().any(|c| {
             std::mem::discriminant(c) == std::mem::discriminant(constraint)
                 && match (c, constraint) {
-                    (Constraint::NotNull, Constraint::NotNull) => true,
-                    (Constraint::PrimaryKey, Constraint::PrimaryKey) => true,
-                    (Constraint::Unique, Constraint::Unique) => true,
-                    (
-                        Constraint::ForeignKey {
-                            table: t1,
-                            column: c1,
-                        },
-                        Constraint::ForeignKey {
-                            table: t2,
-                            column: c2,
-                        },
-                    ) => t1 == t2 && c1 == c2,
-                    (Constraint::Check(e1), Constraint::Check(e2)) => e1 == e2,
-                    _ => false,
-                }
+                (Constraint::NotNull, Constraint::NotNull) => true,
+                (Constraint::PrimaryKey, Constraint::PrimaryKey) => true,
+                (Constraint::Unique, Constraint::Unique) => true,
+                (
+                    Constraint::ForeignKey {
+                        table: t1,
+                        column: c1,
+                    },
+                    Constraint::ForeignKey {
+                        table: t2,
+                        column: c2,
+                    },
+                ) => t1 == t2 && c1 == c2,
+                (Constraint::Check(e1), Constraint::Check(e2)) => e1 == e2,
+                _ => false,
+            }
         })
     }
 
@@ -152,6 +159,10 @@ impl ColumnDef {
 
     pub fn is_nullable(&self) -> bool {
         !self.has_constraint(&Constraint::NotNull)
+    }
+
+    pub fn max_length(&self) -> Option<u32> {
+        self.max_length
     }
 }
 
