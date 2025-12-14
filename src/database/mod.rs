@@ -99,6 +99,7 @@ pub use owned_value::{
 };
 pub use row::Row;
 
+#[derive(Debug)]
 pub enum ExecuteResult {
     CreateTable { created: bool },
     CreateSchema { created: bool },
@@ -1016,5 +1017,91 @@ mod tests {
             }
             other => panic!("Expected Blob for BLOB column, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn test_unique_constraint_auto_creates_index() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("test_db");
+
+        let db = Database::create(&db_path).unwrap();
+
+        db.execute("CREATE TABLE users (id INT PRIMARY KEY, email TEXT UNIQUE, name TEXT)")
+            .unwrap();
+
+        let pk_index_path = db_path.join("root").join("users_id_pkey.idx");
+        assert!(
+            pk_index_path.exists(),
+            "PRIMARY KEY should auto-create index at {:?}",
+            pk_index_path
+        );
+
+        let unique_index_path = db_path.join("root").join("users_email_key.idx");
+        assert!(
+            unique_index_path.exists(),
+            "UNIQUE constraint should auto-create index at {:?}",
+            unique_index_path
+        );
+    }
+
+    #[test]
+    fn test_unique_index_used_for_constraint_check() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("test_db");
+
+        let db = Database::create(&db_path).unwrap();
+
+        db.execute("CREATE TABLE users (id INT PRIMARY KEY, email TEXT UNIQUE)")
+            .unwrap();
+
+        db.execute("INSERT INTO users VALUES (1, 'alice@example.com')")
+            .unwrap();
+
+        let result = db.execute("INSERT INTO users VALUES (2, 'alice@example.com')");
+        assert!(
+            result.is_err(),
+            "UNIQUE constraint should prevent duplicate email"
+        );
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("UNIQUE") || err_msg.contains("unique"),
+            "Error should mention UNIQUE constraint: {}",
+            err_msg
+        );
+    }
+
+    #[test]
+    fn test_unique_index_performance_many_inserts() {
+        use std::time::Instant;
+
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("test_db");
+
+        let db = Database::create(&db_path).unwrap();
+
+        db.execute("CREATE TABLE users (id INT PRIMARY KEY, email TEXT UNIQUE)")
+            .unwrap();
+
+        let start = Instant::now();
+        for i in 0..1000 {
+            let sql = format!(
+                "INSERT INTO users VALUES ({}, 'user{}@example.com')",
+                i, i
+            );
+            db.execute(&sql).unwrap();
+        }
+        let elapsed = start.elapsed();
+
+        println!(
+            "1000 inserts with UNIQUE constraint took {:?} ({:.2} inserts/sec)",
+            elapsed,
+            1000.0 / elapsed.as_secs_f64()
+        );
+
+        assert!(
+            elapsed.as_secs() < 5,
+            "1000 inserts should complete in under 5 seconds with O(log n) index lookup, took {:?}",
+            elapsed
+        );
     }
 }
