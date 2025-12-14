@@ -444,7 +444,49 @@ impl Database {
             .iter()
             .map(|col| {
                 let data_type = Self::convert_data_type(&col.data_type);
-                SchemaColumnDef::new(col.name.to_string(), data_type)
+                let mut column = SchemaColumnDef::new(col.name.to_string(), data_type);
+
+                for constraint in col.constraints {
+                    use crate::schema::table::Constraint as SchemaConstraint;
+                    use crate::sql::ast::ColumnConstraint;
+
+                    match constraint {
+                        ColumnConstraint::NotNull => {
+                            column = column.with_constraint(SchemaConstraint::NotNull);
+                        }
+                        ColumnConstraint::Unique => {
+                            column = column.with_constraint(SchemaConstraint::Unique);
+                        }
+                        ColumnConstraint::PrimaryKey => {
+                            column = column.with_constraint(SchemaConstraint::PrimaryKey);
+                            column = column.with_constraint(SchemaConstraint::NotNull);
+                        }
+                        ColumnConstraint::Default(expr) => {
+                            if let Some(default_str) = Self::expr_to_default_string(expr) {
+                                column = column.with_default(default_str);
+                            }
+                        }
+                        ColumnConstraint::Check(expr) => {
+                            if let Some(check_str) = Self::expr_to_string(expr) {
+                                column =
+                                    column.with_constraint(SchemaConstraint::Check(check_str));
+                            }
+                        }
+                        ColumnConstraint::References {
+                            table,
+                            column: ref_col,
+                            ..
+                        } => {
+                            let fk_column = ref_col.unwrap_or(col.name);
+                            column = column.with_constraint(SchemaConstraint::ForeignKey {
+                                table: table.to_string(),
+                                column: fk_column.to_string(),
+                            });
+                        }
+                        ColumnConstraint::Null | ColumnConstraint::Generated { .. } => {}
+                    }
+                }
+                column
             })
             .collect();
 
@@ -593,12 +635,6 @@ impl Database {
         let columns = table_def.columns().to_vec();
         let table_def_for_validator = table_def.clone();
 
-        drop(catalog_guard);
-
-        let mut file_manager_guard = self.file_manager.write();
-        let file_manager = file_manager_guard.as_mut().unwrap();
-        let storage = file_manager.table_data_mut(schema_name, table_name)?;
-
         let schema = create_record_schema(&columns);
 
         let rows = match &insert.source {
@@ -612,6 +648,101 @@ impl Database {
             columns.iter().map(|c| c.data_type()).collect();
         let validator = ConstraintValidator::new(&table_def_for_validator);
 
+        use crate::schema::table::Constraint;
+        let fk_constraints: Vec<(usize, String, String)> = columns
+            .iter()
+            .enumerate()
+            .flat_map(|(idx, col)| {
+                col.constraints().iter().filter_map(move |c| {
+                    if let Constraint::ForeignKey { table, column } = c {
+                        Some((idx, table.clone(), column.clone()))
+                    } else {
+                        None
+                    }
+                })
+            })
+            .collect();
+
+        if !fk_constraints.is_empty() {
+            let catalog_guard = self.catalog.read();
+            let catalog = catalog_guard.as_ref().unwrap();
+
+            let mut file_manager_guard = self.file_manager.write();
+            let file_manager = file_manager_guard.as_mut().unwrap();
+
+            for row_exprs in rows.iter() {
+                let parsed_values: Vec<OwnedValue> = row_exprs
+                    .iter()
+                    .zip(column_types.iter())
+                    .map(|(expr, data_type)| {
+                        Database::eval_literal_with_type(expr, Some(data_type))
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+
+                for (col_idx, fk_table, fk_column) in &fk_constraints {
+                    if let Some(value) = parsed_values.get(*col_idx) {
+                        if value.is_null() {
+                            continue;
+                        }
+
+                        let referenced_table = catalog.resolve_table(fk_table)?;
+                        let ref_columns = referenced_table.columns();
+                        let ref_col_idx = ref_columns
+                            .iter()
+                            .position(|c| c.name().eq_ignore_ascii_case(fk_column));
+
+                        if ref_col_idx.is_none() {
+                            bail!(
+                                "FOREIGN KEY constraint: column '{}' not found in table '{}'",
+                                fk_column,
+                                fk_table
+                            );
+                        }
+
+                        let ref_schema_name = "root";
+                        let ref_storage =
+                            file_manager.table_data_mut(ref_schema_name, fk_table)?;
+                        let ref_btree = BTree::new(ref_storage, 1)?;
+                        let ref_schema = create_record_schema(ref_columns);
+                        let mut ref_cursor = ref_btree.cursor_first()?;
+
+                        let mut found = false;
+                        while ref_cursor.valid() {
+                            let existing_value = ref_cursor.value()?;
+                            let existing_record =
+                                crate::records::RecordView::new(existing_value, &ref_schema)?;
+                            let existing_values =
+                                OwnedValue::extract_row_from_record(&existing_record, ref_columns)?;
+
+                            if let Some(ref_val) = existing_values.get(ref_col_idx.unwrap()) {
+                                if !ref_val.is_null() && ref_val == value {
+                                    found = true;
+                                    break;
+                                }
+                            }
+                            ref_cursor.advance()?;
+                        }
+
+                        if !found {
+                            bail!(
+                                "FOREIGN KEY constraint violated on column '{}' in table '{}': referenced value not found in {}.{}",
+                                columns[*col_idx].name(),
+                                table_name,
+                                fk_table,
+                                fk_column
+                            );
+                        }
+                    }
+                }
+            }
+
+            drop(file_manager_guard);
+        }
+
+        let mut file_manager_guard = self.file_manager.write();
+        let file_manager = file_manager_guard.as_mut().unwrap();
+        let storage = file_manager.table_data_mut(schema_name, table_name)?;
+
         fn insert_rows<'a, S: crate::storage::Storage>(
             btree: &mut BTree<'_, S>,
             rows: &[&[&crate::sql::ast::Expr<'a>]],
@@ -619,7 +750,21 @@ impl Database {
             column_types: &[crate::records::types::DataType],
             next_row_id: &std::sync::atomic::AtomicU64,
             validator: &ConstraintValidator<'_>,
+            columns: &[SchemaColumnDef],
         ) -> Result<usize> {
+            use crate::records::RecordView;
+            use crate::schema::table::Constraint;
+
+            let unique_col_indices: Vec<usize> = columns
+                .iter()
+                .enumerate()
+                .filter(|(_, col)| {
+                    col.has_constraint(&Constraint::Unique)
+                        || col.has_constraint(&Constraint::PrimaryKey)
+                })
+                .map(|(idx, _)| idx)
+                .collect();
+
             let mut count = 0;
             for row_exprs in rows.iter() {
                 let mut values: Vec<OwnedValue> = row_exprs
@@ -630,6 +775,61 @@ impl Database {
                     })
                     .collect::<Result<Vec<_>>>()?;
                 validator.validate_insert(&mut values)?;
+
+                for (col_idx, col) in columns.iter().enumerate() {
+                    for constraint in col.constraints() {
+                        if let Constraint::Check(expr_str) = constraint {
+                            let col_value = values.get(col_idx);
+                            if !Database::evaluate_check_expression(
+                                expr_str,
+                                col.name(),
+                                col_value,
+                            ) {
+                                bail!(
+                                    "CHECK constraint violated on column '{}' in table '{}': {}",
+                                    col.name(),
+                                    validator.table().name(),
+                                    expr_str
+                                );
+                            }
+                        }
+                    }
+                }
+
+                if !unique_col_indices.is_empty() {
+                    let mut cursor = btree.cursor_first()?;
+                    while cursor.valid() {
+                        let existing_value = cursor.value()?;
+                        let existing_record = RecordView::new(existing_value, schema)?;
+                        let existing_values =
+                            OwnedValue::extract_row_from_record(&existing_record, columns)?;
+
+                        for &col_idx in &unique_col_indices {
+                            let new_val = values.get(col_idx);
+                            let existing_val = existing_values.get(col_idx);
+
+                            if let (Some(new_v), Some(existing_v)) = (new_val, existing_val) {
+                                if !new_v.is_null() && !existing_v.is_null() && new_v == existing_v {
+                                    let col_name = &columns[col_idx].name();
+                                    let constraint_type =
+                                        if columns[col_idx].has_constraint(&Constraint::PrimaryKey) {
+                                            "PRIMARY KEY"
+                                        } else {
+                                            "UNIQUE"
+                                        };
+                                    bail!(
+                                        "{} constraint violated on column '{}' in table '{}': value already exists",
+                                        constraint_type,
+                                        col_name,
+                                        validator.table().name()
+                                    );
+                                }
+                            }
+                        }
+                        cursor.advance()?;
+                    }
+                }
+
                 let record_data = OwnedValue::build_record_from_values(&values, schema)?;
                 let row_id = next_row_id.fetch_add(1, Ordering::Relaxed);
                 let key = Database::generate_row_key(row_id);
@@ -649,6 +849,7 @@ impl Database {
                 &column_types,
                 &self.next_row_id,
                 &validator,
+                &columns,
             )?
         } else {
             let mut btree = BTree::new(storage, root_page)?;
@@ -659,6 +860,7 @@ impl Database {
                 &column_types,
                 &self.next_row_id,
                 &validator,
+                &columns,
             )?
         };
 
@@ -745,10 +947,76 @@ impl Database {
                 let validator = crate::constraints::ConstraintValidator::new(&table_def);
                 validator.validate_update(&row_values)?;
 
+                for (col_idx, col) in columns.iter().enumerate() {
+                    for constraint in col.constraints() {
+                        if let crate::schema::table::Constraint::Check(expr_str) = constraint {
+                            let col_value = row_values.get(col_idx);
+                            if !Self::evaluate_check_expression(expr_str, col.name(), col_value) {
+                                bail!(
+                                    "CHECK constraint violated on column '{}' in table '{}': {}",
+                                    col.name(),
+                                    table_name,
+                                    expr_str
+                                );
+                            }
+                        }
+                    }
+                }
+
                 rows_to_update.push((key.to_vec(), row_values));
             }
 
             cursor.advance()?;
+        }
+
+        use crate::schema::table::Constraint;
+
+        let unique_col_indices: Vec<usize> = columns
+            .iter()
+            .enumerate()
+            .filter(|(_, col)| {
+                col.has_constraint(&Constraint::Unique)
+                    || col.has_constraint(&Constraint::PrimaryKey)
+            })
+            .map(|(idx, _)| idx)
+            .collect();
+
+        if !unique_col_indices.is_empty() {
+            let storage_for_check = file_manager.table_data_mut(schema_name, table_name)?;
+            let btree_for_check = BTree::new(storage_for_check, root_page)?;
+            let mut check_cursor = btree_for_check.cursor_first()?;
+
+            for (update_key, updated_values) in &rows_to_update {
+                while check_cursor.valid() {
+                    let existing_key = check_cursor.key()?;
+
+                    if existing_key != update_key.as_slice() {
+                        let existing_value = check_cursor.value()?;
+                        let existing_record = RecordView::new(existing_value, &schema)?;
+                        let existing_values =
+                            OwnedValue::extract_row_from_record(&existing_record, &columns)?;
+
+                        for &col_idx in &unique_col_indices {
+                            let new_val = updated_values.get(col_idx);
+                            let existing_val = existing_values.get(col_idx);
+
+                            if let (Some(new_v), Some(existing_v)) = (new_val, existing_val) {
+                                if !new_v.is_null() && !existing_v.is_null() && new_v == existing_v
+                                {
+                                    let col_name = &columns[col_idx].name();
+                                    bail!(
+                                        "UNIQUE constraint violated on column '{}' in table '{}': value already exists",
+                                        col_name,
+                                        table_name
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    check_cursor.advance()?;
+                }
+                check_cursor = btree_for_check.cursor_first()?;
+            }
         }
 
         let rows_affected = rows_to_update.len();
@@ -774,6 +1042,7 @@ impl Database {
             create_column_map, create_record_schema, owned_values_to_values,
         };
         use crate::records::RecordView;
+        use crate::schema::table::Constraint;
 
         self.ensure_catalog()?;
         self.ensure_file_manager()?;
@@ -786,6 +1055,49 @@ impl Database {
 
         let table_def = catalog.resolve_table(table_name)?;
         let columns = table_def.columns().to_vec();
+
+        let mut fk_references: Vec<(String, String, String, usize)> = Vec::new();
+        for (schema_key, schema_val) in catalog.schemas() {
+            for (child_table_name, child_table_def) in schema_val.tables() {
+                for col in child_table_def.columns().iter() {
+                    for constraint in col.constraints() {
+                        if let Constraint::ForeignKey { table, column } = constraint {
+                            if table == table_name {
+                                let ref_col_idx = columns
+                                    .iter()
+                                    .position(|c| c.name() == column)
+                                    .unwrap_or(0);
+                                fk_references.push((
+                                    schema_key.clone(),
+                                    child_table_name.clone(),
+                                    col.name().to_string(),
+                                    ref_col_idx,
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        let child_table_schemas: Vec<(String, String, Vec<crate::schema::table::ColumnDef>, usize)> =
+            fk_references
+                .iter()
+                .map(|(schema_key, child_name, fk_col_name, _ref_col_idx)| {
+                    let child_def = catalog.schemas().get(schema_key).unwrap().tables().get(child_name).unwrap();
+                    let fk_col_idx = child_def
+                        .columns()
+                        .iter()
+                        .position(|c| c.name() == fk_col_name)
+                        .unwrap_or(0);
+                    (
+                        schema_key.clone(),
+                        child_name.clone(),
+                        child_def.columns().to_vec(),
+                        fk_col_idx,
+                    )
+                })
+                .collect();
 
         drop(catalog_guard);
 
@@ -805,6 +1117,7 @@ impl Database {
         let mut cursor = btree.cursor_first()?;
 
         let mut keys_to_delete: Vec<Vec<u8>> = Vec::new();
+        let mut values_to_check: Vec<(usize, OwnedValue)> = Vec::new();
 
         while cursor.valid() {
             let key = cursor.key()?;
@@ -826,9 +1139,52 @@ impl Database {
 
             if should_delete {
                 keys_to_delete.push(key.to_vec());
+
+                if !fk_references.is_empty() {
+                    let record = RecordView::new(value, &schema)?;
+                    let row_values = OwnedValue::extract_row_from_record(&record, &columns)?;
+                    for (_, _, _, ref_col_idx) in &fk_references {
+                        if let Some(v) = row_values.get(*ref_col_idx) {
+                            values_to_check.push((*ref_col_idx, v.clone()));
+                        }
+                    }
+                }
             }
 
             cursor.advance()?;
+        }
+
+        if !values_to_check.is_empty() {
+            for (child_schema, child_name, child_columns, fk_col_idx) in &child_table_schemas {
+                let child_storage = file_manager.table_data_mut(child_schema, child_name)?;
+                let child_btree = BTree::new(child_storage, root_page)?;
+                let mut child_cursor = child_btree.cursor_first()?;
+                let child_record_schema = create_record_schema(child_columns);
+
+                while child_cursor.valid() {
+                    let child_value = child_cursor.value()?;
+                    let child_record = RecordView::new(child_value, &child_record_schema)?;
+                    let child_row = OwnedValue::extract_row_from_record(&child_record, child_columns)?;
+
+                    if let Some(child_fk_val) = child_row.get(*fk_col_idx) {
+                        for (ref_col_idx, del_val) in &values_to_check {
+                            if let Some((_, _, _, matching_ref_idx)) = fk_references.iter().find(|(s, n, _, r)| {
+                                s == child_schema && n == child_name && r == ref_col_idx
+                            }) {
+                                if matching_ref_idx == ref_col_idx && child_fk_val == del_val {
+                                    bail!(
+                                        "FOREIGN KEY constraint violated: row in '{}' is still referenced by '{}'",
+                                        table_name,
+                                        child_name
+                                    );
+                                }
+                            }
+                        }
+                    }
+
+                    child_cursor.advance()?;
+                }
+            }
         }
 
         let rows_affected = keys_to_delete.len();
@@ -915,6 +1271,77 @@ impl Database {
         }
     }
 
+    fn evaluate_check_expression(
+        expr_str: &str,
+        col_name: &str,
+        col_value: Option<&OwnedValue>,
+    ) -> bool {
+        let Some(value) = col_value else {
+            return true;
+        };
+
+        if value.is_null() {
+            return true;
+        }
+
+        let expr_lower = expr_str.to_lowercase();
+        let col_lower = col_name.to_lowercase();
+
+        if expr_lower.contains(&col_lower) {
+            if let Some(op_idx) = expr_str.find(">=") {
+                let right_part = expr_str[op_idx + 2..].trim();
+                if let Ok(threshold) = right_part.parse::<i64>() {
+                    if let OwnedValue::Int(v) = value {
+                        return *v >= threshold;
+                    }
+                }
+                if let Ok(threshold) = right_part.parse::<f64>() {
+                    if let OwnedValue::Float(v) = value {
+                        return *v >= threshold;
+                    }
+                }
+            } else if let Some(op_idx) = expr_str.find("<=") {
+                let right_part = expr_str[op_idx + 2..].trim();
+                if let Ok(threshold) = right_part.parse::<i64>() {
+                    if let OwnedValue::Int(v) = value {
+                        return *v <= threshold;
+                    }
+                }
+                if let Ok(threshold) = right_part.parse::<f64>() {
+                    if let OwnedValue::Float(v) = value {
+                        return *v <= threshold;
+                    }
+                }
+            } else if let Some(op_idx) = expr_str.find('>') {
+                let right_part = expr_str[op_idx + 1..].trim();
+                if let Ok(threshold) = right_part.parse::<i64>() {
+                    if let OwnedValue::Int(v) = value {
+                        return *v > threshold;
+                    }
+                }
+                if let Ok(threshold) = right_part.parse::<f64>() {
+                    if let OwnedValue::Float(v) = value {
+                        return *v > threshold;
+                    }
+                }
+            } else if let Some(op_idx) = expr_str.find('<') {
+                let right_part = expr_str[op_idx + 1..].trim();
+                if let Ok(threshold) = right_part.parse::<i64>() {
+                    if let OwnedValue::Int(v) = value {
+                        return *v < threshold;
+                    }
+                }
+                if let Ok(threshold) = right_part.parse::<f64>() {
+                    if let OwnedValue::Float(v) = value {
+                        return *v < threshold;
+                    }
+                }
+            }
+        }
+
+        true
+    }
+
     fn convert_data_type(sql_type: &crate::sql::ast::DataType) -> crate::records::types::DataType {
         use crate::records::types::DataType;
         use crate::sql::ast::DataType as SqlType;
@@ -942,6 +1369,59 @@ impl Database {
         }
     }
 
+    fn expr_to_default_string(expr: &crate::sql::ast::Expr<'_>) -> Option<String> {
+        use crate::sql::ast::Expr;
+
+        match expr {
+            Expr::Literal(lit) => match lit {
+                crate::sql::ast::Literal::Integer(n) => Some(n.to_string()),
+                crate::sql::ast::Literal::Float(f) => Some(f.to_string()),
+                crate::sql::ast::Literal::String(s) => Some(s.to_string()),
+                crate::sql::ast::Literal::Boolean(b) => Some(b.to_string()),
+                crate::sql::ast::Literal::Null => None,
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    fn expr_to_string(expr: &crate::sql::ast::Expr<'_>) -> Option<String> {
+        use crate::sql::ast::{BinaryOperator, Expr};
+
+        match expr {
+            Expr::BinaryOp { left, op, right } => {
+                let left_str = Self::expr_to_string(left)?;
+                let right_str = Self::expr_to_string(right)?;
+                let op_str = match op {
+                    BinaryOperator::Plus => "+",
+                    BinaryOperator::Minus => "-",
+                    BinaryOperator::Multiply => "*",
+                    BinaryOperator::Divide => "/",
+                    BinaryOperator::Modulo => "%",
+                    BinaryOperator::Eq => "=",
+                    BinaryOperator::NotEq => "!=",
+                    BinaryOperator::Lt => "<",
+                    BinaryOperator::LtEq => "<=",
+                    BinaryOperator::Gt => ">",
+                    BinaryOperator::GtEq => ">=",
+                    BinaryOperator::And => "AND",
+                    BinaryOperator::Or => "OR",
+                    _ => "?",
+                };
+                Some(format!("{} {} {}", left_str, op_str, right_str))
+            }
+            Expr::Column(col_ref) => Some(col_ref.column.to_string()),
+            Expr::Literal(lit) => match lit {
+                crate::sql::ast::Literal::Integer(n) => Some(n.to_string()),
+                crate::sql::ast::Literal::Float(f) => Some(f.to_string()),
+                crate::sql::ast::Literal::String(s) => Some(format!("'{}'", s)),
+                crate::sql::ast::Literal::Boolean(b) => Some(b.to_string()),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
     fn eval_literal(expr: &crate::sql::ast::Expr<'_>) -> Result<OwnedValue> {
         Self::eval_literal_with_type(expr, None)
     }
@@ -951,7 +1431,7 @@ impl Database {
         target_type: Option<&crate::records::types::DataType>,
     ) -> Result<OwnedValue> {
         use crate::records::types::DataType;
-        use crate::sql::ast::{Expr, Literal};
+        use crate::sql::ast::{Expr, Literal, UnaryOperator};
 
         match expr {
             Expr::Literal(lit) => match lit {
@@ -978,6 +1458,16 @@ impl Database {
                 Literal::HexNumber(s) => Self::parse_hex_to_blob(s),
                 Literal::BinaryNumber(s) => Self::parse_binary_to_blob(s),
             },
+            Expr::UnaryOp { op, expr: inner } => {
+                let inner_val = Self::eval_literal_with_type(inner, target_type)?;
+                match (op, inner_val) {
+                    (UnaryOperator::Minus, OwnedValue::Int(i)) => Ok(OwnedValue::Int(-i)),
+                    (UnaryOperator::Minus, OwnedValue::Float(f)) => Ok(OwnedValue::Float(-f)),
+                    (UnaryOperator::Plus, val) => Ok(val),
+                    (UnaryOperator::Not, OwnedValue::Bool(b)) => Ok(OwnedValue::Bool(!b)),
+                    _ => bail!("unsupported unary operation"),
+                }
+            }
             _ => bail!("expected literal expression, got {:?}", expr),
         }
     }
