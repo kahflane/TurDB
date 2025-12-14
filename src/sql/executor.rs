@@ -1974,6 +1974,347 @@ impl<'a> CompiledPredicate<'a> {
                     Value::Int(i64::from_str_radix(s.trim_start_matches("0b"), 2).ok()?)
                 }
             }),
+            Expr::BinaryOp { left, op, right } => {
+                let left_val = self.eval_value(left, row)?;
+                let right_val = self.eval_value(right, row)?;
+                self.eval_binary_op(&left_val, op, &right_val)
+            }
+            _ => None,
+        }
+    }
+
+    fn eval_binary_op(
+        &self,
+        left: &Value<'a>,
+        op: &crate::sql::ast::BinaryOperator,
+        right: &Value<'a>,
+    ) -> Option<Value<'a>> {
+        use crate::sql::ast::BinaryOperator;
+
+        match op {
+            BinaryOperator::Plus => self.eval_arithmetic_op(left, right, |a, b| a + b, |a, b| a + b),
+            BinaryOperator::Minus => {
+                self.eval_arithmetic_op(left, right, |a, b| a - b, |a, b| a - b)
+            }
+            BinaryOperator::Multiply => {
+                self.eval_arithmetic_op(left, right, |a, b| a * b, |a, b| a * b)
+            }
+            BinaryOperator::Divide => {
+                match (left, right) {
+                    (Value::Int(a), Value::Int(b)) if *b != 0 => Some(Value::Int(a / b)),
+                    (Value::Int(a), Value::Float(b)) if *b != 0.0 => {
+                        Some(Value::Float(*a as f64 / b))
+                    }
+                    (Value::Float(a), Value::Int(b)) if *b != 0 => {
+                        Some(Value::Float(a / *b as f64))
+                    }
+                    (Value::Float(a), Value::Float(b)) if *b != 0.0 => Some(Value::Float(a / b)),
+                    _ => None,
+                }
+            }
+            BinaryOperator::Modulo => match (left, right) {
+                (Value::Int(a), Value::Int(b)) if *b != 0 => Some(Value::Int(a % b)),
+                (Value::Float(a), Value::Float(b)) if *b != 0.0 => Some(Value::Float(a % b)),
+                (Value::Int(a), Value::Float(b)) if *b != 0.0 => {
+                    Some(Value::Float(*a as f64 % b))
+                }
+                (Value::Float(a), Value::Int(b)) if *b != 0 => Some(Value::Float(a % *b as f64)),
+                _ => None,
+            },
+            BinaryOperator::Power => match (left, right) {
+                (Value::Int(a), Value::Int(b)) => {
+                    if *b >= 0 {
+                        Some(Value::Int(a.pow(*b as u32)))
+                    } else {
+                        Some(Value::Float((*a as f64).powi(*b as i32)))
+                    }
+                }
+                (Value::Float(a), Value::Float(b)) => Some(Value::Float(a.powf(*b))),
+                (Value::Int(a), Value::Float(b)) => Some(Value::Float((*a as f64).powf(*b))),
+                (Value::Float(a), Value::Int(b)) => Some(Value::Float(a.powi(*b as i32))),
+                _ => None,
+            },
+            BinaryOperator::Concat => match (left, right) {
+                (Value::Text(a), Value::Text(b)) => {
+                    Some(Value::Text(Cow::Owned(format!("{}{}", a, b))))
+                }
+                _ => None,
+            },
+            BinaryOperator::BitwiseAnd => match (left, right) {
+                (Value::Int(a), Value::Int(b)) => Some(Value::Int(a & b)),
+                _ => None,
+            },
+            BinaryOperator::BitwiseOr => match (left, right) {
+                (Value::Int(a), Value::Int(b)) => Some(Value::Int(a | b)),
+                _ => None,
+            },
+            BinaryOperator::BitwiseXor => match (left, right) {
+                (Value::Int(a), Value::Int(b)) => Some(Value::Int(a ^ b)),
+                _ => None,
+            },
+            BinaryOperator::LeftShift => match (left, right) {
+                (Value::Int(a), Value::Int(b)) if *b >= 0 && *b < 64 => {
+                    Some(Value::Int(a << (*b as u32)))
+                }
+                _ => None,
+            },
+            BinaryOperator::RightShift => match (left, right) {
+                (Value::Int(a), Value::Int(b)) if *b >= 0 && *b < 64 => {
+                    Some(Value::Int(a >> (*b as u32)))
+                }
+                _ => None,
+            },
+            BinaryOperator::JsonExtractText | BinaryOperator::JsonExtract => {
+                self.eval_json_extract(left, right, *op == BinaryOperator::JsonExtractText)
+            }
+            BinaryOperator::JsonPathExtract | BinaryOperator::JsonPathExtractText => {
+                self.eval_json_path_extract(left, right, *op == BinaryOperator::JsonPathExtractText)
+            }
+            BinaryOperator::VectorL2Distance => self.eval_vector_l2_distance(left, right),
+            BinaryOperator::VectorCosineDistance => self.eval_vector_cosine_distance(left, right),
+            BinaryOperator::VectorInnerProduct => self.eval_vector_inner_product(left, right),
+            _ => None,
+        }
+    }
+
+    fn eval_json_extract(
+        &self,
+        json_val: &Value<'a>,
+        key: &Value<'a>,
+        as_text: bool,
+    ) -> Option<Value<'a>> {
+        let json_bytes = match json_val {
+            Value::Jsonb(bytes) => bytes.as_ref(),
+            Value::Text(s) => s.as_bytes(),
+            _ => return None,
+        };
+
+        let json_str = std::str::from_utf8(json_bytes).ok()?;
+
+        match key {
+            Value::Text(key_str) => self.extract_json_key(json_str, key_str, as_text),
+            Value::Int(index) => self.extract_json_array_index(json_str, *index, as_text),
+            _ => None,
+        }
+    }
+
+    fn extract_json_key(&self, json: &str, key: &str, as_text: bool) -> Option<Value<'a>> {
+        let json = json.trim();
+        if !json.starts_with('{') {
+            return None;
+        }
+
+        let search_key = format!("\"{}\":", key);
+        let key_pos = json.find(&search_key)?;
+        let value_start = key_pos + search_key.len();
+        let rest = json[value_start..].trim_start();
+
+        let (value, _) = self.parse_json_value(rest)?;
+
+        if as_text {
+            match &value {
+                Value::Text(s) => Some(Value::Text(s.clone())),
+                Value::Int(n) => Some(Value::Text(Cow::Owned(n.to_string()))),
+                Value::Float(f) => Some(Value::Text(Cow::Owned(f.to_string()))),
+                Value::Null => Some(Value::Null),
+                _ => None,
+            }
+        } else {
+            Some(value)
+        }
+    }
+
+    fn extract_json_array_index(&self, json: &str, index: i64, as_text: bool) -> Option<Value<'a>> {
+        let json = json.trim();
+        if !json.starts_with('[') {
+            return None;
+        }
+
+        if index < 0 {
+            return None;
+        }
+
+        let inner = &json[1..json.len().saturating_sub(1)];
+        let mut current_idx = 0i64;
+        let mut depth = 0;
+        let mut start = 0;
+
+        for (i, c) in inner.char_indices() {
+            match c {
+                '[' | '{' => depth += 1,
+                ']' | '}' => depth -= 1,
+                ',' if depth == 0 => {
+                    if current_idx == index {
+                        let value_str = inner[start..i].trim();
+                        let (value, _) = self.parse_json_value(value_str)?;
+                        return if as_text {
+                            match &value {
+                                Value::Text(s) => Some(Value::Text(s.clone())),
+                                Value::Int(n) => Some(Value::Text(Cow::Owned(n.to_string()))),
+                                Value::Float(f) => Some(Value::Text(Cow::Owned(f.to_string()))),
+                                Value::Null => Some(Value::Null),
+                                _ => None,
+                            }
+                        } else {
+                            Some(value)
+                        };
+                    }
+                    current_idx += 1;
+                    start = i + 1;
+                }
+                _ => {}
+            }
+        }
+
+        if current_idx == index {
+            let value_str = inner[start..].trim();
+            let (value, _) = self.parse_json_value(value_str)?;
+            return if as_text {
+                match &value {
+                    Value::Text(s) => Some(Value::Text(s.clone())),
+                    Value::Int(n) => Some(Value::Text(Cow::Owned(n.to_string()))),
+                    Value::Float(f) => Some(Value::Text(Cow::Owned(f.to_string()))),
+                    Value::Null => Some(Value::Null),
+                    _ => None,
+                }
+            } else {
+                Some(value)
+            };
+        }
+
+        None
+    }
+
+    fn parse_json_value(&self, s: &str) -> Option<(Value<'a>, usize)> {
+        let s = s.trim_start();
+        if s.is_empty() {
+            return None;
+        }
+
+        if let Some(rest) = s.strip_prefix('"') {
+            let end = rest.find('"')?;
+            let string_content = &rest[..end];
+            Some((Value::Text(Cow::Owned(string_content.to_string())), end + 2))
+        } else if s.starts_with("null") {
+            Some((Value::Null, 4))
+        } else if s.starts_with("true") {
+            Some((Value::Int(1), 4))
+        } else if s.starts_with("false") {
+            Some((Value::Int(0), 5))
+        } else if s.starts_with('{') || s.starts_with('[') {
+            let open = s.chars().next()?;
+            let close = if open == '{' { '}' } else { ']' };
+            let mut depth = 1;
+            let mut end = 1;
+            for (i, c) in s[1..].char_indices() {
+                if c == open {
+                    depth += 1;
+                } else if c == close {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = i + 2;
+                        break;
+                    }
+                }
+            }
+            let obj_str = &s[..end];
+            Some((Value::Jsonb(Cow::Owned(obj_str.as_bytes().to_vec())), end))
+        } else {
+            let end = s
+                .find(|c: char| c == ',' || c == '}' || c == ']' || c.is_whitespace())
+                .unwrap_or(s.len());
+            let num_str = &s[..end];
+            if num_str.contains('.') || num_str.contains('e') || num_str.contains('E') {
+                let f: f64 = num_str.parse().ok()?;
+                Some((Value::Float(f), end))
+            } else {
+                let n: i64 = num_str.parse().ok()?;
+                Some((Value::Int(n), end))
+            }
+        }
+    }
+
+    fn eval_json_path_extract(
+        &self,
+        json_val: &Value<'a>,
+        _path: &Value<'a>,
+        _as_text: bool,
+    ) -> Option<Value<'a>> {
+        let _json_bytes = match json_val {
+            Value::Jsonb(bytes) => bytes.as_ref(),
+            Value::Text(s) => s.as_bytes(),
+            _ => return None,
+        };
+        None
+    }
+
+    fn eval_vector_l2_distance(&self, left: &Value<'a>, right: &Value<'a>) -> Option<Value<'a>> {
+        let (vec1, vec2) = match (left, right) {
+            (Value::Vector(v1), Value::Vector(v2)) if v1.len() == v2.len() => {
+                (v1.as_ref(), v2.as_ref())
+            }
+            _ => return None,
+        };
+
+        let sum: f32 = vec1
+            .iter()
+            .zip(vec2.iter())
+            .map(|(a, b)| (a - b) * (a - b))
+            .sum();
+
+        Some(Value::Float(sum.sqrt() as f64))
+    }
+
+    fn eval_vector_cosine_distance(&self, left: &Value<'a>, right: &Value<'a>) -> Option<Value<'a>> {
+        let (vec1, vec2) = match (left, right) {
+            (Value::Vector(v1), Value::Vector(v2)) if v1.len() == v2.len() => {
+                (v1.as_ref(), v2.as_ref())
+            }
+            _ => return None,
+        };
+
+        let dot: f32 = vec1.iter().zip(vec2.iter()).map(|(a, b)| a * b).sum();
+        let norm1: f32 = vec1.iter().map(|x| x * x).sum::<f32>().sqrt();
+        let norm2: f32 = vec2.iter().map(|x| x * x).sum::<f32>().sqrt();
+
+        if norm1 == 0.0 || norm2 == 0.0 {
+            return None;
+        }
+
+        let cosine_similarity = dot / (norm1 * norm2);
+        let cosine_distance = 1.0 - cosine_similarity;
+
+        Some(Value::Float(cosine_distance as f64))
+    }
+
+    fn eval_vector_inner_product(&self, left: &Value<'a>, right: &Value<'a>) -> Option<Value<'a>> {
+        let (vec1, vec2) = match (left, right) {
+            (Value::Vector(v1), Value::Vector(v2)) if v1.len() == v2.len() => {
+                (v1.as_ref(), v2.as_ref())
+            }
+            _ => return None,
+        };
+
+        let dot: f32 = vec1.iter().zip(vec2.iter()).map(|(a, b)| a * b).sum();
+        Some(Value::Float(-dot as f64))
+    }
+
+    fn eval_arithmetic_op<F, G>(
+        &self,
+        left: &Value<'a>,
+        right: &Value<'a>,
+        int_op: F,
+        float_op: G,
+    ) -> Option<Value<'a>>
+    where
+        F: Fn(i64, i64) -> i64,
+        G: Fn(f64, f64) -> f64,
+    {
+        match (left, right) {
+            (Value::Int(a), Value::Int(b)) => Some(Value::Int(int_op(*a, *b))),
+            (Value::Float(a), Value::Float(b)) => Some(Value::Float(float_op(*a, *b))),
+            (Value::Int(a), Value::Float(b)) => Some(Value::Float(float_op(*a as f64, *b))),
+            (Value::Float(a), Value::Int(b)) => Some(Value::Float(float_op(*a, *b as f64))),
             _ => None,
         }
     }
@@ -4687,5 +5028,747 @@ mod tests {
             }
             other => panic!("expected Value::Decimal, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn compiled_predicate_evaluates_arithmetic_plus() {
+        use crate::sql::ast::{BinaryOperator, ColumnRef, Expr, Literal};
+
+        let arena = Bump::new();
+
+        let col_a = arena.alloc(Expr::Column(ColumnRef {
+            schema: None,
+            table: None,
+            column: "a",
+        }));
+        let one = arena.alloc(Expr::Literal(Literal::Integer("1")));
+        let ten = arena.alloc(Expr::Literal(Literal::Integer("10")));
+
+        let a_plus_one = arena.alloc(Expr::BinaryOp {
+            left: col_a,
+            op: BinaryOperator::Plus,
+            right: one,
+        });
+
+        let expr = arena.alloc(Expr::BinaryOp {
+            left: a_plus_one,
+            op: BinaryOperator::Gt,
+            right: ten,
+        });
+
+        let column_map = vec![("a".to_string(), 0)];
+        let predicate = CompiledPredicate::new(expr, column_map);
+
+        let values: &[Value] = arena.alloc_slice_fill_iter([Value::Int(15)]);
+        let row = ExecutorRow::new(values);
+
+        assert!(
+            predicate.evaluate(&row),
+            "15 + 1 = 16 > 10 should be true"
+        );
+
+        let values_false: &[Value] = arena.alloc_slice_fill_iter([Value::Int(5)]);
+        let row_false = ExecutorRow::new(values_false);
+
+        assert!(
+            !predicate.evaluate(&row_false),
+            "5 + 1 = 6 > 10 should be false"
+        );
+    }
+
+    #[test]
+    fn compiled_predicate_evaluates_arithmetic_minus() {
+        use crate::sql::ast::{BinaryOperator, ColumnRef, Expr, Literal};
+
+        let arena = Bump::new();
+
+        let col_a = arena.alloc(Expr::Column(ColumnRef {
+            schema: None,
+            table: None,
+            column: "a",
+        }));
+        let five = arena.alloc(Expr::Literal(Literal::Integer("5")));
+        let three = arena.alloc(Expr::Literal(Literal::Integer("3")));
+
+        let a_minus_five = arena.alloc(Expr::BinaryOp {
+            left: col_a,
+            op: BinaryOperator::Minus,
+            right: five,
+        });
+
+        let expr = arena.alloc(Expr::BinaryOp {
+            left: a_minus_five,
+            op: BinaryOperator::Eq,
+            right: three,
+        });
+
+        let column_map = vec![("a".to_string(), 0)];
+        let predicate = CompiledPredicate::new(expr, column_map);
+
+        let values: &[Value] = arena.alloc_slice_fill_iter([Value::Int(8)]);
+        let row = ExecutorRow::new(values);
+
+        assert!(
+            predicate.evaluate(&row),
+            "8 - 5 = 3 == 3 should be true"
+        );
+    }
+
+    #[test]
+    fn compiled_predicate_evaluates_arithmetic_multiply() {
+        use crate::sql::ast::{BinaryOperator, ColumnRef, Expr, Literal};
+
+        let arena = Bump::new();
+
+        let col_a = arena.alloc(Expr::Column(ColumnRef {
+            schema: None,
+            table: None,
+            column: "a",
+        }));
+        let two = arena.alloc(Expr::Literal(Literal::Integer("2")));
+        let twenty = arena.alloc(Expr::Literal(Literal::Integer("20")));
+
+        let a_times_two = arena.alloc(Expr::BinaryOp {
+            left: col_a,
+            op: BinaryOperator::Multiply,
+            right: two,
+        });
+
+        let expr = arena.alloc(Expr::BinaryOp {
+            left: a_times_two,
+            op: BinaryOperator::Lt,
+            right: twenty,
+        });
+
+        let column_map = vec![("a".to_string(), 0)];
+        let predicate = CompiledPredicate::new(expr, column_map);
+
+        let values: &[Value] = arena.alloc_slice_fill_iter([Value::Int(5)]);
+        let row = ExecutorRow::new(values);
+
+        assert!(
+            predicate.evaluate(&row),
+            "5 * 2 = 10 < 20 should be true"
+        );
+
+        let values_false: &[Value] = arena.alloc_slice_fill_iter([Value::Int(15)]);
+        let row_false = ExecutorRow::new(values_false);
+
+        assert!(
+            !predicate.evaluate(&row_false),
+            "15 * 2 = 30 < 20 should be false"
+        );
+    }
+
+    #[test]
+    fn compiled_predicate_evaluates_arithmetic_divide() {
+        use crate::sql::ast::{BinaryOperator, ColumnRef, Expr, Literal};
+
+        let arena = Bump::new();
+
+        let col_a = arena.alloc(Expr::Column(ColumnRef {
+            schema: None,
+            table: None,
+            column: "a",
+        }));
+        let two = arena.alloc(Expr::Literal(Literal::Integer("2")));
+        let five = arena.alloc(Expr::Literal(Literal::Integer("5")));
+
+        let a_div_two = arena.alloc(Expr::BinaryOp {
+            left: col_a,
+            op: BinaryOperator::Divide,
+            right: two,
+        });
+
+        let expr = arena.alloc(Expr::BinaryOp {
+            left: a_div_two,
+            op: BinaryOperator::Eq,
+            right: five,
+        });
+
+        let column_map = vec![("a".to_string(), 0)];
+        let predicate = CompiledPredicate::new(expr, column_map);
+
+        let values: &[Value] = arena.alloc_slice_fill_iter([Value::Int(10)]);
+        let row = ExecutorRow::new(values);
+
+        assert!(
+            predicate.evaluate(&row),
+            "10 / 2 = 5 == 5 should be true"
+        );
+    }
+
+    #[test]
+    fn compiled_predicate_evaluates_arithmetic_modulo() {
+        use crate::sql::ast::{BinaryOperator, ColumnRef, Expr, Literal};
+
+        let arena = Bump::new();
+
+        let col_a = arena.alloc(Expr::Column(ColumnRef {
+            schema: None,
+            table: None,
+            column: "a",
+        }));
+        let three = arena.alloc(Expr::Literal(Literal::Integer("3")));
+        let one = arena.alloc(Expr::Literal(Literal::Integer("1")));
+
+        let a_mod_three = arena.alloc(Expr::BinaryOp {
+            left: col_a,
+            op: BinaryOperator::Modulo,
+            right: three,
+        });
+
+        let expr = arena.alloc(Expr::BinaryOp {
+            left: a_mod_three,
+            op: BinaryOperator::Eq,
+            right: one,
+        });
+
+        let column_map = vec![("a".to_string(), 0)];
+        let predicate = CompiledPredicate::new(expr, column_map);
+
+        let values: &[Value] = arena.alloc_slice_fill_iter([Value::Int(10)]);
+        let row = ExecutorRow::new(values);
+
+        assert!(
+            predicate.evaluate(&row),
+            "10 % 3 = 1 == 1 should be true"
+        );
+    }
+
+    #[test]
+    fn compiled_predicate_evaluates_float_arithmetic() {
+        use crate::sql::ast::{BinaryOperator, ColumnRef, Expr, Literal};
+
+        let arena = Bump::new();
+
+        let col_a = arena.alloc(Expr::Column(ColumnRef {
+            schema: None,
+            table: None,
+            column: "a",
+        }));
+        let point_five = arena.alloc(Expr::Literal(Literal::Float("0.5")));
+        let two_point_five = arena.alloc(Expr::Literal(Literal::Float("2.5")));
+
+        let a_times_half = arena.alloc(Expr::BinaryOp {
+            left: col_a,
+            op: BinaryOperator::Multiply,
+            right: point_five,
+        });
+
+        let expr = arena.alloc(Expr::BinaryOp {
+            left: a_times_half,
+            op: BinaryOperator::Eq,
+            right: two_point_five,
+        });
+
+        let column_map = vec![("a".to_string(), 0)];
+        let predicate = CompiledPredicate::new(expr, column_map);
+
+        let values: &[Value] = arena.alloc_slice_fill_iter([Value::Float(5.0)]);
+        let row = ExecutorRow::new(values);
+
+        assert!(
+            predicate.evaluate(&row),
+            "5.0 * 0.5 = 2.5 == 2.5 should be true"
+        );
+    }
+
+    #[test]
+    fn compiled_predicate_evaluates_string_concat() {
+        use crate::sql::ast::{BinaryOperator, ColumnRef, Expr, Literal};
+
+        let arena = Bump::new();
+
+        let col_a = arena.alloc(Expr::Column(ColumnRef {
+            schema: None,
+            table: None,
+            column: "a",
+        }));
+        let world = arena.alloc(Expr::Literal(Literal::String(" world")));
+        let hello_world = arena.alloc(Expr::Literal(Literal::String("hello world")));
+
+        let concat_expr = arena.alloc(Expr::BinaryOp {
+            left: col_a,
+            op: BinaryOperator::Concat,
+            right: world,
+        });
+
+        let expr = arena.alloc(Expr::BinaryOp {
+            left: concat_expr,
+            op: BinaryOperator::Eq,
+            right: hello_world,
+        });
+
+        let column_map = vec![("a".to_string(), 0)];
+        let predicate = CompiledPredicate::new(expr, column_map);
+
+        let values: &[Value] = arena.alloc_slice_fill_iter([Value::Text(Cow::Borrowed("hello"))]);
+        let row = ExecutorRow::new(values);
+
+        assert!(
+            predicate.evaluate(&row),
+            "'hello' || ' world' = 'hello world' should be true"
+        );
+    }
+
+    #[test]
+    fn compiled_predicate_evaluates_bitwise_and() {
+        use crate::sql::ast::{BinaryOperator, ColumnRef, Expr, Literal};
+
+        let arena = Bump::new();
+
+        let col_a = arena.alloc(Expr::Column(ColumnRef {
+            schema: None,
+            table: None,
+            column: "a",
+        }));
+        let mask = arena.alloc(Expr::Literal(Literal::HexNumber("0xF")));
+        let expected = arena.alloc(Expr::Literal(Literal::Integer("5")));
+
+        let and_expr = arena.alloc(Expr::BinaryOp {
+            left: col_a,
+            op: BinaryOperator::BitwiseAnd,
+            right: mask,
+        });
+
+        let expr = arena.alloc(Expr::BinaryOp {
+            left: and_expr,
+            op: BinaryOperator::Eq,
+            right: expected,
+        });
+
+        let column_map = vec![("a".to_string(), 0)];
+        let predicate = CompiledPredicate::new(expr, column_map);
+
+        let values: &[Value] = arena.alloc_slice_fill_iter([Value::Int(0x35)]);
+        let row = ExecutorRow::new(values);
+
+        assert!(
+            predicate.evaluate(&row),
+            "0x35 & 0xF = 5 should be true"
+        );
+    }
+
+    #[test]
+    fn compiled_predicate_evaluates_bitwise_or() {
+        use crate::sql::ast::{BinaryOperator, ColumnRef, Expr, Literal};
+
+        let arena = Bump::new();
+
+        let col_a = arena.alloc(Expr::Column(ColumnRef {
+            schema: None,
+            table: None,
+            column: "a",
+        }));
+        let mask = arena.alloc(Expr::Literal(Literal::HexNumber("0xF0")));
+        let expected = arena.alloc(Expr::Literal(Literal::HexNumber("0xF5")));
+
+        let or_expr = arena.alloc(Expr::BinaryOp {
+            left: col_a,
+            op: BinaryOperator::BitwiseOr,
+            right: mask,
+        });
+
+        let expr = arena.alloc(Expr::BinaryOp {
+            left: or_expr,
+            op: BinaryOperator::Eq,
+            right: expected,
+        });
+
+        let column_map = vec![("a".to_string(), 0)];
+        let predicate = CompiledPredicate::new(expr, column_map);
+
+        let values: &[Value] = arena.alloc_slice_fill_iter([Value::Int(0x05)]);
+        let row = ExecutorRow::new(values);
+
+        assert!(
+            predicate.evaluate(&row),
+            "0x05 | 0xF0 = 0xF5 should be true"
+        );
+    }
+
+    #[test]
+    fn compiled_predicate_evaluates_bitwise_xor() {
+        use crate::sql::ast::{BinaryOperator, ColumnRef, Expr, Literal};
+
+        let arena = Bump::new();
+
+        let col_a = arena.alloc(Expr::Column(ColumnRef {
+            schema: None,
+            table: None,
+            column: "a",
+        }));
+        let mask = arena.alloc(Expr::Literal(Literal::HexNumber("0xFF")));
+        let expected = arena.alloc(Expr::Literal(Literal::HexNumber("0xAA")));
+
+        let xor_expr = arena.alloc(Expr::BinaryOp {
+            left: col_a,
+            op: BinaryOperator::BitwiseXor,
+            right: mask,
+        });
+
+        let expr = arena.alloc(Expr::BinaryOp {
+            left: xor_expr,
+            op: BinaryOperator::Eq,
+            right: expected,
+        });
+
+        let column_map = vec![("a".to_string(), 0)];
+        let predicate = CompiledPredicate::new(expr, column_map);
+
+        let values: &[Value] = arena.alloc_slice_fill_iter([Value::Int(0x55)]);
+        let row = ExecutorRow::new(values);
+
+        assert!(
+            predicate.evaluate(&row),
+            "0x55 ^ 0xFF = 0xAA should be true"
+        );
+    }
+
+    #[test]
+    fn compiled_predicate_evaluates_left_shift() {
+        use crate::sql::ast::{BinaryOperator, ColumnRef, Expr, Literal};
+
+        let arena = Bump::new();
+
+        let col_a = arena.alloc(Expr::Column(ColumnRef {
+            schema: None,
+            table: None,
+            column: "a",
+        }));
+        let shift = arena.alloc(Expr::Literal(Literal::Integer("4")));
+        let expected = arena.alloc(Expr::Literal(Literal::Integer("16")));
+
+        let shift_expr = arena.alloc(Expr::BinaryOp {
+            left: col_a,
+            op: BinaryOperator::LeftShift,
+            right: shift,
+        });
+
+        let expr = arena.alloc(Expr::BinaryOp {
+            left: shift_expr,
+            op: BinaryOperator::Eq,
+            right: expected,
+        });
+
+        let column_map = vec![("a".to_string(), 0)];
+        let predicate = CompiledPredicate::new(expr, column_map);
+
+        let values: &[Value] = arena.alloc_slice_fill_iter([Value::Int(1)]);
+        let row = ExecutorRow::new(values);
+
+        assert!(
+            predicate.evaluate(&row),
+            "1 << 4 = 16 should be true"
+        );
+    }
+
+    #[test]
+    fn compiled_predicate_evaluates_right_shift() {
+        use crate::sql::ast::{BinaryOperator, ColumnRef, Expr, Literal};
+
+        let arena = Bump::new();
+
+        let col_a = arena.alloc(Expr::Column(ColumnRef {
+            schema: None,
+            table: None,
+            column: "a",
+        }));
+        let shift = arena.alloc(Expr::Literal(Literal::Integer("2")));
+        let expected = arena.alloc(Expr::Literal(Literal::Integer("4")));
+
+        let shift_expr = arena.alloc(Expr::BinaryOp {
+            left: col_a,
+            op: BinaryOperator::RightShift,
+            right: shift,
+        });
+
+        let expr = arena.alloc(Expr::BinaryOp {
+            left: shift_expr,
+            op: BinaryOperator::Eq,
+            right: expected,
+        });
+
+        let column_map = vec![("a".to_string(), 0)];
+        let predicate = CompiledPredicate::new(expr, column_map);
+
+        let values: &[Value] = arena.alloc_slice_fill_iter([Value::Int(16)]);
+        let row = ExecutorRow::new(values);
+
+        assert!(
+            predicate.evaluate(&row),
+            "16 >> 2 = 4 should be true"
+        );
+    }
+
+    #[test]
+    fn compiled_predicate_evaluates_power() {
+        use crate::sql::ast::{BinaryOperator, ColumnRef, Expr, Literal};
+
+        let arena = Bump::new();
+
+        let col_a = arena.alloc(Expr::Column(ColumnRef {
+            schema: None,
+            table: None,
+            column: "a",
+        }));
+        let exponent = arena.alloc(Expr::Literal(Literal::Integer("3")));
+        let expected = arena.alloc(Expr::Literal(Literal::Integer("8")));
+
+        let power_expr = arena.alloc(Expr::BinaryOp {
+            left: col_a,
+            op: BinaryOperator::Power,
+            right: exponent,
+        });
+
+        let expr = arena.alloc(Expr::BinaryOp {
+            left: power_expr,
+            op: BinaryOperator::Eq,
+            right: expected,
+        });
+
+        let column_map = vec![("a".to_string(), 0)];
+        let predicate = CompiledPredicate::new(expr, column_map);
+
+        let values: &[Value] = arena.alloc_slice_fill_iter([Value::Int(2)]);
+        let row = ExecutorRow::new(values);
+
+        assert!(
+            predicate.evaluate(&row),
+            "2 ^ 3 = 8 should be true"
+        );
+    }
+
+    #[test]
+    fn compiled_predicate_evaluates_json_extract_text() {
+        use crate::sql::ast::{BinaryOperator, ColumnRef, Expr, Literal};
+
+        let arena = Bump::new();
+
+        let col_json = arena.alloc(Expr::Column(ColumnRef {
+            schema: None,
+            table: None,
+            column: "data",
+        }));
+        let key = arena.alloc(Expr::Literal(Literal::String("name")));
+        let expected = arena.alloc(Expr::Literal(Literal::String("Alice")));
+
+        let extract_expr = arena.alloc(Expr::BinaryOp {
+            left: col_json,
+            op: BinaryOperator::JsonExtractText,
+            right: key,
+        });
+
+        let expr = arena.alloc(Expr::BinaryOp {
+            left: extract_expr,
+            op: BinaryOperator::Eq,
+            right: expected,
+        });
+
+        let column_map = vec![("data".to_string(), 0)];
+        let predicate = CompiledPredicate::new(expr, column_map);
+
+        let json_data = br#"{"name":"Alice","age":30}"#;
+        let values: &[Value] = arena.alloc_slice_fill_iter([Value::Jsonb(Cow::Borrowed(
+            json_data.as_slice(),
+        ))]);
+        let row = ExecutorRow::new(values);
+
+        assert!(
+            predicate.evaluate(&row),
+            "data->>'name' = 'Alice' should be true"
+        );
+    }
+
+    #[test]
+    fn compiled_predicate_evaluates_json_extract_array_index() {
+        use crate::sql::ast::{BinaryOperator, ColumnRef, Expr, Literal};
+
+        let arena = Bump::new();
+
+        let col_json = arena.alloc(Expr::Column(ColumnRef {
+            schema: None,
+            table: None,
+            column: "data",
+        }));
+        let index = arena.alloc(Expr::Literal(Literal::Integer("1")));
+        let expected = arena.alloc(Expr::Literal(Literal::String("b")));
+
+        let extract_expr = arena.alloc(Expr::BinaryOp {
+            left: col_json,
+            op: BinaryOperator::JsonExtractText,
+            right: index,
+        });
+
+        let expr = arena.alloc(Expr::BinaryOp {
+            left: extract_expr,
+            op: BinaryOperator::Eq,
+            right: expected,
+        });
+
+        let column_map = vec![("data".to_string(), 0)];
+        let predicate = CompiledPredicate::new(expr, column_map);
+
+        let json_data = br#"["a","b","c"]"#;
+        let values: &[Value] = arena.alloc_slice_fill_iter([Value::Jsonb(Cow::Borrowed(
+            json_data.as_slice(),
+        ))]);
+        let row = ExecutorRow::new(values);
+
+        assert!(
+            predicate.evaluate(&row),
+            "data->>1 = 'b' should be true"
+        );
+    }
+
+    #[test]
+    fn compiled_predicate_evaluates_vector_l2_distance() {
+        use crate::sql::ast::{BinaryOperator, ColumnRef, Expr, Literal};
+
+        let arena = Bump::new();
+
+        let col_vec = arena.alloc(Expr::Column(ColumnRef {
+            schema: None,
+            table: None,
+            column: "embedding",
+        }));
+        let col_query = arena.alloc(Expr::Column(ColumnRef {
+            schema: None,
+            table: None,
+            column: "query_vec",
+        }));
+        let threshold = arena.alloc(Expr::Literal(Literal::Float("2.0")));
+
+        let distance_expr = arena.alloc(Expr::BinaryOp {
+            left: col_vec,
+            op: BinaryOperator::VectorL2Distance,
+            right: col_query,
+        });
+
+        let expr = arena.alloc(Expr::BinaryOp {
+            left: distance_expr,
+            op: BinaryOperator::Lt,
+            right: threshold,
+        });
+
+        let column_map = vec![
+            ("embedding".to_string(), 0),
+            ("query_vec".to_string(), 1),
+        ];
+        let predicate = CompiledPredicate::new(expr, column_map);
+
+        let vec1: &[f32] = &[1.0, 2.0, 3.0];
+        let vec2: &[f32] = &[1.0, 2.0, 4.0];
+        let values: &[Value] = arena.alloc_slice_fill_iter([
+            Value::Vector(Cow::Borrowed(vec1)),
+            Value::Vector(Cow::Borrowed(vec2)),
+        ]);
+        let row = ExecutorRow::new(values);
+
+        assert!(
+            predicate.evaluate(&row),
+            "L2 distance of [1,2,3] and [1,2,4] is 1.0, which < 2.0"
+        );
+    }
+
+    #[test]
+    fn compiled_predicate_evaluates_vector_cosine_distance() {
+        use crate::sql::ast::{BinaryOperator, ColumnRef, Expr, Literal};
+
+        let arena = Bump::new();
+
+        let col_vec = arena.alloc(Expr::Column(ColumnRef {
+            schema: None,
+            table: None,
+            column: "embedding",
+        }));
+        let col_query = arena.alloc(Expr::Column(ColumnRef {
+            schema: None,
+            table: None,
+            column: "query_vec",
+        }));
+        let threshold = arena.alloc(Expr::Literal(Literal::Float("0.5")));
+
+        let distance_expr = arena.alloc(Expr::BinaryOp {
+            left: col_vec,
+            op: BinaryOperator::VectorCosineDistance,
+            right: col_query,
+        });
+
+        let expr = arena.alloc(Expr::BinaryOp {
+            left: distance_expr,
+            op: BinaryOperator::Lt,
+            right: threshold,
+        });
+
+        let column_map = vec![
+            ("embedding".to_string(), 0),
+            ("query_vec".to_string(), 1),
+        ];
+        let predicate = CompiledPredicate::new(expr, column_map);
+
+        let vec1: &[f32] = &[1.0, 0.0, 0.0];
+        let vec2: &[f32] = &[1.0, 0.0, 0.0];
+        let values: &[Value] = arena.alloc_slice_fill_iter([
+            Value::Vector(Cow::Borrowed(vec1)),
+            Value::Vector(Cow::Borrowed(vec2)),
+        ]);
+        let row = ExecutorRow::new(values);
+
+        assert!(
+            predicate.evaluate(&row),
+            "Cosine distance of identical vectors is 0.0, which < 0.5"
+        );
+    }
+
+    #[test]
+    fn compiled_predicate_evaluates_vector_inner_product() {
+        use crate::sql::ast::{BinaryOperator, ColumnRef, Expr, Literal};
+
+        let arena = Bump::new();
+
+        let col_vec = arena.alloc(Expr::Column(ColumnRef {
+            schema: None,
+            table: None,
+            column: "embedding",
+        }));
+        let col_query = arena.alloc(Expr::Column(ColumnRef {
+            schema: None,
+            table: None,
+            column: "query_vec",
+        }));
+        let threshold = arena.alloc(Expr::Literal(Literal::Float("-10.0")));
+
+        let distance_expr = arena.alloc(Expr::BinaryOp {
+            left: col_vec,
+            op: BinaryOperator::VectorInnerProduct,
+            right: col_query,
+        });
+
+        let expr = arena.alloc(Expr::BinaryOp {
+            left: distance_expr,
+            op: BinaryOperator::Lt,
+            right: threshold,
+        });
+
+        let column_map = vec![
+            ("embedding".to_string(), 0),
+            ("query_vec".to_string(), 1),
+        ];
+        let predicate = CompiledPredicate::new(expr, column_map);
+
+        let vec1: &[f32] = &[1.0, 2.0, 3.0];
+        let vec2: &[f32] = &[4.0, 5.0, 6.0];
+        let values: &[Value] = arena.alloc_slice_fill_iter([
+            Value::Vector(Cow::Borrowed(vec1)),
+            Value::Vector(Cow::Borrowed(vec2)),
+        ]);
+        let row = ExecutorRow::new(values);
+
+        assert!(
+            predicate.evaluate(&row),
+            "Negative inner product (-32) < -10.0 should be true"
+        );
     }
 }
