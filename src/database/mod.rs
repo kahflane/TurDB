@@ -99,6 +99,7 @@ pub use owned_value::{
 };
 pub use row::Row;
 
+#[derive(Debug)]
 pub enum ExecuteResult {
     CreateTable { created: bool },
     CreateSchema { created: bool },
@@ -1016,5 +1017,246 @@ mod tests {
             }
             other => panic!("Expected Blob for BLOB column, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn test_unique_constraint_rejects_duplicate_on_insert() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("test_db");
+
+        let db = Database::create(&db_path).unwrap();
+
+        db.execute("CREATE TABLE users (id INT, email TEXT UNIQUE)")
+            .unwrap();
+
+        db.execute("INSERT INTO users VALUES (1, 'alice@test.com')")
+            .unwrap();
+
+        let result = db.execute("INSERT INTO users VALUES (2, 'alice@test.com')");
+
+        assert!(result.is_err(), "UNIQUE constraint should reject duplicate email");
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("UNIQUE") || err_msg.contains("unique"),
+            "Error should mention UNIQUE constraint violation: {}",
+            err_msg
+        );
+    }
+
+    #[test]
+    fn test_unique_constraint_allows_different_values() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("test_db");
+
+        let db = Database::create(&db_path).unwrap();
+
+        db.execute("CREATE TABLE users (id INT, email TEXT UNIQUE)")
+            .unwrap();
+
+        db.execute("INSERT INTO users VALUES (1, 'alice@test.com')")
+            .unwrap();
+        db.execute("INSERT INTO users VALUES (2, 'bob@test.com')")
+            .unwrap();
+
+        let rows = db.query("SELECT * FROM users").unwrap();
+        assert_eq!(rows.len(), 2, "Both inserts should succeed with different emails");
+    }
+
+    #[test]
+    fn test_unique_constraint_allows_multiple_nulls() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("test_db");
+
+        let db = Database::create(&db_path).unwrap();
+
+        db.execute("CREATE TABLE users (id INT, email TEXT UNIQUE)")
+            .unwrap();
+
+        db.execute("INSERT INTO users VALUES (1, NULL)")
+            .unwrap();
+        db.execute("INSERT INTO users VALUES (2, NULL)")
+            .unwrap();
+
+        let rows = db.query("SELECT * FROM users").unwrap();
+        assert_eq!(rows.len(), 2, "UNIQUE should allow multiple NULLs");
+    }
+
+    #[test]
+    fn test_primary_key_rejects_duplicate_on_insert() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("test_db");
+
+        let db = Database::create(&db_path).unwrap();
+
+        db.execute("CREATE TABLE users (id INT PRIMARY KEY, name TEXT)")
+            .unwrap();
+
+        db.execute("INSERT INTO users VALUES (1, 'Alice')")
+            .unwrap();
+
+        let result = db.execute("INSERT INTO users VALUES (1, 'Bob')");
+
+        assert!(result.is_err(), "PRIMARY KEY should reject duplicate id");
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("PRIMARY KEY") || err_msg.contains("UNIQUE") || err_msg.contains("unique"),
+            "Error should mention constraint violation: {}",
+            err_msg
+        );
+    }
+
+    #[test]
+    fn test_unique_constraint_rejects_duplicate_on_update() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("test_db");
+
+        let db = Database::create(&db_path).unwrap();
+
+        db.execute("CREATE TABLE users (id INT, email TEXT UNIQUE)")
+            .unwrap();
+
+        db.execute("INSERT INTO users VALUES (1, 'alice@test.com')")
+            .unwrap();
+        db.execute("INSERT INTO users VALUES (2, 'bob@test.com')")
+            .unwrap();
+
+        let result = db.execute("UPDATE users SET email = 'alice@test.com' WHERE id = 2");
+
+        assert!(result.is_err(), "UNIQUE constraint should reject duplicate email on UPDATE");
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("UNIQUE") || err_msg.contains("unique"),
+            "Error should mention UNIQUE constraint violation: {}",
+            err_msg
+        );
+    }
+
+    #[test]
+    fn test_check_constraint_rejects_invalid_value_on_insert() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("test_db");
+
+        let db = Database::create(&db_path).unwrap();
+
+        db.execute("CREATE TABLE users (id INT, age INT CHECK(age >= 0))")
+            .unwrap();
+
+        let result = db.execute("INSERT INTO users VALUES (1, -5)");
+
+        assert!(result.is_err(), "CHECK constraint should reject negative age");
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("CHECK") || err_msg.contains("check"),
+            "Error should mention CHECK constraint violation: {}",
+            err_msg
+        );
+    }
+
+    #[test]
+    fn test_check_constraint_accepts_valid_value_on_insert() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("test_db");
+
+        let db = Database::create(&db_path).unwrap();
+
+        db.execute("CREATE TABLE users (id INT, age INT CHECK(age >= 0))")
+            .unwrap();
+
+        db.execute("INSERT INTO users VALUES (1, 25)").unwrap();
+
+        let rows = db.query("SELECT * FROM users").unwrap();
+        assert_eq!(rows.len(), 1, "Insert should succeed with valid age");
+    }
+
+    #[test]
+    fn test_check_constraint_rejects_invalid_value_on_update() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("test_db");
+
+        let db = Database::create(&db_path).unwrap();
+
+        db.execute("CREATE TABLE users (id INT, age INT CHECK(age >= 0))")
+            .unwrap();
+        db.execute("INSERT INTO users VALUES (1, 25)").unwrap();
+
+        let result = db.execute("UPDATE users SET age = -10 WHERE id = 1");
+
+        assert!(result.is_err(), "CHECK constraint should reject negative age on UPDATE");
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("CHECK") || err_msg.contains("check"),
+            "Error should mention CHECK constraint violation: {}",
+            err_msg
+        );
+    }
+
+    #[test]
+    fn test_foreign_key_rejects_missing_reference_on_insert() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("test_db");
+
+        let db = Database::create(&db_path).unwrap();
+
+        db.execute("CREATE TABLE users (id INT PRIMARY KEY, name TEXT)")
+            .unwrap();
+        db.execute("CREATE TABLE orders (id INT, user_id INT REFERENCES users(id))")
+            .unwrap();
+
+        db.execute("INSERT INTO users VALUES (1, 'Alice')").unwrap();
+
+        let result = db.execute("INSERT INTO orders VALUES (1, 999)");
+
+        assert!(result.is_err(), "FOREIGN KEY constraint should reject missing reference");
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("FOREIGN KEY") || err_msg.contains("foreign key") || err_msg.contains("referenced"),
+            "Error should mention FOREIGN KEY constraint violation: {}",
+            err_msg
+        );
+    }
+
+    #[test]
+    fn test_foreign_key_accepts_valid_reference_on_insert() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("test_db");
+
+        let db = Database::create(&db_path).unwrap();
+
+        db.execute("CREATE TABLE users (id INT PRIMARY KEY, name TEXT)")
+            .unwrap();
+        db.execute("CREATE TABLE orders (id INT, user_id INT REFERENCES users(id))")
+            .unwrap();
+
+        db.execute("INSERT INTO users VALUES (1, 'Alice')").unwrap();
+        db.execute("INSERT INTO orders VALUES (1, 1)").unwrap();
+
+        let rows = db.query("SELECT * FROM orders").unwrap();
+        assert_eq!(rows.len(), 1, "Insert should succeed with valid foreign key");
+    }
+
+    #[test]
+    fn test_foreign_key_blocks_delete_of_referenced_row() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("test_db");
+
+        let db = Database::create(&db_path).unwrap();
+
+        db.execute("CREATE TABLE users (id INT PRIMARY KEY, name TEXT)")
+            .unwrap();
+        db.execute("CREATE TABLE orders (id INT, user_id INT REFERENCES users(id))")
+            .unwrap();
+
+        db.execute("INSERT INTO users VALUES (1, 'Alice')").unwrap();
+        db.execute("INSERT INTO orders VALUES (1, 1)").unwrap();
+
+        let result = db.execute("DELETE FROM users WHERE id = 1");
+
+        assert!(result.is_err(), "FOREIGN KEY constraint should block delete of referenced row");
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("referenced") || err_msg.contains("FOREIGN KEY") || err_msg.contains("foreign key"),
+            "Error should mention row is referenced: {}",
+            err_msg
+        );
     }
 }
