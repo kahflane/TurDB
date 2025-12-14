@@ -40,6 +40,10 @@ harness = false
 name = "database"
 harness = false
 
+[[bench]]
+name = "string_constraints"
+harness = false
+
 [profile.release]
 opt-level = 3
 lto = "fat"
