@@ -1,6 +1,7 @@
 use crate::database::owned_value::OwnedValue;
 use crate::database::row::Row;
 use crate::database::{CheckpointInfo, ExecuteResult, RecoveryInfo};
+use crate::parsing::{parse_binary_blob, parse_hex_blob, parse_uuid, parse_vector};
 use crate::schema::{Catalog, ColumnDef as SchemaColumnDef};
 use crate::sql::builder::ExecutorBuilder;
 use crate::sql::context::ExecutionContext;
@@ -969,40 +970,17 @@ impl Database {
                     Ok(OwnedValue::Float(f))
                 }
                 Literal::String(s) => match target_type {
-                    Some(DataType::Uuid) => Self::parse_uuid_string(s),
+                    Some(DataType::Uuid) => parse_uuid(s),
                     Some(DataType::Jsonb) => Self::parse_json_string(s),
-                    Some(DataType::Vector) => Self::parse_vector_string(s),
+                    Some(DataType::Vector) => parse_vector(s),
                     _ => Ok(OwnedValue::Text(s.to_string())),
                 },
                 Literal::Boolean(b) => Ok(OwnedValue::Bool(*b)),
-                Literal::HexNumber(s) => Self::parse_hex_to_blob(s),
-                Literal::BinaryNumber(s) => Self::parse_binary_to_blob(s),
+                Literal::HexNumber(s) => parse_hex_blob(s),
+                Literal::BinaryNumber(s) => parse_binary_blob(s),
             },
             _ => bail!("expected literal expression, got {:?}", expr),
         }
-    }
-
-    fn parse_uuid_string(s: &str) -> Result<OwnedValue> {
-        let s = s.trim();
-        let hex_only: String = s.chars().filter(|c| *c != '-').collect();
-
-        if hex_only.len() != 32 {
-            bail!(
-                "invalid UUID format '{}': expected 32 hex chars, got {}",
-                s,
-                hex_only.len()
-            );
-        }
-
-        let mut bytes = [0u8; 16];
-        for (i, chunk) in hex_only.as_bytes().chunks(2).enumerate() {
-            let hex_pair = std::str::from_utf8(chunk)
-                .wrap_err_with(|| format!("invalid UTF-8 in UUID hex: {:?}", chunk))?;
-            bytes[i] = u8::from_str_radix(hex_pair, 16)
-                .wrap_err_with(|| format!("invalid hex in UUID: '{}'", hex_pair))?;
-        }
-
-        Ok(OwnedValue::Uuid(bytes))
     }
 
     fn parse_json_string(s: &str) -> Result<OwnedValue> {
@@ -1222,67 +1200,6 @@ impl Database {
         }
 
         Ok(JsonbBuilderValue::Array(elements))
-    }
-
-    fn parse_vector_string(s: &str) -> Result<OwnedValue> {
-        let s = s.trim();
-
-        let inner = if s.starts_with('[') && s.ends_with(']') {
-            &s[1..s.len() - 1]
-        } else {
-            s
-        };
-
-        let values: Vec<f32> = inner
-            .split(',')
-            .map(|part| {
-                part.trim()
-                    .parse::<f32>()
-                    .wrap_err_with(|| format!("failed to parse vector element: '{}'", part.trim()))
-            })
-            .collect::<Result<Vec<_>>>()?;
-
-        Ok(OwnedValue::Vector(values))
-    }
-
-    fn parse_hex_to_blob(s: &str) -> Result<OwnedValue> {
-        if !s.len().is_multiple_of(2) {
-            bail!("hex string must have even length, got {}", s.len());
-        }
-
-        let bytes: Vec<u8> = (0..s.len())
-            .step_by(2)
-            .map(|i| {
-                u8::from_str_radix(&s[i..i + 2], 16)
-                    .wrap_err_with(|| format!("invalid hex byte: '{}'", &s[i..i + 2]))
-            })
-            .collect::<Result<Vec<_>>>()?;
-
-        Ok(OwnedValue::Blob(bytes))
-    }
-
-    fn parse_binary_to_blob(s: &str) -> Result<OwnedValue> {
-        if !s.len().is_multiple_of(8) {
-            let bytes: Vec<u8> = (0..s.len())
-                .step_by(8)
-                .map(|i| {
-                    let end = std::cmp::min(i + 8, s.len());
-                    u8::from_str_radix(&s[i..end], 2)
-                        .wrap_err_with(|| format!("invalid binary byte: '{}'", &s[i..end]))
-                })
-                .collect::<Result<Vec<_>>>()?;
-            return Ok(OwnedValue::Blob(bytes));
-        }
-
-        let bytes: Vec<u8> = (0..s.len())
-            .step_by(8)
-            .map(|i| {
-                u8::from_str_radix(&s[i..i + 8], 2)
-                    .wrap_err_with(|| format!("invalid binary byte: '{}'", &s[i..i + 8]))
-            })
-            .collect::<Result<Vec<_>>>()?;
-
-        Ok(OwnedValue::Blob(bytes))
     }
 
     fn generate_row_key(row_id: u64) -> Vec<u8> {
