@@ -358,7 +358,7 @@ impl<'a> CompiledPredicate<'a> {
         }
     }
 
-    fn eval_json_path_extract(
+    pub fn eval_json_path_extract(
         &self,
         json_val: &Value<'a>,
         path: &Value<'a>,
@@ -487,7 +487,7 @@ impl<'a> CompiledPredicate<'a> {
         None
     }
 
-    fn eval_json_contains(&self, left: &Value<'a>, right: &Value<'a>) -> Option<bool> {
+    pub fn eval_json_contains(&self, left: &Value<'a>, right: &Value<'a>) -> Option<bool> {
         let left_bytes = match left {
             Value::Jsonb(bytes) => bytes.as_ref(),
             Value::Text(s) => s.as_bytes(),
@@ -683,7 +683,7 @@ impl<'a> CompiledPredicate<'a> {
         elements
     }
 
-    fn eval_array_contains(&self, left: &Value<'a>, right: &Value<'a>) -> Option<bool> {
+    pub fn eval_array_contains(&self, left: &Value<'a>, right: &Value<'a>) -> Option<bool> {
         let left_bytes = match left {
             Value::Jsonb(bytes) => bytes.as_ref(),
             Value::Text(s) => s.as_bytes(),
@@ -723,7 +723,7 @@ impl<'a> CompiledPredicate<'a> {
         self.eval_array_contains(right, left)
     }
 
-    fn eval_array_overlaps(&self, left: &Value<'a>, right: &Value<'a>) -> Option<bool> {
+    pub fn eval_array_overlaps(&self, left: &Value<'a>, right: &Value<'a>) -> Option<bool> {
         let left_bytes = match left {
             Value::Jsonb(bytes) => bytes.as_ref(),
             Value::Text(s) => s.as_bytes(),

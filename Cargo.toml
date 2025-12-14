@@ -40,6 +40,10 @@ harness = false
 name = "database"
 harness = false
 
+[[bench]]
+name = "sql_operators"
+harness = false
+
 [profile.release]
 opt-level = 3
 lto = "fat"
