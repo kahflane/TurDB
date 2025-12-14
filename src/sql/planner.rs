@@ -466,6 +466,8 @@ impl<'a> Planner<'a> {
         }
 
         let (exprs, aliases) = self.extract_select_expressions(select.columns);
+        #[cfg(test)]
+        eprintln!("DEBUG plan_select: columns.len()={}, exprs.len()={}", select.columns.len(), exprs.len());
         let project = self.arena.alloc(LogicalOperator::Project(LogicalProject {
             input: current,
             expressions: exprs,
@@ -598,6 +600,8 @@ impl<'a> Planner<'a> {
         let mut aliases = bumpalo::collections::Vec::new_in(self.arena);
 
         for col in columns {
+            #[cfg(test)]
+            eprintln!("DEBUG extract_select_expressions: col={:?}", col);
             match col {
                 SelectColumn::Expr { expr, alias } => {
                     exprs.push(*expr);

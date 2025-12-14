@@ -131,6 +131,8 @@ pub enum Value<'a> {
     Text(Cow<'a, str>),
     Blob(Cow<'a, [u8]>),
     Vector(Cow<'a, [f32]>),
+    Uuid([u8; 16]),
+    Jsonb(Cow<'a, [u8]>),
 }
 
 /// Schema-level column data types.
@@ -246,6 +248,31 @@ impl<'a> Value<'a> {
                 TypeAffinity::Blob => Ok(Value::Vector(v.clone())),
                 _ => bail!("cannot coerce vector to affinity {:?}", target),
             },
+            Value::Uuid(u) => match target {
+                TypeAffinity::Blob => Ok(Value::Uuid(*u)),
+                TypeAffinity::Text => {
+                    let hex = u
+                        .iter()
+                        .map(|b| format!("{:02x}", b))
+                        .collect::<Vec<_>>()
+                        .join("");
+                    let formatted = format!(
+                        "{}-{}-{}-{}-{}",
+                        &hex[0..8],
+                        &hex[8..12],
+                        &hex[12..16],
+                        &hex[16..20],
+                        &hex[20..32]
+                    );
+                    Ok(Value::Text(Cow::Owned(formatted)))
+                }
+                _ => bail!("cannot coerce uuid to affinity {:?}", target),
+            },
+            Value::Jsonb(b) => match target {
+                TypeAffinity::Blob => Ok(Value::Jsonb(b.clone())),
+                TypeAffinity::Text => Ok(Value::Text(Cow::Owned(format!("<jsonb:{} bytes>", b.len())))),
+                _ => bail!("cannot coerce jsonb to affinity {:?}", target),
+            },
         }
     }
 
@@ -312,6 +339,15 @@ impl<'a> Value<'a> {
 
             (Value::Blob(_), Value::Vector(_)) => Some(Ordering::Less),
             (Value::Vector(_), Value::Blob(_)) => Some(Ordering::Greater),
+
+            (Value::Uuid(a), Value::Uuid(b)) => Some(a.cmp(b)),
+            (Value::Jsonb(a), Value::Jsonb(b)) => Some(a.cmp(b)),
+
+            (Value::Uuid(_), _) => Some(Ordering::Greater),
+            (_, Value::Uuid(_)) => Some(Ordering::Less),
+
+            (Value::Jsonb(_), _) => Some(Ordering::Greater),
+            (_, Value::Jsonb(_)) => Some(Ordering::Less),
         }
     }
 }

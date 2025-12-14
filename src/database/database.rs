@@ -358,6 +358,8 @@ impl Database {
             let mut rows = Vec::new();
             executor.open()?;
             while let Some(row) = executor.next()? {
+                #[cfg(test)]
+                eprintln!("DEBUG query: row from executor has {} values", row.values.len());
                 let owned: Vec<OwnedValue> = row.values.iter().map(OwnedValue::from).collect();
                 rows.push(Row::new(owned));
             }
@@ -599,17 +601,24 @@ impl Database {
         let root_page = 1u32;
         let rows_affected;
 
+        let column_types: Vec<crate::records::types::DataType> =
+            columns.iter().map(|c| c.data_type()).collect();
+
         fn insert_rows<'a, S: crate::storage::Storage>(
             btree: &mut BTree<'_, S>,
             rows: &[&[&crate::sql::ast::Expr<'a>]],
             schema: &crate::records::Schema,
+            column_types: &[crate::records::types::DataType],
             next_row_id: &std::sync::atomic::AtomicU64,
         ) -> Result<usize> {
             let mut count = 0;
             for row_exprs in rows.iter() {
                 let values: Vec<OwnedValue> = row_exprs
                     .iter()
-                    .map(|expr| Database::eval_literal(expr))
+                    .zip(column_types.iter())
+                    .map(|(expr, data_type)| {
+                        Database::eval_literal_with_type(expr, Some(data_type))
+                    })
                     .collect::<Result<Vec<_>>>()?;
                 let record_data = OwnedValue::build_record_from_values(&values, schema)?;
                 let row_id = next_row_id.fetch_add(1, Ordering::Relaxed);
@@ -623,10 +632,12 @@ impl Database {
         if wal_enabled {
             let mut wal_storage = WalStorage::new(storage, &self.dirty_pages);
             let mut btree = BTree::new(&mut wal_storage, root_page)?;
-            rows_affected = insert_rows(&mut btree, rows, &schema, &self.next_row_id)?;
+            rows_affected =
+                insert_rows(&mut btree, rows, &schema, &column_types, &self.next_row_id)?;
         } else {
             let mut btree = BTree::new(storage, root_page)?;
-            rows_affected = insert_rows(&mut btree, rows, &schema, &self.next_row_id)?;
+            rows_affected =
+                insert_rows(&mut btree, rows, &schema, &column_types, &self.next_row_id)?;
         }
 
         Ok(ExecuteResult::Insert { rows_affected })
@@ -908,6 +919,14 @@ impl Database {
     }
 
     fn eval_literal(expr: &crate::sql::ast::Expr<'_>) -> Result<OwnedValue> {
+        Self::eval_literal_with_type(expr, None)
+    }
+
+    fn eval_literal_with_type(
+        expr: &crate::sql::ast::Expr<'_>,
+        target_type: Option<&crate::records::types::DataType>,
+    ) -> Result<OwnedValue> {
+        use crate::records::types::DataType;
         use crate::sql::ast::{Expr, Literal};
 
         match expr {
@@ -925,12 +944,323 @@ impl Database {
                         .wrap_err_with(|| format!("failed to parse float: {}", s))?;
                     Ok(OwnedValue::Float(f))
                 }
-                Literal::String(s) => Ok(OwnedValue::Text(s.to_string())),
+                Literal::String(s) => {
+                    match target_type {
+                        Some(DataType::Uuid) => Self::parse_uuid_string(s),
+                        Some(DataType::Jsonb) => Self::parse_json_string(s),
+                        Some(DataType::Vector) => Self::parse_vector_string(s),
+                        _ => Ok(OwnedValue::Text(s.to_string())),
+                    }
+                }
                 Literal::Boolean(b) => Ok(OwnedValue::Bool(*b)),
-                _ => bail!("unsupported literal type: {:?}", lit),
+                Literal::HexNumber(s) => Self::parse_hex_to_blob(s),
+                Literal::BinaryNumber(s) => Self::parse_binary_to_blob(s),
             },
             _ => bail!("expected literal expression, got {:?}", expr),
         }
+    }
+
+    fn parse_uuid_string(s: &str) -> Result<OwnedValue> {
+        let s = s.trim();
+        let hex_only: String = s.chars().filter(|c| *c != '-').collect();
+
+        if hex_only.len() != 32 {
+            bail!(
+                "invalid UUID format '{}': expected 32 hex chars, got {}",
+                s,
+                hex_only.len()
+            );
+        }
+
+        let mut bytes = [0u8; 16];
+        for (i, chunk) in hex_only.as_bytes().chunks(2).enumerate() {
+            let hex_pair = std::str::from_utf8(chunk)
+                .wrap_err_with(|| format!("invalid UTF-8 in UUID hex: {:?}", chunk))?;
+            bytes[i] = u8::from_str_radix(hex_pair, 16)
+                .wrap_err_with(|| format!("invalid hex in UUID: '{}'", hex_pair))?;
+        }
+
+        Ok(OwnedValue::Uuid(bytes))
+    }
+
+    fn parse_json_string(s: &str) -> Result<OwnedValue> {
+        let value = Self::parse_json_to_value(s.trim())?;
+        let bytes = Self::jsonb_value_to_bytes(&value);
+        Ok(OwnedValue::Jsonb(bytes))
+    }
+
+    fn parse_json_to_value(s: &str) -> Result<crate::records::jsonb::JsonbBuilderValue> {
+        use crate::records::jsonb::JsonbBuilderValue;
+        let s = s.trim();
+
+        if s == "null" {
+            Ok(JsonbBuilderValue::Null)
+        } else if s == "true" {
+            Ok(JsonbBuilderValue::Bool(true))
+        } else if s == "false" {
+            Ok(JsonbBuilderValue::Bool(false))
+        } else if s.starts_with('"') && s.ends_with('"') {
+            let inner = &s[1..s.len() - 1];
+            let unescaped = Self::unescape_json_string(inner)?;
+            Ok(JsonbBuilderValue::String(unescaped))
+        } else if s.starts_with('{') && s.ends_with('}') {
+            Self::parse_json_object_to_value(&s[1..s.len() - 1])
+        } else if s.starts_with('[') && s.ends_with(']') {
+            Self::parse_json_array_to_value(&s[1..s.len() - 1])
+        } else if let Ok(n) = s.parse::<f64>() {
+            Ok(JsonbBuilderValue::Number(n))
+        } else {
+            bail!("invalid JSON value: '{}'", s)
+        }
+    }
+
+    fn jsonb_value_to_bytes(value: &crate::records::jsonb::JsonbBuilderValue) -> Vec<u8> {
+        use crate::records::jsonb::{JsonbBuilder, JsonbBuilderValue};
+
+        fn build_from_value(value: &JsonbBuilderValue) -> JsonbBuilder {
+            match value {
+                JsonbBuilderValue::Null => JsonbBuilder::new_null(),
+                JsonbBuilderValue::Bool(b) => JsonbBuilder::new_bool(*b),
+                JsonbBuilderValue::Number(n) => JsonbBuilder::new_number(*n),
+                JsonbBuilderValue::String(s) => JsonbBuilder::new_string(s.clone()),
+                JsonbBuilderValue::Array(elements) => {
+                    let mut builder = JsonbBuilder::new_array();
+                    for elem in elements {
+                        builder.push(elem.clone());
+                    }
+                    builder
+                }
+                JsonbBuilderValue::Object(entries) => {
+                    let mut builder = JsonbBuilder::new_object();
+                    for (key, val) in entries {
+                        builder.set(key.clone(), val.clone());
+                    }
+                    builder
+                }
+            }
+        }
+
+        build_from_value(value).build()
+    }
+
+    fn unescape_json_string(s: &str) -> Result<String> {
+        let mut result = String::with_capacity(s.len());
+        let mut chars = s.chars().peekable();
+
+        while let Some(c) = chars.next() {
+            if c == '\\' {
+                match chars.next() {
+                    Some('n') => result.push('\n'),
+                    Some('r') => result.push('\r'),
+                    Some('t') => result.push('\t'),
+                    Some('\\') => result.push('\\'),
+                    Some('"') => result.push('"'),
+                    Some('/') => result.push('/'),
+                    Some('u') => {
+                        let hex: String = chars.by_ref().take(4).collect();
+                        if hex.len() != 4 {
+                            bail!("invalid unicode escape in JSON string");
+                        }
+                        let cp = u32::from_str_radix(&hex, 16)
+                            .wrap_err("invalid unicode escape")?;
+                        if let Some(ch) = char::from_u32(cp) {
+                            result.push(ch);
+                        } else {
+                            bail!("invalid unicode codepoint: {}", cp);
+                        }
+                    }
+                    Some(other) => bail!("invalid escape sequence: \\{}", other),
+                    None => bail!("unexpected end of string after escape"),
+                }
+            } else {
+                result.push(c);
+            }
+        }
+
+        Ok(result)
+    }
+
+    fn parse_json_object_to_value(s: &str) -> Result<crate::records::jsonb::JsonbBuilderValue> {
+        use crate::records::jsonb::JsonbBuilderValue;
+        let s = s.trim();
+
+        if s.is_empty() {
+            return Ok(JsonbBuilderValue::Object(Vec::new()));
+        }
+
+        let mut entries = Vec::new();
+        let mut depth = 0;
+        let mut in_string = false;
+        let mut escape_next = false;
+        let mut current_start = 0;
+
+        for (i, c) in s.char_indices() {
+            if escape_next {
+                escape_next = false;
+                continue;
+            }
+
+            match c {
+                '\\' if in_string => escape_next = true,
+                '"' => in_string = !in_string,
+                '{' | '[' if !in_string => depth += 1,
+                '}' | ']' if !in_string => depth -= 1,
+                ',' if !in_string && depth == 0 => {
+                    let (key, value) = Self::parse_json_kv_pair_to_value(&s[current_start..i])?;
+                    entries.push((key, value));
+                    current_start = i + 1;
+                }
+                _ => {}
+            }
+        }
+
+        if current_start < s.len() {
+            let (key, value) = Self::parse_json_kv_pair_to_value(&s[current_start..])?;
+            entries.push((key, value));
+        }
+
+        Ok(JsonbBuilderValue::Object(entries))
+    }
+
+    fn parse_json_kv_pair_to_value(
+        s: &str,
+    ) -> Result<(String, crate::records::jsonb::JsonbBuilderValue)> {
+        let s = s.trim();
+        let colon_pos = Self::find_json_colon(s)?;
+
+        let key_part = s[..colon_pos].trim();
+        let value_part = s[colon_pos + 1..].trim();
+
+        if !key_part.starts_with('"') || !key_part.ends_with('"') {
+            bail!("JSON object key must be a string: '{}'", key_part);
+        }
+
+        let key = Self::unescape_json_string(&key_part[1..key_part.len() - 1])?;
+        let value = Self::parse_json_to_value(value_part)?;
+
+        Ok((key, value))
+    }
+
+    fn find_json_colon(s: &str) -> Result<usize> {
+        let mut in_string = false;
+        let mut escape_next = false;
+
+        for (i, c) in s.char_indices() {
+            if escape_next {
+                escape_next = false;
+                continue;
+            }
+
+            match c {
+                '\\' if in_string => escape_next = true,
+                '"' => in_string = !in_string,
+                ':' if !in_string => return Ok(i),
+                _ => {}
+            }
+        }
+
+        bail!("no colon found in JSON key-value pair: '{}'", s)
+    }
+
+    fn parse_json_array_to_value(s: &str) -> Result<crate::records::jsonb::JsonbBuilderValue> {
+        use crate::records::jsonb::JsonbBuilderValue;
+        let s = s.trim();
+
+        if s.is_empty() {
+            return Ok(JsonbBuilderValue::Array(Vec::new()));
+        }
+
+        let mut elements = Vec::new();
+        let mut depth = 0;
+        let mut in_string = false;
+        let mut escape_next = false;
+        let mut current_start = 0;
+
+        for (i, c) in s.char_indices() {
+            if escape_next {
+                escape_next = false;
+                continue;
+            }
+
+            match c {
+                '\\' if in_string => escape_next = true,
+                '"' => in_string = !in_string,
+                '{' | '[' if !in_string => depth += 1,
+                '}' | ']' if !in_string => depth -= 1,
+                ',' if !in_string && depth == 0 => {
+                    elements.push(Self::parse_json_to_value(&s[current_start..i])?);
+                    current_start = i + 1;
+                }
+                _ => {}
+            }
+        }
+
+        if current_start < s.len() {
+            elements.push(Self::parse_json_to_value(&s[current_start..])?);
+        }
+
+        Ok(JsonbBuilderValue::Array(elements))
+    }
+
+    fn parse_vector_string(s: &str) -> Result<OwnedValue> {
+        let s = s.trim();
+
+        let inner = if s.starts_with('[') && s.ends_with(']') {
+            &s[1..s.len() - 1]
+        } else {
+            s
+        };
+
+        let values: Vec<f32> = inner
+            .split(',')
+            .map(|part| {
+                part.trim()
+                    .parse::<f32>()
+                    .wrap_err_with(|| format!("failed to parse vector element: '{}'", part.trim()))
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        Ok(OwnedValue::Vector(values))
+    }
+
+    fn parse_hex_to_blob(s: &str) -> Result<OwnedValue> {
+        if s.len() % 2 != 0 {
+            bail!("hex string must have even length, got {}", s.len());
+        }
+
+        let bytes: Vec<u8> = (0..s.len())
+            .step_by(2)
+            .map(|i| {
+                u8::from_str_radix(&s[i..i + 2], 16)
+                    .wrap_err_with(|| format!("invalid hex byte: '{}'", &s[i..i + 2]))
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        Ok(OwnedValue::Blob(bytes))
+    }
+
+    fn parse_binary_to_blob(s: &str) -> Result<OwnedValue> {
+        if s.len() % 8 != 0 {
+            let bytes: Vec<u8> = (0..s.len())
+                .step_by(8)
+                .map(|i| {
+                    let end = std::cmp::min(i + 8, s.len());
+                    u8::from_str_radix(&s[i..end], 2)
+                        .wrap_err_with(|| format!("invalid binary byte: '{}'", &s[i..end]))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            return Ok(OwnedValue::Blob(bytes));
+        }
+
+        let bytes: Vec<u8> = (0..s.len())
+            .step_by(8)
+            .map(|i| {
+                u8::from_str_radix(&s[i..i + 8], 2)
+                    .wrap_err_with(|| format!("invalid binary byte: '{}'", &s[i..i + 8]))
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        Ok(OwnedValue::Blob(bytes))
     }
 
     fn generate_row_key(row_id: u64) -> Vec<u8> {
