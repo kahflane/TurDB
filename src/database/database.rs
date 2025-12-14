@@ -1,206 +1,16 @@
-//! # Database Module
-//!
-//! This module provides the high-level Database API for TurDB, combining all
-//! components (storage, catalog, SQL processing) into a unified interface.
-//!
-//! ## Architecture
-//!
-//! The Database struct serves as the main entry point, orchestrating:
-//! - FileManager: Manages table data files, index files, and metadata
-//! - Catalog: Tracks schemas, tables, columns, and indexes
-//! - SQL Engine: Parses, plans, and executes SQL statements
-//!
-//! ## Query Execution Pipeline
-//!
-//! ```text
-//! SQL String
-//!     │
-//!     ▼
-//! ┌─────────────────────────────────────────────────────┐
-//! │ 1. PARSE: SQL → AST                                 │
-//! │    Lexer → Parser → Statement                       │
-//! └─────────────────────────────────────────────────────┘
-//!     │
-//!     ▼
-//! ┌─────────────────────────────────────────────────────┐
-//! │ 2. PLAN: AST → PhysicalPlan                         │
-//! │    Planner::plan(stmt) → PhysicalPlan               │
-//! └─────────────────────────────────────────────────────┘
-//!     │
-//!     ▼
-//! ┌─────────────────────────────────────────────────────┐
-//! │ 3. BUILD: PhysicalPlan → Executor                   │
-//! │    ExecutorBuilder::build(plan) → DynamicExecutor   │
-//! └─────────────────────────────────────────────────────┘
-//!     │
-//!     ▼
-//! ┌─────────────────────────────────────────────────────┐
-//! │ 4. EXECUTE: Volcano-style pull iteration            │
-//! │    executor.open() → next() → close()               │
-//! └─────────────────────────────────────────────────────┘
-//!     │
-//!     ▼
-//! Vec<Row> returned to user
-//! ```
-//!
-//! ## Memory Management
-//!
-//! Each query uses a dedicated arena allocator (bumpalo::Bump) for:
-//! - AST nodes during parsing
-//! - Plan nodes during planning
-//! - Intermediate results during execution
-//!
-//! The arena is dropped after query completion, bulk-deallocating all
-//! query-scoped allocations in O(1).
-//!
-//! ## Thread Safety
-//!
-//! Database is Send + Sync and can be safely shared across threads.
-//! Internal locking (RwLock) protects:
-//! - Catalog reads/writes
-//! - FileManager file operations
-//!
-//! ## Usage Example
-//!
-//! ```ignore
-//! use turdb::Database;
-//!
-//! // Create or open database
-//! let db = Database::open("./mydb")?;
-//!
-//! // Execute DDL
-//! db.execute("CREATE TABLE users (id INT PRIMARY KEY, name TEXT)")?;
-//!
-//! // Insert data
-//! db.execute("INSERT INTO users VALUES (1, 'Alice')")?;
-//!
-//! // Query data
-//! let rows = db.query("SELECT * FROM users WHERE id = 1")?;
-//! for row in rows {
-//!     println!("{:?}", row);
-//! }
-//! ```
-//!
-//! ## Performance Targets
-//!
-//! - Point read: < 1µs (cached)
-//! - Sequential scan: > 1M rows/sec
-//! - Insert: > 100K rows/sec
-//! - Query planning: < 100µs for simple queries
-
 use crate::schema::{Catalog, ColumnDef as SchemaColumnDef};
 use crate::sql::executor::{ExecutionContext, Executor, ExecutorBuilder, StreamingBTreeSource};
 use crate::sql::planner::Planner;
 use crate::sql::Parser;
 use crate::storage::{FileManager, Wal, WalStorage};
-use crate::types::Value;
 use bumpalo::Bump;
 use eyre::{bail, ensure, Result, WrapErr};
 use hashbrown::HashSet;
 use parking_lot::{Mutex, RwLock};
 use std::path::{Path, PathBuf};
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct Row {
-    pub values: Vec<OwnedValue>,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub enum OwnedValue {
-    Null,
-    Int(i64),
-    Float(f64),
-    Text(String),
-    Blob(Vec<u8>),
-    Vector(Vec<f32>),
-}
-
-impl<'a> From<&Value<'a>> for OwnedValue {
-    fn from(v: &Value<'a>) -> Self {
-        match v {
-            Value::Null => OwnedValue::Null,
-            Value::Int(i) => OwnedValue::Int(*i),
-            Value::Float(f) => OwnedValue::Float(*f),
-            Value::Text(s) => OwnedValue::Text(s.to_string()),
-            Value::Blob(b) => OwnedValue::Blob(b.to_vec()),
-            Value::Vector(v) => OwnedValue::Vector(v.to_vec()),
-        }
-    }
-}
-
-impl Row {
-    pub fn new(values: Vec<OwnedValue>) -> Self {
-        Self { values }
-    }
-
-    pub fn get(&self, index: usize) -> Option<&OwnedValue> {
-        self.values.get(index)
-    }
-
-    pub fn get_int(&self, index: usize) -> Result<i64> {
-        match self.get(index) {
-            Some(OwnedValue::Int(i)) => Ok(*i),
-            Some(other) => bail!("expected INT, got {:?}", other),
-            None => bail!("column {} out of bounds", index),
-        }
-    }
-
-    pub fn get_float(&self, index: usize) -> Result<f64> {
-        match self.get(index) {
-            Some(OwnedValue::Float(f)) => Ok(*f),
-            Some(other) => bail!("expected FLOAT, got {:?}", other),
-            None => bail!("column {} out of bounds", index),
-        }
-    }
-
-    pub fn get_text(&self, index: usize) -> Result<&str> {
-        match self.get(index) {
-            Some(OwnedValue::Text(s)) => Ok(s),
-            Some(other) => bail!("expected TEXT, got {:?}", other),
-            None => bail!("column {} out of bounds", index),
-        }
-    }
-
-    pub fn get_blob(&self, index: usize) -> Result<&[u8]> {
-        match self.get(index) {
-            Some(OwnedValue::Blob(b)) => Ok(b),
-            Some(other) => bail!("expected BLOB, got {:?}", other),
-            None => bail!("column {} out of bounds", index),
-        }
-    }
-
-    pub fn is_null(&self, index: usize) -> bool {
-        matches!(self.get(index), Some(OwnedValue::Null))
-    }
-
-    pub fn column_count(&self) -> usize {
-        self.values.len()
-    }
-}
-
-pub enum ExecuteResult {
-    CreateTable { created: bool },
-    CreateSchema { created: bool },
-    CreateIndex { created: bool },
-    DropTable { dropped: bool },
-    Insert { rows_affected: usize },
-    Update { rows_affected: usize },
-    Delete { rows_affected: usize },
-    Select { rows: Vec<Row> },
-    Pragma { name: String, value: Option<String> },
-}
-
-#[derive(Debug, Clone)]
-pub struct RecoveryInfo {
-    pub frames_recovered: u32,
-    pub wal_size_bytes: u64,
-}
-
-#[derive(Debug, Clone)]
-pub struct CheckpointInfo {
-    pub frames_checkpointed: u32,
-    pub wal_truncated: bool,
-}
+use crate::database::owned_value::OwnedValue;
+use crate::database::{CheckpointInfo, ExecuteResult, RecoveryInfo};
+use crate::database::row::Row;
 
 pub struct Database {
     path: PathBuf,
@@ -537,7 +347,7 @@ impl Database {
                 column_types,
                 projections,
             )
-            .wrap_err("failed to create table scan")?;
+                .wrap_err("failed to create table scan")?;
 
             let ctx = ExecutionContext::new(&arena);
             let builder = ExecutorBuilder::new(&ctx);
@@ -753,8 +563,7 @@ impl Database {
         _arena: &Bump,
     ) -> Result<ExecuteResult> {
         use crate::btree::BTree;
-        use crate::records::types::ColumnDef as RecordColumnDef;
-        use crate::records::{RecordBuilder, Schema};
+        use crate::database::owned_value::create_record_schema;
         use std::sync::atomic::Ordering;
 
         self.ensure_catalog()?;
@@ -780,11 +589,7 @@ impl Database {
         let file_manager = file_manager_guard.as_mut().unwrap();
         let storage = file_manager.table_data_mut(schema_name, table_name)?;
 
-        let record_columns: Vec<RecordColumnDef> = columns
-            .iter()
-            .map(|c| RecordColumnDef::new(c.name().to_string(), c.data_type()))
-            .collect();
-        let schema = Schema::new(record_columns);
+        let schema = create_record_schema(&columns);
 
         let rows = match &insert.source {
             crate::sql::ast::InsertSource::Values(values) => values,
@@ -792,59 +597,36 @@ impl Database {
         };
 
         let root_page = 1u32;
-        let mut rows_affected = 0;
+        let rows_affected;
+
+        fn insert_rows<'a, S: crate::storage::Storage>(
+            btree: &mut BTree<'_, S>,
+            rows: &[&[&crate::sql::ast::Expr<'a>]],
+            schema: &crate::records::Schema,
+            next_row_id: &std::sync::atomic::AtomicU64,
+        ) -> Result<usize> {
+            let mut count = 0;
+            for row_exprs in rows.iter() {
+                let values: Vec<OwnedValue> = row_exprs
+                    .iter()
+                    .map(|expr| Database::eval_literal(expr))
+                    .collect::<Result<Vec<_>>>()?;
+                let record_data = OwnedValue::build_record_from_values(&values, schema)?;
+                let row_id = next_row_id.fetch_add(1, Ordering::Relaxed);
+                let key = Database::generate_row_key(row_id);
+                btree.insert(&key, &record_data)?;
+                count += 1;
+            }
+            Ok(count)
+        }
 
         if wal_enabled {
             let mut wal_storage = WalStorage::new(storage, &self.dirty_pages);
             let mut btree = BTree::new(&mut wal_storage, root_page)?;
-
-            for row_values in rows.iter() {
-                let mut builder = RecordBuilder::new(&schema);
-
-                for (idx, expr) in row_values.iter().enumerate() {
-                    let value = Self::eval_literal(expr)?;
-                    match value {
-                        OwnedValue::Null => builder.set_null(idx),
-                        OwnedValue::Int(i) => builder.set_int8(idx, i)?,
-                        OwnedValue::Float(f) => builder.set_float8(idx, f)?,
-                        OwnedValue::Text(s) => builder.set_text(idx, &s)?,
-                        OwnedValue::Blob(b) => builder.set_blob(idx, &b)?,
-                        OwnedValue::Vector(_) => bail!("vector insert not yet supported"),
-                    }
-                }
-
-                let record_data = builder.build()?;
-
-                let row_id = self.next_row_id.fetch_add(1, Ordering::Relaxed);
-                let key = Self::generate_row_key(row_id);
-                btree.insert(&key, &record_data)?;
-                rows_affected += 1;
-            }
+            rows_affected = insert_rows(&mut btree, rows, &schema, &self.next_row_id)?;
         } else {
             let mut btree = BTree::new(storage, root_page)?;
-
-            for row_values in rows.iter() {
-                let mut builder = RecordBuilder::new(&schema);
-
-                for (idx, expr) in row_values.iter().enumerate() {
-                    let value = Self::eval_literal(expr)?;
-                    match value {
-                        OwnedValue::Null => builder.set_null(idx),
-                        OwnedValue::Int(i) => builder.set_int8(idx, i)?,
-                        OwnedValue::Float(f) => builder.set_float8(idx, f)?,
-                        OwnedValue::Text(s) => builder.set_text(idx, &s)?,
-                        OwnedValue::Blob(b) => builder.set_blob(idx, &b)?,
-                        OwnedValue::Vector(_) => bail!("vector insert not yet supported"),
-                    }
-                }
-
-                let record_data = builder.build()?;
-
-                let row_id = self.next_row_id.fetch_add(1, Ordering::Relaxed);
-                let key = Self::generate_row_key(row_id);
-                btree.insert(&key, &record_data)?;
-                rows_affected += 1;
-            }
+            rows_affected = insert_rows(&mut btree, rows, &schema, &self.next_row_id)?;
         }
 
         Ok(ExecuteResult::Insert { rows_affected })
@@ -856,8 +638,10 @@ impl Database {
         arena: &Bump,
     ) -> Result<ExecuteResult> {
         use crate::btree::BTree;
-        use crate::records::types::ColumnDef as RecordColumnDef;
-        use crate::records::{RecordBuilder, RecordView, Schema};
+        use crate::database::owned_value::{
+            create_column_map, create_record_schema, owned_values_to_values,
+        };
+        use crate::records::RecordView;
         use crate::sql::executor::CompiledPredicate;
 
         self.ensure_catalog()?;
@@ -874,17 +658,8 @@ impl Database {
 
         drop(catalog_guard);
 
-        let record_columns: Vec<RecordColumnDef> = columns
-            .iter()
-            .map(|c| RecordColumnDef::new(c.name().to_string(), c.data_type()))
-            .collect();
-        let schema = Schema::new(record_columns);
-
-        let column_map: Vec<(String, usize)> = columns
-            .iter()
-            .enumerate()
-            .map(|(idx, col)| (col.name().to_lowercase(), idx))
-            .collect();
+        let schema = create_record_schema(&columns);
+        let column_map = create_column_map(&columns);
 
         let predicate = update
             .where_clause
@@ -916,75 +691,12 @@ impl Database {
             let value = cursor.value()?;
 
             let record = RecordView::new(value, &schema)?;
-            let mut row_values: Vec<OwnedValue> = Vec::with_capacity(columns.len());
-
-            for (col_idx, col_def) in columns.iter().enumerate() {
-                use crate::records::types::DataType;
-
-                let owned_val = match col_def.data_type() {
-                    DataType::Int8 => {
-                        let v = record.get_int8_opt(col_idx)?;
-                        v.map(OwnedValue::Int).unwrap_or(OwnedValue::Null)
-                    }
-                    DataType::Int4 => {
-                        let v = record.get_int4_opt(col_idx)?;
-                        v.map(|i| OwnedValue::Int(i as i64))
-                            .unwrap_or(OwnedValue::Null)
-                    }
-                    DataType::Int2 => {
-                        let v = record.get_int2_opt(col_idx)?;
-                        v.map(|i| OwnedValue::Int(i as i64))
-                            .unwrap_or(OwnedValue::Null)
-                    }
-                    DataType::Float8 => {
-                        let v = record.get_float8_opt(col_idx)?;
-                        v.map(OwnedValue::Float).unwrap_or(OwnedValue::Null)
-                    }
-                    DataType::Float4 => {
-                        let v = record.get_float4_opt(col_idx)?;
-                        v.map(|f| OwnedValue::Float(f as f64))
-                            .unwrap_or(OwnedValue::Null)
-                    }
-                    DataType::Text => {
-                        let v = record.get_text_opt(col_idx)?;
-                        v.map(|s| OwnedValue::Text(s.to_string()))
-                            .unwrap_or(OwnedValue::Null)
-                    }
-                    DataType::Blob => {
-                        let v = record.get_blob_opt(col_idx)?;
-                        v.map(|b| OwnedValue::Blob(b.to_vec()))
-                            .unwrap_or(OwnedValue::Null)
-                    }
-                    DataType::Bool => {
-                        let v = record.get_bool_opt(col_idx)?;
-                        v.map(|b| OwnedValue::Int(if b { 1 } else { 0 }))
-                            .unwrap_or(OwnedValue::Null)
-                    }
-                    _ => OwnedValue::Null,
-                };
-                row_values.push(owned_val);
-            }
+            let mut row_values = OwnedValue::extract_row_from_record(&record, &columns)?;
 
             let should_update = if let Some(ref pred) = predicate {
                 use crate::sql::executor::ExecutorRow;
 
-                use std::borrow::Cow;
-
-                let values: Vec<crate::types::Value<'_>> = row_values
-                    .iter()
-                    .map(|ov| match ov {
-                        OwnedValue::Null => crate::types::Value::Null,
-                        OwnedValue::Int(i) => crate::types::Value::Int(*i),
-                        OwnedValue::Float(f) => crate::types::Value::Float(*f),
-                        OwnedValue::Text(s) => crate::types::Value::Text(Cow::Borrowed(s.as_str())),
-                        OwnedValue::Blob(b) => {
-                            crate::types::Value::Blob(Cow::Borrowed(b.as_slice()))
-                        }
-                        OwnedValue::Vector(v) => {
-                            crate::types::Value::Vector(Cow::Borrowed(v.as_slice()))
-                        }
-                    })
-                    .collect();
+                let values = owned_values_to_values(&row_values);
                 let values_slice = arena.alloc_slice_fill_iter(values.into_iter());
                 let exec_row = ExecutorRow::new(values_slice);
                 pred.evaluate(&exec_row)
@@ -1009,19 +721,7 @@ impl Database {
 
         for (key, updated_values) in rows_to_update {
             btree_mut.delete(&key)?;
-
-            let mut builder = RecordBuilder::new(&schema);
-            for (idx, val) in updated_values.iter().enumerate() {
-                match val {
-                    OwnedValue::Null => builder.set_null(idx),
-                    OwnedValue::Int(i) => builder.set_int8(idx, *i)?,
-                    OwnedValue::Float(f) => builder.set_float8(idx, *f)?,
-                    OwnedValue::Text(s) => builder.set_text(idx, s)?,
-                    OwnedValue::Blob(b) => builder.set_blob(idx, b)?,
-                    OwnedValue::Vector(_) => bail!("vector update not yet supported"),
-                }
-            }
-            let record_data = builder.build()?;
+            let record_data = OwnedValue::build_record_from_values(&updated_values, &schema)?;
             btree_mut.insert(&key, &record_data)?;
         }
 
@@ -1034,8 +734,10 @@ impl Database {
         arena: &Bump,
     ) -> Result<ExecuteResult> {
         use crate::btree::BTree;
-        use crate::records::types::ColumnDef as RecordColumnDef;
-        use crate::records::{RecordView, Schema};
+        use crate::database::owned_value::{
+            create_column_map, create_record_schema, owned_values_to_values,
+        };
+        use crate::records::RecordView;
         use crate::sql::executor::CompiledPredicate;
 
         self.ensure_catalog()?;
@@ -1052,17 +754,8 @@ impl Database {
 
         drop(catalog_guard);
 
-        let record_columns: Vec<RecordColumnDef> = columns
-            .iter()
-            .map(|c| RecordColumnDef::new(c.name().to_string(), c.data_type()))
-            .collect();
-        let schema = Schema::new(record_columns);
-
-        let column_map: Vec<(String, usize)> = columns
-            .iter()
-            .enumerate()
-            .map(|(idx, col)| (col.name().to_lowercase(), idx))
-            .collect();
+        let schema = create_record_schema(&columns);
+        let column_map = create_column_map(&columns);
 
         let predicate = delete
             .where_clause
@@ -1084,73 +777,11 @@ impl Database {
 
             let should_delete = if let Some(ref pred) = predicate {
                 let record = RecordView::new(value, &schema)?;
-                let mut row_values: Vec<OwnedValue> = Vec::with_capacity(columns.len());
-
-                for (col_idx, col_def) in columns.iter().enumerate() {
-                    use crate::records::types::DataType;
-
-                    let owned_val = match col_def.data_type() {
-                        DataType::Int8 => {
-                            let v = record.get_int8_opt(col_idx)?;
-                            v.map(OwnedValue::Int).unwrap_or(OwnedValue::Null)
-                        }
-                        DataType::Int4 => {
-                            let v = record.get_int4_opt(col_idx)?;
-                            v.map(|i| OwnedValue::Int(i as i64))
-                                .unwrap_or(OwnedValue::Null)
-                        }
-                        DataType::Int2 => {
-                            let v = record.get_int2_opt(col_idx)?;
-                            v.map(|i| OwnedValue::Int(i as i64))
-                                .unwrap_or(OwnedValue::Null)
-                        }
-                        DataType::Float8 => {
-                            let v = record.get_float8_opt(col_idx)?;
-                            v.map(OwnedValue::Float).unwrap_or(OwnedValue::Null)
-                        }
-                        DataType::Float4 => {
-                            let v = record.get_float4_opt(col_idx)?;
-                            v.map(|f| OwnedValue::Float(f as f64))
-                                .unwrap_or(OwnedValue::Null)
-                        }
-                        DataType::Text => {
-                            let v = record.get_text_opt(col_idx)?;
-                            v.map(|s| OwnedValue::Text(s.to_string()))
-                                .unwrap_or(OwnedValue::Null)
-                        }
-                        DataType::Blob => {
-                            let v = record.get_blob_opt(col_idx)?;
-                            v.map(|b| OwnedValue::Blob(b.to_vec()))
-                                .unwrap_or(OwnedValue::Null)
-                        }
-                        DataType::Bool => {
-                            let v = record.get_bool_opt(col_idx)?;
-                            v.map(|b| OwnedValue::Int(if b { 1 } else { 0 }))
-                                .unwrap_or(OwnedValue::Null)
-                        }
-                        _ => OwnedValue::Null,
-                    };
-                    row_values.push(owned_val);
-                }
+                let row_values = OwnedValue::extract_row_from_record(&record, &columns)?;
 
                 use crate::sql::executor::ExecutorRow;
-                use std::borrow::Cow;
 
-                let values: Vec<crate::types::Value<'_>> = row_values
-                    .iter()
-                    .map(|ov| match ov {
-                        OwnedValue::Null => crate::types::Value::Null,
-                        OwnedValue::Int(i) => crate::types::Value::Int(*i),
-                        OwnedValue::Float(f) => crate::types::Value::Float(*f),
-                        OwnedValue::Text(s) => crate::types::Value::Text(Cow::Borrowed(s.as_str())),
-                        OwnedValue::Blob(b) => {
-                            crate::types::Value::Blob(Cow::Borrowed(b.as_slice()))
-                        }
-                        OwnedValue::Vector(v) => {
-                            crate::types::Value::Vector(Cow::Borrowed(v.as_slice()))
-                        }
-                    })
-                    .collect();
+                let values = owned_values_to_values(&row_values);
                 let values_slice = arena.alloc_slice_fill_iter(values.into_iter());
                 let exec_row = ExecutorRow::new(values_slice);
                 pred.evaluate(&exec_row)
@@ -1295,7 +926,7 @@ impl Database {
                     Ok(OwnedValue::Float(f))
                 }
                 Literal::String(s) => Ok(OwnedValue::Text(s.to_string())),
-                Literal::Boolean(b) => Ok(OwnedValue::Int(if *b { 1 } else { 0 })),
+                Literal::Boolean(b) => Ok(OwnedValue::Bool(*b)),
                 _ => bail!("unsupported literal type: {:?}", lit),
             },
             _ => bail!("expected literal expression, got {:?}", expr),
@@ -1426,454 +1057,5 @@ impl Drop for Database {
                 let _ = file_manager.sync_all();
             }
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use tempfile::tempdir;
-
-    #[test]
-    fn test_create_and_open_database() {
-        let dir = tempdir().unwrap();
-        let db_path = dir.path().join("test_db");
-
-        let db = Database::create(&db_path).unwrap();
-        drop(db);
-
-        let db = Database::open(&db_path).unwrap();
-        assert!(db.path().exists());
-    }
-
-    #[test]
-    fn test_create_table() {
-        let dir = tempdir().unwrap();
-        let db_path = dir.path().join("test_db");
-
-        let db = Database::create(&db_path).unwrap();
-
-        let result = db
-            .execute("CREATE TABLE users (id INT, name TEXT)")
-            .unwrap();
-        assert!(matches!(
-            result,
-            ExecuteResult::CreateTable { created: true }
-        ));
-
-        let result = db
-            .execute("CREATE TABLE IF NOT EXISTS users (id INT, name TEXT)")
-            .unwrap();
-        assert!(matches!(
-            result,
-            ExecuteResult::CreateTable { created: false }
-        ));
-    }
-
-    #[test]
-    fn test_insert_and_query() {
-        let dir = tempdir().unwrap();
-        let db_path = dir.path().join("test_db");
-
-        let db = Database::create(&db_path).unwrap();
-
-        db.execute("CREATE TABLE users (id INT, name TEXT)")
-            .unwrap();
-
-        db.execute("INSERT INTO users VALUES (1, 'Alice')").unwrap();
-        db.execute("INSERT INTO users VALUES (2, 'Bob')").unwrap();
-
-        let rows = db.query("SELECT * FROM users").unwrap();
-        assert_eq!(rows.len(), 2);
-    }
-
-    #[test]
-    fn test_four_column_insert() {
-        let dir = tempdir().unwrap();
-        let db_path = dir.path().join("test_db");
-
-        let db = Database::create(&db_path).unwrap();
-
-        db.execute("CREATE TABLE users (id INT, name TEXT, age INT, score FLOAT)")
-            .unwrap();
-
-        db.execute("INSERT INTO users VALUES (1, 'Alice', 25, 95.5)")
-            .unwrap();
-        db.execute("INSERT INTO users VALUES (2, 'Bob', 30, 88.0)")
-            .unwrap();
-
-        let rows = db.query("SELECT * FROM users").unwrap();
-        assert_eq!(rows.len(), 2);
-    }
-
-    #[test]
-    fn test_many_inserts() {
-        let dir = tempdir().unwrap();
-        let db_path = dir.path().join("test_db");
-
-        let db = Database::create(&db_path).unwrap();
-
-        db.execute("CREATE TABLE users (id INT, name TEXT, age INT, score FLOAT)")
-            .unwrap();
-
-        for i in 0..100 {
-            let sql = format!(
-                "INSERT INTO users VALUES ({}, 'user{}', {}, {})",
-                i,
-                i,
-                20 + (i % 60),
-                (i as f64) * 0.1
-            );
-            db.execute(&sql).unwrap();
-        }
-
-        let rows = db.query("SELECT * FROM users").unwrap();
-        assert_eq!(rows.len(), 100);
-    }
-
-    #[test]
-    fn test_wal_directory_created_lazily() {
-        let dir = tempdir().unwrap();
-        let db_path = dir.path().join("test_db");
-
-        let db = Database::create(&db_path).unwrap();
-
-        let wal_dir = db_path.join("wal");
-        assert!(
-            !wal_dir.exists(),
-            "WAL directory should NOT exist before first write"
-        );
-
-        db.execute("CREATE TABLE test (id INT)").unwrap();
-        db.execute("INSERT INTO test VALUES (1)").unwrap();
-
-        db.ensure_wal().unwrap();
-
-        assert!(
-            wal_dir.exists(),
-            "WAL directory should exist after ensure_wal"
-        );
-        assert!(wal_dir.is_dir(), "WAL should be a directory");
-    }
-
-    #[test]
-    fn test_wal_directory_created_on_checkpoint() {
-        let dir = tempdir().unwrap();
-        let db_path = dir.path().join("test_db");
-
-        {
-            let db = Database::create(&db_path).unwrap();
-            drop(db);
-        }
-
-        let db = Database::open(&db_path).unwrap();
-
-        let wal_dir = db_path.join("wal");
-        assert!(
-            !wal_dir.exists(),
-            "WAL directory should NOT exist immediately after open"
-        );
-
-        db.checkpoint().unwrap();
-    }
-
-    #[test]
-    fn test_checkpoint_returns_info() {
-        let dir = tempdir().unwrap();
-        let db_path = dir.path().join("test_db");
-
-        let db = Database::create(&db_path).unwrap();
-
-        let checkpoint_info = db.checkpoint().unwrap();
-        assert_eq!(checkpoint_info.frames_checkpointed, 0);
-        assert!(!checkpoint_info.wal_truncated);
-    }
-
-    #[test]
-    fn test_close_returns_checkpoint_info() {
-        let dir = tempdir().unwrap();
-        let db_path = dir.path().join("test_db");
-
-        let db = Database::create(&db_path).unwrap();
-
-        let checkpoint_info = db.close().unwrap();
-        assert_eq!(checkpoint_info.frames_checkpointed, 0);
-
-        assert!(db.is_closed());
-    }
-
-    #[test]
-    fn test_close_prevents_further_operations() {
-        let dir = tempdir().unwrap();
-        let db_path = dir.path().join("test_db");
-
-        let db = Database::create(&db_path).unwrap();
-        db.close().unwrap();
-
-        let result = db.checkpoint();
-        assert!(result.is_err(), "checkpoint should fail after close");
-    }
-
-    #[test]
-    fn test_double_close_fails() {
-        let dir = tempdir().unwrap();
-        let db_path = dir.path().join("test_db");
-
-        let db = Database::create(&db_path).unwrap();
-        db.close().unwrap();
-
-        let result = db.close();
-        assert!(result.is_err(), "second close should fail");
-    }
-
-    #[test]
-    fn test_open_with_recovery_returns_info() {
-        let dir = tempdir().unwrap();
-        let db_path = dir.path().join("test_db");
-
-        {
-            let db = Database::create(&db_path).unwrap();
-            drop(db);
-        }
-
-        let (db, recovery_info) = Database::open_with_recovery(&db_path).unwrap();
-        assert_eq!(recovery_info.frames_recovered, 0);
-        assert_eq!(recovery_info.wal_size_bytes, 0);
-        drop(db);
-    }
-
-    #[test]
-    fn test_database_survives_reopen() {
-        let dir = tempdir().unwrap();
-        let db_path = dir.path().join("test_db");
-
-        {
-            let db = Database::create(&db_path).unwrap();
-            db.execute("CREATE TABLE users (id INT, name TEXT)")
-                .unwrap();
-            db.execute("INSERT INTO users VALUES (1, 'Alice')").unwrap();
-            db.close().unwrap();
-        }
-
-        let db = Database::open(&db_path).unwrap();
-        let rows = db.query("SELECT * FROM users").unwrap();
-        assert_eq!(rows.len(), 1);
-    }
-
-    #[test]
-    fn test_update_basic() {
-        let dir = tempdir().unwrap();
-        let db_path = dir.path().join("test_db");
-
-        let db = Database::create(&db_path).unwrap();
-
-        db.execute("CREATE TABLE users (id INT, name TEXT)")
-            .unwrap();
-        db.execute("INSERT INTO users VALUES (1, 'Alice')").unwrap();
-        db.execute("INSERT INTO users VALUES (2, 'Bob')").unwrap();
-
-        let result = db
-            .execute("UPDATE users SET name = 'Charlie' WHERE id = 1")
-            .unwrap();
-
-        assert!(
-            matches!(result, ExecuteResult::Update { rows_affected: 1 }),
-            "expected Update with 1 row affected"
-        );
-
-        let rows = db.query("SELECT * FROM users").unwrap();
-        assert_eq!(
-            rows.len(),
-            2,
-            "row count should remain unchanged after UPDATE"
-        );
-    }
-
-    #[test]
-    fn test_update_all_rows() {
-        let dir = tempdir().unwrap();
-        let db_path = dir.path().join("test_db");
-
-        let db = Database::create(&db_path).unwrap();
-
-        db.execute("CREATE TABLE users (id INT, name TEXT)")
-            .unwrap();
-        db.execute("INSERT INTO users VALUES (1, 'Alice')").unwrap();
-        db.execute("INSERT INTO users VALUES (2, 'Bob')").unwrap();
-        db.execute("INSERT INTO users VALUES (3, 'Carol')").unwrap();
-
-        let result = db.execute("UPDATE users SET name = 'Updated'").unwrap();
-
-        assert!(
-            matches!(result, ExecuteResult::Update { rows_affected: 3 }),
-            "expected Update with 3 rows affected"
-        );
-
-        let rows = db.query("SELECT * FROM users").unwrap();
-        assert_eq!(
-            rows.len(),
-            3,
-            "row count should remain unchanged after UPDATE"
-        );
-    }
-
-    #[test]
-    fn test_update_no_match() {
-        let dir = tempdir().unwrap();
-        let db_path = dir.path().join("test_db");
-
-        let db = Database::create(&db_path).unwrap();
-
-        db.execute("CREATE TABLE users (id INT, name TEXT)")
-            .unwrap();
-        db.execute("INSERT INTO users VALUES (1, 'Alice')").unwrap();
-        db.execute("INSERT INTO users VALUES (2, 'Bob')").unwrap();
-
-        let result = db
-            .execute("UPDATE users SET name = 'X' WHERE id = 999")
-            .unwrap();
-
-        assert!(
-            matches!(result, ExecuteResult::Update { rows_affected: 0 }),
-            "expected Update with 0 rows affected"
-        );
-
-        let rows = db.query("SELECT * FROM users").unwrap();
-        assert_eq!(
-            rows.len(),
-            2,
-            "row count should remain unchanged after UPDATE"
-        );
-    }
-
-    #[test]
-    fn test_update_multiple_columns() {
-        let dir = tempdir().unwrap();
-        let db_path = dir.path().join("test_db");
-
-        let db = Database::create(&db_path).unwrap();
-
-        db.execute("CREATE TABLE users (id INT, name TEXT, age INT)")
-            .unwrap();
-        db.execute("INSERT INTO users VALUES (1, 'Alice', 25)")
-            .unwrap();
-        db.execute("INSERT INTO users VALUES (2, 'Bob', 30)")
-            .unwrap();
-
-        let result = db
-            .execute("UPDATE users SET name = 'Updated', age = 99 WHERE id = 1")
-            .unwrap();
-
-        assert!(
-            matches!(result, ExecuteResult::Update { rows_affected: 1 }),
-            "expected Update with 1 row affected"
-        );
-
-        let rows = db.query("SELECT * FROM users").unwrap();
-        assert_eq!(
-            rows.len(),
-            2,
-            "row count should remain unchanged after UPDATE"
-        );
-    }
-
-    #[test]
-    fn test_delete_basic() {
-        let dir = tempdir().unwrap();
-        let db_path = dir.path().join("test_db");
-
-        let db = Database::create(&db_path).unwrap();
-
-        db.execute("CREATE TABLE users (id INT, name TEXT)")
-            .unwrap();
-        db.execute("INSERT INTO users VALUES (1, 'Alice')").unwrap();
-        db.execute("INSERT INTO users VALUES (2, 'Bob')").unwrap();
-        db.execute("INSERT INTO users VALUES (3, 'Carol')").unwrap();
-
-        let result = db.execute("DELETE FROM users WHERE id = 2").unwrap();
-
-        assert!(
-            matches!(result, ExecuteResult::Delete { rows_affected: 1 }),
-            "expected Delete with 1 row affected"
-        );
-
-        let rows = db.query("SELECT * FROM users").unwrap();
-        assert_eq!(rows.len(), 2, "one row should be deleted");
-    }
-
-    #[test]
-    fn test_delete_all_rows() {
-        let dir = tempdir().unwrap();
-        let db_path = dir.path().join("test_db");
-
-        let db = Database::create(&db_path).unwrap();
-
-        db.execute("CREATE TABLE users (id INT, name TEXT)")
-            .unwrap();
-        db.execute("INSERT INTO users VALUES (1, 'Alice')").unwrap();
-        db.execute("INSERT INTO users VALUES (2, 'Bob')").unwrap();
-        db.execute("INSERT INTO users VALUES (3, 'Carol')").unwrap();
-
-        let result = db.execute("DELETE FROM users").unwrap();
-
-        assert!(
-            matches!(result, ExecuteResult::Delete { rows_affected: 3 }),
-            "expected Delete with 3 rows affected"
-        );
-
-        let rows = db.query("SELECT * FROM users").unwrap();
-        assert_eq!(rows.len(), 0, "all rows should be deleted");
-    }
-
-    #[test]
-    fn test_delete_no_match() {
-        let dir = tempdir().unwrap();
-        let db_path = dir.path().join("test_db");
-
-        let db = Database::create(&db_path).unwrap();
-
-        db.execute("CREATE TABLE users (id INT, name TEXT)")
-            .unwrap();
-        db.execute("INSERT INTO users VALUES (1, 'Alice')").unwrap();
-        db.execute("INSERT INTO users VALUES (2, 'Bob')").unwrap();
-
-        let result = db.execute("DELETE FROM users WHERE id = 999").unwrap();
-
-        assert!(
-            matches!(result, ExecuteResult::Delete { rows_affected: 0 }),
-            "expected Delete with 0 rows affected"
-        );
-
-        let rows = db.query("SELECT * FROM users").unwrap();
-        assert_eq!(rows.len(), 2, "no rows should be deleted");
-    }
-
-    #[test]
-    fn test_delete_multiple_matches() {
-        let dir = tempdir().unwrap();
-        let db_path = dir.path().join("test_db");
-
-        let db = Database::create(&db_path).unwrap();
-
-        db.execute("CREATE TABLE users (id INT, name TEXT, active INT)")
-            .unwrap();
-        db.execute("INSERT INTO users VALUES (1, 'Alice', 1)")
-            .unwrap();
-        db.execute("INSERT INTO users VALUES (2, 'Bob', 0)")
-            .unwrap();
-        db.execute("INSERT INTO users VALUES (3, 'Carol', 0)")
-            .unwrap();
-        db.execute("INSERT INTO users VALUES (4, 'Dave', 1)")
-            .unwrap();
-
-        let result = db.execute("DELETE FROM users WHERE active = 0").unwrap();
-
-        assert!(
-            matches!(result, ExecuteResult::Delete { rows_affected: 2 }),
-            "expected Delete with 2 rows affected"
-        );
-
-        let rows = db.query("SELECT * FROM users").unwrap();
-        assert_eq!(rows.len(), 2, "two rows should remain");
     }
 }
