@@ -467,7 +467,11 @@ impl<'a> Planner<'a> {
 
         let (exprs, aliases) = self.extract_select_expressions(select.columns);
         #[cfg(test)]
-        eprintln!("DEBUG plan_select: columns.len()={}, exprs.len()={}", select.columns.len(), exprs.len());
+        eprintln!(
+            "DEBUG plan_select: columns.len()={}, exprs.len()={}",
+            select.columns.len(),
+            exprs.len()
+        );
         let project = self.arena.alloc(LogicalOperator::Project(LogicalProject {
             input: current,
             expressions: exprs,

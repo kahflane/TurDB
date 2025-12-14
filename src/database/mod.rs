@@ -88,9 +88,10 @@
 //! - Insert: > 100K rows/sec
 //! - Query planning: < 100µs for simple queries
 
+#[allow(clippy::module_inception)]
 mod database;
-pub mod row;
 pub mod owned_value;
+pub mod row;
 
 pub use database::Database;
 pub use owned_value::{
@@ -125,8 +126,8 @@ pub struct CheckpointInfo {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::tempdir;
     use crate::database::database::Database;
+    use tempfile::tempdir;
 
     #[test]
     fn test_create_and_open_database() {
@@ -671,7 +672,7 @@ mod tests {
                 tinyint = (i % 127) as i8,
                 real = (i as f32) * 1.5,
                 float = (i as f64) * 2.5,
-                double = (i as f64) * 3.14159,
+                double = (i as f64) * std::f64::consts::PI,
                 decimal = (i as f64) * 100.0,
                 numeric = (i as f64) / 10.0,
                 bool_val = if i % 2 == 0 { "TRUE" } else { "FALSE" },
@@ -686,10 +687,7 @@ mod tests {
         }
 
         for i in 0..20 {
-            let sql = format!(
-                "INSERT INTO json_table VALUES ({}, 'item_{}', NULL)",
-                i, i
-            );
+            let sql = format!("INSERT INTO json_table VALUES ({}, 'item_{}', NULL)", i, i);
             if let Err(e) = db.execute(&sql) {
                 eprintln!("Warning: Failed to insert json_table row {}: {:?}", i, e);
             }
@@ -740,7 +738,7 @@ mod tests {
 
         let rows = db.query("SELECT * FROM all_types").unwrap();
         println!("all_types row count: {}", rows.len());
-        assert!(rows.len() > 0, "should have inserted rows into all_types");
+        assert!(!rows.is_empty(), "should have inserted rows into all_types");
 
         let rows = db.query("SELECT * FROM related_data").unwrap();
         assert_eq!(rows.len(), 100, "should have 100 related_data rows");
@@ -753,7 +751,7 @@ mod tests {
             )
             .unwrap();
         println!("JOIN query returned {} rows", rows.len());
-        assert!(rows.len() > 0, "JOIN should return results");
+        assert!(!rows.is_empty(), "JOIN should return results");
 
         let rows = db
             .query(
@@ -784,9 +782,7 @@ mod tests {
             .unwrap();
         println!("LIKE query: {} rows", rows.len());
 
-        let rows = db
-            .query("SELECT * FROM all_types LIMIT 10")
-            .unwrap();
+        let rows = db.query("SELECT * FROM all_types LIMIT 10").unwrap();
         assert!(rows.len() <= 10, "LIMIT 10 should return at most 10 rows");
 
         let rows = db
@@ -840,7 +836,11 @@ mod tests {
         }
 
         let rows = db.query("SELECT * FROM related_data").unwrap();
-        assert_eq!(rows.len(), 95, "should have 95 related_data rows after delete");
+        assert_eq!(
+            rows.len(),
+            95,
+            "should have 95 related_data rows after delete"
+        );
 
         let rows = db
             .query(
@@ -857,7 +857,7 @@ mod tests {
         let db = Database::open(&db_path).unwrap();
         let rows = db.query("SELECT * FROM all_types").unwrap();
         println!("After reopen, all_types has {} rows", rows.len());
-        assert!(rows.len() > 0, "data should persist after reopen");
+        assert!(!rows.is_empty(), "data should persist after reopen");
 
         let rows = db.query("SELECT * FROM related_data").unwrap();
         assert_eq!(rows.len(), 95, "related_data should persist with 95 rows");
@@ -888,8 +888,10 @@ mod tests {
         db.execute("CREATE TABLE items (id UUID, name TEXT)")
             .unwrap();
 
-        db.execute("INSERT INTO items VALUES ('550e8400-e29b-41d4-a716-446655440000', 'Test Item')")
-            .unwrap();
+        db.execute(
+            "INSERT INTO items VALUES ('550e8400-e29b-41d4-a716-446655440000', 'Test Item')",
+        )
+        .unwrap();
 
         let rows = db.query("SELECT id, name FROM items").unwrap();
         println!("rows.len() = {}", rows.len());
@@ -898,13 +900,18 @@ mod tests {
         let row = &rows[0];
         println!("row.values.len() = {}", row.values.len());
         println!("row.values = {:?}", row.values);
-        assert_eq!(row.values.len(), 2, "Expected 2 values, got {:?}", row.values);
+        assert_eq!(
+            row.values.len(),
+            2,
+            "Expected 2 values, got {:?}",
+            row.values
+        );
 
         match &row.values[0] {
             OwnedValue::Uuid(u) => {
                 let expected: [u8; 16] = [
-                    0x55, 0x0e, 0x84, 0x00, 0xe2, 0x9b, 0x41, 0xd4,
-                    0xa7, 0x16, 0x44, 0x66, 0x55, 0x44, 0x00, 0x00
+                    0x55, 0x0e, 0x84, 0x00, 0xe2, 0x9b, 0x41, 0xd4, 0xa7, 0x16, 0x44, 0x66, 0x55,
+                    0x44, 0x00, 0x00,
                 ];
                 assert_eq!(u, &expected, "UUID bytes should match");
             }

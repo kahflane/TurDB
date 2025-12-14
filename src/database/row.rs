@@ -1,5 +1,5 @@
-use eyre::{bail, Result};
 use crate::database::owned_value::OwnedValue;
+use eyre::{bail, Result};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Row {

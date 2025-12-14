@@ -132,7 +132,17 @@ pub enum Value<'a> {
     Blob(Cow<'a, [u8]>),
     Vector(Cow<'a, [f32]>),
     Uuid([u8; 16]),
+    MacAddr([u8; 6]),
+    Inet4([u8; 4]),
+    Inet6([u8; 16]),
     Jsonb(Cow<'a, [u8]>),
+    TimestampTz { micros: i64, offset_secs: i32 },
+    Interval { micros: i64, days: i32, months: i32 },
+    Point { x: f64, y: f64 },
+    GeoBox { low: (f64, f64), high: (f64, f64) },
+    Circle { center: (f64, f64), radius: f64 },
+    Enum { type_id: u16, ordinal: u16 },
+    Decimal { digits: i128, scale: i16 },
 }
 
 /// Schema-level column data types.
@@ -268,10 +278,124 @@ impl<'a> Value<'a> {
                 }
                 _ => bail!("cannot coerce uuid to affinity {:?}", target),
             },
+            Value::MacAddr(m) => match target {
+                TypeAffinity::Blob => Ok(Value::MacAddr(*m)),
+                TypeAffinity::Text => {
+                    let formatted = m
+                        .iter()
+                        .map(|b| format!("{:02x}", b))
+                        .collect::<Vec<_>>()
+                        .join(":");
+                    Ok(Value::Text(Cow::Owned(formatted)))
+                }
+                _ => bail!("cannot coerce macaddr to affinity {:?}", target),
+            },
+            Value::Inet4(ip) => match target {
+                TypeAffinity::Blob => Ok(Value::Inet4(*ip)),
+                TypeAffinity::Text => Ok(Value::Text(Cow::Owned(format!(
+                    "{}.{}.{}.{}",
+                    ip[0], ip[1], ip[2], ip[3]
+                )))),
+                _ => bail!("cannot coerce inet4 to affinity {:?}", target),
+            },
+            Value::Inet6(ip) => match target {
+                TypeAffinity::Blob => Ok(Value::Inet6(*ip)),
+                TypeAffinity::Text => {
+                    let parts: Vec<String> = (0..8)
+                        .map(|i| format!("{:04x}", u16::from_be_bytes([ip[i * 2], ip[i * 2 + 1]])))
+                        .collect();
+                    Ok(Value::Text(Cow::Owned(parts.join(":"))))
+                }
+                _ => bail!("cannot coerce inet6 to affinity {:?}", target),
+            },
             Value::Jsonb(b) => match target {
                 TypeAffinity::Blob => Ok(Value::Jsonb(b.clone())),
-                TypeAffinity::Text => Ok(Value::Text(Cow::Owned(format!("<jsonb:{} bytes>", b.len())))),
+                TypeAffinity::Text => Ok(Value::Text(Cow::Owned(format!(
+                    "<jsonb:{} bytes>",
+                    b.len()
+                )))),
                 _ => bail!("cannot coerce jsonb to affinity {:?}", target),
+            },
+            Value::TimestampTz {
+                micros,
+                offset_secs,
+            } => match target {
+                TypeAffinity::Integer | TypeAffinity::Numeric => Ok(Value::Int(*micros)),
+                TypeAffinity::Text => Ok(Value::Text(Cow::Owned(format!(
+                    "{}+{}",
+                    micros, offset_secs
+                )))),
+                _ => bail!("cannot coerce timestamptz to affinity {:?}", target),
+            },
+            Value::Interval {
+                micros,
+                days,
+                months,
+            } => match target {
+                TypeAffinity::Integer | TypeAffinity::Numeric => Ok(Value::Int(*micros)),
+                TypeAffinity::Text => Ok(Value::Text(Cow::Owned(format!(
+                    "{} months {} days {} us",
+                    months, days, micros
+                )))),
+                _ => bail!("cannot coerce interval to affinity {:?}", target),
+            },
+            Value::Point { x, y } => match target {
+                TypeAffinity::Text => Ok(Value::Text(Cow::Owned(format!("({},{})", x, y)))),
+                _ => bail!("cannot coerce point to affinity {:?}", target),
+            },
+            Value::GeoBox { low, high } => match target {
+                TypeAffinity::Text => Ok(Value::Text(Cow::Owned(format!(
+                    "(({},{}),({},{}))",
+                    low.0, low.1, high.0, high.1
+                )))),
+                _ => bail!("cannot coerce box to affinity {:?}", target),
+            },
+            Value::Circle { center, radius } => match target {
+                TypeAffinity::Text => Ok(Value::Text(Cow::Owned(format!(
+                    "<({},{}),{}>",
+                    center.0, center.1, radius
+                )))),
+                _ => bail!("cannot coerce circle to affinity {:?}", target),
+            },
+            Value::Enum { type_id, ordinal } => match target {
+                TypeAffinity::Integer | TypeAffinity::Numeric => {
+                    Ok(Value::Int(((*type_id as i64) << 16) | (*ordinal as i64)))
+                }
+                TypeAffinity::Text => Ok(Value::Text(Cow::Owned(format!(
+                    "enum({}:{})",
+                    type_id, ordinal
+                )))),
+                _ => bail!("cannot coerce enum to affinity {:?}", target),
+            },
+            Value::Decimal { digits, scale } => match target {
+                TypeAffinity::Integer | TypeAffinity::Numeric => {
+                    if *scale <= 0 {
+                        Ok(Value::Int(*digits as i64))
+                    } else {
+                        let divisor = 10i128.pow(*scale as u32);
+                        Ok(Value::Int((*digits / divisor) as i64))
+                    }
+                }
+                TypeAffinity::Real => {
+                    let divisor = 10f64.powi(*scale as i32);
+                    Ok(Value::Float(*digits as f64 / divisor))
+                }
+                TypeAffinity::Text => {
+                    if *scale <= 0 {
+                        Ok(Value::Text(Cow::Owned(format!("{}", digits))))
+                    } else {
+                        let divisor = 10i128.pow(*scale as u32);
+                        let int_part = *digits / divisor;
+                        let frac_part = (*digits % divisor).abs();
+                        Ok(Value::Text(Cow::Owned(format!(
+                            "{}.{:0>width$}",
+                            int_part,
+                            frac_part,
+                            width = *scale as usize
+                        ))))
+                    }
+                }
+                _ => bail!("cannot coerce decimal to affinity {:?}", target),
             },
         }
     }
@@ -341,13 +465,151 @@ impl<'a> Value<'a> {
             (Value::Vector(_), Value::Blob(_)) => Some(Ordering::Greater),
 
             (Value::Uuid(a), Value::Uuid(b)) => Some(a.cmp(b)),
+            (Value::MacAddr(a), Value::MacAddr(b)) => Some(a.cmp(b)),
+            (Value::Inet4(a), Value::Inet4(b)) => Some(a.cmp(b)),
+            (Value::Inet6(a), Value::Inet6(b)) => Some(a.cmp(b)),
             (Value::Jsonb(a), Value::Jsonb(b)) => Some(a.cmp(b)),
+
+            (Value::TimestampTz { micros: a, .. }, Value::TimestampTz { micros: b, .. }) => {
+                Some(a.cmp(b))
+            }
+            (
+                Value::Interval {
+                    micros: a,
+                    days: ad,
+                    months: am,
+                },
+                Value::Interval {
+                    micros: b,
+                    days: bd,
+                    months: bm,
+                },
+            ) => Some((am, ad, a).cmp(&(bm, bd, b))),
+            (Value::Point { x: ax, y: ay }, Value::Point { x: bx, y: by }) => {
+                ax.partial_cmp(bx).and_then(|o| {
+                    if o == Ordering::Equal {
+                        ay.partial_cmp(by)
+                    } else {
+                        Some(o)
+                    }
+                })
+            }
+            (Value::GeoBox { low: al, high: ah }, Value::GeoBox { low: bl, high: bh }) => {
+                al.0.partial_cmp(&bl.0).and_then(|o| {
+                    if o == Ordering::Equal {
+                        al.1.partial_cmp(&bl.1).and_then(|o| {
+                            if o == Ordering::Equal {
+                                ah.0.partial_cmp(&bh.0).and_then(|o| {
+                                    if o == Ordering::Equal {
+                                        ah.1.partial_cmp(&bh.1)
+                                    } else {
+                                        Some(o)
+                                    }
+                                })
+                            } else {
+                                Some(o)
+                            }
+                        })
+                    } else {
+                        Some(o)
+                    }
+                })
+            }
+            (
+                Value::Circle {
+                    center: ac,
+                    radius: ar,
+                },
+                Value::Circle {
+                    center: bc,
+                    radius: br,
+                },
+            ) => ac.0.partial_cmp(&bc.0).and_then(|o| {
+                if o == Ordering::Equal {
+                    ac.1.partial_cmp(&bc.1).and_then(|o| {
+                        if o == Ordering::Equal {
+                            ar.partial_cmp(br)
+                        } else {
+                            Some(o)
+                        }
+                    })
+                } else {
+                    Some(o)
+                }
+            }),
+            (
+                Value::Enum {
+                    type_id: at,
+                    ordinal: ao,
+                },
+                Value::Enum {
+                    type_id: bt,
+                    ordinal: bo,
+                },
+            ) => Some((at, ao).cmp(&(bt, bo))),
+            (
+                Value::Decimal {
+                    digits: a,
+                    scale: as_,
+                },
+                Value::Decimal {
+                    digits: b,
+                    scale: bs_,
+                },
+            ) => {
+                if as_ == bs_ {
+                    Some(a.cmp(b))
+                } else {
+                    let max_scale = (*as_).max(*bs_);
+                    let a_scaled = if *as_ < max_scale {
+                        *a * 10i128.pow((max_scale - *as_) as u32)
+                    } else {
+                        *a
+                    };
+                    let b_scaled = if *bs_ < max_scale {
+                        *b * 10i128.pow((max_scale - *bs_) as u32)
+                    } else {
+                        *b
+                    };
+                    Some(a_scaled.cmp(&b_scaled))
+                }
+            }
 
             (Value::Uuid(_), _) => Some(Ordering::Greater),
             (_, Value::Uuid(_)) => Some(Ordering::Less),
 
+            (Value::MacAddr(_), _) => Some(Ordering::Greater),
+            (_, Value::MacAddr(_)) => Some(Ordering::Less),
+
+            (Value::Inet4(_), _) => Some(Ordering::Greater),
+            (_, Value::Inet4(_)) => Some(Ordering::Less),
+
+            (Value::Inet6(_), _) => Some(Ordering::Greater),
+            (_, Value::Inet6(_)) => Some(Ordering::Less),
+
             (Value::Jsonb(_), _) => Some(Ordering::Greater),
             (_, Value::Jsonb(_)) => Some(Ordering::Less),
+
+            (Value::TimestampTz { .. }, _) => Some(Ordering::Greater),
+            (_, Value::TimestampTz { .. }) => Some(Ordering::Less),
+
+            (Value::Interval { .. }, _) => Some(Ordering::Greater),
+            (_, Value::Interval { .. }) => Some(Ordering::Less),
+
+            (Value::Point { .. }, _) => Some(Ordering::Greater),
+            (_, Value::Point { .. }) => Some(Ordering::Less),
+
+            (Value::GeoBox { .. }, _) => Some(Ordering::Greater),
+            (_, Value::GeoBox { .. }) => Some(Ordering::Less),
+
+            (Value::Circle { .. }, _) => Some(Ordering::Greater),
+            (_, Value::Circle { .. }) => Some(Ordering::Less),
+
+            (Value::Enum { .. }, _) => Some(Ordering::Greater),
+            (_, Value::Enum { .. }) => Some(Ordering::Less),
+
+            (Value::Decimal { .. }, _) => Some(Ordering::Greater),
+            (_, Value::Decimal { .. }) => Some(Ordering::Less),
         }
     }
 }
@@ -369,7 +631,7 @@ mod tests {
     #[test]
     fn test_value_sizes() {
         use std::mem::size_of;
-        assert!(size_of::<Value>() <= 32, "Value should be compact");
+        assert!(size_of::<Value>() <= 48, "Value should be compact");
     }
 
     #[test]
