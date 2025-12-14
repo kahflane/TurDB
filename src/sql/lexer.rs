@@ -693,6 +693,13 @@ impl<'a> Lexer<'a> {
 
     fn scan_identifier_or_keyword(&mut self) -> Token<'a> {
         let start = self.pos;
+
+        if (self.current() == b'x' || self.current() == b'X')
+            && self.peek_char() == Some(b'\'')
+        {
+            return self.scan_hex_string_literal();
+        }
+
         while !self.is_eof() && (self.current().is_ascii_alphanumeric() || self.current() == b'_') {
             self.advance();
         }
@@ -705,6 +712,29 @@ impl<'a> Lexer<'a> {
         } else {
             Token::Ident(ident)
         }
+    }
+
+    fn scan_hex_string_literal(&mut self) -> Token<'a> {
+        self.advance();
+        self.advance();
+
+        let start = self.pos;
+
+        while !self.is_eof() && self.current() != b'\'' {
+            if !self.current().is_ascii_hexdigit() {
+                return Token::Error("invalid hex character in hex string literal");
+            }
+            self.advance();
+        }
+
+        if self.is_eof() {
+            return Token::Error("unterminated hex string literal");
+        }
+
+        let hex_str = &self.input[start..self.pos];
+        self.advance();
+
+        Token::HexNumber(hex_str)
     }
 
     fn scan_number(&mut self) -> Token<'a> {

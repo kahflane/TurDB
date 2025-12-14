@@ -109,6 +109,11 @@ impl<'a> ExecutorRow<'a> {
                 let floats = arena.alloc_slice_copy(v);
                 Value::Vector(Cow::Borrowed(floats))
             }
+            Value::Uuid(u) => Value::Uuid(*u),
+            Value::Jsonb(b) => {
+                let bytes = arena.alloc_slice_copy(b);
+                Value::Jsonb(Cow::Borrowed(bytes))
+            }
         }
     }
 }
@@ -271,6 +276,12 @@ impl SimpleDecoder {
                 DataType::Bool => Value::Int(if view.get_bool(idx)? { 1 } else { 0 }),
                 DataType::Text => Value::Text(Cow::Owned(view.get_text(idx)?.to_string())),
                 DataType::Blob => Value::Blob(Cow::Owned(view.get_blob(idx)?.to_vec())),
+                DataType::Uuid => Value::Uuid(*view.get_uuid(idx)?),
+                DataType::Vector => Value::Vector(Cow::Owned(view.get_vector(idx)?.to_vec())),
+                DataType::Jsonb => {
+                    let jsonb_view = view.get_jsonb(idx)?;
+                    Value::Jsonb(Cow::Owned(jsonb_view.data().to_vec()))
+                }
                 _ => Value::Null,
             };
             output.push(val);
@@ -563,6 +574,13 @@ impl<'a, S: RowSource> Executor<'a> for TableScanExecutor<'a, S> {
                             }
                             Value::Vector(Cow::Borrowed(v)) => {
                                 Value::Vector(Cow::Borrowed(self.arena.alloc_slice_copy(v)))
+                            }
+                            Value::Uuid(u) => Value::Uuid(u),
+                            Value::Jsonb(Cow::Owned(b)) => {
+                                Value::Jsonb(Cow::Borrowed(self.arena.alloc_slice_copy(&b)))
+                            }
+                            Value::Jsonb(Cow::Borrowed(b)) => {
+                                Value::Jsonb(Cow::Borrowed(self.arena.alloc_slice_copy(b)))
                             }
                         }));
                 Ok(Some(ExecutorRow::new(allocated)))
@@ -929,6 +947,8 @@ where
                             f.to_bits().hash(&mut hasher);
                         }
                     }
+                    Value::Uuid(u) => u.hash(&mut hasher),
+                    Value::Jsonb(b) => b.hash(&mut hasher),
                 }
             }
         }
@@ -986,6 +1006,8 @@ where
                 Value::Text(s) => Value::Text(Cow::Owned(s.to_string())),
                 Value::Blob(b) => Value::Blob(Cow::Owned(b.to_vec())),
                 Value::Vector(v) => Value::Vector(Cow::Owned(v.to_vec())),
+                Value::Uuid(u) => Value::Uuid(*u),
+                Value::Jsonb(b) => Value::Jsonb(Cow::Owned(b.to_vec())),
             })
             .collect();
         let slice = self.arena.alloc_slice_fill_iter(combined);
@@ -1030,6 +1052,8 @@ where
                         Value::Text(s) => Value::Text(Cow::Owned(s.to_string())),
                         Value::Blob(b) => Value::Blob(Cow::Owned(b.to_vec())),
                         Value::Vector(v) => Value::Vector(Cow::Owned(v.to_vec())),
+                        Value::Uuid(u) => Value::Uuid(*u),
+                        Value::Jsonb(b) => Value::Jsonb(Cow::Owned(b.to_vec())),
                     })
                     .collect();
                 let hash = Self::hash_keys(&owned, &self.left_key_indices);
@@ -1048,6 +1072,8 @@ where
                         Value::Text(s) => Value::Text(Cow::Owned(s.to_string())),
                         Value::Blob(b) => Value::Blob(Cow::Owned(b.to_vec())),
                         Value::Vector(v) => Value::Vector(Cow::Owned(v.to_vec())),
+                        Value::Uuid(u) => Value::Uuid(*u),
+                        Value::Jsonb(b) => Value::Jsonb(Cow::Owned(b.to_vec())),
                     })
                     .collect();
                 let hash = Self::hash_keys(&owned, &self.right_key_indices);
@@ -1325,6 +1351,15 @@ where
                             key.extend(f.to_bits().to_be_bytes());
                         }
                     }
+                    Value::Uuid(u) => {
+                        key.push(6);
+                        key.extend(u.iter());
+                    }
+                    Value::Jsonb(b) => {
+                        key.push(7);
+                        key.extend(b.iter());
+                        key.push(0);
+                    }
                 }
             }
         }
@@ -1343,6 +1378,8 @@ where
                         Value::Text(s) => Value::Text(Cow::Owned(s.to_string())),
                         Value::Blob(b) => Value::Blob(Cow::Owned(b.to_vec())),
                         Value::Vector(v) => Value::Vector(Cow::Owned(v.to_vec())),
+                        Value::Uuid(u) => Value::Uuid(*u),
+                        Value::Jsonb(b) => Value::Jsonb(Cow::Owned(b.to_vec())),
                     })
                     .unwrap_or(Value::Null)
             })
@@ -1423,6 +1460,13 @@ where
                         Value::Vector(Cow::Borrowed(v)) => {
                             Value::Vector(Cow::Borrowed(self.arena.alloc_slice_copy(v)))
                         }
+                        Value::Uuid(u) => Value::Uuid(u),
+                        Value::Jsonb(Cow::Owned(b)) => {
+                            Value::Jsonb(Cow::Borrowed(self.arena.alloc_slice_copy(&b)))
+                        }
+                        Value::Jsonb(Cow::Borrowed(b)) => {
+                            Value::Jsonb(Cow::Borrowed(self.arena.alloc_slice_copy(b)))
+                        }
                     };
                     values.push(arena_val);
                 }
@@ -1450,6 +1494,13 @@ where
                         }
                         Value::Vector(Cow::Borrowed(v)) => {
                             Value::Vector(Cow::Borrowed(self.arena.alloc_slice_copy(v)))
+                        }
+                        Value::Uuid(u) => Value::Uuid(u),
+                        Value::Jsonb(Cow::Owned(b)) => {
+                            Value::Jsonb(Cow::Borrowed(self.arena.alloc_slice_copy(&b)))
+                        }
+                        Value::Jsonb(Cow::Borrowed(b)) => {
+                            Value::Jsonb(Cow::Borrowed(self.arena.alloc_slice_copy(b)))
                         }
                     };
                     values.push(arena_val);
@@ -1540,6 +1591,8 @@ where
                         Value::Text(s) => Value::Text(Cow::Owned(s.to_string())),
                         Value::Blob(b) => Value::Blob(Cow::Owned(b.to_vec())),
                         Value::Vector(v) => Value::Vector(Cow::Owned(v.to_vec())),
+                        Value::Uuid(u) => Value::Uuid(*u),
+                        Value::Jsonb(b) => Value::Jsonb(Cow::Owned(b.to_vec())),
                     })
                     .collect();
                 self.rows.push(owned_values);
@@ -1588,6 +1641,13 @@ where
                         }
                         Value::Vector(Cow::Borrowed(v)) => {
                             Value::Vector(Cow::Borrowed(self.arena.alloc_slice_copy(v)))
+                        }
+                        Value::Uuid(u) => Value::Uuid(u),
+                        Value::Jsonb(Cow::Owned(b)) => {
+                            Value::Jsonb(Cow::Borrowed(self.arena.alloc_slice_copy(&b)))
+                        }
+                        Value::Jsonb(Cow::Borrowed(b)) => {
+                            Value::Jsonb(Cow::Borrowed(self.arena.alloc_slice_copy(b)))
                         }
                     })
                     .collect();
@@ -1848,6 +1908,8 @@ impl<'a, S: RowSource> Executor<'a> for DynamicExecutor<'a, S> {
                                 Value::Text(s) => Value::Text(Cow::Owned(s.to_string())),
                                 Value::Blob(b) => Value::Blob(Cow::Owned(b.to_vec())),
                                 Value::Vector(v) => Value::Vector(Cow::Owned(v.to_vec())),
+                                Value::Uuid(u) => Value::Uuid(*u),
+                                Value::Jsonb(b) => Value::Jsonb(Cow::Owned(b.to_vec())),
                             })
                             .collect();
                         state.right_rows.push(owned);
@@ -1875,6 +1937,8 @@ impl<'a, S: RowSource> Executor<'a> for DynamicExecutor<'a, S> {
                                 Value::Text(s) => Value::Text(Cow::Owned(s.to_string())),
                                 Value::Blob(b) => Value::Blob(Cow::Owned(b.to_vec())),
                                 Value::Vector(v) => Value::Vector(Cow::Owned(v.to_vec())),
+                                Value::Uuid(u) => Value::Uuid(*u),
+                                Value::Jsonb(b) => Value::Jsonb(Cow::Owned(b.to_vec())),
                             })
                             .collect();
                         state.left_partitions[partition].push(owned);
@@ -1895,6 +1959,8 @@ impl<'a, S: RowSource> Executor<'a> for DynamicExecutor<'a, S> {
                                 Value::Text(s) => Value::Text(Cow::Owned(s.to_string())),
                                 Value::Blob(b) => Value::Blob(Cow::Owned(b.to_vec())),
                                 Value::Vector(v) => Value::Vector(Cow::Owned(v.to_vec())),
+                                Value::Uuid(u) => Value::Uuid(*u),
+                                Value::Jsonb(b) => Value::Jsonb(Cow::Owned(b.to_vec())),
                             })
                             .collect();
                         state.right_partitions[partition].push(owned);
@@ -1933,6 +1999,8 @@ impl<'a, S: RowSource> Executor<'a> for DynamicExecutor<'a, S> {
                                 Value::Text(s) => Value::Text(Cow::Owned(s.into_owned())),
                                 Value::Blob(b) => Value::Blob(Cow::Owned(b.into_owned())),
                                 Value::Vector(v) => Value::Vector(Cow::Owned(v.into_owned())),
+                                Value::Uuid(u) => Value::Uuid(u),
+                                Value::Jsonb(b) => Value::Jsonb(Cow::Owned(b.into_owned())),
                             }),
                         );
                         let row = ExecutorRow::new(values);
@@ -2004,6 +2072,8 @@ impl<'a, S: RowSource> Executor<'a> for DynamicExecutor<'a, S> {
                                 Value::Text(s) => Value::Text(Cow::Owned(s.to_string())),
                                 Value::Blob(b) => Value::Blob(Cow::Owned(b.to_vec())),
                                 Value::Vector(v) => Value::Vector(Cow::Owned(v.to_vec())),
+                                Value::Uuid(u) => Value::Uuid(*u),
+                                Value::Jsonb(b) => Value::Jsonb(Cow::Owned(b.to_vec())),
                             })
                             .collect();
                         state.rows.push(owned);
@@ -2041,6 +2111,10 @@ impl<'a, S: RowSource> Executor<'a> for DynamicExecutor<'a, S> {
                             Value::Vector(v) => {
                                 Value::Vector(Cow::Borrowed(state.arena.alloc_slice_copy(v)))
                             }
+                            Value::Uuid(u) => Value::Uuid(*u),
+                            Value::Jsonb(b) => {
+                                Value::Jsonb(Cow::Borrowed(state.arena.alloc_slice_copy(b)))
+                            }
                         })
                         .collect();
                     let allocated = state.arena.alloc_slice_fill_iter(arena_values);
@@ -2062,6 +2136,8 @@ impl<'a, S: RowSource> Executor<'a> for DynamicExecutor<'a, S> {
                                     Value::Text(s) => Value::Text(Cow::Owned(s.to_string())),
                                     Value::Blob(b) => Value::Blob(Cow::Owned(b.to_vec())),
                                     Value::Vector(v) => Value::Vector(Cow::Owned(v.to_vec())),
+                                    Value::Uuid(u) => Value::Uuid(*u),
+                                    Value::Jsonb(b) => Value::Jsonb(Cow::Owned(b.to_vec())),
                                 })
                                 .collect();
                             state.current_left_row = Some(owned);
@@ -2096,6 +2172,10 @@ impl<'a, S: RowSource> Executor<'a> for DynamicExecutor<'a, S> {
                                         Value::Vector(v) => Value::Vector(Cow::Borrowed(
                                             state.arena.alloc_slice_copy(v),
                                         )),
+                                        Value::Uuid(u) => Value::Uuid(*u),
+                                        Value::Jsonb(b) => Value::Jsonb(Cow::Borrowed(
+                                            state.arena.alloc_slice_copy(b),
+                                        )),
                                     }
                                 } else {
                                     let r = &right_row[i - left_row.len()];
@@ -2111,6 +2191,10 @@ impl<'a, S: RowSource> Executor<'a> for DynamicExecutor<'a, S> {
                                         )),
                                         Value::Vector(v) => Value::Vector(Cow::Borrowed(
                                             state.arena.alloc_slice_copy(v),
+                                        )),
+                                        Value::Uuid(u) => Value::Uuid(*u),
+                                        Value::Jsonb(b) => Value::Jsonb(Cow::Borrowed(
+                                            state.arena.alloc_slice_copy(b),
                                         )),
                                     }
                                 }
@@ -2141,6 +2225,10 @@ impl<'a, S: RowSource> Executor<'a> for DynamicExecutor<'a, S> {
                                         Value::Vector(v) => Value::Vector(Cow::Borrowed(
                                             state.arena.alloc_slice_copy(v),
                                         )),
+                                        Value::Uuid(u) => Value::Uuid(*u),
+                                        Value::Jsonb(b) => Value::Jsonb(Cow::Borrowed(
+                                            state.arena.alloc_slice_copy(b),
+                                        )),
                                     }
                                 } else {
                                     let r = &right_row[i - left_col_count];
@@ -2156,6 +2244,10 @@ impl<'a, S: RowSource> Executor<'a> for DynamicExecutor<'a, S> {
                                         )),
                                         Value::Vector(v) => Value::Vector(Cow::Borrowed(
                                             state.arena.alloc_slice_copy(v),
+                                        )),
+                                        Value::Uuid(u) => Value::Uuid(*u),
+                                        Value::Jsonb(b) => Value::Jsonb(Cow::Borrowed(
+                                            state.arena.alloc_slice_copy(b),
                                         )),
                                     }
                                 }
@@ -2192,6 +2284,10 @@ impl<'a, S: RowSource> Executor<'a> for DynamicExecutor<'a, S> {
                                     Value::Vector(v) => Value::Vector(Cow::Borrowed(
                                         state.arena.alloc_slice_copy(v),
                                     )),
+                                    Value::Uuid(u) => Value::Uuid(*u),
+                                    Value::Jsonb(b) => {
+                                        Value::Jsonb(Cow::Borrowed(state.arena.alloc_slice_copy(b)))
+                                    }
                                 }
                             } else {
                                 let r = &probe_row[i - build_row.len()];
@@ -2208,6 +2304,10 @@ impl<'a, S: RowSource> Executor<'a> for DynamicExecutor<'a, S> {
                                     Value::Vector(v) => Value::Vector(Cow::Borrowed(
                                         state.arena.alloc_slice_copy(v),
                                     )),
+                                    Value::Uuid(u) => Value::Uuid(*u),
+                                    Value::Jsonb(b) => {
+                                        Value::Jsonb(Cow::Borrowed(state.arena.alloc_slice_copy(b)))
+                                    }
                                 }
                             }
                         })
@@ -2277,6 +2377,8 @@ impl<'a, S: RowSource> Executor<'a> for DynamicExecutor<'a, S> {
                                         Value::Text(s) => Value::Text(Cow::Owned(s.to_string())),
                                         Value::Blob(b) => Value::Blob(Cow::Owned(b.to_vec())),
                                         Value::Vector(v) => Value::Vector(Cow::Owned(v.to_vec())),
+                                        Value::Uuid(u) => Value::Uuid(*u),
+                                        Value::Jsonb(b) => Value::Jsonb(Cow::Owned(b.to_vec())),
                                     })
                                     .unwrap_or(Value::Null)
                             })
@@ -2318,6 +2420,10 @@ impl<'a, S: RowSource> Executor<'a> for DynamicExecutor<'a, S> {
                                 }
                                 Value::Vector(v) => {
                                     Value::Vector(Cow::Borrowed(state.arena.alloc_slice_copy(&v)))
+                                }
+                                Value::Uuid(u) => Value::Uuid(u),
+                                Value::Jsonb(b) => {
+                                    Value::Jsonb(Cow::Borrowed(state.arena.alloc_slice_copy(&b)))
                                 }
                             })
                             .collect();
@@ -2386,6 +2492,8 @@ fn hash_keys<'a>(row: &ExecutorRow<'a>, key_indices: &[usize]) -> u64 {
                         f.to_bits().hash(&mut hasher);
                     }
                 }
+                Value::Uuid(u) => u.hash(&mut hasher),
+                Value::Jsonb(b) => b.hash(&mut hasher),
             }
         }
     }
@@ -2410,6 +2518,8 @@ fn hash_keys_static(row: &[Value<'static>], key_indices: &[usize]) -> u64 {
                         f.to_bits().hash(&mut hasher);
                     }
                 }
+                Value::Uuid(u) => u.hash(&mut hasher),
+                Value::Jsonb(b) => b.hash(&mut hasher),
             }
         }
     }
@@ -2473,6 +2583,15 @@ fn compute_group_key_for_dynamic(row: &ExecutorRow, group_by: &[usize]) -> Vec<u
                         key.extend(f.to_bits().to_be_bytes());
                     }
                 }
+                Value::Uuid(u) => {
+                    key.push(6);
+                    key.extend(u.iter());
+                }
+                Value::Jsonb(b) => {
+                    key.push(7);
+                    key.extend(b.iter());
+                    key.push(0);
+                }
             }
         }
     }
@@ -2524,6 +2643,8 @@ impl<'a> ExecutorBuilder<'a> {
             PhysicalOperator::ProjectExec(project) => {
                 let child = self.build_operator(project.input, source, column_map)?;
                 let projections: Vec<usize> = (0..project.expressions.len()).collect();
+                #[cfg(test)]
+                eprintln!("DEBUG ProjectExec: expressions.len() = {}, projections = {:?}", project.expressions.len(), projections);
                 Ok(DynamicExecutor::Project(
                     Box::new(child),
                     projections,

@@ -37,6 +37,8 @@ impl<'a> From<&Value<'a>> for OwnedValue {
             Value::Text(s) => OwnedValue::Text(s.to_string()),
             Value::Blob(b) => OwnedValue::Blob(b.to_vec()),
             Value::Vector(v) => OwnedValue::Vector(v.to_vec()),
+            Value::Uuid(u) => OwnedValue::Uuid(*u),
+            Value::Jsonb(b) => OwnedValue::Jsonb(b.to_vec()),
         }
     }
 }
@@ -55,7 +57,7 @@ impl OwnedValue {
             OwnedValue::Time(t) => Value::Int(*t),
             OwnedValue::Timestamp(ts) => Value::Int(*ts),
             OwnedValue::TimestampTz(ts, _tz) => Value::Int(*ts),
-            OwnedValue::Uuid(u) => Value::Blob(Cow::Borrowed(u.as_slice())),
+            OwnedValue::Uuid(u) => Value::Uuid(*u),
             OwnedValue::MacAddr(m) => Value::Blob(Cow::Borrowed(m.as_slice())),
             OwnedValue::Inet4(ip) => Value::Blob(Cow::Borrowed(ip.as_slice())),
             OwnedValue::Inet6(ip) => Value::Blob(Cow::Borrowed(ip.as_slice())),
@@ -67,7 +69,7 @@ impl OwnedValue {
             OwnedValue::Circle(center, radius) => {
                 Value::Text(Cow::Owned(format!("<({},{}),{}>", center.0, center.1, radius)))
             }
-            OwnedValue::Jsonb(data) => Value::Blob(Cow::Borrowed(data.as_slice())),
+            OwnedValue::Jsonb(data) => Value::Jsonb(Cow::Borrowed(data.as_slice())),
         }
     }
 

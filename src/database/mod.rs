@@ -875,4 +875,139 @@ mod tests {
         println!("LIMIT, OFFSET, LIKE, complex WHERE clauses verified");
         println!("Data persistence across close/reopen verified");
     }
+
+    #[test]
+    fn test_insert_uuid_from_string_literal() {
+        use crate::database::owned_value::OwnedValue;
+
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("test_db");
+
+        let db = Database::create(&db_path).unwrap();
+
+        db.execute("CREATE TABLE items (id UUID, name TEXT)")
+            .unwrap();
+
+        db.execute("INSERT INTO items VALUES ('550e8400-e29b-41d4-a716-446655440000', 'Test Item')")
+            .unwrap();
+
+        let rows = db.query("SELECT id, name FROM items").unwrap();
+        println!("rows.len() = {}", rows.len());
+        assert_eq!(rows.len(), 1);
+
+        let row = &rows[0];
+        println!("row.values.len() = {}", row.values.len());
+        println!("row.values = {:?}", row.values);
+        assert_eq!(row.values.len(), 2, "Expected 2 values, got {:?}", row.values);
+
+        match &row.values[0] {
+            OwnedValue::Uuid(u) => {
+                let expected: [u8; 16] = [
+                    0x55, 0x0e, 0x84, 0x00, 0xe2, 0x9b, 0x41, 0xd4,
+                    0xa7, 0x16, 0x44, 0x66, 0x55, 0x44, 0x00, 0x00
+                ];
+                assert_eq!(u, &expected, "UUID bytes should match");
+            }
+            OwnedValue::Null => panic!("UUID decoded as NULL"),
+            other => panic!("Expected Uuid for UUID column, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_insert_jsonb_from_string_literal() {
+        use crate::database::owned_value::OwnedValue;
+
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("test_db");
+
+        let db = Database::create(&db_path).unwrap();
+
+        db.execute("CREATE TABLE docs (id INT, data JSONB)")
+            .unwrap();
+
+        db.execute(r#"INSERT INTO docs VALUES (1, '{"name": "test", "value": 42}')"#)
+            .unwrap();
+
+        let rows = db.query("SELECT id, data FROM docs").unwrap();
+        assert_eq!(rows.len(), 1);
+
+        let row = &rows[0];
+        assert_eq!(row.values.len(), 2);
+
+        match &row.values[0] {
+            OwnedValue::Int(id) => assert_eq!(*id, 1),
+            other => panic!("Expected Int for id column, got {:?}", other),
+        }
+
+        match &row.values[1] {
+            OwnedValue::Jsonb(data) => {
+                assert!(!data.is_empty(), "JSONB data should not be empty");
+            }
+            OwnedValue::Null => panic!("JSONB should not be NULL after insertion"),
+            other => panic!("Expected Jsonb for JSONB column, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_insert_vector_from_array_literal() {
+        use crate::database::owned_value::OwnedValue;
+
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("test_db");
+
+        let db = Database::create(&db_path).unwrap();
+
+        db.execute("CREATE TABLE embeddings (id INT, vec VECTOR(3))")
+            .unwrap();
+
+        db.execute("INSERT INTO embeddings VALUES (1, '[1.0, 2.0, 3.0]')")
+            .unwrap();
+
+        let rows = db.query("SELECT id, vec FROM embeddings").unwrap();
+        assert_eq!(rows.len(), 1);
+
+        let row = &rows[0];
+        assert_eq!(row.values.len(), 2);
+
+        match &row.values[1] {
+            OwnedValue::Vector(v) => {
+                assert_eq!(v.len(), 3, "Vector should have 3 elements");
+                assert!((v[0] - 1.0).abs() < 0.001);
+                assert!((v[1] - 2.0).abs() < 0.001);
+                assert!((v[2] - 3.0).abs() < 0.001);
+            }
+            OwnedValue::Null => panic!("Vector should not be NULL after insertion"),
+            other => panic!("Expected Vector for VECTOR column, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_insert_blob_from_hex_literal() {
+        use crate::database::owned_value::OwnedValue;
+
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("test_db");
+
+        let db = Database::create(&db_path).unwrap();
+
+        db.execute("CREATE TABLE binaries (id INT, data BLOB)")
+            .unwrap();
+
+        db.execute("INSERT INTO binaries VALUES (1, x'DEADBEEF')")
+            .unwrap();
+
+        let rows = db.query("SELECT id, data FROM binaries").unwrap();
+        assert_eq!(rows.len(), 1);
+
+        let row = &rows[0];
+        assert_eq!(row.values.len(), 2);
+
+        match &row.values[1] {
+            OwnedValue::Blob(b) => {
+                assert_eq!(b.len(), 4, "BLOB should have 4 bytes");
+                assert_eq!(b.as_slice(), &[0xDE, 0xAD, 0xBE, 0xEF]);
+            }
+            other => panic!("Expected Blob for BLOB column, got {:?}", other),
+        }
+    }
 }
