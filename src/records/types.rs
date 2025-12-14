@@ -114,6 +114,7 @@ impl DataType {
 pub struct ColumnDef {
     pub name: String,
     pub data_type: DataType,
+    char_length: Option<u32>,
 }
 
 impl ColumnDef {
@@ -121,7 +122,28 @@ impl ColumnDef {
         Self {
             name: name.into(),
             data_type,
+            char_length: None,
         }
+    }
+
+    pub fn new_char(name: impl Into<String>, length: u32) -> Self {
+        Self {
+            name: name.into(),
+            data_type: DataType::Char,
+            char_length: Some(length),
+        }
+    }
+
+    pub fn new_varchar(name: impl Into<String>, length: Option<u32>) -> Self {
+        Self {
+            name: name.into(),
+            data_type: DataType::Varchar,
+            char_length: length,
+        }
+    }
+
+    pub fn char_length(&self) -> Option<u32> {
+        self.char_length
     }
 }
 

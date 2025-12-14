@@ -1798,3 +1798,171 @@ fn composite_view_depth_limit_enforced() {
     assert!(result.is_err());
     assert!(result.unwrap_err().to_string().contains("depth"));
 }
+
+#[test]
+fn char_type_stores_length_constraint() {
+    let col = ColumnDef::new_char("code", 5);
+    assert_eq!(col.char_length(), Some(5));
+    assert_eq!(col.data_type, DataType::Char);
+}
+
+#[test]
+fn char_type_pads_shorter_strings_with_spaces() {
+    let schema = Schema::new(vec![ColumnDef::new_char("code", 5)]);
+
+    let mut builder = RecordBuilder::new(&schema);
+    builder.set_char(0, "AB").unwrap();
+
+    let data = builder.build().unwrap();
+    let view = RecordView::new(&data, &schema).unwrap();
+
+    assert_eq!(view.get_char(0).unwrap(), "AB   ");
+}
+
+#[test]
+fn char_type_accepts_exact_length() {
+    let schema = Schema::new(vec![ColumnDef::new_char("code", 5)]);
+
+    let mut builder = RecordBuilder::new(&schema);
+    builder.set_char(0, "ABCDE").unwrap();
+
+    let data = builder.build().unwrap();
+    let view = RecordView::new(&data, &schema).unwrap();
+
+    assert_eq!(view.get_char(0).unwrap(), "ABCDE");
+}
+
+#[test]
+fn char_type_rejects_longer_strings() {
+    let schema = Schema::new(vec![ColumnDef::new_char("code", 5)]);
+
+    let mut builder = RecordBuilder::new(&schema);
+    let result = builder.set_char(0, "ABCDEF");
+
+    assert!(result.is_err());
+    let err = result.unwrap_err().to_string();
+    assert!(err.contains("exceeds") || err.contains("too long") || err.contains("length"));
+}
+
+#[test]
+fn char_without_length_defaults_to_one() {
+    let col = ColumnDef::new_char("c", 1);
+    assert_eq!(col.char_length(), Some(1));
+}
+
+#[test]
+fn varchar_type_stores_length_constraint() {
+    let col = ColumnDef::new_varchar("name", Some(100));
+    assert_eq!(col.char_length(), Some(100));
+    assert_eq!(col.data_type, DataType::Varchar);
+}
+
+#[test]
+fn varchar_type_accepts_shorter_strings_without_padding() {
+    let schema = Schema::new(vec![ColumnDef::new_varchar("name", Some(10))]);
+
+    let mut builder = RecordBuilder::new(&schema);
+    builder.set_varchar(0, "hello").unwrap();
+
+    let data = builder.build().unwrap();
+    let view = RecordView::new(&data, &schema).unwrap();
+
+    assert_eq!(view.get_varchar(0).unwrap(), "hello");
+}
+
+#[test]
+fn varchar_type_accepts_exact_length() {
+    let schema = Schema::new(vec![ColumnDef::new_varchar("name", Some(5))]);
+
+    let mut builder = RecordBuilder::new(&schema);
+    builder.set_varchar(0, "hello").unwrap();
+
+    let data = builder.build().unwrap();
+    let view = RecordView::new(&data, &schema).unwrap();
+
+    assert_eq!(view.get_varchar(0).unwrap(), "hello");
+}
+
+#[test]
+fn varchar_type_rejects_longer_strings() {
+    let schema = Schema::new(vec![ColumnDef::new_varchar("name", Some(5))]);
+
+    let mut builder = RecordBuilder::new(&schema);
+    let result = builder.set_varchar(0, "hello world");
+
+    assert!(result.is_err());
+    let err = result.unwrap_err().to_string();
+    assert!(err.contains("exceeds") || err.contains("too long") || err.contains("length"));
+}
+
+#[test]
+fn varchar_without_length_accepts_any_length() {
+    let schema = Schema::new(vec![ColumnDef::new_varchar("name", None)]);
+
+    let mut builder = RecordBuilder::new(&schema);
+    let long_string = "a".repeat(10000);
+    builder.set_varchar(0, &long_string).unwrap();
+
+    let data = builder.build().unwrap();
+    let view = RecordView::new(&data, &schema).unwrap();
+
+    assert_eq!(view.get_varchar(0).unwrap(), long_string);
+}
+
+#[test]
+fn text_type_has_no_length_constraint() {
+    let col = ColumnDef::new("content", DataType::Text);
+    assert_eq!(col.char_length(), None);
+}
+
+#[test]
+fn text_type_accepts_any_length() {
+    let schema = Schema::new(vec![ColumnDef::new("content", DataType::Text)]);
+
+    let mut builder = RecordBuilder::new(&schema);
+    let long_string = "x".repeat(50_000);
+    builder.set_text(0, &long_string).unwrap();
+
+    let data = builder.build().unwrap();
+    let view = RecordView::new(&data, &schema).unwrap();
+
+    assert_eq!(view.get_text(0).unwrap(), long_string);
+}
+
+#[test]
+fn char_counts_characters_not_bytes() {
+    let schema = Schema::new(vec![ColumnDef::new_char("emoji", 3)]);
+
+    let mut builder = RecordBuilder::new(&schema);
+    builder.set_char(0, "🎉").unwrap();
+
+    let data = builder.build().unwrap();
+    let view = RecordView::new(&data, &schema).unwrap();
+
+    let result = view.get_char(0).unwrap();
+    assert_eq!(result.chars().count(), 3);
+    assert!(result.starts_with("🎉"));
+}
+
+#[test]
+fn varchar_counts_characters_not_bytes() {
+    let schema = Schema::new(vec![ColumnDef::new_varchar("text", Some(2))]);
+
+    let mut builder = RecordBuilder::new(&schema);
+    builder.set_varchar(0, "日本").unwrap();
+
+    let data = builder.build().unwrap();
+    let view = RecordView::new(&data, &schema).unwrap();
+
+    assert_eq!(view.get_varchar(0).unwrap(), "日本");
+}
+
+#[test]
+fn varchar_rejects_too_many_characters_unicode() {
+    let schema = Schema::new(vec![ColumnDef::new_varchar("text", Some(2))]);
+
+    let mut builder = RecordBuilder::new(&schema);
+    let result = builder.set_varchar(0, "日本語");
+
+    assert!(result.is_err());
+}

@@ -900,9 +900,7 @@ mod tests {
 
         let is_referenced_checker =
             |table_name: &str, col_name: &str, value: &OwnedValue| -> Option<String> {
-                if table_name == "users"
-                    && col_name == "id"
-                    && matches!(value, OwnedValue::Int(1))
+                if table_name == "users" && col_name == "id" && matches!(value, OwnedValue::Int(1))
                 {
                     return Some("orders".to_string());
                 }
