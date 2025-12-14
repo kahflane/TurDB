@@ -424,8 +424,7 @@ impl Database {
             .wrap_err("failed to seek to start of metadata file")?;
         file.write_all(&page)
             .wrap_err("failed to write metadata header")?;
-        file.sync_all()
-            .wrap_err("failed to sync metadata file")?;
+        file.sync_all().wrap_err("failed to sync metadata file")?;
 
         Ok(())
     }
@@ -576,6 +575,8 @@ impl Database {
             Statement::CreateSchema(create) => self.execute_create_schema(create),
             Statement::CreateIndex(create) => self.execute_create_index(create, &arena),
             Statement::Insert(insert) => self.execute_insert(insert, &arena),
+            Statement::Update(update) => self.execute_update(update, &arena),
+            Statement::Delete(delete) => self.execute_delete(delete, &arena),
             Statement::Select(_) => {
                 let rows = self.query(sql)?;
                 Ok(ExecuteResult::Select { rows })
@@ -814,9 +815,7 @@ impl Database {
 
                 let record_data = builder.build()?;
 
-                let row_id = self
-                    .next_row_id
-                    .fetch_add(1, Ordering::Relaxed);
+                let row_id = self.next_row_id.fetch_add(1, Ordering::Relaxed);
                 let key = Self::generate_row_key(row_id);
                 btree.insert(&key, &record_data)?;
                 rows_affected += 1;
@@ -841,9 +840,7 @@ impl Database {
 
                 let record_data = builder.build()?;
 
-                let row_id = self
-                    .next_row_id
-                    .fetch_add(1, Ordering::Relaxed);
+                let row_id = self.next_row_id.fetch_add(1, Ordering::Relaxed);
                 let key = Self::generate_row_key(row_id);
                 btree.insert(&key, &record_data)?;
                 rows_affected += 1;
@@ -851,6 +848,332 @@ impl Database {
         }
 
         Ok(ExecuteResult::Insert { rows_affected })
+    }
+
+    fn execute_update(
+        &self,
+        update: &crate::sql::ast::UpdateStmt<'_>,
+        arena: &Bump,
+    ) -> Result<ExecuteResult> {
+        use crate::btree::BTree;
+        use crate::records::types::ColumnDef as RecordColumnDef;
+        use crate::records::{RecordBuilder, RecordView, Schema};
+        use crate::sql::executor::CompiledPredicate;
+
+        self.ensure_catalog()?;
+        self.ensure_file_manager()?;
+
+        let catalog_guard = self.catalog.read();
+        let catalog = catalog_guard.as_ref().unwrap();
+
+        let schema_name = update.table.schema.unwrap_or("root");
+        let table_name = update.table.name;
+
+        let table_def = catalog.resolve_table(table_name)?;
+        let columns = table_def.columns().to_vec();
+
+        drop(catalog_guard);
+
+        let record_columns: Vec<RecordColumnDef> = columns
+            .iter()
+            .map(|c| RecordColumnDef::new(c.name().to_string(), c.data_type()))
+            .collect();
+        let schema = Schema::new(record_columns);
+
+        let column_map: Vec<(String, usize)> = columns
+            .iter()
+            .enumerate()
+            .map(|(idx, col)| (col.name().to_lowercase(), idx))
+            .collect();
+
+        let predicate = update
+            .where_clause
+            .map(|expr| CompiledPredicate::new(expr, column_map));
+
+        let assignment_indices: Vec<(usize, &crate::sql::ast::Expr<'_>)> = update
+            .assignments
+            .iter()
+            .filter_map(|a| {
+                columns
+                    .iter()
+                    .position(|c| c.name().eq_ignore_ascii_case(a.column.column))
+                    .map(|idx| (idx, a.value))
+            })
+            .collect();
+
+        let mut file_manager_guard = self.file_manager.write();
+        let file_manager = file_manager_guard.as_mut().unwrap();
+        let storage = file_manager.table_data_mut(schema_name, table_name)?;
+
+        let root_page = 1u32;
+        let btree = BTree::new(storage, root_page)?;
+        let mut cursor = btree.cursor_first()?;
+
+        let mut rows_to_update: Vec<(Vec<u8>, Vec<OwnedValue>)> = Vec::new();
+
+        while cursor.valid() {
+            let key = cursor.key()?;
+            let value = cursor.value()?;
+
+            let record = RecordView::new(value, &schema)?;
+            let mut row_values: Vec<OwnedValue> = Vec::with_capacity(columns.len());
+
+            for (col_idx, col_def) in columns.iter().enumerate() {
+                use crate::records::types::DataType;
+
+                let owned_val = match col_def.data_type() {
+                    DataType::Int8 => {
+                        let v = record.get_int8_opt(col_idx)?;
+                        v.map(OwnedValue::Int).unwrap_or(OwnedValue::Null)
+                    }
+                    DataType::Int4 => {
+                        let v = record.get_int4_opt(col_idx)?;
+                        v.map(|i| OwnedValue::Int(i as i64))
+                            .unwrap_or(OwnedValue::Null)
+                    }
+                    DataType::Int2 => {
+                        let v = record.get_int2_opt(col_idx)?;
+                        v.map(|i| OwnedValue::Int(i as i64))
+                            .unwrap_or(OwnedValue::Null)
+                    }
+                    DataType::Float8 => {
+                        let v = record.get_float8_opt(col_idx)?;
+                        v.map(OwnedValue::Float).unwrap_or(OwnedValue::Null)
+                    }
+                    DataType::Float4 => {
+                        let v = record.get_float4_opt(col_idx)?;
+                        v.map(|f| OwnedValue::Float(f as f64))
+                            .unwrap_or(OwnedValue::Null)
+                    }
+                    DataType::Text => {
+                        let v = record.get_text_opt(col_idx)?;
+                        v.map(|s| OwnedValue::Text(s.to_string()))
+                            .unwrap_or(OwnedValue::Null)
+                    }
+                    DataType::Blob => {
+                        let v = record.get_blob_opt(col_idx)?;
+                        v.map(|b| OwnedValue::Blob(b.to_vec()))
+                            .unwrap_or(OwnedValue::Null)
+                    }
+                    DataType::Bool => {
+                        let v = record.get_bool_opt(col_idx)?;
+                        v.map(|b| OwnedValue::Int(if b { 1 } else { 0 }))
+                            .unwrap_or(OwnedValue::Null)
+                    }
+                    _ => OwnedValue::Null,
+                };
+                row_values.push(owned_val);
+            }
+
+            let should_update = if let Some(ref pred) = predicate {
+                use crate::sql::executor::ExecutorRow;
+
+                use std::borrow::Cow;
+
+                let values: Vec<crate::types::Value<'_>> = row_values
+                    .iter()
+                    .map(|ov| match ov {
+                        OwnedValue::Null => crate::types::Value::Null,
+                        OwnedValue::Int(i) => crate::types::Value::Int(*i),
+                        OwnedValue::Float(f) => crate::types::Value::Float(*f),
+                        OwnedValue::Text(s) => crate::types::Value::Text(Cow::Borrowed(s.as_str())),
+                        OwnedValue::Blob(b) => {
+                            crate::types::Value::Blob(Cow::Borrowed(b.as_slice()))
+                        }
+                        OwnedValue::Vector(v) => {
+                            crate::types::Value::Vector(Cow::Borrowed(v.as_slice()))
+                        }
+                    })
+                    .collect();
+                let values_slice = arena.alloc_slice_fill_iter(values.into_iter());
+                let exec_row = ExecutorRow::new(values_slice);
+                pred.evaluate(&exec_row)
+            } else {
+                true
+            };
+
+            if should_update {
+                for (col_idx, value_expr) in &assignment_indices {
+                    let new_value = Self::eval_literal(value_expr)?;
+                    row_values[*col_idx] = new_value;
+                }
+                rows_to_update.push((key.to_vec(), row_values));
+            }
+
+            cursor.advance()?;
+        }
+
+        let rows_affected = rows_to_update.len();
+        let storage = file_manager.table_data_mut(schema_name, table_name)?;
+        let mut btree_mut = BTree::new(storage, root_page)?;
+
+        for (key, updated_values) in rows_to_update {
+            btree_mut.delete(&key)?;
+
+            let mut builder = RecordBuilder::new(&schema);
+            for (idx, val) in updated_values.iter().enumerate() {
+                match val {
+                    OwnedValue::Null => builder.set_null(idx),
+                    OwnedValue::Int(i) => builder.set_int8(idx, *i)?,
+                    OwnedValue::Float(f) => builder.set_float8(idx, *f)?,
+                    OwnedValue::Text(s) => builder.set_text(idx, s)?,
+                    OwnedValue::Blob(b) => builder.set_blob(idx, b)?,
+                    OwnedValue::Vector(_) => bail!("vector update not yet supported"),
+                }
+            }
+            let record_data = builder.build()?;
+            btree_mut.insert(&key, &record_data)?;
+        }
+
+        Ok(ExecuteResult::Update { rows_affected })
+    }
+
+    fn execute_delete(
+        &self,
+        delete: &crate::sql::ast::DeleteStmt<'_>,
+        arena: &Bump,
+    ) -> Result<ExecuteResult> {
+        use crate::btree::BTree;
+        use crate::records::types::ColumnDef as RecordColumnDef;
+        use crate::records::{RecordView, Schema};
+        use crate::sql::executor::CompiledPredicate;
+
+        self.ensure_catalog()?;
+        self.ensure_file_manager()?;
+
+        let catalog_guard = self.catalog.read();
+        let catalog = catalog_guard.as_ref().unwrap();
+
+        let schema_name = delete.table.schema.unwrap_or("root");
+        let table_name = delete.table.name;
+
+        let table_def = catalog.resolve_table(table_name)?;
+        let columns = table_def.columns().to_vec();
+
+        drop(catalog_guard);
+
+        let record_columns: Vec<RecordColumnDef> = columns
+            .iter()
+            .map(|c| RecordColumnDef::new(c.name().to_string(), c.data_type()))
+            .collect();
+        let schema = Schema::new(record_columns);
+
+        let column_map: Vec<(String, usize)> = columns
+            .iter()
+            .enumerate()
+            .map(|(idx, col)| (col.name().to_lowercase(), idx))
+            .collect();
+
+        let predicate = delete
+            .where_clause
+            .map(|expr| CompiledPredicate::new(expr, column_map));
+
+        let mut file_manager_guard = self.file_manager.write();
+        let file_manager = file_manager_guard.as_mut().unwrap();
+        let storage = file_manager.table_data_mut(schema_name, table_name)?;
+
+        let root_page = 1u32;
+        let btree = BTree::new(storage, root_page)?;
+        let mut cursor = btree.cursor_first()?;
+
+        let mut keys_to_delete: Vec<Vec<u8>> = Vec::new();
+
+        while cursor.valid() {
+            let key = cursor.key()?;
+            let value = cursor.value()?;
+
+            let should_delete = if let Some(ref pred) = predicate {
+                let record = RecordView::new(value, &schema)?;
+                let mut row_values: Vec<OwnedValue> = Vec::with_capacity(columns.len());
+
+                for (col_idx, col_def) in columns.iter().enumerate() {
+                    use crate::records::types::DataType;
+
+                    let owned_val = match col_def.data_type() {
+                        DataType::Int8 => {
+                            let v = record.get_int8_opt(col_idx)?;
+                            v.map(OwnedValue::Int).unwrap_or(OwnedValue::Null)
+                        }
+                        DataType::Int4 => {
+                            let v = record.get_int4_opt(col_idx)?;
+                            v.map(|i| OwnedValue::Int(i as i64))
+                                .unwrap_or(OwnedValue::Null)
+                        }
+                        DataType::Int2 => {
+                            let v = record.get_int2_opt(col_idx)?;
+                            v.map(|i| OwnedValue::Int(i as i64))
+                                .unwrap_or(OwnedValue::Null)
+                        }
+                        DataType::Float8 => {
+                            let v = record.get_float8_opt(col_idx)?;
+                            v.map(OwnedValue::Float).unwrap_or(OwnedValue::Null)
+                        }
+                        DataType::Float4 => {
+                            let v = record.get_float4_opt(col_idx)?;
+                            v.map(|f| OwnedValue::Float(f as f64))
+                                .unwrap_or(OwnedValue::Null)
+                        }
+                        DataType::Text => {
+                            let v = record.get_text_opt(col_idx)?;
+                            v.map(|s| OwnedValue::Text(s.to_string()))
+                                .unwrap_or(OwnedValue::Null)
+                        }
+                        DataType::Blob => {
+                            let v = record.get_blob_opt(col_idx)?;
+                            v.map(|b| OwnedValue::Blob(b.to_vec()))
+                                .unwrap_or(OwnedValue::Null)
+                        }
+                        DataType::Bool => {
+                            let v = record.get_bool_opt(col_idx)?;
+                            v.map(|b| OwnedValue::Int(if b { 1 } else { 0 }))
+                                .unwrap_or(OwnedValue::Null)
+                        }
+                        _ => OwnedValue::Null,
+                    };
+                    row_values.push(owned_val);
+                }
+
+                use crate::sql::executor::ExecutorRow;
+                use std::borrow::Cow;
+
+                let values: Vec<crate::types::Value<'_>> = row_values
+                    .iter()
+                    .map(|ov| match ov {
+                        OwnedValue::Null => crate::types::Value::Null,
+                        OwnedValue::Int(i) => crate::types::Value::Int(*i),
+                        OwnedValue::Float(f) => crate::types::Value::Float(*f),
+                        OwnedValue::Text(s) => crate::types::Value::Text(Cow::Borrowed(s.as_str())),
+                        OwnedValue::Blob(b) => {
+                            crate::types::Value::Blob(Cow::Borrowed(b.as_slice()))
+                        }
+                        OwnedValue::Vector(v) => {
+                            crate::types::Value::Vector(Cow::Borrowed(v.as_slice()))
+                        }
+                    })
+                    .collect();
+                let values_slice = arena.alloc_slice_fill_iter(values.into_iter());
+                let exec_row = ExecutorRow::new(values_slice);
+                pred.evaluate(&exec_row)
+            } else {
+                true
+            };
+
+            if should_delete {
+                keys_to_delete.push(key.to_vec());
+            }
+
+            cursor.advance()?;
+        }
+
+        let rows_affected = keys_to_delete.len();
+        let storage = file_manager.table_data_mut(schema_name, table_name)?;
+        let mut btree_mut = BTree::new(storage, root_page)?;
+
+        for key in keys_to_delete {
+            btree_mut.delete(&key)?;
+        }
+
+        Ok(ExecuteResult::Delete { rows_affected })
     }
 
     fn execute_drop_table(
@@ -892,10 +1215,7 @@ impl Database {
         Ok(ExecuteResult::DropTable { dropped: true })
     }
 
-    fn execute_pragma(
-        &self,
-        pragma: &crate::sql::ast::PragmaStmt<'_>,
-    ) -> Result<ExecuteResult> {
+    fn execute_pragma(&self, pragma: &crate::sql::ast::PragmaStmt<'_>) -> Result<ExecuteResult> {
         use std::sync::atomic::Ordering;
 
         let name = pragma.name.to_uppercase();
@@ -918,7 +1238,11 @@ impl Database {
                 let current = self.wal_enabled.load(Ordering::Acquire);
                 Ok(ExecuteResult::Pragma {
                     name: name.clone(),
-                    value: Some(if current { "ON".to_string() } else { "OFF".to_string() }),
+                    value: Some(if current {
+                        "ON".to_string()
+                    } else {
+                        "OFF".to_string()
+                    }),
                 })
             }
             _ => bail!("unknown PRAGMA: {}", name),
@@ -1334,5 +1658,222 @@ mod tests {
         let db = Database::open(&db_path).unwrap();
         let rows = db.query("SELECT * FROM users").unwrap();
         assert_eq!(rows.len(), 1);
+    }
+
+    #[test]
+    fn test_update_basic() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("test_db");
+
+        let db = Database::create(&db_path).unwrap();
+
+        db.execute("CREATE TABLE users (id INT, name TEXT)")
+            .unwrap();
+        db.execute("INSERT INTO users VALUES (1, 'Alice')").unwrap();
+        db.execute("INSERT INTO users VALUES (2, 'Bob')").unwrap();
+
+        let result = db
+            .execute("UPDATE users SET name = 'Charlie' WHERE id = 1")
+            .unwrap();
+
+        assert!(
+            matches!(result, ExecuteResult::Update { rows_affected: 1 }),
+            "expected Update with 1 row affected"
+        );
+
+        let rows = db.query("SELECT * FROM users").unwrap();
+        assert_eq!(
+            rows.len(),
+            2,
+            "row count should remain unchanged after UPDATE"
+        );
+    }
+
+    #[test]
+    fn test_update_all_rows() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("test_db");
+
+        let db = Database::create(&db_path).unwrap();
+
+        db.execute("CREATE TABLE users (id INT, name TEXT)")
+            .unwrap();
+        db.execute("INSERT INTO users VALUES (1, 'Alice')").unwrap();
+        db.execute("INSERT INTO users VALUES (2, 'Bob')").unwrap();
+        db.execute("INSERT INTO users VALUES (3, 'Carol')").unwrap();
+
+        let result = db.execute("UPDATE users SET name = 'Updated'").unwrap();
+
+        assert!(
+            matches!(result, ExecuteResult::Update { rows_affected: 3 }),
+            "expected Update with 3 rows affected"
+        );
+
+        let rows = db.query("SELECT * FROM users").unwrap();
+        assert_eq!(
+            rows.len(),
+            3,
+            "row count should remain unchanged after UPDATE"
+        );
+    }
+
+    #[test]
+    fn test_update_no_match() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("test_db");
+
+        let db = Database::create(&db_path).unwrap();
+
+        db.execute("CREATE TABLE users (id INT, name TEXT)")
+            .unwrap();
+        db.execute("INSERT INTO users VALUES (1, 'Alice')").unwrap();
+        db.execute("INSERT INTO users VALUES (2, 'Bob')").unwrap();
+
+        let result = db
+            .execute("UPDATE users SET name = 'X' WHERE id = 999")
+            .unwrap();
+
+        assert!(
+            matches!(result, ExecuteResult::Update { rows_affected: 0 }),
+            "expected Update with 0 rows affected"
+        );
+
+        let rows = db.query("SELECT * FROM users").unwrap();
+        assert_eq!(
+            rows.len(),
+            2,
+            "row count should remain unchanged after UPDATE"
+        );
+    }
+
+    #[test]
+    fn test_update_multiple_columns() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("test_db");
+
+        let db = Database::create(&db_path).unwrap();
+
+        db.execute("CREATE TABLE users (id INT, name TEXT, age INT)")
+            .unwrap();
+        db.execute("INSERT INTO users VALUES (1, 'Alice', 25)")
+            .unwrap();
+        db.execute("INSERT INTO users VALUES (2, 'Bob', 30)")
+            .unwrap();
+
+        let result = db
+            .execute("UPDATE users SET name = 'Updated', age = 99 WHERE id = 1")
+            .unwrap();
+
+        assert!(
+            matches!(result, ExecuteResult::Update { rows_affected: 1 }),
+            "expected Update with 1 row affected"
+        );
+
+        let rows = db.query("SELECT * FROM users").unwrap();
+        assert_eq!(
+            rows.len(),
+            2,
+            "row count should remain unchanged after UPDATE"
+        );
+    }
+
+    #[test]
+    fn test_delete_basic() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("test_db");
+
+        let db = Database::create(&db_path).unwrap();
+
+        db.execute("CREATE TABLE users (id INT, name TEXT)")
+            .unwrap();
+        db.execute("INSERT INTO users VALUES (1, 'Alice')").unwrap();
+        db.execute("INSERT INTO users VALUES (2, 'Bob')").unwrap();
+        db.execute("INSERT INTO users VALUES (3, 'Carol')").unwrap();
+
+        let result = db.execute("DELETE FROM users WHERE id = 2").unwrap();
+
+        assert!(
+            matches!(result, ExecuteResult::Delete { rows_affected: 1 }),
+            "expected Delete with 1 row affected"
+        );
+
+        let rows = db.query("SELECT * FROM users").unwrap();
+        assert_eq!(rows.len(), 2, "one row should be deleted");
+    }
+
+    #[test]
+    fn test_delete_all_rows() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("test_db");
+
+        let db = Database::create(&db_path).unwrap();
+
+        db.execute("CREATE TABLE users (id INT, name TEXT)")
+            .unwrap();
+        db.execute("INSERT INTO users VALUES (1, 'Alice')").unwrap();
+        db.execute("INSERT INTO users VALUES (2, 'Bob')").unwrap();
+        db.execute("INSERT INTO users VALUES (3, 'Carol')").unwrap();
+
+        let result = db.execute("DELETE FROM users").unwrap();
+
+        assert!(
+            matches!(result, ExecuteResult::Delete { rows_affected: 3 }),
+            "expected Delete with 3 rows affected"
+        );
+
+        let rows = db.query("SELECT * FROM users").unwrap();
+        assert_eq!(rows.len(), 0, "all rows should be deleted");
+    }
+
+    #[test]
+    fn test_delete_no_match() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("test_db");
+
+        let db = Database::create(&db_path).unwrap();
+
+        db.execute("CREATE TABLE users (id INT, name TEXT)")
+            .unwrap();
+        db.execute("INSERT INTO users VALUES (1, 'Alice')").unwrap();
+        db.execute("INSERT INTO users VALUES (2, 'Bob')").unwrap();
+
+        let result = db.execute("DELETE FROM users WHERE id = 999").unwrap();
+
+        assert!(
+            matches!(result, ExecuteResult::Delete { rows_affected: 0 }),
+            "expected Delete with 0 rows affected"
+        );
+
+        let rows = db.query("SELECT * FROM users").unwrap();
+        assert_eq!(rows.len(), 2, "no rows should be deleted");
+    }
+
+    #[test]
+    fn test_delete_multiple_matches() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("test_db");
+
+        let db = Database::create(&db_path).unwrap();
+
+        db.execute("CREATE TABLE users (id INT, name TEXT, active INT)")
+            .unwrap();
+        db.execute("INSERT INTO users VALUES (1, 'Alice', 1)")
+            .unwrap();
+        db.execute("INSERT INTO users VALUES (2, 'Bob', 0)")
+            .unwrap();
+        db.execute("INSERT INTO users VALUES (3, 'Carol', 0)")
+            .unwrap();
+        db.execute("INSERT INTO users VALUES (4, 'Dave', 1)")
+            .unwrap();
+
+        let result = db.execute("DELETE FROM users WHERE active = 0").unwrap();
+
+        assert!(
+            matches!(result, ExecuteResult::Delete { rows_affected: 2 }),
+            "expected Delete with 2 rows affected"
+        );
+
+        let rows = db.query("SELECT * FROM users").unwrap();
+        assert_eq!(rows.len(), 2, "two rows should remain");
     }
 }
