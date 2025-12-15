@@ -254,6 +254,8 @@ impl Database {
     }
 
     pub fn query(&self, sql: &str) -> Result<Vec<Row>> {
+        use crate::sql::ast::{Distinct, Statement};
+
         self.ensure_catalog()?;
         self.ensure_file_manager()?;
 
@@ -263,6 +265,9 @@ impl Database {
         let stmt = parser
             .parse_statement()
             .wrap_err("failed to parse SQL statement")?;
+
+        let is_distinct =
+            matches!(&stmt, Statement::Select(select) if select.distinct == Distinct::Distinct);
 
         let catalog_guard = self.catalog.read();
         let catalog = catalog_guard.as_ref().unwrap();
@@ -374,6 +379,27 @@ impl Database {
             rows
         } else {
             bail!("unsupported query plan type - only table scans currently supported")
+        };
+
+        let rows = if is_distinct {
+            let mut seen: std::collections::HashSet<Vec<u64>> = std::collections::HashSet::new();
+            rows.into_iter()
+                .filter(|row| {
+                    let key: Vec<u64> = row
+                        .values
+                        .iter()
+                        .map(|v| {
+                            use std::hash::{Hash, Hasher};
+                            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                            format!("{:?}", v).hash(&mut hasher);
+                            hasher.finish()
+                        })
+                        .collect();
+                    seen.insert(key)
+                })
+                .collect()
+        } else {
+            rows
         };
 
         Ok(rows)
