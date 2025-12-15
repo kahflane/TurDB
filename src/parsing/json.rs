@@ -78,6 +78,134 @@ pub enum JsonValue {
     Object(Vec<(String, JsonValue)>),
 }
 
+impl JsonValue {
+    pub fn to_jsonb_bytes(&self) -> Vec<u8> {
+        use crate::records::jsonb::{
+            JSONB_TYPE_ARRAY, JSONB_TYPE_BOOL, JSONB_TYPE_NULL, JSONB_TYPE_NUMBER,
+            JSONB_TYPE_OBJECT, JSONB_TYPE_STRING,
+        };
+
+        const FLAG_IS_KEY: u32 = 1 << 31;
+        const FLAG_IS_VARIABLE: u32 = 1 << 30;
+        const TYPE_SHIFT: u32 = 24;
+        const OFFSET_MASK: u32 = 0x00FF_FFFF;
+
+        fn encode_value(value: &JsonValue, buf: &mut Vec<u8>) {
+            match value {
+                JsonValue::Null => {
+                    let header = (JSONB_TYPE_NULL as u32) << 28;
+                    buf.extend(header.to_le_bytes());
+                }
+                JsonValue::Bool(v) => {
+                    let header = ((JSONB_TYPE_BOOL as u32) << 28) | (*v as u32);
+                    buf.extend(header.to_le_bytes());
+                }
+                JsonValue::Number(v) => {
+                    let header = (JSONB_TYPE_NUMBER as u32) << 28;
+                    buf.extend(header.to_le_bytes());
+                    buf.extend(v.to_le_bytes());
+                }
+                JsonValue::String(s) => {
+                    let header = ((JSONB_TYPE_STRING as u32) << 28) | (s.len() as u32);
+                    buf.extend(header.to_le_bytes());
+                    buf.extend(s.as_bytes());
+                }
+                JsonValue::Array(elements) => {
+                    let header = ((JSONB_TYPE_ARRAY as u32) << 28) | (elements.len() as u32);
+                    buf.extend(header.to_le_bytes());
+
+                    let entries_start = buf.len();
+                    buf.resize(entries_start + elements.len() * 4, 0);
+
+                    let mut data_buf = Vec::new();
+
+                    for (i, elem) in elements.iter().enumerate() {
+                        let entry = encode_entry(elem, &mut data_buf);
+                        let entry_offset = entries_start + i * 4;
+                        buf[entry_offset..entry_offset + 4].copy_from_slice(&entry.to_le_bytes());
+                    }
+
+                    buf.extend(&data_buf);
+                }
+                JsonValue::Object(entries) => {
+                    let mut sorted_entries: Vec<_> = entries.iter().collect();
+                    sorted_entries.sort_by(|a, b| a.0.cmp(&b.0));
+
+                    let entry_count = sorted_entries.len() * 2;
+                    let header = ((JSONB_TYPE_OBJECT as u32) << 28) | (entry_count as u32);
+                    buf.extend(header.to_le_bytes());
+
+                    let entries_start = buf.len();
+                    buf.resize(entries_start + entry_count * 4, 0);
+
+                    let mut data_buf = Vec::new();
+
+                    for (i, (key, val)) in sorted_entries.iter().enumerate() {
+                        let key_offset = data_buf.len();
+                        data_buf.extend((key.len() as u16).to_le_bytes());
+                        data_buf.extend(key.as_bytes());
+
+                        let key_entry =
+                            FLAG_IS_KEY | FLAG_IS_VARIABLE | (key_offset as u32 & OFFSET_MASK);
+
+                        let val_entry = encode_entry(val, &mut data_buf);
+
+                        let key_entry_offset = entries_start + i * 2 * 4;
+                        let val_entry_offset = entries_start + (i * 2 + 1) * 4;
+                        buf[key_entry_offset..key_entry_offset + 4]
+                            .copy_from_slice(&key_entry.to_le_bytes());
+                        buf[val_entry_offset..val_entry_offset + 4]
+                            .copy_from_slice(&val_entry.to_le_bytes());
+                    }
+
+                    buf.extend(&data_buf);
+                }
+            }
+        }
+
+        fn encode_entry(value: &JsonValue, data_buf: &mut Vec<u8>) -> u32 {
+            match value {
+                JsonValue::Null => (JSONB_TYPE_NULL as u32) << TYPE_SHIFT,
+                JsonValue::Bool(v) => ((JSONB_TYPE_BOOL as u32) << TYPE_SHIFT) | (*v as u32),
+                JsonValue::Number(v) => {
+                    let offset = data_buf.len();
+                    data_buf.extend(v.to_le_bytes());
+                    FLAG_IS_VARIABLE
+                        | ((JSONB_TYPE_NUMBER as u32) << TYPE_SHIFT)
+                        | (offset as u32 & OFFSET_MASK)
+                }
+                JsonValue::String(s) => {
+                    let offset = data_buf.len();
+                    data_buf.extend((s.len() as u16).to_le_bytes());
+                    data_buf.extend(s.as_bytes());
+                    FLAG_IS_VARIABLE
+                        | ((JSONB_TYPE_STRING as u32) << TYPE_SHIFT)
+                        | (offset as u32 & OFFSET_MASK)
+                }
+                JsonValue::Array(_) | JsonValue::Object(_) => {
+                    let offset = data_buf.len();
+                    let mut nested_buf = Vec::new();
+                    encode_value(value, &mut nested_buf);
+                    data_buf.extend((nested_buf.len() as u32).to_le_bytes());
+                    data_buf.extend(&nested_buf);
+
+                    let typ = if matches!(value, JsonValue::Array(_)) {
+                        JSONB_TYPE_ARRAY
+                    } else {
+                        JSONB_TYPE_OBJECT
+                    };
+
+                    FLAG_IS_VARIABLE | ((typ as u32) << TYPE_SHIFT) | (offset as u32 & OFFSET_MASK)
+                }
+            }
+        }
+
+        let mut buf = Vec::new();
+        encode_value(self, &mut buf);
+        buf
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum JsonToken<'a> {
     ObjectStart,
@@ -884,5 +1012,118 @@ mod tests {
     fn parse_json_path_invalid() {
         assert_eq!(parse_json_path("abc"), None);
         assert_eq!(parse_json_path("{abc"), None);
+    }
+
+    #[test]
+    fn to_jsonb_null() {
+        use crate::records::jsonb::{JsonbView, JSONB_TYPE_NULL};
+
+        let json = JsonValue::Null;
+        let bytes = json.to_jsonb_bytes();
+
+        let view = JsonbView::new(&bytes).unwrap();
+        assert_eq!(view.root_type(), JSONB_TYPE_NULL);
+    }
+
+    #[test]
+    fn to_jsonb_bool() {
+        use crate::records::jsonb::{JsonbValue, JsonbView, JSONB_TYPE_BOOL};
+
+        let json_true = JsonValue::Bool(true);
+        let bytes_true = json_true.to_jsonb_bytes();
+        let view_true = JsonbView::new(&bytes_true).unwrap();
+        assert_eq!(view_true.root_type(), JSONB_TYPE_BOOL);
+        assert_eq!(view_true.as_value().unwrap(), JsonbValue::Bool(true));
+
+        let json_false = JsonValue::Bool(false);
+        let bytes_false = json_false.to_jsonb_bytes();
+        let view_false = JsonbView::new(&bytes_false).unwrap();
+        assert_eq!(view_false.as_value().unwrap(), JsonbValue::Bool(false));
+    }
+
+    #[test]
+    fn to_jsonb_number() {
+        use crate::records::jsonb::{JsonbValue, JsonbView, JSONB_TYPE_NUMBER};
+
+        let json = JsonValue::Number(42.5);
+        let bytes = json.to_jsonb_bytes();
+
+        let view = JsonbView::new(&bytes).unwrap();
+        assert_eq!(view.root_type(), JSONB_TYPE_NUMBER);
+        assert_eq!(view.as_value().unwrap(), JsonbValue::Number(42.5));
+    }
+
+    #[test]
+    fn to_jsonb_string() {
+        use crate::records::jsonb::{JsonbValue, JsonbView, JSONB_TYPE_STRING};
+
+        let json = JsonValue::String("hello".to_string());
+        let bytes = json.to_jsonb_bytes();
+
+        let view = JsonbView::new(&bytes).unwrap();
+        assert_eq!(view.root_type(), JSONB_TYPE_STRING);
+        assert_eq!(view.as_value().unwrap(), JsonbValue::String("hello"));
+    }
+
+    #[test]
+    fn to_jsonb_array() {
+        use crate::records::jsonb::{JsonbValue, JsonbView, JSONB_TYPE_ARRAY};
+
+        let json = JsonValue::Array(vec![
+            JsonValue::Number(1.0),
+            JsonValue::Number(2.0),
+            JsonValue::Number(3.0),
+        ]);
+        let bytes = json.to_jsonb_bytes();
+
+        let view = JsonbView::new(&bytes).unwrap();
+        assert_eq!(view.root_type(), JSONB_TYPE_ARRAY);
+        assert_eq!(view.array_len().unwrap(), 3);
+        assert_eq!(view.array_get(0).unwrap(), Some(JsonbValue::Number(1.0)));
+        assert_eq!(view.array_get(2).unwrap(), Some(JsonbValue::Number(3.0)));
+    }
+
+    #[test]
+    fn to_jsonb_object() {
+        use crate::records::jsonb::{JsonbValue, JsonbView, JSONB_TYPE_OBJECT};
+
+        let json = JsonValue::Object(vec![
+            ("name".to_string(), JsonValue::String("test".to_string())),
+            ("value".to_string(), JsonValue::Number(42.0)),
+        ]);
+        let bytes = json.to_jsonb_bytes();
+
+        let view = JsonbView::new(&bytes).unwrap();
+        assert_eq!(view.root_type(), JSONB_TYPE_OBJECT);
+        assert_eq!(view.object_len().unwrap(), 2);
+        assert_eq!(
+            view.get("name").unwrap(),
+            Some(JsonbValue::String("test"))
+        );
+        assert_eq!(view.get("value").unwrap(), Some(JsonbValue::Number(42.0)));
+    }
+
+    #[test]
+    fn to_jsonb_roundtrip() {
+        let json_str = r#"{"arr": [1, 2], "nested": {"inner": true}}"#;
+        let json = parse_json(json_str).unwrap().value;
+        let bytes = json.to_jsonb_bytes();
+
+        use crate::records::jsonb::{JsonbValue, JsonbView};
+
+        let view = JsonbView::new(&bytes).unwrap();
+        let arr_val = view.get("arr").unwrap().unwrap();
+        if let JsonbValue::Array(arr_view) = arr_val {
+            assert_eq!(arr_view.array_len().unwrap(), 2);
+        } else {
+            panic!("expected array");
+        }
+
+        let nested_val = view.get("nested").unwrap().unwrap();
+        if let JsonbValue::Object(nested_view) = nested_val {
+            assert_eq!(nested_view.get("inner").unwrap(), Some(JsonbValue::Bool(true)));
+        } else {
+            panic!("expected object");
+        }
     }
 }
