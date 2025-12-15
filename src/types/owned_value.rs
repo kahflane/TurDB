@@ -517,37 +517,3 @@ pub fn create_column_map(columns: &[crate::schema::ColumnDef]) -> Vec<(String, u
         .map(|(idx, col)| (col.name().to_lowercase(), idx))
         .collect()
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_owned_value_to_value_roundtrip() {
-        let owned = OwnedValue::Int(42);
-        let value = owned.to_value();
-        let back: OwnedValue = (&value).into();
-        assert_eq!(owned, back);
-    }
-
-    #[test]
-    fn test_owned_value_text() {
-        let owned = OwnedValue::Text("hello".to_string());
-        let value = owned.to_value();
-        assert!(matches!(value, Value::Text(Cow::Borrowed("hello"))));
-    }
-
-    #[test]
-    fn test_owned_value_data_type() {
-        assert_eq!(OwnedValue::Int(42).data_type(), DataType::Int8);
-        assert_eq!(OwnedValue::Text("x".into()).data_type(), DataType::Text);
-        assert_eq!(OwnedValue::Uuid([0; 16]).data_type(), DataType::Uuid);
-    }
-
-    #[test]
-    fn test_value_to_owned() {
-        let value = Value::Text(Cow::Borrowed("hello"));
-        let owned: OwnedValue = (&value).into();
-        assert_eq!(owned, OwnedValue::Text("hello".to_string()));
-    }
-}

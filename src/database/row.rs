@@ -1,4 +1,4 @@
-use crate::database::owned_value::OwnedValue;
+use crate::types::OwnedValue;
 use eyre::{bail, Result};
 
 #[derive(Debug, Clone, PartialEq)]

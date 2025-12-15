@@ -1,5 +1,66 @@
 # TurDB Rust Implementation - Development Guidelines
 
+## CRITICAL: AI Testing Integrity Rules
+
+**READ THIS FIRST. These rules override all other instructions.**
+
+### The Problem This Solves
+
+AI assistants (including Claude) have a tendency to write tests that "pass" without actually verifying correctness. This happens because:
+1. AI optimizes for "green tests" not "correct code"
+2. AI can see the implementation while writing tests (circular reasoning)
+3. AI writes tests that describe what code does, not what it should do
+
+### MANDATORY Rules for AI Writing Tests
+
+**RULE 1: Specification-First Testing**
+- Tests must be derived from REQUIREMENTS, not from reading the implementation
+- Before writing a test, state: "This function SHOULD [behavior] because [requirement]"
+- If you can't state the requirement, you don't understand what to test
+
+**RULE 2: The "Delete Implementation" Mental Test**
+- Before finalizing a test, ask: "If I deleted the implementation and wrote it wrong, would this test catch it?"
+- If the answer is no, the test is worthless
+
+**RULE 3: No Reverse-Engineering Tests**
+- FORBIDDEN: Reading implementation, then writing test that matches it
+- REQUIRED: Write test from spec, THEN verify implementation passes
+
+**RULE 4: Mutation Testing Mindset**
+- For every test, identify at least ONE mutation that would break it
+- Example: "If I changed `<` to `<=`, this test would fail because..."
+- If you can't identify a breaking mutation, the test is too weak
+
+**RULE 5: Expected Values Must Be Independently Computed**
+```rust
+// FORBIDDEN: Using the function to compute expected value
+let expected = encode_int(42);
+assert_eq!(encode_int(42), expected); // Tautology!
+
+// REQUIRED: Independently derived expected value
+// 42 in big-endian with POS_INT prefix = [0x16, 0, 0, 0, 0, 0, 0, 0, 42]
+let expected = vec![0x16, 0, 0, 0, 0, 0, 0, 0, 42];
+assert_eq!(encode_int(42), expected);
+```
+
+**RULE 6: Prove Test Can Fail**
+- After writing a test, INTENTIONALLY break the implementation
+- Run the test - it MUST fail
+- If it doesn't fail, the test doesn't test anything
+- Revert the break, verify test passes again
+
+### AI Self-Check Before Every Test
+
+Ask yourself:
+1. "What REQUIREMENT does this test verify?" (not "what does the code do")
+2. "What specific bug would this test catch?"
+3. "What's the expected value and HOW did I compute it?"
+4. "If I made a common mistake in implementation, would this fail?"
+
+If you cannot answer all four questions, DO NOT write the test.
+
+---
+
 ## Project Overview
 
 TurDB is an embedded database combining SQLite-inspired row storage with native vector search (HNSW). This Rust implementation prioritizes zero-copy operations, zero allocation during CRUD, and extreme memory efficiency.
@@ -268,44 +329,6 @@ pub fn open(path: &Path) -> Result<Database>
 
 /// Returns the number of rows in this table.
 pub fn row_count(&self) -> u64
-```
-
-## Module Structure
-
-### Crate Organization
-
-```
-src/
-├── lib.rs              # Public API re-exports
-├── database.rs         # Database handle and lifecycle
-├── transaction.rs      # Transaction management
-├── schema/
-│   ├── mod.rs          # Schema types and catalog
-│   ├── table.rs        # Table definitions
-│   └── index.rs        # Index definitions
-├── storage/
-│   ├── mod.rs          # Storage traits
-│   ├── pager.rs        # Page manager
-│   ├── page.rs         # Page types and layouts
-│   ├── mmap.rs         # Memory-mapped storage
-│   └── wal.rs          # Write-ahead log
-├── btree/
-│   ├── mod.rs          # B-tree implementation
-│   ├── node.rs         # Node operations
-│   └── cursor.rs       # Cursor for iteration
-├── hnsw/
-│   ├── mod.rs          # HNSW index
-│   ├── graph.rs        # Graph structure
-│   └── search.rs       # k-NN search
-├── sql/
-│   ├── mod.rs          # SQL processing
-│   ├── lexer.rs        # Tokenization
-│   ├── parser.rs       # Parsing
-│   ├── planner.rs      # Query planning
-│   └── executor.rs     # Execution engine
-├── record.rs           # Row serialization
-├── types.rs            # Value types
-└── encoding.rs         # Varint and binary encoding
 ```
 
 ### Visibility Rules
@@ -817,29 +840,255 @@ impl SQ8Vector {
         (sum as f32) * self.scale * self.scale
     }
 }
+```
 
-## Testing Requirements
+## Testing Requirements - STRICT TDD ENFORCEMENT
 
-### Unit Tests
+### MANDATORY: Test-Driven Development (RED-GREEN-REFACTOR)
 
-- Test every public function
-- Test edge cases (empty, max size, boundary conditions)
-- Test error paths
+**This is NON-NEGOTIABLE. Every implementation MUST follow this exact sequence:**
+
+1. **RED**: Write test FIRST. Run it. It MUST FAIL.
+   - If the test passes before implementation exists, the test is WORTHLESS
+   - A test that never fails proves nothing
+
+2. **GREEN**: Write MINIMAL code to make test pass.
+   - No extra features, no "while I'm here" additions
+
+3. **REFACTOR**: Clean up while tests stay green.
+
+**VIOLATION = REJECTED CODE. No exceptions.**
+
+### FORBIDDEN: Tautological Tests (Tests That Test Nothing)
+
+**NEVER write tests that:**
+
+```rust
+// FORBIDDEN: Testing that function returns what function returns
+#[test]
+fn test_parse() {
+    let result = parse("input");
+    assert_eq!(result, parse("input")); // USELESS - comparing function to itself
+}
+
+// FORBIDDEN: Testing implementation, not behavior
+#[test]
+fn test_insert() {
+    let mut tree = BTree::new();
+    tree.insert(b"key", b"value");
+    assert!(tree.root.is_some()); // WRONG - tests internal state, not behavior
+}
+
+// FORBIDDEN: Tests with no meaningful assertions
+#[test]
+fn test_something() {
+    let x = do_thing();
+    assert!(true); // USELESS
+}
+
+// FORBIDDEN: Tests that just check "doesn't panic"
+#[test]
+fn test_create() {
+    let _ = Widget::new(); // No assertion = no test
+}
+```
+
+### REQUIRED: Tests Must Verify BEHAVIOR, Not Implementation
+
+**CORRECT pattern - test observable behavior:**
+
+```rust
+// CORRECT: Tests actual behavior with specific expected values
+#[test]
+fn test_insert_and_retrieve() {
+    let mut tree = BTree::new();
+    tree.insert(b"key", b"value").unwrap();
+
+    // Test RETRIEVAL behavior, not internal state
+    let result = tree.get(b"key").unwrap();
+    assert_eq!(result, b"value");
+}
+
+// CORRECT: Test boundary behavior
+#[test]
+fn test_insert_causes_split_at_capacity() {
+    let mut tree = BTree::new();
+    // Fill to capacity
+    for i in 0..MAX_KEYS {
+        tree.insert(&[i as u8], &[i as u8]).unwrap();
+    }
+    // Insert one more - should still work (split happens internally)
+    tree.insert(&[255], &[255]).unwrap();
+
+    // Verify ALL keys still retrievable (behavior preserved)
+    for i in 0..MAX_KEYS {
+        assert_eq!(tree.get(&[i as u8]).unwrap(), &[i as u8]);
+    }
+    assert_eq!(tree.get(&[255]).unwrap(), &[255]);
+}
+```
+
+### REQUIRED: Edge Cases Are MANDATORY
+
+Every function MUST have tests for:
+
+1. **Empty/Zero inputs**: `""`, `[]`, `0`, `None`
+2. **Single element**: Minimum valid input
+3. **Boundary conditions**: `MAX-1`, `MAX`, `MAX+1`
+4. **Error conditions**: Invalid inputs that SHOULD fail
+5. **Negative cases**: What should NOT happen
+
+```rust
+// REQUIRED edge case coverage example
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn get_empty_key_returns_error() {
+        let tree = BTree::new();
+        assert!(tree.get(b"").is_err());
+    }
+
+    #[test]
+    fn get_nonexistent_key_returns_none() {
+        let tree = BTree::new();
+        assert!(tree.get(b"missing").unwrap().is_none());
+    }
+
+    #[test]
+    fn insert_max_size_key_succeeds() {
+        let mut tree = BTree::new();
+        let max_key = vec![0u8; MAX_KEY_SIZE];
+        assert!(tree.insert(&max_key, b"v").is_ok());
+    }
+
+    #[test]
+    fn insert_oversized_key_returns_error() {
+        let mut tree = BTree::new();
+        let big_key = vec![0u8; MAX_KEY_SIZE + 1];
+        assert!(tree.insert(&big_key, b"v").is_err());
+    }
+}
+```
+
+### REQUIRED: Bug Fix Tests
+
+**For EVERY bug fix:**
+
+1. Write a test that REPRODUCES the bug FIRST
+2. Run test - it MUST FAIL (proving bug exists)
+3. Fix the bug
+4. Run test - it MUST PASS
+5. The test stays forever as regression protection
+
+```rust
+// Bug fix test example
+#[test]
+fn test_issue_42_off_by_one_in_split() {
+    // This specific sequence triggered the bug
+    let mut tree = BTree::new();
+    for i in (0..100).rev() {
+        tree.insert(&[i], &[i]).unwrap();
+    }
+    // Bug caused key 50 to be lost after split
+    assert_eq!(tree.get(&[50]).unwrap(), Some(&[50][..]));
+}
+```
+
+### FORBIDDEN: Test Anti-Patterns
+
+1. **NO mocking unless absolutely necessary**
+   - Mocks test your mocks, not your code
+   - Only mock: file systems, network, time, randomness
+   - NEVER mock your own code to make tests pass
+
+2. **NO test-only methods in production code**
+   ```rust
+   // FORBIDDEN
+   impl BTree {
+       #[cfg(test)]
+       pub fn get_internal_state(&self) -> &Node { ... } // NO!
+   }
+   ```
+
+3. **NO changing implementation to pass tests**
+   - If test fails, either the test or implementation is wrong
+   - Figure out WHICH before changing anything
+
+4. **NO snapshot tests for logic**
+   - Snapshots are for UI/output format only
+   - Logic must have explicit assertions
+
+5. **NO ignoring flaky tests**
+   - Flaky test = bug in test or code
+   - Fix it or delete it
+
+### REQUIRED: Assertions Must Be Specific
+
+```rust
+// FORBIDDEN: Vague assertions
+assert!(result.is_ok()); // What's in the Ok?
+assert!(list.len() > 0); // How many exactly?
+assert!(value != 0);     // What should it be?
+
+// REQUIRED: Specific assertions
+assert_eq!(result.unwrap(), expected_value);
+assert_eq!(list.len(), 3);
+assert_eq!(value, 42);
+```
+
+### REQUIRED: Test Naming Convention
+
+Test names MUST describe:
+1. What is being tested
+2. Under what conditions
+3. What the expected outcome is
+
+```rust
+// CORRECT naming
+#[test]
+fn insert_duplicate_key_overwrites_existing_value() { }
+
+#[test]
+fn delete_nonexistent_key_returns_not_found_error() { }
+
+#[test]
+fn split_preserves_all_keys_when_node_full() { }
+
+// FORBIDDEN: Vague names
+#[test]
+fn test_insert() { }  // Insert what? Expected result?
+
+#[test]
+fn test_1() { }  // Meaningless
+```
+
+### Test Coverage Requirements
+
+- **Minimum 80% line coverage** for all modules
+- **100% coverage** for: serialization, encoding, public API
+- Coverage alone is NOT sufficient - tests must be meaningful
 
 ### Integration Tests
 
-- Full CRUD cycles
-- Crash recovery scenarios
-- Concurrent access patterns
-- Memory-constrained operation (1MB limit)
+- Full CRUD cycles with real files (not mocks)
+- Crash recovery scenarios (kill process mid-operation)
+- Concurrent access patterns (multiple threads/processes)
+- Memory-constrained operation (1MB limit enforcement)
 
 ### Fuzz Testing
 
 Use `cargo-fuzz` for:
-- SQL parser
-- Record serialization
-- B-tree operations
-- HNSW graph operations
+- SQL parser (malformed input)
+- Record serialization (random bytes)
+- B-tree operations (random key sequences)
+- HNSW graph operations (edge cases in graph structure)
+
+### Pre-Commit Test Verification
+
+Before ANY commit:
+1. `cargo test` - ALL tests must pass
+2. `cargo clippy` - No warnings
+3. Review each test: "Would this catch a bug?"
 
 ## Dependencies
 
@@ -1017,24 +1266,3 @@ All resources use RAII:
 - `Database` closes files on drop
 - `Transaction` rolls back if not committed
 - `Cursor` releases page pins on drop
-
-## Migration from Go
-
-### Phase Priority
-
-1. Storage layer (pager, mmap, page types)
-2. B-tree implementation
-3. Record serialization
-4. Schema and catalog
-5. SQL parser and planner
-6. Query executor
-7. HNSW index
-8. MVCC and transactions
-9. WAL and recovery
-10. Public API and CLI
-
-### Compatibility
-
-- Binary format is NOT compatible with Go version
-- SQL syntax should be compatible
-- Migration tool will be provided for data export/import

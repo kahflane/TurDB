@@ -1,4 +1,3 @@
-use crate::database::owned_value::OwnedValue;
 use crate::database::row::Row;
 use crate::database::{CheckpointInfo, ExecuteResult, RecoveryInfo};
 use crate::mvcc::{TransactionManager, TxnId, TxnState, WriteEntry};
@@ -12,6 +11,7 @@ use crate::sql::planner::Planner;
 use crate::sql::predicate::CompiledPredicate;
 use crate::sql::Parser;
 use crate::storage::{FileManager, Wal, WalStorage};
+use crate::types::{create_column_map, create_record_schema, owned_values_to_values, OwnedValue};
 use bumpalo::Bump;
 use eyre::{bail, ensure, Result, WrapErr};
 use hashbrown::HashSet;
@@ -863,7 +863,6 @@ impl Database {
     ) -> Result<ExecuteResult> {
         use crate::btree::BTree;
         use crate::constraints::ConstraintValidator;
-        use crate::database::owned_value::create_record_schema;
         use crate::schema::table::Constraint;
         use std::sync::atomic::Ordering;
 
@@ -1170,9 +1169,6 @@ impl Database {
         arena: &Bump,
     ) -> Result<ExecuteResult> {
         use crate::btree::BTree;
-        use crate::database::owned_value::{
-            create_column_map, create_record_schema, owned_values_to_values,
-        };
         use crate::records::RecordView;
 
         self.ensure_catalog()?;
@@ -1360,9 +1356,6 @@ impl Database {
         arena: &Bump,
     ) -> Result<ExecuteResult> {
         use crate::btree::BTree;
-        use crate::database::owned_value::{
-            create_column_map, create_record_schema, owned_values_to_values,
-        };
         use crate::records::RecordView;
         use crate::schema::table::Constraint;
 
