@@ -65,5 +65,6 @@ pub use json::{
     JsonValue,
 };
 pub use literal::{
-    parse_binary_blob, parse_hex_blob, parse_uuid, parse_vector, LiteralParser, ParsedLiteral,
+    parse_binary_blob, parse_date, parse_hex_blob, parse_time, parse_timestamp, parse_uuid,
+    parse_vector, LiteralParser, ParsedLiteral,
 };

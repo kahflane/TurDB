@@ -1,3 +1,4 @@
+use crate::parsing::{parse_json_path, JsonNavigator};
 use crate::sql::executor::ExecutorRow;
 use crate::types::Value;
 use std::borrow::Cow;
@@ -375,24 +376,14 @@ impl<'a> CompiledPredicate<'a> {
             _ => return None,
         };
 
-        let path_elements = self.parse_json_path(path_str)?;
+        let path_elements = self.parse_json_path_elements(path_str)?;
         let json_str = std::str::from_utf8(json_bytes).ok()?;
 
         self.traverse_json_path(json_str, &path_elements, as_text)
     }
 
-    fn parse_json_path(&self, path: &str) -> Option<Vec<String>> {
-        let path = path.trim();
-        if !path.starts_with('{') || !path.ends_with('}') {
-            return None;
-        }
-
-        let inner = &path[1..path.len() - 1];
-        if inner.is_empty() {
-            return Some(vec![]);
-        }
-
-        Some(inner.split(',').map(|s| s.trim().to_string()).collect())
+    fn parse_json_path_elements(&self, path: &str) -> Option<Vec<String>> {
+        parse_json_path(path)
     }
 
     fn traverse_json_path(&self, json: &str, path: &[String], as_text: bool) -> Option<Value<'a>> {
@@ -510,46 +501,8 @@ impl<'a> CompiledPredicate<'a> {
     }
 
     fn json_contains_impl(&self, container: &str, contained: &str) -> bool {
-        let container = container.trim();
-        let contained = contained.trim();
-
-        if container.starts_with('{') && contained.starts_with('{') {
-            self.object_contains_object(container, contained)
-        } else if container.starts_with('[') && contained.starts_with('[') {
-            self.array_contains_array(container, contained)
-        } else {
-            self.json_values_equal(container, contained)
-        }
-    }
-
-    fn object_contains_object(&self, container: &str, contained: &str) -> bool {
-        let container_pairs = self.parse_object_pairs(container);
-        let contained_pairs = self.parse_object_pairs(contained);
-
-        for (key, value) in &contained_pairs {
-            let found = container_pairs
-                .iter()
-                .any(|(k, v)| k == key && self.json_contains_impl(v, value));
-            if !found {
-                return false;
-            }
-        }
-        true
-    }
-
-    fn array_contains_array(&self, container: &str, contained: &str) -> bool {
-        let container_elements = self.parse_array_elements(container);
-        let contained_elements = self.parse_array_elements(contained);
-
-        for elem in &contained_elements {
-            let found = container_elements
-                .iter()
-                .any(|c| self.json_contains_impl(c, elem));
-            if !found {
-                return false;
-            }
-        }
-        true
+        let nav = JsonNavigator::new("");
+        nav.json_contains(container, contained)
     }
 
     fn json_values_equal(&self, a: &str, b: &str) -> bool {
@@ -580,107 +533,9 @@ impl<'a> CompiledPredicate<'a> {
         }
     }
 
-    fn parse_object_pairs(&self, json: &str) -> Vec<(String, String)> {
-        let json = json.trim();
-        if !json.starts_with('{') || !json.ends_with('}') {
-            return vec![];
-        }
-
-        let inner = &json[1..json.len() - 1];
-        let mut pairs = Vec::new();
-        let mut depth = 0;
-        let mut in_string = false;
-        let mut escape_next = false;
-        let mut start = 0;
-
-        for (i, c) in inner.char_indices() {
-            if escape_next {
-                escape_next = false;
-                continue;
-            }
-
-            match c {
-                '\\' if in_string => escape_next = true,
-                '"' => in_string = !in_string,
-                '[' | '{' if !in_string => depth += 1,
-                ']' | '}' if !in_string => depth -= 1,
-                ',' if depth == 0 && !in_string => {
-                    if let Some(pair) = self.parse_key_value(&inner[start..i]) {
-                        pairs.push(pair);
-                    }
-                    start = i + 1;
-                }
-                _ => {}
-            }
-        }
-
-        if start < inner.len() {
-            if let Some(pair) = self.parse_key_value(&inner[start..]) {
-                pairs.push(pair);
-            }
-        }
-
-        pairs
-    }
-
-    fn parse_key_value(&self, s: &str) -> Option<(String, String)> {
-        let s = s.trim();
-        let colon_pos = s.find(':')?;
-        let key = s[..colon_pos].trim();
-        let value = s[colon_pos + 1..].trim();
-
-        let key = if key.starts_with('"') && key.ends_with('"') {
-            &key[1..key.len() - 1]
-        } else {
-            key
-        };
-
-        Some((key.to_string(), value.to_string()))
-    }
-
-    fn parse_array_elements(&self, json: &str) -> Vec<String> {
-        let json = json.trim();
-        if !json.starts_with('[') || !json.ends_with(']') {
-            return vec![];
-        }
-
-        let inner = &json[1..json.len() - 1];
-        let mut elements = Vec::new();
-        let mut depth = 0;
-        let mut in_string = false;
-        let mut escape_next = false;
-        let mut start = 0;
-
-        for (i, c) in inner.char_indices() {
-            if escape_next {
-                escape_next = false;
-                continue;
-            }
-
-            match c {
-                '\\' if in_string => escape_next = true,
-                '"' => in_string = !in_string,
-                '[' | '{' if !in_string => depth += 1,
-                ']' | '}' if !in_string => depth -= 1,
-                ',' if depth == 0 && !in_string => {
-                    let elem = inner[start..i].trim();
-                    if !elem.is_empty() {
-                        elements.push(elem.to_string());
-                    }
-                    start = i + 1;
-                }
-                _ => {}
-            }
-        }
-
-        if start < inner.len() {
-            let elem = inner[start..].trim();
-            if !elem.is_empty() {
-                elements.push(elem.to_string());
-            }
-        }
-
-        elements
+    fn parse_array_elements_local(&self, json: &str) -> Vec<String> {
+        let nav = JsonNavigator::new("");
+        nav.parse_array_elements(json)
     }
 
     pub fn eval_array_contains(&self, left: &Value<'a>, right: &Value<'a>) -> Option<bool> {
@@ -698,8 +553,8 @@ impl<'a> CompiledPredicate<'a> {
         let left_str = std::str::from_utf8(left_bytes).ok()?;
         let right_str = std::str::from_utf8(right_bytes).ok()?;
 
-        let left_elements = self.parse_array_elements(left_str.trim());
-        let right_elements = self.parse_array_elements(right_str.trim());
+        let left_elements = self.parse_array_elements_local(left_str.trim());
+        let right_elements = self.parse_array_elements_local(right_str.trim());
 
         if left_elements.is_empty() && !left_str.trim().starts_with('[') {
             return None;
@@ -738,8 +593,8 @@ impl<'a> CompiledPredicate<'a> {
         let left_str = std::str::from_utf8(left_bytes).ok()?;
         let right_str = std::str::from_utf8(right_bytes).ok()?;
 
-        let left_elements = self.parse_array_elements(left_str.trim());
-        let right_elements = self.parse_array_elements(right_str.trim());
+        let left_elements = self.parse_array_elements_local(left_str.trim());
+        let right_elements = self.parse_array_elements_local(right_str.trim());
 
         if left_elements.is_empty() && !left_str.trim().starts_with('[') {
             return None;
