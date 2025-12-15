@@ -1,7 +1,7 @@
 use crate::database::owned_value::OwnedValue;
 use crate::database::row::Row;
 use crate::database::{CheckpointInfo, ExecuteResult, RecoveryInfo};
-use crate::parsing::{parse_binary_blob, parse_hex_blob, parse_uuid, parse_vector};
+use crate::parsing::{parse_binary_blob, parse_hex_blob, parse_interval, parse_uuid, parse_vector};
 use crate::schema::{Catalog, ColumnDef as SchemaColumnDef};
 use crate::sql::builder::ExecutorBuilder;
 use crate::sql::context::ExecutionContext;
@@ -1452,7 +1452,7 @@ impl Database {
             SqlType::Json | SqlType::Jsonb => DataType::Jsonb,
             SqlType::Vector(_) => DataType::Vector,
             SqlType::Array(_) => DataType::Array,
-            SqlType::Interval => DataType::Text,
+            SqlType::Interval => DataType::Interval,
             SqlType::Point => DataType::Point,
             SqlType::Box => DataType::Box,
             SqlType::Circle => DataType::Circle,
@@ -1549,6 +1549,7 @@ impl Database {
                     Some(DataType::Uuid) => parse_uuid(s),
                     Some(DataType::Jsonb) => Self::parse_json_string(s),
                     Some(DataType::Vector) => parse_vector(s),
+                    Some(DataType::Interval) => parse_interval(s),
                     _ => Ok(OwnedValue::Text(s.to_string())),
                 },
                 Literal::Boolean(b) => Ok(OwnedValue::Bool(*b)),
