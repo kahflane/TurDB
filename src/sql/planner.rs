@@ -2975,11 +2975,11 @@ mod tests {
             IndexDef::new("idx_active_email", vec!["email"], false, IndexType::BTree)
                 .with_where_clause("status = 'active'".to_string());
 
-        let table =
-            TableDef::new(1, "users", vec![]).with_index(partial_index);
+        let table = TableDef::new(1, "users", vec![]).with_index(partial_index);
 
         let filter_columns: Vec<&str> = vec!["email"];
-        let candidates = planner.find_applicable_indexes_with_predicate(&table, &filter_columns, None);
+        let candidates =
+            planner.find_applicable_indexes_with_predicate(&table, &filter_columns, None);
 
         assert!(
             candidates.is_empty(),
@@ -2999,13 +2999,15 @@ mod tests {
             IndexDef::new("idx_active_email", vec!["email"], false, IndexType::BTree)
                 .with_where_clause("status = 'active'".to_string());
 
-        let table =
-            TableDef::new(1, "users", vec![]).with_index(partial_index);
+        let table = TableDef::new(1, "users", vec![]).with_index(partial_index);
 
         let filter_columns: Vec<&str> = vec!["email", "status"];
         let query_predicate = Some("(status Eq 'active')");
-        let candidates =
-            planner.find_applicable_indexes_with_predicate(&table, &filter_columns, query_predicate);
+        let candidates = planner.find_applicable_indexes_with_predicate(
+            &table,
+            &filter_columns,
+            query_predicate,
+        );
 
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].name(), "idx_active_email");
@@ -3021,14 +3023,16 @@ mod tests {
 
         let regular_index = IndexDef::new("idx_email", vec!["email"], false, IndexType::BTree);
 
-        let table =
-            TableDef::new(1, "users", vec![]).with_index(regular_index);
+        let table = TableDef::new(1, "users", vec![]).with_index(regular_index);
 
         let filter_columns: Vec<&str> = vec!["email"];
         let candidates_no_pred =
             planner.find_applicable_indexes_with_predicate(&table, &filter_columns, None);
-        let candidates_with_pred =
-            planner.find_applicable_indexes_with_predicate(&table, &filter_columns, Some("status = 'foo'"));
+        let candidates_with_pred = planner.find_applicable_indexes_with_predicate(
+            &table,
+            &filter_columns,
+            Some("status = 'foo'"),
+        );
 
         assert_eq!(candidates_no_pred.len(), 1);
         assert_eq!(candidates_with_pred.len(), 1);
