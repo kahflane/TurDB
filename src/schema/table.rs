@@ -202,6 +202,7 @@ pub struct IndexDef {
     column_defs: Vec<IndexColumnDef>,
     is_unique: bool,
     index_type: IndexType,
+    where_clause: Option<String>,
 }
 
 impl IndexDef {
@@ -219,6 +220,7 @@ impl IndexDef {
                 .collect(),
             is_unique,
             index_type,
+            where_clause: None,
         }
     }
 
@@ -233,7 +235,13 @@ impl IndexDef {
             column_defs,
             is_unique,
             index_type,
+            where_clause: None,
         }
+    }
+
+    pub fn with_where_clause(mut self, predicate: String) -> Self {
+        self.where_clause = Some(predicate);
+        self
     }
 
     pub fn name(&self) -> &str {
@@ -261,6 +269,14 @@ impl IndexDef {
 
     pub fn has_expressions(&self) -> bool {
         self.column_defs.iter().any(|cd| cd.is_expression())
+    }
+
+    pub fn is_partial(&self) -> bool {
+        self.where_clause.is_some()
+    }
+
+    pub fn where_clause(&self) -> Option<&str> {
+        self.where_clause.as_deref()
     }
 }
 
@@ -395,5 +411,45 @@ mod tests {
         let cols = simple_index.column_defs();
         assert_eq!(cols.len(), 1);
         assert!(matches!(&cols[0], IndexColumnDef::Column(c) if c == "email"));
+    }
+
+    #[test]
+    fn index_def_supports_partial_index_where_clause() {
+        let partial_index =
+            IndexDef::new("idx_active_users", vec!["email"], false, IndexType::BTree)
+                .with_where_clause("status = 'active'".to_string());
+
+        assert_eq!(partial_index.name(), "idx_active_users");
+        assert!(!partial_index.is_unique());
+        assert!(partial_index.is_partial());
+        assert_eq!(partial_index.where_clause(), Some("status = 'active'"));
+    }
+
+    #[test]
+    fn index_def_non_partial_has_no_where_clause() {
+        let regular_index = IndexDef::new("idx_email", vec!["email"], false, IndexType::BTree);
+
+        assert!(!regular_index.is_partial());
+        assert_eq!(regular_index.where_clause(), None);
+    }
+
+    #[test]
+    fn index_def_partial_with_expression_columns() {
+        let partial_expr_index = IndexDef::new_expression(
+            "idx_lower_active",
+            vec![IndexColumnDef::Expression("LOWER(email)".to_string())],
+            true,
+            IndexType::BTree,
+        )
+        .with_where_clause("deleted_at IS NULL".to_string());
+
+        assert_eq!(partial_expr_index.name(), "idx_lower_active");
+        assert!(partial_expr_index.is_unique());
+        assert!(partial_expr_index.is_partial());
+        assert!(partial_expr_index.has_expressions());
+        assert_eq!(
+            partial_expr_index.where_clause(),
+            Some("deleted_at IS NULL")
+        );
     }
 }
