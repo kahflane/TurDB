@@ -1,0 +1,362 @@
+{
+  "workflow": {
+    "codeQualityRules": {
+      "documentation": "80-100 line block comment at top of each file. No inline comments. Doc comments (///) for public API only.",
+      "errorHandling": "Use eyre exclusively. Every error must include context (operation, resource, reason). No custom error enums.",
+      "naming": "Follow Rust naming conventions. snake_case for functions/variables, PascalCase for types.",
+      "noPartialWork": "Each task must be 100% complete before marking done=true",
+      "noPlaceholders": "NEVER write TODO comments or placeholder implementations. Complete each task fully.",
+      "testsMustPass": "All tests must pass before committing. Run 'cargo test' to verify",
+      "zeroAllocation": "CRUD operations must not allocate. Use arenas for query-scoped allocations.",
+      "zeroCopy": "Return &[u8] slices from mmap. Never clone page data."
+    },
+    "fileStructure": {
+      "maxLength": "Strictly aim for files under 800 lines.",
+      "modularity": "Prefer many small modules over one large module.",
+      "oneStructRule": "Major structs should usually have their own file.",
+      "barrels": "Use mod.rs (or file-named modules) primarily for pub mod and pub use re-exports to create a clean public API. Avoid putting core logic in the root of a module."
+    },
+    "idiomaticSeparation": {
+      "tests": "Unit tests (#[cfg(test)]) go at the bottom of the file. If tests exceed 200 lines, move them to a tests/ directory (integration style) or a separate _tests.rs submodule."
+    },
+    "commitConvention": {
+      "examples": [
+        "feat(storage): implement SIEVE cache eviction algorithm",
+        "feat(btree): add slot array with prefix hints for fast lookup",
+        "test(hnsw): add benchmarks for SQ8 quantized distance",
+        "fix(mvcc): correct version chain visibility check"
+      ],
+      "format": "<type>(<scope>): <description>",
+      "scopes": [
+        "storage - Storage engine (pager, mmap, cache, wal)",
+        "btree - B-tree index implementation",
+        "hnsw - HNSW vector index",
+        "mvcc - Transaction/concurrency",
+        "sql - SQL parser/planner/executor",
+        "record - Row serialization",
+        "schema - Catalog and schema management",
+        "api - Public API",
+        "cli - Command-line interface"
+      ],
+      "types": {
+        "docs": "Documentation updates",
+        "feat": "New feature implementation",
+        "fix": "Bug fix",
+        "perf": "Performance improvement",
+        "refactor": "Code refactoring without behavior change",
+        "test": "Adding or updating tests"
+      }
+    },
+    "concurrency": {
+      "avoidConflicts": "Before starting, check 'git worktree list' for active feature worktrees",
+      "cleanup": "After merging a feature, remove the worktree: 'git worktree remove ./tur-feature-<name>'",
+      "mergeStrategy": "Each feature worktree is isolated. After completion, merge from the worktree or create PR",
+      "multipleAgents": "Multiple agents can work on DIFFERENT features simultaneously using git worktrees",
+      "worktreeNaming": "Directory: ./tur-feature-<feature-title-kebab-case>, Branch: feature/<feature-title-kebab-case>",
+      "worktreePath": "./.worktrees"
+    },
+    "mandatorySteps": {
+      "beforeStarting": [
+        "Read this entire workflow section carefully",
+        "Check active worktrees: run 'git worktree list' to see active feature worktrees",
+        "Pick ONE feature where status=false AND no worktree exists for it",
+        "Review CLAUDE.md for Rust-specific guidelines"
+      ],
+      "implementationCycle": [
+        "STEP 1: Create feature worktree with dedicated directory",
+        "  Note: Worktree directory: /Users/julfikar/Documents/PassionFruit.nosync/tur/rust/.worktrees",
+        "  → Run: git worktree add ./.worktrees/tur-feature-<feature-title-kebab-case> -b feature/<feature-title-kebab-case>",
+        "  → Change directory: cd ./.worktrees/tur-feature-<feature-title-kebab-case>",
+        "",
+        "STEP 2: For EACH task in the feature.tasks array (in order):",
+        "  ",
+        "  2a. ANALYZE THE TASK",
+        "     → Read the task description carefully",
+        "     → Identify what files need to be created/modified",
+        "     → Review CLAUDE.md for Rust-specific patterns",
+        "  ",
+        "  2b. WRITE TEST FIRST (RED phase)",
+        "     → Create or update test module in tests/ directory",
+        "     → Write specific test case for this task",
+        "     → Run: cargo test",
+        "     → VERIFY test FAILS (if it passes, test is wrong or task already done)",
+        "  ",
+        "  2c. IMPLEMENT CODE (GREEN phase)",
+        "     → Write MINIMAL code to make the test pass",
+        "     → Ensure zero-copy and zero-allocation where required",
+        "     → Focus on making THIS test pass",
+        "     → Run: cargo test",
+        "     → VERIFY test now PASSES",
+        "  ",
+        "  2d. REFACTOR (if needed)",
+        "     → Clean up code while keeping tests green",
+        "     → Run: cargo clippy -- -D warnings",
+        "     → Run: cargo fmt",
+        "     → Run: cargo test (ensure still passing)",
+        "  ",
+        "  2e. UPDATE FEATURE LIST",
+        "     → Edit rust/.claude/pending-list.json",
+        "     → Find this exact task in the feature",
+        "     → Change 'status': pending to 'status': completed",
+        "  ",
+        "  2f. COMMIT",
+        "     → Run: git add .",
+        "     → Run: git commit -m 'feat(<scope>): <task-description>'",
+        "  ",
+        "  REPEAT 2a-2f for ALL tasks in the feature",
+        "",
+        "STEP 3: Complete feature",
+        "  → Verify ALL tasks have 'status': completed",
+        "  → Run: cargo test",
+        "  → Run: cargo clippy -- -D warnings",
+        "  → Run: cargo build --release",
+        "  → Update pending-list.json: set 'status': completed",
+        "  → Commit: git commit -m 'feat(<scope>): complete feature implementation'",
+        "",
+        "STEP 4: Report completion",
+        "  → List completed tasks",
+        "  → Show test results",
+        "  → Report any blockers or dependencies discovered"
+      ]
+    },
+    "method": "TDD (Test-Driven Development)",
+    "objective": "Achieve CONCRETE, WORKING implementation of TurDB Rust features. Zero-copy, zero allocation, 16KB pages, 1MB RAM minimum.",
+    "referenceResources": {
+      "projectDocs": [
+        "CLAUDE.md - Rust-specific development guidelines"
+      ],
+      "testExamples": "Look at Rust crate tests for testing patterns"
+    },
+    "testingGuidelines": {
+      "coverage": "Aim for >80% code coverage per module",
+      "examples": [
+        "#[test] fn sieve_cache_evicts_unvisited_first() { ... }",
+        "#[test] fn btree_slot_array_finds_by_prefix() { ... }",
+        "#[test] fn record_zero_copy_text_access() { ... }"
+      ],
+      "location": "Tests in #[cfg(test)] mod tests { } at end of file, or tests/ directory for integration",
+      "naming": "fn test_function_scenario() with snake_case",
+      "structure": "Arrange-Act-Assert pattern"
+    },
+    "troubleshooting": {
+      "conflictingWorktree": "Feature worktree already exists? Pick a different feature.",
+      "lifetimeErrors": "Borrow checker issues? Review CLAUDE.md zero-copy patterns. Consider arena allocation.",
+      "missingDependencies": "Task depends on another incomplete feature? Note as blocker. Implement dependency first.",
+      "testWontFail": "Test passes immediately? Either task is already done, or test isn't testing the right thing.",
+      "testWontPass": "Can't make test pass? Break task into smaller steps.",
+      "worktreeCleanup": "When done: 'git worktree remove <path>' to clean up"
+    }
+  },
+  "todo": [
+    {
+      "id": 1,
+      "priority": "critical",
+      "title": "Wire WAL recovery into open_with_recovery()",
+      "description": "WAL recover() method exists but is NOT called during database open. frames_recovered is hardcoded to 0.",
+      "files": ["src/database/database.rs:175-180", "src/storage/wal.rs:264-294"],
+      "effort": "~20 lines, 2-4 hours",
+      "impact": "Data loss after crashes - crash recovery doesn't work",
+      "status": "completed"
+    },
+    {
+      "id": 2,
+      "priority": "high",
+      "title": "Create integration test suite",
+      "description": "tests/ directory is empty. Need end-to-end SQL tests, multi-table queries, transaction rollback tests, crash recovery tests.",
+      "files": ["tests/"],
+      "effort": "1 week",
+      "impact": "No integration test coverage",
+      "status": "pending"
+    },
+    {
+      "id": 3,
+      "priority": "high",
+      "title": "Implement subqueries in FROM clause",
+      "description": "Parsed but explicitly not implemented. Planner returns bail!(\"subqueries in FROM clause not yet implemented\")",
+      "files": ["src/sql/planner.rs:537-538", "src/sql/executor.rs"],
+      "effort": "~300-400 lines, 1 week",
+      "impact": "Complex queries not supported",
+      "status": "pending"
+    },
+    {
+      "id": 4,
+      "priority": "high",
+      "title": "Implement CTEs (WITH clause)",
+      "description": "Parsed in parser but no planner/executor implementation.",
+      "files": ["src/sql/planner.rs", "src/sql/executor.rs", "src/sql/ast.rs"],
+      "effort": "~400 lines, 1 week",
+      "impact": "Common table expressions not supported",
+      "status": "pending"
+    },
+    {
+      "id": 5,
+      "priority": "high",
+      "title": "Implement UNION/INTERSECT/EXCEPT set operations",
+      "description": "Lexer and parser support these keywords but no executor implementation.",
+      "files": ["src/sql/planner.rs", "src/sql/executor.rs"],
+      "effort": "~300 lines, 3-5 days",
+      "impact": "Set operations not supported",
+      "status": "pending"
+    },
+    {
+      "id": 6,
+      "priority": "high",
+      "title": "Implement prepared statements",
+      "description": "No prepared statement support. Important for SQL injection defense.",
+      "files": ["src/database/database.rs", "src/sql/mod.rs"],
+      "effort": "~300 lines, 3-5 days",
+      "impact": "Security hardening",
+      "status": "pending"
+    },
+    {
+      "id": 7,
+      "priority": "high",
+      "title": "Add DEFAULT parsing for advanced types",
+      "description": "UUID, JSONB, Date/Time, Vector, Interval, Point fall back to Text. Need proper parsing.",
+      "files": ["src/constraints/mod.rs:151-176"],
+      "effort": "~100 lines, 1-2 days",
+      "impact": "Advanced type DEFAULT values don't work",
+      "status": "completed"
+    },
+    {
+      "id": 8,
+      "priority": "medium",
+      "title": "Implement window functions",
+      "description": "Lexer/parser support window functions (OVER PARTITION) but no executor implementation.",
+      "files": ["src/sql/planner.rs", "src/sql/executor.rs"],
+      "effort": "~500 lines, 1-2 weeks",
+      "impact": "Analytics queries not supported",
+      "status": "pending"
+    },
+    {
+      "id": 9,
+      "priority": "medium",
+      "title": "Implement INSERT...SELECT",
+      "description": "Parsed but not executed in database layer.",
+      "files": ["src/database/database.rs", "src/sql/planner.rs"],
+      "effort": "~150 lines, 2-3 days",
+      "impact": "Common data migration pattern not supported",
+      "status": "pending"
+    },
+    {
+      "id": 10,
+      "priority": "medium",
+      "title": "Implement INSERT...ON CONFLICT (upsert)",
+      "description": "Parsed (DoNothing, DoUpdate actions) but not executed.",
+      "files": ["src/database/database.rs", "src/sql/planner.rs"],
+      "effort": "~200 lines, 3-4 days",
+      "impact": "Upsert pattern not supported",
+      "status": "pending"
+    },
+    {
+      "id": 11,
+      "priority": "medium",
+      "title": "Implement ALTER TABLE execution",
+      "description": "All ALTER TABLE actions are parsed but return unsupported statement type.",
+      "files": ["src/database/database.rs", "src/schema/mod.rs"],
+      "effort": "~400 lines, 1 week",
+      "impact": "Schema evolution not supported",
+      "status": "pending"
+    },
+    {
+      "id": 12,
+      "priority": "medium",
+      "title": "Implement RETURNING clause",
+      "description": "Not implemented for INSERT/UPDATE/DELETE.",
+      "files": ["src/database/database.rs", "src/sql/planner.rs"],
+      "effort": "~150 lines, 2-3 days",
+      "impact": "Can't get inserted/updated values back",
+      "status": "pending"
+    },
+    {
+      "id": 13,
+      "priority": "medium",
+      "title": "Implement UPDATE...FROM",
+      "description": "Update with join/from clause not implemented.",
+      "files": ["src/database/database.rs", "src/sql/planner.rs"],
+      "effort": "~200 lines, 2-3 days",
+      "impact": "Complex updates not supported",
+      "status": "pending"
+    },
+    {
+      "id": 14,
+      "priority": "medium",
+      "title": "Add query timeout mechanism",
+      "description": "No timeout for long-running queries. DoS prevention.",
+      "files": ["src/database/database.rs", "src/sql/executor.rs"],
+      "effort": "~100 lines, 1-2 days",
+      "impact": "Security - infinite queries possible",
+      "status": "pending"
+    },
+    {
+      "id": 15,
+      "priority": "medium",
+      "title": "Add Array type decoding",
+      "description": "Array types return NULL when decoded. Need proper decode implementation.",
+      "files": ["src/sql/decoder.rs", "src/records/array.rs"],
+      "effort": "~100 lines, 1-2 days",
+      "impact": "Array columns show as NULL",
+      "status": "completed"
+    },
+    {
+      "id": 16,
+      "priority": "medium",
+      "title": "Add Composite type decoding",
+      "description": "Composite types return NULL when decoded.",
+      "files": ["src/sql/decoder.rs", "src/records/composite.rs"],
+      "effort": "~100 lines, 1-2 days",
+      "impact": "Composite columns show as NULL",
+      "status": "completed"
+    },
+    {
+      "id": 17,
+      "priority": "medium",
+      "title": "Add Range type decoding",
+      "description": "Range types (Int4Range, Int8Range, DateRange, TimestampRange) return NULL.",
+      "files": ["src/sql/decoder.rs"],
+      "effort": "~100 lines, 1-2 days",
+      "impact": "Range columns show as NULL",
+      "status": "completed"
+    },
+    {
+      "id": 18,
+      "priority": "low",
+      "title": "Parse CREATE TYPE (enum)",
+      "description": "Enum types cannot be created via SQL. Need parser support.",
+      "files": ["src/sql/parser.rs", "src/sql/lexer.rs"],
+      "effort": "~150 lines, 2-3 days",
+      "impact": "Custom enum types not supported",
+      "status": "pending"
+    },
+    {
+      "id": 19,
+      "priority": "low",
+      "title": "Add fuzz testing for parser",
+      "description": "No fuzz tests for SQL parser. Important for security.",
+      "files": ["fuzz/"],
+      "effort": "~100 lines, 1-2 days",
+      "impact": "Parser crash bugs may exist",
+      "status": "pending"
+    },
+    {
+      "id": 20,
+      "priority": "low",
+      "title": "Add fuzz testing for decoder",
+      "description": "No fuzz tests for record decoder.",
+      "files": ["fuzz/"],
+      "effort": "~100 lines, 1-2 days",
+      "impact": "Decoder crash bugs may exist",
+      "status": "completed"
+    },
+    {
+      "id": 21,
+      "priority": "low",
+      "title": "Complete HNSW SQL integration",
+      "description": "HNSW index exists but SQL CREATE INDEX for HNSW may not be fully wired.",
+      "files": ["src/hnsw/mod.rs", "src/database/database.rs"],
+      "effort": "~200 lines, 3-5 days",
+      "impact": "Vector search via SQL may be incomplete",
+      "status": "pending"
+    }
+  ]
+}

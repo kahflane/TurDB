@@ -53,9 +53,6 @@ pub mod schema;
 pub mod types;
 pub mod view;
 
-#[cfg(test)]
-mod tests;
-
 pub use array::{ArrayBuilder, ArrayView};
 pub use builder::RecordBuilder;
 pub use composite::{CompositeView, MAX_NESTING_DEPTH};

@@ -90,13 +90,9 @@
 
 #[allow(clippy::module_inception)]
 mod database;
-pub mod owned_value;
 pub mod row;
 
 pub use database::Database;
-pub use owned_value::{
-    create_column_map, create_record_schema, owned_values_to_values, OwnedValue,
-};
 pub use row::Row;
 
 #[derive(Debug)]
@@ -135,6 +131,7 @@ pub struct CheckpointInfo {
 mod tests {
     use super::*;
     use crate::database::database::Database;
+    use crate::OwnedValue;
     use tempfile::tempdir;
 
     #[test]
@@ -891,7 +888,7 @@ mod tests {
 
     #[test]
     fn test_insert_uuid_from_string_literal() {
-        use crate::database::owned_value::OwnedValue;
+        use crate::OwnedValue;
 
         let dir = tempdir().unwrap();
         let db_path = dir.path().join("test_db");
@@ -935,7 +932,7 @@ mod tests {
 
     #[test]
     fn test_insert_jsonb_from_string_literal() {
-        use crate::database::owned_value::OwnedValue;
+        use crate::OwnedValue;
 
         let dir = tempdir().unwrap();
         let db_path = dir.path().join("test_db");
@@ -970,7 +967,7 @@ mod tests {
 
     #[test]
     fn test_insert_vector_from_array_literal() {
-        use crate::database::owned_value::OwnedValue;
+        use crate::OwnedValue;
 
         let dir = tempdir().unwrap();
         let db_path = dir.path().join("test_db");
@@ -1003,7 +1000,7 @@ mod tests {
 
     #[test]
     fn test_insert_blob_from_hex_literal() {
-        use crate::database::owned_value::OwnedValue;
+        use crate::OwnedValue;
 
         let dir = tempdir().unwrap();
         let db_path = dir.path().join("test_db");
