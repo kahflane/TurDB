@@ -75,6 +75,527 @@ impl<'a> CompiledPredicate<'a> {
                 let right_val = self.eval_value(right, row)?;
                 self.eval_binary_op(&left_val, op, &right_val)
             }
+            Expr::UnaryOp { op, expr } => {
+                let val = self.eval_value(expr, row)?;
+                self.eval_unary_op(op, &val)
+            }
+            Expr::Case {
+                operand,
+                conditions,
+                else_result,
+            } => self.eval_case(operand.as_deref(), conditions, else_result.as_deref(), row),
+            Expr::Cast { expr, data_type } => {
+                let val = self.eval_value(expr, row)?;
+                self.eval_cast(&val, data_type)
+            }
+            Expr::IsNull { expr, negated } => {
+                let val = self.eval_value(expr, row);
+                let is_null = matches!(val, Some(Value::Null) | None);
+                let result = if *negated { !is_null } else { is_null };
+                Some(Value::Int(if result { 1 } else { 0 }))
+            }
+            Expr::InList {
+                expr,
+                negated,
+                list,
+            } => {
+                let target_val = self.eval_value(expr, row)?;
+                let mut found = false;
+                for list_item in list.iter() {
+                    if let Some(list_val) = self.eval_value(list_item, row) {
+                        if self.values_equal(&target_val, &list_val) {
+                            found = true;
+                            break;
+                        }
+                    }
+                }
+                let result = if *negated { !found } else { found };
+                Some(Value::Int(if result { 1 } else { 0 }))
+            }
+            Expr::Between {
+                expr,
+                negated,
+                low,
+                high,
+            } => {
+                let val = self.eval_value(expr, row)?;
+                let low_val = self.eval_value(low, row)?;
+                let high_val = self.eval_value(high, row)?;
+                let in_range = self
+                    .value_cmp(&val, &low_val)
+                    .is_some_and(|o| o != std::cmp::Ordering::Less)
+                    && self
+                        .value_cmp(&val, &high_val)
+                        .is_some_and(|o| o != std::cmp::Ordering::Greater);
+                let result = if *negated { !in_range } else { in_range };
+                Some(Value::Int(if result { 1 } else { 0 }))
+            }
+            Expr::Like {
+                expr,
+                negated,
+                pattern,
+                escape: _,
+                case_insensitive,
+            } => {
+                let val = self.eval_value(expr, row)?;
+                let pat = self.eval_value(pattern, row)?;
+                let matches = match (&val, &pat) {
+                    (Value::Text(s), Value::Text(p)) => self.like_match(s, p, *case_insensitive),
+                    _ => false,
+                };
+                let result = if *negated { !matches } else { matches };
+                Some(Value::Int(if result { 1 } else { 0 }))
+            }
+            Expr::ArraySubscript { array, index } => {
+                let array_val = self.eval_value(array, row)?;
+                let index_val = self.eval_value(index, row)?;
+                self.eval_array_subscript(&array_val, &index_val)
+            }
+            Expr::Function(func) => self.eval_function(func, row),
+            _ => None,
+        }
+    }
+
+    fn eval_unary_op(
+        &self,
+        op: &crate::sql::ast::UnaryOperator,
+        val: &Value<'a>,
+    ) -> Option<Value<'a>> {
+        use crate::sql::ast::UnaryOperator;
+
+        match op {
+            UnaryOperator::Minus => match val {
+                Value::Int(n) => Some(Value::Int(-n)),
+                Value::Float(f) => Some(Value::Float(-f)),
+                _ => None,
+            },
+            UnaryOperator::Plus => match val {
+                Value::Int(n) => Some(Value::Int(*n)),
+                Value::Float(f) => Some(Value::Float(*f)),
+                _ => None,
+            },
+            UnaryOperator::Not => match val {
+                Value::Int(n) => Some(Value::Int(if *n == 0 { 1 } else { 0 })),
+                _ => None,
+            },
+            UnaryOperator::BitwiseNot => match val {
+                Value::Int(n) => Some(Value::Int(!n)),
+                _ => None,
+            },
+        }
+    }
+
+    fn eval_case(
+        &self,
+        operand: Option<&crate::sql::ast::Expr<'a>>,
+        conditions: &[crate::sql::ast::WhenClause<'a>],
+        else_result: Option<&crate::sql::ast::Expr<'a>>,
+        row: &ExecutorRow<'a>,
+    ) -> Option<Value<'a>> {
+        match operand {
+            Some(op_expr) => {
+                let op_val = self.eval_value(op_expr, row)?;
+                for when_clause in conditions {
+                    let when_val = self.eval_value(when_clause.condition, row)?;
+                    if self.values_equal(&op_val, &when_val) {
+                        return self.eval_value(when_clause.result, row);
+                    }
+                }
+            }
+            None => {
+                for when_clause in conditions {
+                    if self.eval_condition_as_bool(when_clause.condition, row) {
+                        return self.eval_value(when_clause.result, row);
+                    }
+                }
+            }
+        }
+
+        if let Some(else_expr) = else_result {
+            self.eval_value(else_expr, row)
+        } else {
+            Some(Value::Null)
+        }
+    }
+
+    fn eval_condition_as_bool(
+        &self,
+        expr: &crate::sql::ast::Expr<'a>,
+        row: &ExecutorRow<'a>,
+    ) -> bool {
+        if let Some(val) = self.eval_value(expr, row) {
+            match val {
+                Value::Int(n) => n != 0,
+                Value::Float(f) => f != 0.0,
+                Value::Null => false,
+                _ => false,
+            }
+        } else {
+            false
+        }
+    }
+
+    fn values_equal(&self, a: &Value<'a>, b: &Value<'a>) -> bool {
+        match (a, b) {
+            (Value::Null, Value::Null) => true,
+            (Value::Null, _) | (_, Value::Null) => false,
+            (Value::Int(x), Value::Int(y)) => x == y,
+            (Value::Float(x), Value::Float(y)) => (x - y).abs() < f64::EPSILON,
+            (Value::Int(x), Value::Float(y)) => ((*x as f64) - y).abs() < f64::EPSILON,
+            (Value::Float(x), Value::Int(y)) => (x - (*y as f64)).abs() < f64::EPSILON,
+            (Value::Text(x), Value::Text(y)) => x == y,
+            _ => false,
+        }
+    }
+
+    fn value_cmp(&self, a: &Value<'a>, b: &Value<'a>) -> Option<std::cmp::Ordering> {
+        match (a, b) {
+            (Value::Null, _) | (_, Value::Null) => None,
+            (Value::Int(x), Value::Int(y)) => Some(x.cmp(y)),
+            (Value::Float(x), Value::Float(y)) => x.partial_cmp(y),
+            (Value::Int(x), Value::Float(y)) => (*x as f64).partial_cmp(y),
+            (Value::Float(x), Value::Int(y)) => x.partial_cmp(&(*y as f64)),
+            (Value::Text(x), Value::Text(y)) => Some(x.cmp(y)),
+            _ => None,
+        }
+    }
+
+    fn like_match(&self, text: &str, pattern: &str, case_insensitive: bool) -> bool {
+        let (text, pattern) = if case_insensitive {
+            (text.to_lowercase(), pattern.to_lowercase())
+        } else {
+            (text.to_string(), pattern.to_string())
+        };
+
+        self.like_match_impl(text.as_bytes(), pattern.as_bytes())
+    }
+
+    fn like_match_impl(&self, text: &[u8], pattern: &[u8]) -> bool {
+        let mut ti = 0;
+        let mut pi = 0;
+        let mut star_pi = None;
+        let mut star_ti = 0;
+
+        while ti < text.len() {
+            if pi < pattern.len() && (pattern[pi] == b'_' || pattern[pi] == text[ti]) {
+                ti += 1;
+                pi += 1;
+            } else if pi < pattern.len() && pattern[pi] == b'%' {
+                star_pi = Some(pi);
+                star_ti = ti;
+                pi += 1;
+            } else if let Some(sp) = star_pi {
+                pi = sp + 1;
+                star_ti += 1;
+                ti = star_ti;
+            } else {
+                return false;
+            }
+        }
+
+        while pi < pattern.len() && pattern[pi] == b'%' {
+            pi += 1;
+        }
+
+        pi == pattern.len()
+    }
+
+    fn eval_array_subscript(&self, array: &Value<'a>, index: &Value<'a>) -> Option<Value<'a>> {
+        let idx = match index {
+            Value::Int(i) => *i,
+            _ => return None,
+        };
+
+        let json_str = match array {
+            Value::Text(s) if s.trim().starts_with('[') => s.as_ref(),
+            Value::Jsonb(bytes) => {
+                let s = std::str::from_utf8(bytes).ok()?;
+                if s.trim().starts_with('[') {
+                    s
+                } else {
+                    return Some(Value::Null);
+                }
+            }
+            _ => return Some(Value::Null),
+        };
+
+        match self.extract_json_array_index(json_str, idx, false) {
+            Some(val) => Some(val),
+            None => Some(Value::Null),
+        }
+    }
+
+    fn eval_cast(
+        &self,
+        val: &Value<'a>,
+        data_type: &crate::sql::ast::DataType<'a>,
+    ) -> Option<Value<'a>> {
+        use crate::sql::ast::DataType;
+
+        match data_type {
+            DataType::Integer | DataType::BigInt | DataType::SmallInt | DataType::TinyInt => {
+                match val {
+                    Value::Int(n) => Some(Value::Int(*n)),
+                    Value::Float(f) => Some(Value::Int(*f as i64)),
+                    Value::Text(s) => s.parse::<i64>().ok().map(Value::Int),
+                    Value::Null => Some(Value::Null),
+                    _ => None,
+                }
+            }
+            DataType::Real
+            | DataType::DoublePrecision
+            | DataType::Decimal(_, _)
+            | DataType::Numeric(_, _) => match val {
+                Value::Int(n) => Some(Value::Float(*n as f64)),
+                Value::Float(f) => Some(Value::Float(*f)),
+                Value::Text(s) => s.parse::<f64>().ok().map(Value::Float),
+                Value::Null => Some(Value::Null),
+                _ => None,
+            },
+            DataType::Text | DataType::Varchar(_) | DataType::Char(_) => match val {
+                Value::Int(n) => Some(Value::Text(Cow::Owned(n.to_string()))),
+                Value::Float(f) => Some(Value::Text(Cow::Owned(f.to_string()))),
+                Value::Text(s) => Some(Value::Text(s.clone())),
+                Value::Null => Some(Value::Null),
+                _ => None,
+            },
+            DataType::Boolean => match val {
+                Value::Int(n) => Some(Value::Int(if *n != 0 { 1 } else { 0 })),
+                Value::Float(f) => Some(Value::Int(if *f != 0.0 { 1 } else { 0 })),
+                Value::Text(s) => {
+                    let lower = s.to_lowercase();
+                    if lower == "true"
+                        || lower == "t"
+                        || lower == "1"
+                        || lower == "yes"
+                        || lower == "on"
+                    {
+                        Some(Value::Int(1))
+                    } else if lower == "false"
+                        || lower == "f"
+                        || lower == "0"
+                        || lower == "no"
+                        || lower == "off"
+                    {
+                        Some(Value::Int(0))
+                    } else {
+                        None
+                    }
+                }
+                Value::Null => Some(Value::Null),
+                _ => None,
+            },
+            _ => Some(val.clone()),
+        }
+    }
+
+    fn eval_function(
+        &self,
+        func: &crate::sql::ast::FunctionCall<'a>,
+        row: &ExecutorRow<'a>,
+    ) -> Option<Value<'a>> {
+        use crate::sql::ast::FunctionArgs;
+
+        let func_name = func.name.name.to_uppercase();
+        let args: Vec<Option<Value<'a>>> = match &func.args {
+            FunctionArgs::None | FunctionArgs::Star => vec![],
+            FunctionArgs::Args(args) => args
+                .iter()
+                .map(|arg| self.eval_value(arg.value, row))
+                .collect(),
+        };
+
+        match func_name.as_str() {
+            "UPPER" => {
+                let arg = args.first()?.as_ref()?;
+                match arg {
+                    Value::Text(s) => Some(Value::Text(Cow::Owned(s.to_uppercase()))),
+                    Value::Null => Some(Value::Null),
+                    _ => None,
+                }
+            }
+            "LOWER" => {
+                let arg = args.first()?.as_ref()?;
+                match arg {
+                    Value::Text(s) => Some(Value::Text(Cow::Owned(s.to_lowercase()))),
+                    Value::Null => Some(Value::Null),
+                    _ => None,
+                }
+            }
+            "COALESCE" => {
+                for arg in args {
+                    match arg {
+                        Some(Value::Null) | None => continue,
+                        Some(val) => return Some(val),
+                    }
+                }
+                Some(Value::Null)
+            }
+            "ABS" => {
+                let arg = args.first()?.as_ref()?;
+                match arg {
+                    Value::Int(n) => Some(Value::Int(n.abs())),
+                    Value::Float(f) => Some(Value::Float(f.abs())),
+                    Value::Null => Some(Value::Null),
+                    _ => None,
+                }
+            }
+            "LENGTH" | "LEN" | "CHAR_LENGTH" | "CHARACTER_LENGTH" => {
+                let arg = args.first()?.as_ref()?;
+                match arg {
+                    Value::Text(s) => Some(Value::Int(s.chars().count() as i64)),
+                    Value::Null => Some(Value::Null),
+                    _ => None,
+                }
+            }
+            "CONCAT" => {
+                let mut result = String::new();
+                for arg in args {
+                    match arg {
+                        Some(Value::Text(s)) => result.push_str(&s),
+                        Some(Value::Int(n)) => result.push_str(&n.to_string()),
+                        Some(Value::Float(f)) => result.push_str(&f.to_string()),
+                        Some(Value::Null) | None => {}
+                        _ => {}
+                    }
+                }
+                Some(Value::Text(Cow::Owned(result)))
+            }
+            "TRIM" => {
+                let arg = args.first()?.as_ref()?;
+                match arg {
+                    Value::Text(s) => Some(Value::Text(Cow::Owned(s.trim().to_string()))),
+                    Value::Null => Some(Value::Null),
+                    _ => None,
+                }
+            }
+            "LTRIM" => {
+                let arg = args.first()?.as_ref()?;
+                match arg {
+                    Value::Text(s) => Some(Value::Text(Cow::Owned(s.trim_start().to_string()))),
+                    Value::Null => Some(Value::Null),
+                    _ => None,
+                }
+            }
+            "RTRIM" => {
+                let arg = args.first()?.as_ref()?;
+                match arg {
+                    Value::Text(s) => Some(Value::Text(Cow::Owned(s.trim_end().to_string()))),
+                    Value::Null => Some(Value::Null),
+                    _ => None,
+                }
+            }
+            "SUBSTRING" | "SUBSTR" => {
+                let text = match args.first()?.as_ref()? {
+                    Value::Text(s) => s.as_ref(),
+                    Value::Null => return Some(Value::Null),
+                    _ => return None,
+                };
+                let start = match args.get(1)?.as_ref()? {
+                    Value::Int(n) => (*n).max(1) as usize - 1,
+                    _ => return None,
+                };
+                let len = if args.len() > 2 {
+                    match args.get(2)?.as_ref()? {
+                        Value::Int(n) => Some((*n).max(0) as usize),
+                        _ => return None,
+                    }
+                } else {
+                    None
+                };
+                let chars: Vec<char> = text.chars().collect();
+                let result: String = if let Some(l) = len {
+                    chars.iter().skip(start).take(l).collect()
+                } else {
+                    chars.iter().skip(start).collect()
+                };
+                Some(Value::Text(Cow::Owned(result)))
+            }
+            "NULLIF" => {
+                if args.len() != 2 {
+                    return None;
+                }
+                let first = args.first()?.as_ref()?;
+                let second = args.get(1)?.as_ref()?;
+                if self.values_equal(first, second) {
+                    Some(Value::Null)
+                } else {
+                    Some(first.clone())
+                }
+            }
+            "IFNULL" | "NVL" => {
+                if args.len() != 2 {
+                    return None;
+                }
+                let first = args.first()?;
+                let second = args.get(1)?;
+                match first {
+                    Some(Value::Null) | None => second.clone(),
+                    Some(val) => Some(val.clone()),
+                }
+            }
+            "FLOOR" => {
+                let arg = args.first()?.as_ref()?;
+                match arg {
+                    Value::Float(f) => Some(Value::Float(f.floor())),
+                    Value::Int(n) => Some(Value::Int(*n)),
+                    Value::Null => Some(Value::Null),
+                    _ => None,
+                }
+            }
+            "CEIL" | "CEILING" => {
+                let arg = args.first()?.as_ref()?;
+                match arg {
+                    Value::Float(f) => Some(Value::Float(f.ceil())),
+                    Value::Int(n) => Some(Value::Int(*n)),
+                    Value::Null => Some(Value::Null),
+                    _ => None,
+                }
+            }
+            "ROUND" => {
+                let arg = args.first()?.as_ref()?;
+                let precision = if args.len() > 1 {
+                    match args.get(1)?.as_ref()? {
+                        Value::Int(n) => *n as i32,
+                        _ => 0,
+                    }
+                } else {
+                    0
+                };
+                match arg {
+                    Value::Float(f) => {
+                        let factor = 10f64.powi(precision);
+                        Some(Value::Float((f * factor).round() / factor))
+                    }
+                    Value::Int(n) => Some(Value::Int(*n)),
+                    Value::Null => Some(Value::Null),
+                    _ => None,
+                }
+            }
+            "SQRT" => {
+                let arg = args.first()?.as_ref()?;
+                match arg {
+                    Value::Float(f) if *f >= 0.0 => Some(Value::Float(f.sqrt())),
+                    Value::Int(n) if *n >= 0 => Some(Value::Float((*n as f64).sqrt())),
+                    Value::Null => Some(Value::Null),
+                    _ => None,
+                }
+            }
+            "POWER" | "POW" => {
+                if args.len() != 2 {
+                    return None;
+                }
+                let base = args.first()?.as_ref()?;
+                let exp = args.get(1)?.as_ref()?;
+                match (base, exp) {
+                    (Value::Float(b), Value::Float(e)) => Some(Value::Float(b.powf(*e))),
+                    (Value::Int(b), Value::Int(e)) if *e >= 0 => Some(Value::Int(b.pow(*e as u32))),
+                    (Value::Int(b), Value::Float(e)) => Some(Value::Float((*b as f64).powf(*e))),
+                    (Value::Float(b), Value::Int(e)) => Some(Value::Float(b.powi(*e as i32))),
+                    (Value::Null, _) | (_, Value::Null) => Some(Value::Null),
+                    _ => None,
+                }
+            }
             _ => None,
         }
     }
@@ -970,5 +1491,1087 @@ mod tests {
         let result = predicate.eval_array_contains(&left, &right);
 
         assert!(result.unwrap_or(false));
+    }
+
+    #[test]
+    fn unary_minus_negates_integer() {
+        use crate::sql::ast::{Expr, Literal, UnaryOperator};
+        use bumpalo::Bump;
+
+        let arena = Bump::new();
+        let inner = arena.alloc(Expr::Literal(Literal::Integer("42")));
+        let expr = arena.alloc(Expr::UnaryOp {
+            op: UnaryOperator::Minus,
+            expr: inner,
+        });
+
+        let predicate = CompiledPredicate::new(expr, vec![]);
+        let values: Vec<Value> = vec![];
+        let row = crate::sql::executor::ExecutorRow::new(&values);
+        let result = predicate.eval_value(expr, &row);
+
+        assert!(result.is_some(), "UnaryOp::Minus should return a value");
+        match result.unwrap() {
+            Value::Int(n) => assert_eq!(n, -42),
+            _ => panic!("Expected Int value"),
+        }
+    }
+
+    #[test]
+    fn unary_plus_preserves_integer() {
+        use crate::sql::ast::{Expr, Literal, UnaryOperator};
+        use bumpalo::Bump;
+
+        let arena = Bump::new();
+        let inner = arena.alloc(Expr::Literal(Literal::Integer("42")));
+        let expr = arena.alloc(Expr::UnaryOp {
+            op: UnaryOperator::Plus,
+            expr: inner,
+        });
+
+        let predicate = CompiledPredicate::new(expr, vec![]);
+        let values: Vec<Value> = vec![];
+        let row = crate::sql::executor::ExecutorRow::new(&values);
+        let result = predicate.eval_value(expr, &row);
+
+        assert!(result.is_some(), "UnaryOp::Plus should return a value");
+        match result.unwrap() {
+            Value::Int(n) => assert_eq!(n, 42),
+            _ => panic!("Expected Int value"),
+        }
+    }
+
+    #[test]
+    fn unary_not_negates_boolean() {
+        use crate::sql::ast::{Expr, Literal, UnaryOperator};
+        use bumpalo::Bump;
+
+        let arena = Bump::new();
+        let inner = arena.alloc(Expr::Literal(Literal::Boolean(true)));
+        let expr = arena.alloc(Expr::UnaryOp {
+            op: UnaryOperator::Not,
+            expr: inner,
+        });
+
+        let predicate = CompiledPredicate::new(expr, vec![]);
+        let values: Vec<Value> = vec![];
+        let row = crate::sql::executor::ExecutorRow::new(&values);
+        let result = predicate.eval_value(expr, &row);
+
+        assert!(result.is_some(), "UnaryOp::Not should return a value");
+        match result.unwrap() {
+            Value::Int(n) => assert_eq!(n, 0),
+            _ => panic!("Expected Int value (0 for false)"),
+        }
+    }
+
+    #[test]
+    fn unary_bitwise_not_inverts_bits() {
+        use crate::sql::ast::{Expr, Literal, UnaryOperator};
+        use bumpalo::Bump;
+
+        let arena = Bump::new();
+        let inner = arena.alloc(Expr::Literal(Literal::Integer("0")));
+        let expr = arena.alloc(Expr::UnaryOp {
+            op: UnaryOperator::BitwiseNot,
+            expr: inner,
+        });
+
+        let predicate = CompiledPredicate::new(expr, vec![]);
+        let values: Vec<Value> = vec![];
+        let row = crate::sql::executor::ExecutorRow::new(&values);
+        let result = predicate.eval_value(expr, &row);
+
+        assert!(
+            result.is_some(),
+            "UnaryOp::BitwiseNot should return a value"
+        );
+        match result.unwrap() {
+            Value::Int(n) => assert_eq!(n, -1),
+            _ => panic!("Expected Int value"),
+        }
+    }
+
+    #[test]
+    fn case_searched_returns_first_matching() {
+        use crate::sql::ast::{Expr, Literal, WhenClause};
+        use bumpalo::Bump;
+
+        let arena = Bump::new();
+        let lit_true = arena.alloc(Expr::Literal(Literal::Boolean(true)));
+        let lit_false = arena.alloc(Expr::Literal(Literal::Boolean(false)));
+        let result1 = arena.alloc(Expr::Literal(Literal::Integer("100")));
+        let result2 = arena.alloc(Expr::Literal(Literal::Integer("200")));
+        let else_result = arena.alloc(Expr::Literal(Literal::Integer("999")));
+
+        let conditions = arena.alloc_slice_copy(&[
+            WhenClause {
+                condition: lit_false,
+                result: result1,
+            },
+            WhenClause {
+                condition: lit_true,
+                result: result2,
+            },
+        ]);
+
+        let expr = arena.alloc(Expr::Case {
+            operand: None,
+            conditions,
+            else_result: Some(else_result),
+        });
+
+        let predicate = CompiledPredicate::new(expr, vec![]);
+        let values: Vec<Value> = vec![];
+        let row = crate::sql::executor::ExecutorRow::new(&values);
+        let result = predicate.eval_value(expr, &row);
+
+        assert!(result.is_some(), "CASE should return a value");
+        match result.unwrap() {
+            Value::Int(n) => assert_eq!(n, 200),
+            _ => panic!("Expected Int value"),
+        }
+    }
+
+    #[test]
+    fn case_searched_returns_else_when_no_match() {
+        use crate::sql::ast::{Expr, Literal, WhenClause};
+        use bumpalo::Bump;
+
+        let arena = Bump::new();
+        let lit_false = arena.alloc(Expr::Literal(Literal::Boolean(false)));
+        let result1 = arena.alloc(Expr::Literal(Literal::Integer("100")));
+        let else_result = arena.alloc(Expr::Literal(Literal::Integer("999")));
+
+        let conditions = arena.alloc_slice_copy(&[WhenClause {
+            condition: lit_false,
+            result: result1,
+        }]);
+
+        let expr = arena.alloc(Expr::Case {
+            operand: None,
+            conditions,
+            else_result: Some(else_result),
+        });
+
+        let predicate = CompiledPredicate::new(expr, vec![]);
+        let values: Vec<Value> = vec![];
+        let row = crate::sql::executor::ExecutorRow::new(&values);
+        let result = predicate.eval_value(expr, &row);
+
+        assert!(result.is_some(), "CASE should return ELSE value");
+        match result.unwrap() {
+            Value::Int(n) => assert_eq!(n, 999),
+            _ => panic!("Expected Int value"),
+        }
+    }
+
+    #[test]
+    fn case_simple_compares_operand() {
+        use crate::sql::ast::{Expr, Literal, WhenClause};
+        use bumpalo::Bump;
+
+        let arena = Bump::new();
+        let operand = arena.alloc(Expr::Literal(Literal::Integer("2")));
+        let when1 = arena.alloc(Expr::Literal(Literal::Integer("1")));
+        let when2 = arena.alloc(Expr::Literal(Literal::Integer("2")));
+        let result1 = arena.alloc(Expr::Literal(Literal::String("one")));
+        let result2 = arena.alloc(Expr::Literal(Literal::String("two")));
+        let else_result = arena.alloc(Expr::Literal(Literal::String("other")));
+
+        let conditions = arena.alloc_slice_copy(&[
+            WhenClause {
+                condition: when1,
+                result: result1,
+            },
+            WhenClause {
+                condition: when2,
+                result: result2,
+            },
+        ]);
+
+        let expr = arena.alloc(Expr::Case {
+            operand: Some(operand),
+            conditions,
+            else_result: Some(else_result),
+        });
+
+        let predicate = CompiledPredicate::new(expr, vec![]);
+        let values: Vec<Value> = vec![];
+        let row = crate::sql::executor::ExecutorRow::new(&values);
+        let result = predicate.eval_value(expr, &row);
+
+        assert!(
+            result.is_some(),
+            "Simple CASE should return matching result"
+        );
+        match result.unwrap() {
+            Value::Text(s) => assert_eq!(s.as_ref(), "two"),
+            _ => panic!("Expected Text value"),
+        }
+    }
+
+    #[test]
+    fn case_returns_null_when_no_match_and_no_else() {
+        use crate::sql::ast::{Expr, Literal, WhenClause};
+        use bumpalo::Bump;
+
+        let arena = Bump::new();
+        let lit_false = arena.alloc(Expr::Literal(Literal::Boolean(false)));
+        let result1 = arena.alloc(Expr::Literal(Literal::Integer("100")));
+
+        let conditions = arena.alloc_slice_copy(&[WhenClause {
+            condition: lit_false,
+            result: result1,
+        }]);
+
+        let expr = arena.alloc(Expr::Case {
+            operand: None,
+            conditions,
+            else_result: None,
+        });
+
+        let predicate = CompiledPredicate::new(expr, vec![]);
+        let values: Vec<Value> = vec![];
+        let row = crate::sql::executor::ExecutorRow::new(&values);
+        let result = predicate.eval_value(expr, &row);
+
+        assert!(
+            result.is_some(),
+            "CASE should return NULL when no match and no ELSE"
+        );
+        assert!(matches!(result.unwrap(), Value::Null));
+    }
+
+    #[test]
+    fn cast_int_to_text() {
+        use crate::sql::ast::{DataType, Expr, Literal};
+        use bumpalo::Bump;
+
+        let arena = Bump::new();
+        let inner = arena.alloc(Expr::Literal(Literal::Integer("42")));
+        let expr = arena.alloc(Expr::Cast {
+            expr: inner,
+            data_type: DataType::Text,
+        });
+
+        let predicate = CompiledPredicate::new(expr, vec![]);
+        let values: Vec<Value> = vec![];
+        let row = crate::sql::executor::ExecutorRow::new(&values);
+        let result = predicate.eval_value(expr, &row);
+
+        assert!(result.is_some(), "CAST should return a value");
+        match result.unwrap() {
+            Value::Text(s) => assert_eq!(s.as_ref(), "42"),
+            _ => panic!("Expected Text value"),
+        }
+    }
+
+    #[test]
+    fn cast_text_to_int() {
+        use crate::sql::ast::{DataType, Expr, Literal};
+        use bumpalo::Bump;
+
+        let arena = Bump::new();
+        let inner = arena.alloc(Expr::Literal(Literal::String("123")));
+        let expr = arena.alloc(Expr::Cast {
+            expr: inner,
+            data_type: DataType::Integer,
+        });
+
+        let predicate = CompiledPredicate::new(expr, vec![]);
+        let values: Vec<Value> = vec![];
+        let row = crate::sql::executor::ExecutorRow::new(&values);
+        let result = predicate.eval_value(expr, &row);
+
+        assert!(result.is_some(), "CAST should return a value");
+        match result.unwrap() {
+            Value::Int(n) => assert_eq!(n, 123),
+            _ => panic!("Expected Int value"),
+        }
+    }
+
+    #[test]
+    fn cast_float_to_int() {
+        use crate::sql::ast::{DataType, Expr, Literal};
+        use bumpalo::Bump;
+
+        let arena = Bump::new();
+        let inner = arena.alloc(Expr::Literal(Literal::Float("3.14")));
+        let expr = arena.alloc(Expr::Cast {
+            expr: inner,
+            data_type: DataType::Integer,
+        });
+
+        let predicate = CompiledPredicate::new(expr, vec![]);
+        let values: Vec<Value> = vec![];
+        let row = crate::sql::executor::ExecutorRow::new(&values);
+        let result = predicate.eval_value(expr, &row);
+
+        assert!(result.is_some(), "CAST should return a value");
+        match result.unwrap() {
+            Value::Int(n) => assert_eq!(n, 3),
+            _ => panic!("Expected Int value"),
+        }
+    }
+
+    #[test]
+    fn cast_int_to_float() {
+        use crate::sql::ast::{DataType, Expr, Literal};
+        use bumpalo::Bump;
+
+        let arena = Bump::new();
+        let inner = arena.alloc(Expr::Literal(Literal::Integer("42")));
+        let expr = arena.alloc(Expr::Cast {
+            expr: inner,
+            data_type: DataType::Real,
+        });
+
+        let predicate = CompiledPredicate::new(expr, vec![]);
+        let values: Vec<Value> = vec![];
+        let row = crate::sql::executor::ExecutorRow::new(&values);
+        let result = predicate.eval_value(expr, &row);
+
+        assert!(result.is_some(), "CAST should return a value");
+        match result.unwrap() {
+            Value::Float(f) => assert!((f - 42.0).abs() < f64::EPSILON),
+            _ => panic!("Expected Float value"),
+        }
+    }
+
+    #[test]
+    fn cast_to_boolean() {
+        use crate::sql::ast::{DataType, Expr, Literal};
+        use bumpalo::Bump;
+
+        let arena = Bump::new();
+        let inner = arena.alloc(Expr::Literal(Literal::Integer("1")));
+        let expr = arena.alloc(Expr::Cast {
+            expr: inner,
+            data_type: DataType::Boolean,
+        });
+
+        let predicate = CompiledPredicate::new(expr, vec![]);
+        let values: Vec<Value> = vec![];
+        let row = crate::sql::executor::ExecutorRow::new(&values);
+        let result = predicate.eval_value(expr, &row);
+
+        assert!(result.is_some(), "CAST should return a value");
+        match result.unwrap() {
+            Value::Int(n) => assert_eq!(n, 1),
+            _ => panic!("Expected Int value (boolean)"),
+        }
+    }
+
+    #[test]
+    fn is_null_returns_true_for_null() {
+        use crate::sql::ast::{Expr, Literal};
+        use bumpalo::Bump;
+
+        let arena = Bump::new();
+        let inner = arena.alloc(Expr::Literal(Literal::Null));
+        let expr = arena.alloc(Expr::IsNull {
+            expr: inner,
+            negated: false,
+        });
+
+        let predicate = CompiledPredicate::new(expr, vec![]);
+        let values: Vec<Value> = vec![];
+        let row = crate::sql::executor::ExecutorRow::new(&values);
+        let result = predicate.eval_value(expr, &row);
+
+        assert!(result.is_some(), "IS NULL should return a value");
+        match result.unwrap() {
+            Value::Int(n) => assert_eq!(n, 1),
+            _ => panic!("Expected Int value (true)"),
+        }
+    }
+
+    #[test]
+    fn is_null_returns_false_for_non_null() {
+        use crate::sql::ast::{Expr, Literal};
+        use bumpalo::Bump;
+
+        let arena = Bump::new();
+        let inner = arena.alloc(Expr::Literal(Literal::Integer("42")));
+        let expr = arena.alloc(Expr::IsNull {
+            expr: inner,
+            negated: false,
+        });
+
+        let predicate = CompiledPredicate::new(expr, vec![]);
+        let values: Vec<Value> = vec![];
+        let row = crate::sql::executor::ExecutorRow::new(&values);
+        let result = predicate.eval_value(expr, &row);
+
+        assert!(result.is_some(), "IS NULL should return a value");
+        match result.unwrap() {
+            Value::Int(n) => assert_eq!(n, 0),
+            _ => panic!("Expected Int value (false)"),
+        }
+    }
+
+    #[test]
+    fn is_not_null_returns_true_for_non_null() {
+        use crate::sql::ast::{Expr, Literal};
+        use bumpalo::Bump;
+
+        let arena = Bump::new();
+        let inner = arena.alloc(Expr::Literal(Literal::Integer("42")));
+        let expr = arena.alloc(Expr::IsNull {
+            expr: inner,
+            negated: true,
+        });
+
+        let predicate = CompiledPredicate::new(expr, vec![]);
+        let values: Vec<Value> = vec![];
+        let row = crate::sql::executor::ExecutorRow::new(&values);
+        let result = predicate.eval_value(expr, &row);
+
+        assert!(result.is_some(), "IS NOT NULL should return a value");
+        match result.unwrap() {
+            Value::Int(n) => assert_eq!(n, 1),
+            _ => panic!("Expected Int value (true)"),
+        }
+    }
+
+    #[test]
+    fn is_not_null_returns_false_for_null() {
+        use crate::sql::ast::{Expr, Literal};
+        use bumpalo::Bump;
+
+        let arena = Bump::new();
+        let inner = arena.alloc(Expr::Literal(Literal::Null));
+        let expr = arena.alloc(Expr::IsNull {
+            expr: inner,
+            negated: true,
+        });
+
+        let predicate = CompiledPredicate::new(expr, vec![]);
+        let values: Vec<Value> = vec![];
+        let row = crate::sql::executor::ExecutorRow::new(&values);
+        let result = predicate.eval_value(expr, &row);
+
+        assert!(result.is_some(), "IS NOT NULL should return a value");
+        match result.unwrap() {
+            Value::Int(n) => assert_eq!(n, 0),
+            _ => panic!("Expected Int value (false)"),
+        }
+    }
+
+    #[test]
+    fn in_list_returns_true_when_value_in_list() {
+        use crate::sql::ast::{Expr, Literal};
+        use bumpalo::Bump;
+
+        let arena = Bump::new();
+        let target = arena.alloc(Expr::Literal(Literal::Integer("2")));
+        let val1: &Expr = arena.alloc(Expr::Literal(Literal::Integer("1")));
+        let val2: &Expr = arena.alloc(Expr::Literal(Literal::Integer("2")));
+        let val3: &Expr = arena.alloc(Expr::Literal(Literal::Integer("3")));
+        let list = arena.alloc_slice_copy(&[val1, val2, val3]);
+
+        let expr = arena.alloc(Expr::InList {
+            expr: target,
+            negated: false,
+            list,
+        });
+
+        let predicate = CompiledPredicate::new(expr, vec![]);
+        let values: Vec<Value> = vec![];
+        let row = crate::sql::executor::ExecutorRow::new(&values);
+        let result = predicate.eval_value(expr, &row);
+
+        assert!(result.is_some(), "IN should return a value");
+        match result.unwrap() {
+            Value::Int(n) => assert_eq!(n, 1),
+            _ => panic!("Expected Int value (true)"),
+        }
+    }
+
+    #[test]
+    fn in_list_returns_false_when_value_not_in_list() {
+        use crate::sql::ast::{Expr, Literal};
+        use bumpalo::Bump;
+
+        let arena = Bump::new();
+        let target = arena.alloc(Expr::Literal(Literal::Integer("5")));
+        let val1: &Expr = arena.alloc(Expr::Literal(Literal::Integer("1")));
+        let val2: &Expr = arena.alloc(Expr::Literal(Literal::Integer("2")));
+        let list = arena.alloc_slice_copy(&[val1, val2]);
+
+        let expr = arena.alloc(Expr::InList {
+            expr: target,
+            negated: false,
+            list,
+        });
+
+        let predicate = CompiledPredicate::new(expr, vec![]);
+        let values: Vec<Value> = vec![];
+        let row = crate::sql::executor::ExecutorRow::new(&values);
+        let result = predicate.eval_value(expr, &row);
+
+        assert!(result.is_some(), "IN should return a value");
+        match result.unwrap() {
+            Value::Int(n) => assert_eq!(n, 0),
+            _ => panic!("Expected Int value (false)"),
+        }
+    }
+
+    #[test]
+    fn not_in_list_returns_true_when_value_not_in_list() {
+        use crate::sql::ast::{Expr, Literal};
+        use bumpalo::Bump;
+
+        let arena = Bump::new();
+        let target = arena.alloc(Expr::Literal(Literal::Integer("5")));
+        let val1: &Expr = arena.alloc(Expr::Literal(Literal::Integer("1")));
+        let val2: &Expr = arena.alloc(Expr::Literal(Literal::Integer("2")));
+        let list = arena.alloc_slice_copy(&[val1, val2]);
+
+        let expr = arena.alloc(Expr::InList {
+            expr: target,
+            negated: true,
+            list,
+        });
+
+        let predicate = CompiledPredicate::new(expr, vec![]);
+        let values: Vec<Value> = vec![];
+        let row = crate::sql::executor::ExecutorRow::new(&values);
+        let result = predicate.eval_value(expr, &row);
+
+        assert!(result.is_some(), "NOT IN should return a value");
+        match result.unwrap() {
+            Value::Int(n) => assert_eq!(n, 1),
+            _ => panic!("Expected Int value (true)"),
+        }
+    }
+
+    #[test]
+    fn in_list_with_strings() {
+        use crate::sql::ast::{Expr, Literal};
+        use bumpalo::Bump;
+
+        let arena = Bump::new();
+        let target = arena.alloc(Expr::Literal(Literal::String("apple")));
+        let val1: &Expr = arena.alloc(Expr::Literal(Literal::String("apple")));
+        let val2: &Expr = arena.alloc(Expr::Literal(Literal::String("banana")));
+        let list = arena.alloc_slice_copy(&[val1, val2]);
+
+        let expr = arena.alloc(Expr::InList {
+            expr: target,
+            negated: false,
+            list,
+        });
+
+        let predicate = CompiledPredicate::new(expr, vec![]);
+        let values: Vec<Value> = vec![];
+        let row = crate::sql::executor::ExecutorRow::new(&values);
+        let result = predicate.eval_value(expr, &row);
+
+        assert!(result.is_some(), "IN with strings should return a value");
+        match result.unwrap() {
+            Value::Int(n) => assert_eq!(n, 1),
+            _ => panic!("Expected Int value (true)"),
+        }
+    }
+
+    #[test]
+    fn between_returns_true_when_in_range() {
+        use crate::sql::ast::{Expr, Literal};
+        use bumpalo::Bump;
+
+        let arena = Bump::new();
+        let value = arena.alloc(Expr::Literal(Literal::Integer("5")));
+        let low = arena.alloc(Expr::Literal(Literal::Integer("1")));
+        let high = arena.alloc(Expr::Literal(Literal::Integer("10")));
+
+        let expr = arena.alloc(Expr::Between {
+            expr: value,
+            negated: false,
+            low,
+            high,
+        });
+
+        let predicate = CompiledPredicate::new(expr, vec![]);
+        let values: Vec<Value> = vec![];
+        let row = crate::sql::executor::ExecutorRow::new(&values);
+        let result = predicate.eval_value(expr, &row);
+
+        assert!(result.is_some(), "BETWEEN should return a value");
+        match result.unwrap() {
+            Value::Int(n) => assert_eq!(n, 1),
+            _ => panic!("Expected Int value (true)"),
+        }
+    }
+
+    #[test]
+    fn between_returns_false_when_below_range() {
+        use crate::sql::ast::{Expr, Literal};
+        use bumpalo::Bump;
+
+        let arena = Bump::new();
+        let value = arena.alloc(Expr::Literal(Literal::Integer("0")));
+        let low = arena.alloc(Expr::Literal(Literal::Integer("1")));
+        let high = arena.alloc(Expr::Literal(Literal::Integer("10")));
+
+        let expr = arena.alloc(Expr::Between {
+            expr: value,
+            negated: false,
+            low,
+            high,
+        });
+
+        let predicate = CompiledPredicate::new(expr, vec![]);
+        let values: Vec<Value> = vec![];
+        let row = crate::sql::executor::ExecutorRow::new(&values);
+        let result = predicate.eval_value(expr, &row);
+
+        assert!(result.is_some(), "BETWEEN should return a value");
+        match result.unwrap() {
+            Value::Int(n) => assert_eq!(n, 0),
+            _ => panic!("Expected Int value (false)"),
+        }
+    }
+
+    #[test]
+    fn between_includes_boundaries() {
+        use crate::sql::ast::{Expr, Literal};
+        use bumpalo::Bump;
+
+        let arena = Bump::new();
+        let value = arena.alloc(Expr::Literal(Literal::Integer("1")));
+        let low = arena.alloc(Expr::Literal(Literal::Integer("1")));
+        let high = arena.alloc(Expr::Literal(Literal::Integer("10")));
+
+        let expr = arena.alloc(Expr::Between {
+            expr: value,
+            negated: false,
+            low,
+            high,
+        });
+
+        let predicate = CompiledPredicate::new(expr, vec![]);
+        let values: Vec<Value> = vec![];
+        let row = crate::sql::executor::ExecutorRow::new(&values);
+        let result = predicate.eval_value(expr, &row);
+
+        assert!(result.is_some(), "BETWEEN should include boundaries");
+        match result.unwrap() {
+            Value::Int(n) => assert_eq!(n, 1),
+            _ => panic!("Expected Int value (true)"),
+        }
+    }
+
+    #[test]
+    fn not_between_returns_true_when_outside_range() {
+        use crate::sql::ast::{Expr, Literal};
+        use bumpalo::Bump;
+
+        let arena = Bump::new();
+        let value = arena.alloc(Expr::Literal(Literal::Integer("15")));
+        let low = arena.alloc(Expr::Literal(Literal::Integer("1")));
+        let high = arena.alloc(Expr::Literal(Literal::Integer("10")));
+
+        let expr = arena.alloc(Expr::Between {
+            expr: value,
+            negated: true,
+            low,
+            high,
+        });
+
+        let predicate = CompiledPredicate::new(expr, vec![]);
+        let values: Vec<Value> = vec![];
+        let row = crate::sql::executor::ExecutorRow::new(&values);
+        let result = predicate.eval_value(expr, &row);
+
+        assert!(result.is_some(), "NOT BETWEEN should return a value");
+        match result.unwrap() {
+            Value::Int(n) => assert_eq!(n, 1),
+            _ => panic!("Expected Int value (true)"),
+        }
+    }
+
+    #[test]
+    fn like_matches_percent_wildcard() {
+        use crate::sql::ast::{Expr, Literal};
+        use bumpalo::Bump;
+
+        let arena = Bump::new();
+        let value = arena.alloc(Expr::Literal(Literal::String("hello world")));
+        let pattern = arena.alloc(Expr::Literal(Literal::String("hello%")));
+
+        let expr = arena.alloc(Expr::Like {
+            expr: value,
+            negated: false,
+            pattern,
+            escape: None,
+            case_insensitive: false,
+        });
+
+        let predicate = CompiledPredicate::new(expr, vec![]);
+        let values: Vec<Value> = vec![];
+        let row = crate::sql::executor::ExecutorRow::new(&values);
+        let result = predicate.eval_value(expr, &row);
+
+        assert!(result.is_some(), "LIKE should return a value");
+        match result.unwrap() {
+            Value::Int(n) => assert_eq!(n, 1),
+            _ => panic!("Expected Int value (true)"),
+        }
+    }
+
+    #[test]
+    fn like_matches_underscore_wildcard() {
+        use crate::sql::ast::{Expr, Literal};
+        use bumpalo::Bump;
+
+        let arena = Bump::new();
+        let value = arena.alloc(Expr::Literal(Literal::String("abc")));
+        let pattern = arena.alloc(Expr::Literal(Literal::String("a_c")));
+
+        let expr = arena.alloc(Expr::Like {
+            expr: value,
+            negated: false,
+            pattern,
+            escape: None,
+            case_insensitive: false,
+        });
+
+        let predicate = CompiledPredicate::new(expr, vec![]);
+        let values: Vec<Value> = vec![];
+        let row = crate::sql::executor::ExecutorRow::new(&values);
+        let result = predicate.eval_value(expr, &row);
+
+        assert!(result.is_some(), "LIKE should return a value");
+        match result.unwrap() {
+            Value::Int(n) => assert_eq!(n, 1),
+            _ => panic!("Expected Int value (true)"),
+        }
+    }
+
+    #[test]
+    fn like_returns_false_when_not_matching() {
+        use crate::sql::ast::{Expr, Literal};
+        use bumpalo::Bump;
+
+        let arena = Bump::new();
+        let value = arena.alloc(Expr::Literal(Literal::String("goodbye")));
+        let pattern = arena.alloc(Expr::Literal(Literal::String("hello%")));
+
+        let expr = arena.alloc(Expr::Like {
+            expr: value,
+            negated: false,
+            pattern,
+            escape: None,
+            case_insensitive: false,
+        });
+
+        let predicate = CompiledPredicate::new(expr, vec![]);
+        let values: Vec<Value> = vec![];
+        let row = crate::sql::executor::ExecutorRow::new(&values);
+        let result = predicate.eval_value(expr, &row);
+
+        assert!(result.is_some(), "LIKE should return a value");
+        match result.unwrap() {
+            Value::Int(n) => assert_eq!(n, 0),
+            _ => panic!("Expected Int value (false)"),
+        }
+    }
+
+    #[test]
+    fn ilike_case_insensitive_match() {
+        use crate::sql::ast::{Expr, Literal};
+        use bumpalo::Bump;
+
+        let arena = Bump::new();
+        let value = arena.alloc(Expr::Literal(Literal::String("HELLO World")));
+        let pattern = arena.alloc(Expr::Literal(Literal::String("hello%")));
+
+        let expr = arena.alloc(Expr::Like {
+            expr: value,
+            negated: false,
+            pattern,
+            escape: None,
+            case_insensitive: true,
+        });
+
+        let predicate = CompiledPredicate::new(expr, vec![]);
+        let values: Vec<Value> = vec![];
+        let row = crate::sql::executor::ExecutorRow::new(&values);
+        let result = predicate.eval_value(expr, &row);
+
+        assert!(result.is_some(), "ILIKE should return a value");
+        match result.unwrap() {
+            Value::Int(n) => assert_eq!(n, 1),
+            _ => panic!("Expected Int value (true)"),
+        }
+    }
+
+    #[test]
+    fn not_like_returns_true_when_not_matching() {
+        use crate::sql::ast::{Expr, Literal};
+        use bumpalo::Bump;
+
+        let arena = Bump::new();
+        let value = arena.alloc(Expr::Literal(Literal::String("goodbye")));
+        let pattern = arena.alloc(Expr::Literal(Literal::String("hello%")));
+
+        let expr = arena.alloc(Expr::Like {
+            expr: value,
+            negated: true,
+            pattern,
+            escape: None,
+            case_insensitive: false,
+        });
+
+        let predicate = CompiledPredicate::new(expr, vec![]);
+        let values: Vec<Value> = vec![];
+        let row = crate::sql::executor::ExecutorRow::new(&values);
+        let result = predicate.eval_value(expr, &row);
+
+        assert!(result.is_some(), "NOT LIKE should return a value");
+        match result.unwrap() {
+            Value::Int(n) => assert_eq!(n, 1),
+            _ => panic!("Expected Int value (true)"),
+        }
+    }
+
+    #[test]
+    fn array_subscript_accesses_json_array() {
+        use crate::sql::ast::{Expr, Literal};
+        use bumpalo::Bump;
+
+        let arena = Bump::new();
+        let array = arena.alloc(Expr::Literal(Literal::String("[10, 20, 30]")));
+        let index = arena.alloc(Expr::Literal(Literal::Integer("1")));
+
+        let expr = arena.alloc(Expr::ArraySubscript { array, index });
+
+        let predicate = CompiledPredicate::new(expr, vec![]);
+        let values: Vec<Value> = vec![];
+        let row = crate::sql::executor::ExecutorRow::new(&values);
+        let result = predicate.eval_value(expr, &row);
+
+        assert!(result.is_some(), "ArraySubscript should return a value");
+        match result.unwrap() {
+            Value::Int(n) => assert_eq!(n, 20),
+            _ => panic!("Expected Int value"),
+        }
+    }
+
+    #[test]
+    fn array_subscript_returns_null_for_out_of_bounds() {
+        use crate::sql::ast::{Expr, Literal};
+        use bumpalo::Bump;
+
+        let arena = Bump::new();
+        let array = arena.alloc(Expr::Literal(Literal::String("[10, 20]")));
+        let index = arena.alloc(Expr::Literal(Literal::Integer("5")));
+
+        let expr = arena.alloc(Expr::ArraySubscript { array, index });
+
+        let predicate = CompiledPredicate::new(expr, vec![]);
+        let values: Vec<Value> = vec![];
+        let row = crate::sql::executor::ExecutorRow::new(&values);
+        let result = predicate.eval_value(expr, &row);
+
+        assert!(
+            result.is_some(),
+            "ArraySubscript should return NULL for out of bounds"
+        );
+        assert!(matches!(result.unwrap(), Value::Null));
+    }
+
+    #[test]
+    fn function_upper_converts_to_uppercase() {
+        use crate::sql::ast::{
+            Expr, FunctionArg, FunctionArgs, FunctionCall, FunctionName, Literal,
+        };
+        use bumpalo::Bump;
+
+        let arena = Bump::new();
+        let arg_val = arena.alloc(Expr::Literal(Literal::String("hello")));
+        let args = arena.alloc_slice_copy(&[FunctionArg {
+            name: None,
+            value: arg_val,
+        }]);
+        let func = arena.alloc(FunctionCall {
+            name: FunctionName {
+                schema: None,
+                name: "upper",
+            },
+            args: FunctionArgs::Args(args),
+            distinct: false,
+            filter: None,
+            over: None,
+        });
+        let expr = arena.alloc(Expr::Function(*func));
+
+        let predicate = CompiledPredicate::new(expr, vec![]);
+        let values: Vec<Value> = vec![];
+        let row = crate::sql::executor::ExecutorRow::new(&values);
+        let result = predicate.eval_value(expr, &row);
+
+        assert!(result.is_some(), "UPPER should return a value");
+        match result.unwrap() {
+            Value::Text(s) => assert_eq!(s.as_ref(), "HELLO"),
+            _ => panic!("Expected Text value"),
+        }
+    }
+
+    #[test]
+    fn function_lower_converts_to_lowercase() {
+        use crate::sql::ast::{
+            Expr, FunctionArg, FunctionArgs, FunctionCall, FunctionName, Literal,
+        };
+        use bumpalo::Bump;
+
+        let arena = Bump::new();
+        let arg_val = arena.alloc(Expr::Literal(Literal::String("HELLO")));
+        let args = arena.alloc_slice_copy(&[FunctionArg {
+            name: None,
+            value: arg_val,
+        }]);
+        let func = arena.alloc(FunctionCall {
+            name: FunctionName {
+                schema: None,
+                name: "lower",
+            },
+            args: FunctionArgs::Args(args),
+            distinct: false,
+            filter: None,
+            over: None,
+        });
+        let expr = arena.alloc(Expr::Function(*func));
+
+        let predicate = CompiledPredicate::new(expr, vec![]);
+        let values: Vec<Value> = vec![];
+        let row = crate::sql::executor::ExecutorRow::new(&values);
+        let result = predicate.eval_value(expr, &row);
+
+        assert!(result.is_some(), "LOWER should return a value");
+        match result.unwrap() {
+            Value::Text(s) => assert_eq!(s.as_ref(), "hello"),
+            _ => panic!("Expected Text value"),
+        }
+    }
+
+    #[test]
+    fn function_coalesce_returns_first_non_null() {
+        use crate::sql::ast::{
+            Expr, FunctionArg, FunctionArgs, FunctionCall, FunctionName, Literal,
+        };
+        use bumpalo::Bump;
+
+        let arena = Bump::new();
+        let arg1 = arena.alloc(Expr::Literal(Literal::Null));
+        let arg2 = arena.alloc(Expr::Literal(Literal::String("default")));
+        let args = arena.alloc_slice_copy(&[
+            FunctionArg {
+                name: None,
+                value: arg1,
+            },
+            FunctionArg {
+                name: None,
+                value: arg2,
+            },
+        ]);
+        let func = arena.alloc(FunctionCall {
+            name: FunctionName {
+                schema: None,
+                name: "coalesce",
+            },
+            args: FunctionArgs::Args(args),
+            distinct: false,
+            filter: None,
+            over: None,
+        });
+        let expr = arena.alloc(Expr::Function(*func));
+
+        let predicate = CompiledPredicate::new(expr, vec![]);
+        let values: Vec<Value> = vec![];
+        let row = crate::sql::executor::ExecutorRow::new(&values);
+        let result = predicate.eval_value(expr, &row);
+
+        assert!(result.is_some(), "COALESCE should return a value");
+        match result.unwrap() {
+            Value::Text(s) => assert_eq!(s.as_ref(), "default"),
+            _ => panic!("Expected Text value"),
+        }
+    }
+
+    #[test]
+    fn function_abs_returns_absolute_value() {
+        use crate::sql::ast::{
+            Expr, FunctionArg, FunctionArgs, FunctionCall, FunctionName, Literal,
+        };
+        use bumpalo::Bump;
+
+        let arena = Bump::new();
+        let arg_val = arena.alloc(Expr::Literal(Literal::Integer("-42")));
+        let args = arena.alloc_slice_copy(&[FunctionArg {
+            name: None,
+            value: arg_val,
+        }]);
+        let func = arena.alloc(FunctionCall {
+            name: FunctionName {
+                schema: None,
+                name: "abs",
+            },
+            args: FunctionArgs::Args(args),
+            distinct: false,
+            filter: None,
+            over: None,
+        });
+        let expr = arena.alloc(Expr::Function(*func));
+
+        let predicate = CompiledPredicate::new(expr, vec![]);
+        let values: Vec<Value> = vec![];
+        let row = crate::sql::executor::ExecutorRow::new(&values);
+        let result = predicate.eval_value(expr, &row);
+
+        assert!(result.is_some(), "ABS should return a value");
+        match result.unwrap() {
+            Value::Int(n) => assert_eq!(n, 42),
+            _ => panic!("Expected Int value"),
+        }
+    }
+
+    #[test]
+    fn function_length_returns_string_length() {
+        use crate::sql::ast::{
+            Expr, FunctionArg, FunctionArgs, FunctionCall, FunctionName, Literal,
+        };
+        use bumpalo::Bump;
+
+        let arena = Bump::new();
+        let arg_val = arena.alloc(Expr::Literal(Literal::String("hello")));
+        let args = arena.alloc_slice_copy(&[FunctionArg {
+            name: None,
+            value: arg_val,
+        }]);
+        let func = arena.alloc(FunctionCall {
+            name: FunctionName {
+                schema: None,
+                name: "length",
+            },
+            args: FunctionArgs::Args(args),
+            distinct: false,
+            filter: None,
+            over: None,
+        });
+        let expr = arena.alloc(Expr::Function(*func));
+
+        let predicate = CompiledPredicate::new(expr, vec![]);
+        let values: Vec<Value> = vec![];
+        let row = crate::sql::executor::ExecutorRow::new(&values);
+        let result = predicate.eval_value(expr, &row);
+
+        assert!(result.is_some(), "LENGTH should return a value");
+        match result.unwrap() {
+            Value::Int(n) => assert_eq!(n, 5),
+            _ => panic!("Expected Int value"),
+        }
     }
 }
