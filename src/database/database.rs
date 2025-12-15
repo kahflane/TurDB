@@ -92,8 +92,13 @@ impl ActiveTransaction {
     }
 
     #[allow(clippy::type_complexity)]
-    pub fn take_write_entries(&mut self) -> (SmallVec<[WriteEntry; 16]>, SmallVec<[Option<Vec<u8>>; 16]>) {
-        (std::mem::take(&mut self.write_entries), std::mem::take(&mut self.undo_data))
+    pub fn take_write_entries(
+        &mut self,
+    ) -> (SmallVec<[WriteEntry; 16]>, SmallVec<[Option<Vec<u8>>; 16]>) {
+        (
+            std::mem::take(&mut self.write_entries),
+            std::mem::take(&mut self.undo_data),
+        )
     }
 }
 
@@ -119,7 +124,7 @@ impl Database {
     }
 
     pub fn open_with_recovery<P: AsRef<Path>>(path: P) -> Result<(Self, RecoveryInfo)> {
-        use crate::storage::{MetaFileHeader, FILE_HEADER_SIZE};
+        use crate::storage::{MetaFileHeader, MmapStorage, Wal, FILE_HEADER_SIZE};
         use std::fs::File;
         use std::io::Read;
         use std::sync::atomic::{AtomicBool, AtomicU64};
@@ -156,6 +161,27 @@ impl Database {
             0
         };
 
+        let mut frames_recovered = 0u32;
+
+        if wal_size_bytes > 0 && wal_dir.exists() {
+            let mut wal = Wal::open(&wal_dir)
+                .wrap_err_with(|| format!("failed to open WAL at {:?} for recovery", wal_dir))?;
+
+            let users_table_path = path.join("root").join("users.tbd");
+            if users_table_path.exists() {
+                let mut storage = MmapStorage::open(&users_table_path).wrap_err_with(|| {
+                    format!(
+                        "failed to open table storage {:?} for WAL recovery",
+                        users_table_path
+                    )
+                })?;
+
+                frames_recovered = wal
+                    .recover(&mut storage)
+                    .wrap_err("failed to recover WAL frames to table storage")?;
+            }
+        }
+
         let db = Self {
             path,
             file_manager: RwLock::new(None),
@@ -173,7 +199,7 @@ impl Database {
         };
 
         let recovery_info = RecoveryInfo {
-            frames_recovered: 0,
+            frames_recovered,
             wal_size_bytes,
         };
 
@@ -1737,7 +1763,11 @@ impl Database {
         Ok(ExecuteResult::Rollback)
     }
 
-    fn undo_write_entries(&self, entries: &[WriteEntry], undo_data: &[Option<Vec<u8>>]) -> Result<()> {
+    fn undo_write_entries(
+        &self,
+        entries: &[WriteEntry],
+        undo_data: &[Option<Vec<u8>>],
+    ) -> Result<()> {
         for (i, entry) in entries.iter().enumerate().rev() {
             let undo = undo_data.get(i).and_then(|o| o.as_ref());
             self.undo_write_entry(entry, undo)?;
