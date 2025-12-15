@@ -427,6 +427,115 @@ impl Default for LiteralParser {
     }
 }
 
+pub fn parse_interval(s: &str) -> Result<OwnedValue> {
+    let s = s.trim();
+
+    if s.starts_with('P') || s.starts_with('p') {
+        return parse_iso8601_interval(s);
+    }
+
+    parse_postgres_interval(s)
+}
+
+fn parse_iso8601_interval(s: &str) -> Result<OwnedValue> {
+    let mut months: i32 = 0;
+    let mut days: i32 = 0;
+    let mut micros: i64 = 0;
+
+    let s = &s[1..];
+
+    let (date_part, time_part) = if let Some(idx) = s.find('T') {
+        (&s[..idx], Some(&s[idx + 1..]))
+    } else {
+        (s, None)
+    };
+
+    let mut current_num = String::new();
+    for c in date_part.chars() {
+        if c.is_ascii_digit() {
+            current_num.push(c);
+        } else if !current_num.is_empty() {
+            let num: i32 = current_num
+                .parse()
+                .wrap_err_with(|| format!("invalid number in ISO interval: '{}'", current_num))?;
+            current_num.clear();
+
+            match c.to_ascii_uppercase() {
+                'Y' => months += num * 12,
+                'M' => months += num,
+                'W' => days += num * 7,
+                'D' => days += num,
+                _ => bail!("unknown ISO 8601 interval designator: '{}'", c),
+            }
+        }
+    }
+
+    if let Some(time_str) = time_part {
+        current_num.clear();
+        for c in time_str.chars() {
+            if c.is_ascii_digit() || c == '.' {
+                current_num.push(c);
+            } else if !current_num.is_empty() {
+                let num: f64 = current_num
+                    .parse()
+                    .wrap_err_with(|| format!("invalid number in ISO interval time: '{}'", current_num))?;
+                current_num.clear();
+
+                match c.to_ascii_uppercase() {
+                    'H' => micros += (num * 3600.0 * 1_000_000.0) as i64,
+                    'M' => micros += (num * 60.0 * 1_000_000.0) as i64,
+                    'S' => micros += (num * 1_000_000.0) as i64,
+                    _ => bail!("unknown ISO 8601 time designator: '{}'", c),
+                }
+            }
+        }
+    }
+
+    Ok(OwnedValue::Interval(micros, days, months))
+}
+
+fn parse_postgres_interval(s: &str) -> Result<OwnedValue> {
+    let mut months: i32 = 0;
+    let mut days: i32 = 0;
+    let mut micros: i64 = 0;
+
+    let s_lower = s.to_lowercase();
+    let parts: Vec<&str> = s_lower.split_whitespace().collect();
+
+    let mut i = 0;
+    while i < parts.len() {
+        let part = parts[i];
+
+        if let Ok(num) = part.parse::<f64>() {
+            if i + 1 < parts.len() {
+                let unit = parts[i + 1];
+                match unit {
+                    "year" | "years" | "yr" | "yrs" => months += (num * 12.0) as i32,
+                    "month" | "months" | "mon" | "mons" => months += num as i32,
+                    "week" | "weeks" => days += (num * 7.0) as i32,
+                    "day" | "days" => days += num as i32,
+                    "hour" | "hours" | "hr" | "hrs" => micros += (num * 3600.0 * 1_000_000.0) as i64,
+                    "minute" | "minutes" | "min" | "mins" => {
+                        micros += (num * 60.0 * 1_000_000.0) as i64
+                    }
+                    "second" | "seconds" | "sec" | "secs" => {
+                        micros += (num * 1_000_000.0) as i64
+                    }
+                    "millisecond" | "milliseconds" | "ms" => micros += (num * 1_000.0) as i64,
+                    "microsecond" | "microseconds" | "us" => micros += num as i64,
+                    _ => bail!("unknown interval unit: '{}'", unit),
+                }
+                i += 2;
+                continue;
+            }
+        }
+
+        i += 1;
+    }
+
+    Ok(OwnedValue::Interval(micros, days, months))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

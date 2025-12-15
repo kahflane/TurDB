@@ -1392,4 +1392,48 @@ mod tests {
             result.err()
         );
     }
+
+    #[test]
+    fn test_interval_type_end_to_end() {
+        use crate::types::OwnedValue;
+
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("test_db");
+
+        let db = Database::create(&db_path).unwrap();
+
+        db.execute("CREATE TABLE events (id INT, name TEXT, duration INTERVAL)")
+            .unwrap();
+
+        db.execute("INSERT INTO events VALUES (1, 'meeting', '1 hour')")
+            .unwrap();
+        db.execute("INSERT INTO events VALUES (2, 'project', '2 years 3 months 5 days')")
+            .unwrap();
+        db.execute("INSERT INTO events VALUES (3, 'task', 'P1Y2M3D')")
+            .unwrap();
+
+        let rows = db.query("SELECT id, name, duration FROM events").unwrap();
+        assert_eq!(rows.len(), 3, "Should have 3 rows");
+
+        let duration1 = rows[0].get(2).expect("should have duration column");
+        assert!(
+            matches!(duration1, OwnedValue::Interval(micros, days, months) if *micros == 3_600_000_000 && *days == 0 && *months == 0),
+            "First interval should be 1 hour (3600000000 microseconds): got {:?}",
+            duration1
+        );
+
+        let duration2 = rows[1].get(2).expect("should have duration column");
+        assert!(
+            matches!(duration2, OwnedValue::Interval(_, days, months) if *days == 5 && *months == 27),
+            "Second interval should be 2 years 3 months 5 days: got {:?}",
+            duration2
+        );
+
+        let duration3 = rows[2].get(2).expect("should have duration column");
+        assert!(
+            matches!(duration3, OwnedValue::Interval(_, days, months) if *days == 3 && *months == 14),
+            "Third interval should be 1 year 2 months 3 days (ISO 8601): got {:?}",
+            duration3
+        );
+    }
 }
