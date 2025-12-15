@@ -243,7 +243,9 @@ impl SimpleDecoder {
                     let b = arr.get_blob(i)?;
                     format!(
                         "\\x{}",
-                        b.iter().map(|byte| format!("{:02x}", byte)).collect::<String>()
+                        b.iter()
+                            .map(|byte| format!("{:02x}", byte))
+                            .collect::<String>()
                     )
                 }
                 _ => "?".to_string(),
@@ -282,7 +284,10 @@ impl SimpleDecoder {
         let right_bracket = if upper_inclusive { ']' } else { ')' };
         let lower_str = lower.map(|v| v.to_string()).unwrap_or_default();
         let upper_str = upper.map(|v| v.to_string()).unwrap_or_default();
-        format!("{}{},{}{}", left_bracket, lower_str, upper_str, right_bracket)
+        format!(
+            "{}{},{}{}",
+            left_bracket, lower_str, upper_str, right_bracket
+        )
     }
 
     pub fn decode_into(
