@@ -6,7 +6,7 @@ use crate::schema::{Catalog, ColumnDef as SchemaColumnDef};
 use crate::sql::ast::IsolationLevel;
 use crate::sql::builder::ExecutorBuilder;
 use crate::sql::context::ExecutionContext;
-use crate::sql::executor::{Executor, StreamingBTreeSource};
+use crate::sql::executor::{Executor, MaterializedRowSource, StreamingBTreeSource};
 use crate::sql::planner::Planner;
 use crate::sql::predicate::CompiledPredicate;
 use crate::sql::Parser;
@@ -461,6 +461,26 @@ impl Database {
         let mut file_manager_guard = self.file_manager.write();
         let file_manager = file_manager_guard.as_mut().unwrap();
 
+        enum PlanSource<'a> {
+            TableScan(&'a crate::sql::planner::PhysicalTableScan<'a>),
+            Subquery(&'a crate::sql::planner::PhysicalSubqueryExec<'a>),
+        }
+
+        fn find_plan_source<'a>(
+            op: &'a crate::sql::planner::PhysicalOperator<'a>,
+        ) -> Option<PlanSource<'a>> {
+            use crate::sql::planner::PhysicalOperator;
+            match op {
+                PhysicalOperator::TableScan(scan) => Some(PlanSource::TableScan(scan)),
+                PhysicalOperator::SubqueryExec(subq) => Some(PlanSource::Subquery(subq)),
+                PhysicalOperator::FilterExec(filter) => find_plan_source(filter.input),
+                PhysicalOperator::ProjectExec(project) => find_plan_source(project.input),
+                PhysicalOperator::LimitExec(limit) => find_plan_source(limit.input),
+                PhysicalOperator::SortExec(sort) => find_plan_source(sort.input),
+                _ => None,
+            }
+        }
+
         fn find_table_scan<'a>(
             op: &'a crate::sql::planner::PhysicalOperator<'a>,
         ) -> Option<&'a crate::sql::planner::PhysicalTableScan<'a>> {
@@ -508,59 +528,142 @@ impl Database {
             }
         }
 
-        let table_scan = find_table_scan(physical_plan.root);
+        let plan_source = find_plan_source(physical_plan.root);
 
-        let rows = if let Some(scan) = table_scan {
-            let schema_name = scan.schema.unwrap_or("root");
-            let table_name = scan.table;
+        let rows = match plan_source {
+            Some(PlanSource::TableScan(scan)) => {
+                let schema_name = scan.schema.unwrap_or("root");
+                let table_name = scan.table;
 
-            let table_def = catalog
-                .resolve_table(table_name)
-                .wrap_err_with(|| format!("table '{}' not found", table_name))?;
+                let table_def = catalog
+                    .resolve_table(table_name)
+                    .wrap_err_with(|| format!("table '{}' not found", table_name))?;
 
-            let column_types: Vec<_> = table_def.columns().iter().map(|c| c.data_type()).collect();
+                let column_types: Vec<_> =
+                    table_def.columns().iter().map(|c| c.data_type()).collect();
 
-            let projections = find_projections(physical_plan.root, table_def);
+                let projections = find_projections(physical_plan.root, table_def);
 
-            let storage = file_manager
-                .table_data(schema_name, table_name)
-                .wrap_err_with(|| {
-                    format!(
-                        "failed to open table storage for {}.{}",
-                        schema_name, table_name
-                    )
-                })?;
+                let storage = file_manager
+                    .table_data(schema_name, table_name)
+                    .wrap_err_with(|| {
+                        format!(
+                            "failed to open table storage for {}.{}",
+                            schema_name, table_name
+                        )
+                    })?;
 
-            let root_page = 1u32;
-            let source = StreamingBTreeSource::from_btree_scan_with_projections(
-                storage,
-                root_page,
-                column_types,
-                projections,
-            )
-            .wrap_err("failed to create table scan")?;
+                let root_page = 1u32;
+                let source = StreamingBTreeSource::from_btree_scan_with_projections(
+                    storage,
+                    root_page,
+                    column_types,
+                    projections,
+                )
+                .wrap_err("failed to create table scan")?;
 
-            let ctx = ExecutionContext::new(&arena);
-            let builder = ExecutorBuilder::new(&ctx);
-            let mut executor = builder
-                .build_with_source(&physical_plan, source)
-                .wrap_err("failed to build executor")?;
+                let ctx = ExecutionContext::new(&arena);
+                let builder = ExecutorBuilder::new(&ctx);
+                let mut executor = builder
+                    .build_with_source(&physical_plan, source)
+                    .wrap_err("failed to build executor")?;
 
-            let mut rows = Vec::new();
-            executor.open()?;
-            while let Some(row) = executor.next()? {
-                #[cfg(test)]
-                eprintln!(
-                    "DEBUG query: row from executor has {} values",
-                    row.values.len()
-                );
-                let owned: Vec<OwnedValue> = row.values.iter().map(OwnedValue::from).collect();
-                rows.push(Row::new(owned));
+                let mut rows = Vec::new();
+                executor.open()?;
+                while let Some(row) = executor.next()? {
+                    #[cfg(test)]
+                    eprintln!(
+                        "DEBUG query: row from executor has {} values",
+                        row.values.len()
+                    );
+                    let owned: Vec<OwnedValue> = row.values.iter().map(OwnedValue::from).collect();
+                    rows.push(Row::new(owned));
+                }
+                executor.close()?;
+                rows
             }
-            executor.close()?;
-            rows
-        } else {
-            bail!("unsupported query plan type - only table scans currently supported")
+            Some(PlanSource::Subquery(subq)) => {
+                let inner_table_scan = find_table_scan(subq.child_plan);
+
+                let inner_rows = if let Some(inner_scan) = inner_table_scan {
+                    let schema_name = inner_scan.schema.unwrap_or("root");
+                    let table_name = inner_scan.table;
+
+                    let table_def = catalog
+                        .resolve_table(table_name)
+                        .wrap_err_with(|| format!("table '{}' not found", table_name))?;
+
+                    let column_types: Vec<_> =
+                        table_def.columns().iter().map(|c| c.data_type()).collect();
+
+                    let storage = file_manager
+                        .table_data(schema_name, table_name)
+                        .wrap_err_with(|| {
+                            format!(
+                                "failed to open table storage for {}.{}",
+                                schema_name, table_name
+                            )
+                        })?;
+
+                    let root_page = 1u32;
+                    let inner_source = StreamingBTreeSource::from_btree_scan_with_projections(
+                        storage,
+                        root_page,
+                        column_types,
+                        None,
+                    )
+                    .wrap_err("failed to create inner table scan")?;
+
+                    let inner_arena = Bump::new();
+                    let inner_plan = crate::sql::planner::PhysicalPlan {
+                        root: subq.child_plan,
+                        output_schema: subq.output_schema.clone(),
+                    };
+
+                    let inner_ctx = ExecutionContext::new(&inner_arena);
+                    let inner_builder = ExecutorBuilder::new(&inner_ctx);
+                    let mut inner_executor = inner_builder
+                        .build_with_source(&inner_plan, inner_source)
+                        .wrap_err("failed to build inner executor")?;
+
+                    let mut materialized_rows: Vec<Vec<OwnedValue>> = Vec::new();
+                    inner_executor.open()?;
+                    while let Some(row) = inner_executor.next()? {
+                        let owned_values: Vec<OwnedValue> =
+                            row.values.iter().map(OwnedValue::from).collect();
+                        materialized_rows.push(owned_values);
+                    }
+                    inner_executor.close()?;
+                    materialized_rows
+                } else {
+                    bail!("subquery inner plan must have a table scan")
+                };
+
+                let materialized_source = MaterializedRowSource::new(inner_rows);
+
+                let ctx = ExecutionContext::new(&arena);
+                let builder = ExecutorBuilder::new(&ctx);
+                let mut executor = builder
+                    .build_with_source(&physical_plan, materialized_source)
+                    .wrap_err("failed to build executor with subquery source")?;
+
+                let mut rows = Vec::new();
+                executor.open()?;
+                while let Some(row) = executor.next()? {
+                    #[cfg(test)]
+                    eprintln!(
+                        "DEBUG query: row from subquery executor has {} values",
+                        row.values.len()
+                    );
+                    let owned: Vec<OwnedValue> = row.values.iter().map(OwnedValue::from).collect();
+                    rows.push(Row::new(owned));
+                }
+                executor.close()?;
+                rows
+            }
+            None => {
+                bail!("unsupported query plan type - no table scan or subquery found")
+            }
         };
 
         let rows = if is_distinct {

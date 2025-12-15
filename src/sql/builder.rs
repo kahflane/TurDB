@@ -240,6 +240,12 @@ impl<'a> ExecutorBuilder<'a> {
                     "GraceHashJoin requires two sources - use build_grace_hash_join instead"
                 )
             }
+            PhysicalOperator::SubqueryExec(_) => {
+                Ok(DynamicExecutor::TableScan(TableScanExecutor::new(
+                    source,
+                    self.ctx.arena,
+                )))
+            }
         }
     }
 

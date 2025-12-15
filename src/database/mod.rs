@@ -2130,4 +2130,39 @@ mod tests {
             "After COMMIT, first_update should persist"
         );
     }
+
+    fn get_int_value(value: &OwnedValue) -> i64 {
+        match value {
+            OwnedValue::Int(i) => *i,
+            _ => panic!("Expected Int value, got {:?}", value),
+        }
+    }
+
+    #[test]
+    fn subquery_in_from_clause_returns_inner_query_rows() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("test_db");
+
+        let db = Database::create(&db_path).unwrap();
+
+        db.execute("CREATE TABLE users (id INT, name TEXT)").unwrap();
+        db.execute("INSERT INTO users VALUES (1, 'Alice')").unwrap();
+        db.execute("INSERT INTO users VALUES (2, 'Bob')").unwrap();
+
+        let rows = db
+            .query("SELECT s.id, s.name FROM (SELECT id, name FROM users) AS s")
+            .unwrap();
+
+        assert_eq!(rows.len(), 2, "Subquery should return 2 rows");
+
+        let id0 = get_int_value(&rows[0].values[0]);
+        let name0 = get_text_value(&rows[0].values[1]);
+        assert_eq!(id0, 1);
+        assert_eq!(name0, "Alice");
+
+        let id1 = get_int_value(&rows[1].values[0]);
+        let name1 = get_text_value(&rows[1].values[1]);
+        assert_eq!(id1, 2);
+        assert_eq!(name1, "Bob");
+    }
 }
