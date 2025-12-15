@@ -1153,7 +1153,8 @@ impl<'a> Planner<'a> {
         let filter_columns = self.extract_filter_columns(filter.predicate);
         let best_index = self.select_best_index(table_def, filter_columns)?;
 
-        let first_index_col = best_index.columns().first()?;
+        let index_columns = best_index.columns();
+        let first_index_col = index_columns.first()?;
         let bounds = self.extract_scan_bounds_for_column(filter.predicate, first_index_col);
         let scan_type = self.bounds_to_scan_type(&bounds);
 
@@ -1167,7 +1168,7 @@ impl<'a> Planner<'a> {
             return None;
         }
 
-        let residual = self.compute_residual_filter(filter.predicate, best_index.columns());
+        let residual = self.compute_residual_filter(filter.predicate, &index_columns);
 
         let index_scan = self
             .arena

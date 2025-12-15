@@ -24,8 +24,7 @@ fn create_turdb_json_database(row_count: usize) -> (tempfile::TempDir, Database)
     let db_path = dir.path().join("bench_db");
     let db = Database::create(&db_path).unwrap();
 
-    db.execute("CREATE TABLE docs (id INT, data TEXT)")
-        .unwrap();
+    db.execute("CREATE TABLE docs (id INT, data TEXT)").unwrap();
 
     for i in 0..row_count {
         let json = format!(
@@ -147,7 +146,9 @@ fn bench_json_nested_extract_comparison(c: &mut Criterion) {
             |b, _count| {
                 b.iter(|| {
                     let mut stmt = sqlite_conn
-                        .prepare_cached("SELECT json_extract(data, '$.user.profile.score') FROM docs")
+                        .prepare_cached(
+                            "SELECT json_extract(data, '$.user.profile.score') FROM docs",
+                        )
                         .unwrap();
                     let rows: Vec<_> = stmt
                         .query_map([], |row| Ok(row.get::<_, f64>(0).unwrap_or(0.0)))
