@@ -5140,7 +5140,7 @@ impl<'a> Parser<'a> {
                 self.advance();
                 Ok(DataType::Circle)
             }
-            Token::Keyword(Keyword::Macaddr) => {
+            Token::Keyword(Keyword::MacAddr) => {
                 self.advance();
                 Ok(DataType::MacAddr)
             }
@@ -5148,19 +5148,19 @@ impl<'a> Parser<'a> {
                 self.advance();
                 Ok(DataType::Inet)
             }
-            Token::Keyword(Keyword::Int4range) => {
+            Token::Keyword(Keyword::Int4Range) => {
                 self.advance();
                 Ok(DataType::Int4Range)
             }
-            Token::Keyword(Keyword::Int8range) => {
+            Token::Keyword(Keyword::Int8Range) => {
                 self.advance();
                 Ok(DataType::Int8Range)
             }
-            Token::Keyword(Keyword::Daterange) => {
+            Token::Keyword(Keyword::DateRange) => {
                 self.advance();
                 Ok(DataType::DateRange)
             }
-            Token::Keyword(Keyword::Tsrange) => {
+            Token::Keyword(Keyword::TsRange) => {
                 self.advance();
                 Ok(DataType::TsRange)
             }

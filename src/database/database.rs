@@ -1453,6 +1453,15 @@ impl Database {
             SqlType::Vector(_) => DataType::Vector,
             SqlType::Array(_) => DataType::Array,
             SqlType::Interval => DataType::Text,
+            SqlType::Point => DataType::Point,
+            SqlType::Box => DataType::Box,
+            SqlType::Circle => DataType::Circle,
+            SqlType::MacAddr => DataType::MacAddr,
+            SqlType::Inet => DataType::Inet6,
+            SqlType::Int4Range => DataType::Int4Range,
+            SqlType::Int8Range => DataType::Int8Range,
+            SqlType::DateRange => DataType::DateRange,
+            SqlType::TsRange => DataType::TimestampRange,
             _ => DataType::Text,
         }
     }
