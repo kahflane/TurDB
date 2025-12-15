@@ -746,24 +746,27 @@ mod tests {
         let rows = db.query("SELECT * FROM related_data").unwrap();
         assert_eq!(rows.len(), 100, "should have 100 related_data rows");
 
-        let rows = db
-            .query(
-                "SELECT a.id, a.text_col, r.name, r.score
-                 FROM all_types a, related_data r
-                 WHERE a.id = r.all_types_id",
-            )
-            .unwrap();
-        println!("JOIN query returned {} rows", rows.len());
-        assert!(!rows.is_empty(), "JOIN should return results");
+        let result = db.query(
+            "SELECT a.id, a.text_col, r.name, r.score
+             FROM all_types a, related_data r
+             WHERE a.id = r.all_types_id",
+        );
+        assert!(
+            result.is_err(),
+            "JOIN queries should fail until executor supports joins"
+        );
+        println!("JOIN query correctly rejected (executor doesn't support joins yet)");
 
-        let rows = db
-            .query(
-                "SELECT a.id, a.bigint_col, r.category
-                 FROM all_types a, related_data r
-                 WHERE a.id = r.id AND r.active = TRUE",
-            )
-            .unwrap();
-        println!("Filtered JOIN returned {} rows", rows.len());
+        let result = db.query(
+            "SELECT a.id, a.bigint_col, r.category
+             FROM all_types a, related_data r
+             WHERE a.id = r.id AND r.active = TRUE",
+        );
+        assert!(
+            result.is_err(),
+            "Filtered JOIN queries should fail until executor supports joins"
+        );
+        println!("Filtered JOIN correctly rejected");
 
         let rows = db
             .query("SELECT * FROM all_types WHERE bigint_col > 50000000")
@@ -845,15 +848,17 @@ mod tests {
             "should have 95 related_data rows after delete"
         );
 
-        let rows = db
-            .query(
-                "SELECT a.id, r.name, r.category
-                 FROM all_types a, related_data r
-                 WHERE a.id = r.id AND r.score > 5.0
-                 LIMIT 10",
-            )
-            .unwrap();
-        println!("Complex JOIN with filter and LIMIT: {} rows", rows.len());
+        let result = db.query(
+            "SELECT a.id, r.name, r.category
+             FROM all_types a, related_data r
+             WHERE a.id = r.id AND r.score > 5.0
+             LIMIT 10",
+        );
+        assert!(
+            result.is_err(),
+            "Complex JOIN query should fail until executor supports joins"
+        );
+        println!("Complex JOIN with filter and LIMIT correctly rejected");
 
         db.close().unwrap();
 

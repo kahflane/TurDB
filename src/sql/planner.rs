@@ -438,7 +438,11 @@ impl<'a> Planner<'a> {
             None => bail!("SELECT without FROM clause not yet supported"),
         };
 
+        let tables_in_scope = self.collect_tables_in_scope(current);
+        self.validate_select_columns(select.columns, &tables_in_scope)?;
+
         if let Some(predicate) = select.where_clause {
+            self.validate_expr_columns(predicate, &tables_in_scope)?;
             let filter = self.arena.alloc(LogicalOperator::Filter(LogicalFilter {
                 input: current,
                 predicate,
@@ -447,6 +451,10 @@ impl<'a> Planner<'a> {
         }
 
         if !select.group_by.is_empty() {
+            for group_expr in select.group_by.iter() {
+                self.validate_expr_columns(group_expr, &tables_in_scope)?;
+            }
+
             let aggregates = self.extract_aggregates(select.columns);
             let agg = self
                 .arena
@@ -458,6 +466,7 @@ impl<'a> Planner<'a> {
             current = agg;
 
             if let Some(having) = select.having {
+                self.validate_expr_columns(having, &tables_in_scope)?;
                 let having_filter = self.arena.alloc(LogicalOperator::Filter(LogicalFilter {
                     input: current,
                     predicate: having,
@@ -481,6 +490,9 @@ impl<'a> Planner<'a> {
         current = project;
 
         if !select.order_by.is_empty() {
+            for order_item in select.order_by.iter() {
+                self.validate_expr_columns(order_item.expr, &tables_in_scope)?;
+            }
             let sort_keys = self.convert_order_by(select.order_by);
             let sort = self.arena.alloc(LogicalOperator::Sort(LogicalSort {
                 input: current,
@@ -656,8 +668,239 @@ impl<'a> Planner<'a> {
         self.catalog.resolve_table(table_name).map(|_| ())
     }
 
+    fn collect_tables_in_scope(
+        &self,
+        op: &'a LogicalOperator<'a>,
+    ) -> Vec<(Option<&'a str>, &'a str, Option<&'a str>, &'a TableDef)> {
+        let mut tables = Vec::new();
+        self.collect_tables_recursive(op, &mut tables);
+        tables
+    }
+
+    fn collect_tables_recursive(
+        &self,
+        op: &'a LogicalOperator<'a>,
+        tables: &mut Vec<(Option<&'a str>, &'a str, Option<&'a str>, &'a TableDef)>,
+    ) {
+        match op {
+            LogicalOperator::Scan(scan) => {
+                let table_name = if let Some(schema) = scan.schema {
+                    self.arena.alloc_str(&format!("{}.{}", schema, scan.table))
+                } else {
+                    scan.table
+                };
+                if let Ok(table_def) = self.catalog.resolve_table(table_name) {
+                    tables.push((scan.schema, scan.table, scan.alias, table_def));
+                }
+            }
+            LogicalOperator::Join(join) => {
+                self.collect_tables_recursive(join.left, tables);
+                self.collect_tables_recursive(join.right, tables);
+            }
+            LogicalOperator::Filter(filter) => {
+                self.collect_tables_recursive(filter.input, tables);
+            }
+            LogicalOperator::Project(project) => {
+                self.collect_tables_recursive(project.input, tables);
+            }
+            LogicalOperator::Aggregate(agg) => {
+                self.collect_tables_recursive(agg.input, tables);
+            }
+            LogicalOperator::Sort(sort) => {
+                self.collect_tables_recursive(sort.input, tables);
+            }
+            LogicalOperator::Limit(limit) => {
+                self.collect_tables_recursive(limit.input, tables);
+            }
+            _ => {}
+        }
+    }
+
+    fn validate_column_in_scope(
+        &self,
+        col_ref: &crate::sql::ast::ColumnRef<'a>,
+        tables: &[(Option<&'a str>, &'a str, Option<&'a str>, &'a TableDef)],
+    ) -> Result<()> {
+        if col_ref.table.is_some() {
+            for (_schema, table_name, alias, table_def) in tables {
+                let col_table = col_ref.table.unwrap();
+                let matches_table = if let Some(al) = alias {
+                    col_table.eq_ignore_ascii_case(al)
+                } else {
+                    col_table.eq_ignore_ascii_case(table_name)
+                };
+
+                if matches_table {
+                    for col in table_def.columns() {
+                        if col.name().eq_ignore_ascii_case(col_ref.column) {
+                            return Ok(());
+                        }
+                    }
+                }
+            }
+
+            bail!(
+                "column '{}' not found in table '{}'",
+                col_ref.column,
+                col_ref.table.unwrap()
+            )
+        } else {
+            let mut matching_tables: Vec<&str> = Vec::new();
+            for (_schema, table_name, alias, table_def) in tables {
+                for col in table_def.columns() {
+                    if col.name().eq_ignore_ascii_case(col_ref.column) {
+                        let tbl_name = if let Some(al) = alias { al } else { table_name };
+                        matching_tables.push(tbl_name);
+                        break;
+                    }
+                }
+            }
+
+            match matching_tables.len() {
+                0 => bail!(
+                    "column '{}' not found in any table in scope",
+                    col_ref.column
+                ),
+                1 => Ok(()),
+                _ => bail!(
+                    "column '{}' is ambiguous (found in tables: {})",
+                    col_ref.column,
+                    matching_tables.join(", ")
+                ),
+            }
+        }
+    }
+
+    fn validate_expr_columns(
+        &self,
+        expr: &Expr<'a>,
+        tables: &[(Option<&'a str>, &'a str, Option<&'a str>, &'a TableDef)],
+    ) -> Result<()> {
+        match expr {
+            Expr::Column(col_ref) => self.validate_column_in_scope(col_ref, tables),
+            Expr::BinaryOp { left, right, .. } => {
+                self.validate_expr_columns(left, tables)?;
+                self.validate_expr_columns(right, tables)
+            }
+            Expr::UnaryOp { expr, .. } => self.validate_expr_columns(expr, tables),
+            Expr::Function(func) => {
+                use crate::sql::ast::FunctionArgs;
+                if let FunctionArgs::Args(args) = func.args {
+                    for arg in args.iter() {
+                        self.validate_expr_columns(arg.value, tables)?;
+                    }
+                }
+                Ok(())
+            }
+            Expr::Case {
+                operand,
+                conditions,
+                else_result,
+            } => {
+                if let Some(op) = operand {
+                    self.validate_expr_columns(op, tables)?;
+                }
+                for when_clause in conditions.iter() {
+                    self.validate_expr_columns(when_clause.condition, tables)?;
+                    self.validate_expr_columns(when_clause.result, tables)?;
+                }
+                if let Some(el) = else_result {
+                    self.validate_expr_columns(el, tables)?;
+                }
+                Ok(())
+            }
+            Expr::Cast { expr, .. } => self.validate_expr_columns(expr, tables),
+            Expr::Between {
+                expr, low, high, ..
+            } => {
+                self.validate_expr_columns(expr, tables)?;
+                self.validate_expr_columns(low, tables)?;
+                self.validate_expr_columns(high, tables)
+            }
+            Expr::InList { expr, list, .. } => {
+                self.validate_expr_columns(expr, tables)?;
+                for item in list.iter() {
+                    self.validate_expr_columns(item, tables)?;
+                }
+                Ok(())
+            }
+            Expr::IsNull { expr, .. } => self.validate_expr_columns(expr, tables),
+            _ => Ok(()),
+        }
+    }
+
+    fn validate_select_columns(
+        &self,
+        columns: &'a [crate::sql::ast::SelectColumn<'a>],
+        tables: &[(Option<&'a str>, &'a str, Option<&'a str>, &'a TableDef)],
+    ) -> Result<()> {
+        use crate::sql::ast::SelectColumn;
+
+        for col in columns {
+            match col {
+                SelectColumn::Expr { expr, .. } => {
+                    self.validate_expr_columns(expr, tables)?;
+                }
+                SelectColumn::AllColumns => {}
+                SelectColumn::TableAllColumns(table_name) => {
+                    let found = tables.iter().any(|(_, t, alias, _)| {
+                        if let Some(al) = alias {
+                            table_name.eq_ignore_ascii_case(al)
+                        } else {
+                            table_name.eq_ignore_ascii_case(t)
+                        }
+                    });
+                    if !found {
+                        bail!("table '{}' not found in FROM clause", table_name);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn plan_insert(&self, insert: &crate::sql::ast::InsertStmt<'a>) -> Result<LogicalPlan<'a>> {
         self.validate_table_exists(insert.table.schema, insert.table.name)?;
+
+        let table_name = if let Some(schema) = insert.table.schema {
+            self.arena
+                .alloc_str(&format!("{}.{}", schema, insert.table.name))
+        } else {
+            insert.table.name
+        };
+        let table_def = self.catalog.resolve_table(table_name)?;
+
+        let expected_column_count = if let Some(columns) = insert.columns {
+            for col_name in columns.iter() {
+                let col_exists = table_def
+                    .columns()
+                    .iter()
+                    .any(|c| c.name().eq_ignore_ascii_case(col_name));
+                if !col_exists {
+                    bail!(
+                        "column '{}' not found in table '{}'",
+                        col_name,
+                        insert.table.name
+                    );
+                }
+            }
+            columns.len()
+        } else {
+            table_def.columns().len()
+        };
+
+        if let crate::sql::ast::InsertSource::Values(rows) = insert.source {
+            for (row_idx, row) in rows.iter().enumerate() {
+                if row.len() != expected_column_count {
+                    bail!(
+                        "INSERT has {} values but {} columns were expected (row {})",
+                        row.len(),
+                        expected_column_count,
+                        row_idx + 1
+                    );
+                }
+            }
+        }
 
         let source = match insert.source {
             crate::sql::ast::InsertSource::Values(rows) => InsertSource::Values(rows),
@@ -680,6 +923,46 @@ impl<'a> Planner<'a> {
 
     fn plan_update(&self, update: &crate::sql::ast::UpdateStmt<'a>) -> Result<LogicalPlan<'a>> {
         self.validate_table_exists(update.table.schema, update.table.name)?;
+
+        let table_name = if let Some(schema) = update.table.schema {
+            self.arena
+                .alloc_str(&format!("{}.{}", schema, update.table.name))
+        } else {
+            update.table.name
+        };
+        let table_def = self.catalog.resolve_table(table_name)?;
+
+        let tables_in_scope: Vec<(
+            Option<&'a str>,
+            &'a str,
+            Option<&'a str>,
+            &'a crate::schema::TableDef,
+        )> = vec![(
+            update.table.schema,
+            update.table.name,
+            update.table.alias,
+            table_def,
+        )];
+
+        for assign in update.assignments {
+            let col_exists = table_def
+                .columns()
+                .iter()
+                .any(|c| c.name().eq_ignore_ascii_case(assign.column.column));
+            if !col_exists {
+                bail!(
+                    "column '{}' not found in table '{}'",
+                    assign.column.column,
+                    update.table.name
+                );
+            }
+
+            self.validate_expr_columns(assign.value, &tables_in_scope)?;
+        }
+
+        if let Some(predicate) = update.where_clause {
+            self.validate_expr_columns(predicate, &tables_in_scope)?;
+        }
 
         let mut assignments = bumpalo::collections::Vec::new_in(self.arena);
         for assign in update.assignments {
@@ -2486,7 +2769,10 @@ mod tests {
 
         let val1 = arena.alloc(Expr::Literal(Literal::Integer("1")));
         let val2 = arena.alloc(Expr::Literal(Literal::String("Alice")));
-        let row: &[&Expr] = arena.alloc_slice_copy(&[val1 as &Expr, val2 as &Expr]);
+        let val3 = arena.alloc(Expr::Literal(Literal::String("alice@example.com")));
+        let val4 = arena.alloc(Expr::Literal(Literal::Boolean(true)));
+        let row: &[&Expr] =
+            arena.alloc_slice_copy(&[val1 as &Expr, val2 as &Expr, val3 as &Expr, val4 as &Expr]);
         let rows: &[&[&Expr]] = arena.alloc_slice_copy(&[row]);
 
         let insert = arena.alloc(InsertStmt {
@@ -2646,12 +2932,12 @@ mod tests {
         let catalog = create_test_catalog();
         let planner = Planner::new(&catalog, &arena);
 
-        let value = arena.alloc(Expr::Literal(Literal::Integer("42")));
+        let value = arena.alloc(Expr::Literal(Literal::String("John")));
         let assignments: &[Assignment] = arena.alloc_slice_copy(&[Assignment {
             column: ColumnRef {
                 schema: None,
                 table: None,
-                column: "age",
+                column: "name",
             },
             value,
         }]);
@@ -2679,7 +2965,7 @@ mod tests {
             assert_eq!(update_op.table, "users");
             assert!(update_op.schema.is_none());
             assert_eq!(update_op.assignments.len(), 1);
-            assert_eq!(update_op.assignments[0].column, "age");
+            assert_eq!(update_op.assignments[0].column, "name");
             assert!(update_op.filter.is_none());
         }
     }
@@ -2692,12 +2978,12 @@ mod tests {
         let catalog = create_test_catalog();
         let planner = Planner::new(&catalog, &arena);
 
-        let value = arena.alloc(Expr::Literal(Literal::String("inactive")));
+        let value = arena.alloc(Expr::Literal(Literal::Boolean(false)));
         let assignments: &[Assignment] = arena.alloc_slice_copy(&[Assignment {
             column: ColumnRef {
                 schema: None,
                 table: None,
-                column: "status",
+                column: "active",
             },
             value,
         }]);
@@ -2737,7 +3023,7 @@ mod tests {
         let planner = Planner::new(&catalog, &arena);
 
         let val1 = arena.alloc(Expr::Literal(Literal::String("John")));
-        let val2 = arena.alloc(Expr::Literal(Literal::Integer("30")));
+        let val2 = arena.alloc(Expr::Literal(Literal::String("john@example.com")));
         let assignments: &[Assignment] = arena.alloc_slice_copy(&[
             Assignment {
                 column: ColumnRef {
@@ -2751,7 +3037,7 @@ mod tests {
                 column: ColumnRef {
                     schema: None,
                     table: None,
-                    column: "age",
+                    column: "email",
                 },
                 value: val2,
             },
@@ -2777,7 +3063,7 @@ mod tests {
         if let LogicalOperator::Update(update_op) = plan.root {
             assert_eq!(update_op.assignments.len(), 2);
             assert_eq!(update_op.assignments[0].column, "name");
-            assert_eq!(update_op.assignments[1].column, "age");
+            assert_eq!(update_op.assignments[1].column, "email");
         }
     }
 
@@ -2975,11 +3261,11 @@ mod tests {
             IndexDef::new("idx_active_email", vec!["email"], false, IndexType::BTree)
                 .with_where_clause("status = 'active'".to_string());
 
-        let table =
-            TableDef::new(1, "users", vec![]).with_index(partial_index);
+        let table = TableDef::new(1, "users", vec![]).with_index(partial_index);
 
         let filter_columns: Vec<&str> = vec!["email"];
-        let candidates = planner.find_applicable_indexes_with_predicate(&table, &filter_columns, None);
+        let candidates =
+            planner.find_applicable_indexes_with_predicate(&table, &filter_columns, None);
 
         assert!(
             candidates.is_empty(),
@@ -2999,13 +3285,15 @@ mod tests {
             IndexDef::new("idx_active_email", vec!["email"], false, IndexType::BTree)
                 .with_where_clause("status = 'active'".to_string());
 
-        let table =
-            TableDef::new(1, "users", vec![]).with_index(partial_index);
+        let table = TableDef::new(1, "users", vec![]).with_index(partial_index);
 
         let filter_columns: Vec<&str> = vec!["email", "status"];
         let query_predicate = Some("(status Eq 'active')");
-        let candidates =
-            planner.find_applicable_indexes_with_predicate(&table, &filter_columns, query_predicate);
+        let candidates = planner.find_applicable_indexes_with_predicate(
+            &table,
+            &filter_columns,
+            query_predicate,
+        );
 
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].name(), "idx_active_email");
@@ -3021,14 +3309,16 @@ mod tests {
 
         let regular_index = IndexDef::new("idx_email", vec!["email"], false, IndexType::BTree);
 
-        let table =
-            TableDef::new(1, "users", vec![]).with_index(regular_index);
+        let table = TableDef::new(1, "users", vec![]).with_index(regular_index);
 
         let filter_columns: Vec<&str> = vec!["email"];
         let candidates_no_pred =
             planner.find_applicable_indexes_with_predicate(&table, &filter_columns, None);
-        let candidates_with_pred =
-            planner.find_applicable_indexes_with_predicate(&table, &filter_columns, Some("status = 'foo'"));
+        let candidates_with_pred = planner.find_applicable_indexes_with_predicate(
+            &table,
+            &filter_columns,
+            Some("status = 'foo'"),
+        );
 
         assert_eq!(candidates_no_pred.len(), 1);
         assert_eq!(candidates_with_pred.len(), 1);
@@ -4929,5 +5219,1237 @@ mod tests {
         };
 
         assert!(!non_covering.is_covering);
+    }
+
+    #[test]
+    fn validate_column_with_table_alias() {
+        use crate::records::types::DataType;
+        use crate::schema::ColumnDef;
+        use crate::sql::ast::{
+            ColumnRef, Distinct, Expr, FromClause, JoinClause, JoinCondition, JoinType,
+            SelectColumn, SelectStmt, TableRef,
+        };
+
+        let arena = Bump::new();
+        let mut catalog = Catalog::new();
+
+        let users_cols = vec![
+            ColumnDef::new("id", DataType::Int8),
+            ColumnDef::new("name", DataType::Text),
+        ];
+        catalog.create_table("root", "users", users_cols).unwrap();
+
+        let orders_cols = vec![
+            ColumnDef::new("id", DataType::Int8),
+            ColumnDef::new("user_id", DataType::Int8),
+            ColumnDef::new("total", DataType::Float8),
+        ];
+        catalog.create_table("root", "orders", orders_cols).unwrap();
+
+        let planner = Planner::new(&catalog, &arena);
+
+        let u_id = arena.alloc(Expr::Column(ColumnRef {
+            schema: None,
+            table: Some("u"),
+            column: "id",
+        }));
+
+        let o_total = arena.alloc(Expr::Column(ColumnRef {
+            schema: None,
+            table: Some("o"),
+            column: "total",
+        }));
+
+        let left = arena.alloc(FromClause::Table(TableRef {
+            schema: None,
+            name: "users",
+            alias: Some("u"),
+        }));
+
+        let right = arena.alloc(FromClause::Table(TableRef {
+            schema: None,
+            name: "orders",
+            alias: Some("o"),
+        }));
+
+        let join = arena.alloc(FromClause::Join(arena.alloc(JoinClause {
+            left,
+            join_type: JoinType::Cross,
+            right,
+            condition: JoinCondition::None,
+        })));
+
+        let select = arena.alloc(SelectStmt {
+            with: None,
+            distinct: Distinct::All,
+            columns: arena.alloc_slice_copy(&[
+                SelectColumn::Expr {
+                    expr: u_id,
+                    alias: None,
+                },
+                SelectColumn::Expr {
+                    expr: o_total,
+                    alias: None,
+                },
+            ]),
+            from: Some(join),
+            where_clause: None,
+            group_by: &[],
+            having: None,
+            order_by: &[],
+            limit: None,
+            offset: None,
+            set_op: None,
+            for_clause: None,
+        });
+
+        let result = planner.plan_select(select);
+        assert!(
+            result.is_ok(),
+            "Should succeed with qualified columns using table aliases: {:?}",
+            result.err()
+        );
+    }
+
+    #[test]
+    fn validate_column_not_found_in_select() {
+        use crate::records::types::DataType;
+        use crate::schema::ColumnDef;
+        use crate::sql::ast::{
+            ColumnRef, Distinct, Expr, FromClause, SelectColumn, SelectStmt, TableRef,
+        };
+
+        let arena = Bump::new();
+        let mut catalog = Catalog::new();
+
+        let columns = vec![
+            ColumnDef::new("id", DataType::Int8),
+            ColumnDef::new("name", DataType::Text),
+        ];
+        catalog.create_table("root", "users", columns).unwrap();
+
+        let planner = Planner::new(&catalog, &arena);
+
+        let nonexistent_col = arena.alloc(Expr::Column(ColumnRef {
+            schema: None,
+            table: None,
+            column: "nonexistent_column",
+        }));
+
+        let select = arena.alloc(SelectStmt {
+            with: None,
+            distinct: Distinct::All,
+            columns: arena.alloc_slice_copy(&[SelectColumn::Expr {
+                expr: nonexistent_col,
+                alias: None,
+            }]),
+            from: Some(arena.alloc(FromClause::Table(TableRef {
+                schema: None,
+                name: "users",
+                alias: None,
+            }))),
+            where_clause: None,
+            group_by: &[],
+            having: None,
+            order_by: &[],
+            limit: None,
+            offset: None,
+            set_op: None,
+            for_clause: None,
+        });
+
+        let result = planner.plan_select(select);
+        assert!(
+            result.is_err(),
+            "Should fail when selecting non-existent column"
+        );
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("column") && err_msg.contains("not found"),
+            "Error should mention column not found: {}",
+            err_msg
+        );
+    }
+
+    #[test]
+    fn validate_column_exists_in_select() {
+        use crate::records::types::DataType;
+        use crate::schema::ColumnDef;
+        use crate::sql::ast::{
+            ColumnRef, Distinct, Expr, FromClause, SelectColumn, SelectStmt, TableRef,
+        };
+
+        let arena = Bump::new();
+        let mut catalog = Catalog::new();
+
+        let columns = vec![
+            ColumnDef::new("id", DataType::Int8),
+            ColumnDef::new("name", DataType::Text),
+        ];
+        catalog.create_table("root", "users", columns).unwrap();
+
+        let planner = Planner::new(&catalog, &arena);
+
+        let existing_col = arena.alloc(Expr::Column(ColumnRef {
+            schema: None,
+            table: None,
+            column: "id",
+        }));
+
+        let select = arena.alloc(SelectStmt {
+            with: None,
+            distinct: Distinct::All,
+            columns: arena.alloc_slice_copy(&[SelectColumn::Expr {
+                expr: existing_col,
+                alias: None,
+            }]),
+            from: Some(arena.alloc(FromClause::Table(TableRef {
+                schema: None,
+                name: "users",
+                alias: None,
+            }))),
+            where_clause: None,
+            group_by: &[],
+            having: None,
+            order_by: &[],
+            limit: None,
+            offset: None,
+            set_op: None,
+            for_clause: None,
+        });
+
+        let result = planner.plan_select(select);
+        assert!(
+            result.is_ok(),
+            "Should succeed when selecting existing column"
+        );
+    }
+
+    #[test]
+    fn validate_column_not_found_in_where_clause() {
+        use crate::records::types::DataType;
+        use crate::schema::ColumnDef;
+        use crate::sql::ast::{
+            BinaryOperator, ColumnRef, Distinct, Expr, FromClause, Literal, SelectColumn,
+            SelectStmt, TableRef,
+        };
+
+        let arena = Bump::new();
+        let mut catalog = Catalog::new();
+
+        let columns = vec![
+            ColumnDef::new("id", DataType::Int8),
+            ColumnDef::new("name", DataType::Text),
+        ];
+        catalog.create_table("root", "users", columns).unwrap();
+
+        let planner = Planner::new(&catalog, &arena);
+
+        let nonexistent_col = arena.alloc(Expr::Column(ColumnRef {
+            schema: None,
+            table: None,
+            column: "nonexistent",
+        }));
+
+        let predicate = arena.alloc(Expr::BinaryOp {
+            left: nonexistent_col,
+            op: BinaryOperator::Eq,
+            right: arena.alloc(Expr::Literal(Literal::Integer("1"))),
+        });
+
+        let select = arena.alloc(SelectStmt {
+            with: None,
+            distinct: Distinct::All,
+            columns: arena.alloc_slice_copy(&[SelectColumn::AllColumns]),
+            from: Some(arena.alloc(FromClause::Table(TableRef {
+                schema: None,
+                name: "users",
+                alias: None,
+            }))),
+            where_clause: Some(predicate),
+            group_by: &[],
+            having: None,
+            order_by: &[],
+            limit: None,
+            offset: None,
+            set_op: None,
+            for_clause: None,
+        });
+
+        let result = planner.plan_select(select);
+        assert!(
+            result.is_err(),
+            "Should fail when WHERE references non-existent column"
+        );
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("column") && err_msg.contains("not found"),
+            "Error should mention column not found: {}",
+            err_msg
+        );
+    }
+
+    #[test]
+    fn validate_column_not_found_in_group_by() {
+        use crate::records::types::DataType;
+        use crate::schema::ColumnDef;
+        use crate::sql::ast::{
+            ColumnRef, Distinct, Expr, FromClause, SelectColumn, SelectStmt, TableRef,
+        };
+
+        let arena = Bump::new();
+        let mut catalog = Catalog::new();
+
+        let columns = vec![
+            ColumnDef::new("id", DataType::Int8),
+            ColumnDef::new("name", DataType::Text),
+        ];
+        catalog.create_table("root", "users", columns).unwrap();
+
+        let planner = Planner::new(&catalog, &arena);
+
+        let nonexistent_col: &Expr = arena.alloc(Expr::Column(ColumnRef {
+            schema: None,
+            table: None,
+            column: "nonexistent_group",
+        }));
+
+        let group_by_slice: &[&Expr] = arena.alloc_slice_copy(&[nonexistent_col]);
+
+        let select = arena.alloc(SelectStmt {
+            with: None,
+            distinct: Distinct::All,
+            columns: arena.alloc_slice_copy(&[SelectColumn::AllColumns]),
+            from: Some(arena.alloc(FromClause::Table(TableRef {
+                schema: None,
+                name: "users",
+                alias: None,
+            }))),
+            where_clause: None,
+            group_by: group_by_slice,
+            having: None,
+            order_by: &[],
+            limit: None,
+            offset: None,
+            set_op: None,
+            for_clause: None,
+        });
+
+        let result = planner.plan_select(select);
+        assert!(
+            result.is_err(),
+            "Should fail when GROUP BY references non-existent column"
+        );
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("column") && err_msg.contains("not found"),
+            "Error should mention column not found: {}",
+            err_msg
+        );
+    }
+
+    #[test]
+    fn validate_column_not_found_in_order_by() {
+        use crate::records::types::DataType;
+        use crate::schema::ColumnDef;
+        use crate::sql::ast::{
+            ColumnRef, Distinct, Expr, FromClause, NullsOrder, OrderByItem, OrderDirection,
+            SelectColumn, SelectStmt, TableRef,
+        };
+
+        let arena = Bump::new();
+        let mut catalog = Catalog::new();
+
+        let columns = vec![
+            ColumnDef::new("id", DataType::Int8),
+            ColumnDef::new("name", DataType::Text),
+        ];
+        catalog.create_table("root", "users", columns).unwrap();
+
+        let planner = Planner::new(&catalog, &arena);
+
+        let nonexistent_col = arena.alloc(Expr::Column(ColumnRef {
+            schema: None,
+            table: None,
+            column: "nonexistent_order",
+        }));
+
+        let order_by_item = OrderByItem {
+            expr: nonexistent_col,
+            direction: OrderDirection::Asc,
+            nulls: NullsOrder::Last,
+        };
+
+        let select = arena.alloc(SelectStmt {
+            with: None,
+            distinct: Distinct::All,
+            columns: arena.alloc_slice_copy(&[SelectColumn::AllColumns]),
+            from: Some(arena.alloc(FromClause::Table(TableRef {
+                schema: None,
+                name: "users",
+                alias: None,
+            }))),
+            where_clause: None,
+            group_by: &[],
+            having: None,
+            order_by: arena.alloc_slice_copy(&[order_by_item]),
+            limit: None,
+            offset: None,
+            set_op: None,
+            for_clause: None,
+        });
+
+        let result = planner.plan_select(select);
+        assert!(
+            result.is_err(),
+            "Should fail when ORDER BY references non-existent column"
+        );
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("column") && err_msg.contains("not found"),
+            "Error should mention column not found: {}",
+            err_msg
+        );
+    }
+
+    #[test]
+    fn validate_insert_column_not_found() {
+        use crate::records::types::DataType;
+        use crate::schema::{Catalog, ColumnDef};
+        use crate::sql::ast::{InsertStmt, Literal, TableRef};
+
+        let arena = Bump::new();
+        let mut catalog = Catalog::new();
+
+        let columns = vec![
+            ColumnDef::new("id", DataType::Int8),
+            ColumnDef::new("name", DataType::Text),
+        ];
+        catalog.create_table("root", "users", columns).unwrap();
+
+        let planner = Planner::new(&catalog, &arena);
+
+        let val1 = arena.alloc(Expr::Literal(Literal::Integer("1")));
+        let val2 = arena.alloc(Expr::Literal(Literal::String("Alice")));
+        let row: &[&Expr] = arena.alloc_slice_copy(&[val1 as &Expr, val2 as &Expr]);
+        let rows: &[&[&Expr]] = arena.alloc_slice_copy(&[row]);
+        let columns: &[&str] = arena.alloc_slice_copy(&["id", "nonexistent_column"]);
+
+        let insert = arena.alloc(InsertStmt {
+            table: TableRef {
+                schema: None,
+                name: "users",
+                alias: None,
+            },
+            columns: Some(columns),
+            source: crate::sql::ast::InsertSource::Values(rows),
+            on_conflict: None,
+            returning: None,
+        });
+
+        let stmt = Statement::Insert(insert);
+        let result = planner.create_logical_plan(&stmt);
+        assert!(
+            result.is_err(),
+            "Should fail when INSERT references non-existent column"
+        );
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("column") && err_msg.contains("nonexistent_column"),
+            "Error should mention the non-existent column: {}",
+            err_msg
+        );
+    }
+
+    #[test]
+    fn validate_insert_column_exists() {
+        use crate::records::types::DataType;
+        use crate::schema::{Catalog, ColumnDef};
+        use crate::sql::ast::{InsertStmt, Literal, TableRef};
+
+        let arena = Bump::new();
+        let mut catalog = Catalog::new();
+
+        let columns = vec![
+            ColumnDef::new("id", DataType::Int8),
+            ColumnDef::new("name", DataType::Text),
+        ];
+        catalog.create_table("root", "users", columns).unwrap();
+
+        let planner = Planner::new(&catalog, &arena);
+
+        let val1 = arena.alloc(Expr::Literal(Literal::Integer("1")));
+        let val2 = arena.alloc(Expr::Literal(Literal::String("Alice")));
+        let row: &[&Expr] = arena.alloc_slice_copy(&[val1 as &Expr, val2 as &Expr]);
+        let rows: &[&[&Expr]] = arena.alloc_slice_copy(&[row]);
+        let columns: &[&str] = arena.alloc_slice_copy(&["id", "name"]);
+
+        let insert = arena.alloc(InsertStmt {
+            table: TableRef {
+                schema: None,
+                name: "users",
+                alias: None,
+            },
+            columns: Some(columns),
+            source: crate::sql::ast::InsertSource::Values(rows),
+            on_conflict: None,
+            returning: None,
+        });
+
+        let stmt = Statement::Insert(insert);
+        let result = planner.create_logical_plan(&stmt);
+        assert!(
+            result.is_ok(),
+            "Should succeed when INSERT columns exist: {:?}",
+            result.err()
+        );
+    }
+
+    #[test]
+    fn validate_insert_value_count_mismatch_too_few() {
+        use crate::records::types::DataType;
+        use crate::schema::{Catalog, ColumnDef};
+        use crate::sql::ast::{InsertStmt, Literal, TableRef};
+
+        let arena = Bump::new();
+        let mut catalog = Catalog::new();
+
+        let columns = vec![
+            ColumnDef::new("id", DataType::Int8),
+            ColumnDef::new("name", DataType::Text),
+        ];
+        catalog.create_table("root", "users", columns).unwrap();
+
+        let planner = Planner::new(&catalog, &arena);
+
+        let val1 = arena.alloc(Expr::Literal(Literal::Integer("1")));
+        let row: &[&Expr] = arena.alloc_slice_copy(&[val1 as &Expr]);
+        let rows: &[&[&Expr]] = arena.alloc_slice_copy(&[row]);
+        let columns: &[&str] = arena.alloc_slice_copy(&["id", "name"]);
+
+        let insert = arena.alloc(InsertStmt {
+            table: TableRef {
+                schema: None,
+                name: "users",
+                alias: None,
+            },
+            columns: Some(columns),
+            source: crate::sql::ast::InsertSource::Values(rows),
+            on_conflict: None,
+            returning: None,
+        });
+
+        let stmt = Statement::Insert(insert);
+        let result = planner.create_logical_plan(&stmt);
+        assert!(
+            result.is_err(),
+            "Should fail when value count is less than column count"
+        );
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("value") || err_msg.contains("column"),
+            "Error should mention value/column count mismatch: {}",
+            err_msg
+        );
+    }
+
+    #[test]
+    fn validate_insert_value_count_mismatch_too_many() {
+        use crate::records::types::DataType;
+        use crate::schema::{Catalog, ColumnDef};
+        use crate::sql::ast::{InsertStmt, Literal, TableRef};
+
+        let arena = Bump::new();
+        let mut catalog = Catalog::new();
+
+        let columns = vec![
+            ColumnDef::new("id", DataType::Int8),
+            ColumnDef::new("name", DataType::Text),
+        ];
+        catalog.create_table("root", "users", columns).unwrap();
+
+        let planner = Planner::new(&catalog, &arena);
+
+        let val1 = arena.alloc(Expr::Literal(Literal::Integer("1")));
+        let val2 = arena.alloc(Expr::Literal(Literal::String("Alice")));
+        let val3 = arena.alloc(Expr::Literal(Literal::String("extra")));
+        let row: &[&Expr] = arena.alloc_slice_copy(&[val1 as &Expr, val2 as &Expr, val3 as &Expr]);
+        let rows: &[&[&Expr]] = arena.alloc_slice_copy(&[row]);
+        let columns: &[&str] = arena.alloc_slice_copy(&["id", "name"]);
+
+        let insert = arena.alloc(InsertStmt {
+            table: TableRef {
+                schema: None,
+                name: "users",
+                alias: None,
+            },
+            columns: Some(columns),
+            source: crate::sql::ast::InsertSource::Values(rows),
+            on_conflict: None,
+            returning: None,
+        });
+
+        let stmt = Statement::Insert(insert);
+        let result = planner.create_logical_plan(&stmt);
+        assert!(
+            result.is_err(),
+            "Should fail when value count is more than column count"
+        );
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("value") || err_msg.contains("column"),
+            "Error should mention value/column count mismatch: {}",
+            err_msg
+        );
+    }
+
+    #[test]
+    fn validate_insert_without_columns_value_count_matches_table() {
+        use crate::records::types::DataType;
+        use crate::schema::{Catalog, ColumnDef};
+        use crate::sql::ast::{InsertStmt, Literal, TableRef};
+
+        let arena = Bump::new();
+        let mut catalog = Catalog::new();
+
+        let columns = vec![
+            ColumnDef::new("id", DataType::Int8),
+            ColumnDef::new("name", DataType::Text),
+        ];
+        catalog.create_table("root", "users", columns).unwrap();
+
+        let planner = Planner::new(&catalog, &arena);
+
+        let val1 = arena.alloc(Expr::Literal(Literal::Integer("1")));
+        let row: &[&Expr] = arena.alloc_slice_copy(&[val1 as &Expr]);
+        let rows: &[&[&Expr]] = arena.alloc_slice_copy(&[row]);
+
+        let insert = arena.alloc(InsertStmt {
+            table: TableRef {
+                schema: None,
+                name: "users",
+                alias: None,
+            },
+            columns: None,
+            source: crate::sql::ast::InsertSource::Values(rows),
+            on_conflict: None,
+            returning: None,
+        });
+
+        let stmt = Statement::Insert(insert);
+        let result = planner.create_logical_plan(&stmt);
+        assert!(
+            result.is_err(),
+            "Should fail when no columns specified and value count doesn't match table column count"
+        );
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("value") || err_msg.contains("column"),
+            "Error should mention value/column count mismatch: {}",
+            err_msg
+        );
+    }
+
+    #[test]
+    fn validate_update_column_not_found_in_set() {
+        use crate::records::types::DataType;
+        use crate::schema::{Catalog, ColumnDef};
+        use crate::sql::ast::{Assignment, ColumnRef, Literal, TableRef, UpdateStmt};
+
+        let arena = Bump::new();
+        let mut catalog = Catalog::new();
+
+        let columns = vec![
+            ColumnDef::new("id", DataType::Int8),
+            ColumnDef::new("name", DataType::Text),
+        ];
+        catalog.create_table("root", "users", columns).unwrap();
+
+        let planner = Planner::new(&catalog, &arena);
+
+        let value = arena.alloc(Expr::Literal(Literal::String("Alice")));
+        let assignments: &[Assignment] = arena.alloc_slice_copy(&[Assignment {
+            column: ColumnRef {
+                schema: None,
+                table: None,
+                column: "nonexistent_column",
+            },
+            value,
+        }]);
+
+        let update = arena.alloc(UpdateStmt {
+            table: TableRef {
+                schema: None,
+                name: "users",
+                alias: None,
+            },
+            assignments,
+            from: None,
+            where_clause: None,
+            returning: None,
+        });
+
+        let stmt = Statement::Update(update);
+        let result = planner.create_logical_plan(&stmt);
+        assert!(
+            result.is_err(),
+            "Should fail when UPDATE SET references non-existent column"
+        );
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("column") && err_msg.contains("nonexistent_column"),
+            "Error should mention the non-existent column: {}",
+            err_msg
+        );
+    }
+
+    #[test]
+    fn validate_update_column_not_found_in_where() {
+        use crate::records::types::DataType;
+        use crate::schema::{Catalog, ColumnDef};
+        use crate::sql::ast::{
+            Assignment, BinaryOperator, ColumnRef, Literal, TableRef, UpdateStmt,
+        };
+
+        let arena = Bump::new();
+        let mut catalog = Catalog::new();
+
+        let columns = vec![
+            ColumnDef::new("id", DataType::Int8),
+            ColumnDef::new("name", DataType::Text),
+        ];
+        catalog.create_table("root", "users", columns).unwrap();
+
+        let planner = Planner::new(&catalog, &arena);
+
+        let value = arena.alloc(Expr::Literal(Literal::String("Alice")));
+        let assignments: &[Assignment] = arena.alloc_slice_copy(&[Assignment {
+            column: ColumnRef {
+                schema: None,
+                table: None,
+                column: "name",
+            },
+            value,
+        }]);
+
+        let nonexistent_col = arena.alloc(Expr::Column(ColumnRef {
+            schema: None,
+            table: None,
+            column: "nonexistent_where",
+        }));
+        let lit_val = arena.alloc(Expr::Literal(Literal::Integer("1")));
+        let where_clause = arena.alloc(Expr::BinaryOp {
+            left: nonexistent_col,
+            op: BinaryOperator::Eq,
+            right: lit_val,
+        });
+
+        let update = arena.alloc(UpdateStmt {
+            table: TableRef {
+                schema: None,
+                name: "users",
+                alias: None,
+            },
+            assignments,
+            from: None,
+            where_clause: Some(where_clause),
+            returning: None,
+        });
+
+        let stmt = Statement::Update(update);
+        let result = planner.create_logical_plan(&stmt);
+        assert!(
+            result.is_err(),
+            "Should fail when UPDATE WHERE references non-existent column"
+        );
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("column") && err_msg.contains("nonexistent_where"),
+            "Error should mention the non-existent column: {}",
+            err_msg
+        );
+    }
+
+    #[test]
+    fn validate_update_column_exists() {
+        use crate::records::types::DataType;
+        use crate::schema::{Catalog, ColumnDef};
+        use crate::sql::ast::{
+            Assignment, BinaryOperator, ColumnRef, Literal, TableRef, UpdateStmt,
+        };
+
+        let arena = Bump::new();
+        let mut catalog = Catalog::new();
+
+        let columns = vec![
+            ColumnDef::new("id", DataType::Int8),
+            ColumnDef::new("name", DataType::Text),
+        ];
+        catalog.create_table("root", "users", columns).unwrap();
+
+        let planner = Planner::new(&catalog, &arena);
+
+        let value = arena.alloc(Expr::Literal(Literal::String("Alice")));
+        let assignments: &[Assignment] = arena.alloc_slice_copy(&[Assignment {
+            column: ColumnRef {
+                schema: None,
+                table: None,
+                column: "name",
+            },
+            value,
+        }]);
+
+        let id_col = arena.alloc(Expr::Column(ColumnRef {
+            schema: None,
+            table: None,
+            column: "id",
+        }));
+        let lit_val = arena.alloc(Expr::Literal(Literal::Integer("1")));
+        let where_clause = arena.alloc(Expr::BinaryOp {
+            left: id_col,
+            op: BinaryOperator::Eq,
+            right: lit_val,
+        });
+
+        let update = arena.alloc(UpdateStmt {
+            table: TableRef {
+                schema: None,
+                name: "users",
+                alias: None,
+            },
+            assignments,
+            from: None,
+            where_clause: Some(where_clause),
+            returning: None,
+        });
+
+        let stmt = Statement::Update(update);
+        let result = planner.create_logical_plan(&stmt);
+        assert!(
+            result.is_ok(),
+            "Should succeed when UPDATE columns exist: {:?}",
+            result.err()
+        );
+    }
+
+    #[test]
+    fn validate_update_column_reference_in_value() {
+        use crate::records::types::DataType;
+        use crate::schema::{Catalog, ColumnDef};
+        use crate::sql::ast::{
+            Assignment, BinaryOperator, ColumnRef, Literal, TableRef, UpdateStmt,
+        };
+
+        let arena = Bump::new();
+        let mut catalog = Catalog::new();
+
+        let columns = vec![
+            ColumnDef::new("id", DataType::Int8),
+            ColumnDef::new("count", DataType::Int8),
+        ];
+        catalog.create_table("root", "counters", columns).unwrap();
+
+        let planner = Planner::new(&catalog, &arena);
+
+        let count_col = arena.alloc(Expr::Column(ColumnRef {
+            schema: None,
+            table: None,
+            column: "nonexistent_ref",
+        }));
+        let lit_one = arena.alloc(Expr::Literal(Literal::Integer("1")));
+        let value = arena.alloc(Expr::BinaryOp {
+            left: count_col,
+            op: BinaryOperator::Plus,
+            right: lit_one,
+        });
+
+        let assignments: &[Assignment] = arena.alloc_slice_copy(&[Assignment {
+            column: ColumnRef {
+                schema: None,
+                table: None,
+                column: "count",
+            },
+            value,
+        }]);
+
+        let update = arena.alloc(UpdateStmt {
+            table: TableRef {
+                schema: None,
+                name: "counters",
+                alias: None,
+            },
+            assignments,
+            from: None,
+            where_clause: None,
+            returning: None,
+        });
+
+        let stmt = Statement::Update(update);
+        let result = planner.create_logical_plan(&stmt);
+        assert!(
+            result.is_err(),
+            "Should fail when UPDATE value expression references non-existent column"
+        );
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("column") && err_msg.contains("nonexistent_ref"),
+            "Error should mention the non-existent column: {}",
+            err_msg
+        );
+    }
+
+    #[test]
+    fn validate_ambiguous_column_in_join_select() {
+        use crate::records::types::DataType;
+        use crate::schema::{Catalog, ColumnDef};
+        use crate::sql::ast::{
+            ColumnRef, Distinct, FromClause, JoinClause, JoinCondition, JoinType, SelectColumn,
+            SelectStmt, TableRef,
+        };
+
+        let arena = Bump::new();
+        let mut catalog = Catalog::new();
+
+        let users_columns = vec![
+            ColumnDef::new("id", DataType::Int8),
+            ColumnDef::new("name", DataType::Text),
+        ];
+        catalog
+            .create_table("root", "users", users_columns)
+            .unwrap();
+
+        let orders_columns = vec![
+            ColumnDef::new("id", DataType::Int8),
+            ColumnDef::new("user_id", DataType::Int8),
+            ColumnDef::new("total", DataType::Float8),
+        ];
+        catalog
+            .create_table("root", "orders", orders_columns)
+            .unwrap();
+
+        let planner = Planner::new(&catalog, &arena);
+
+        let id_col = arena.alloc(Expr::Column(ColumnRef {
+            schema: None,
+            table: None,
+            column: "id",
+        }));
+        let select_cols: &[SelectColumn] = arena.alloc_slice_copy(&[SelectColumn::Expr {
+            expr: id_col,
+            alias: None,
+        }]);
+
+        let users_table = arena.alloc(FromClause::Table(TableRef {
+            schema: None,
+            name: "users",
+            alias: None,
+        }));
+        let orders_table = arena.alloc(FromClause::Table(TableRef {
+            schema: None,
+            name: "orders",
+            alias: None,
+        }));
+
+        let join = arena.alloc(JoinClause {
+            left: users_table,
+            join_type: JoinType::Inner,
+            right: orders_table,
+            condition: JoinCondition::None,
+        });
+        let from = arena.alloc(FromClause::Join(join));
+
+        let select = arena.alloc(SelectStmt {
+            with: None,
+            distinct: Distinct::All,
+            columns: select_cols,
+            from: Some(from),
+            where_clause: None,
+            group_by: &[],
+            having: None,
+            order_by: &[],
+            limit: None,
+            offset: None,
+            set_op: None,
+            for_clause: None,
+        });
+
+        let result = planner.plan_select(select);
+        assert!(
+            result.is_err(),
+            "Should fail when column 'id' is ambiguous (exists in both users and orders)"
+        );
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("ambiguous"),
+            "Error should mention ambiguous column: {}",
+            err_msg
+        );
+    }
+
+    #[test]
+    fn validate_ambiguous_column_in_join_where() {
+        use crate::records::types::DataType;
+        use crate::schema::{Catalog, ColumnDef};
+        use crate::sql::ast::{
+            BinaryOperator, ColumnRef, Distinct, FromClause, JoinClause, JoinCondition, JoinType,
+            Literal, SelectColumn, SelectStmt, TableRef,
+        };
+
+        let arena = Bump::new();
+        let mut catalog = Catalog::new();
+
+        let users_columns = vec![
+            ColumnDef::new("id", DataType::Int8),
+            ColumnDef::new("name", DataType::Text),
+        ];
+        catalog
+            .create_table("root", "users", users_columns)
+            .unwrap();
+
+        let orders_columns = vec![
+            ColumnDef::new("id", DataType::Int8),
+            ColumnDef::new("user_id", DataType::Int8),
+            ColumnDef::new("total", DataType::Float8),
+        ];
+        catalog
+            .create_table("root", "orders", orders_columns)
+            .unwrap();
+
+        let planner = Planner::new(&catalog, &arena);
+
+        let users_table = arena.alloc(FromClause::Table(TableRef {
+            schema: None,
+            name: "users",
+            alias: None,
+        }));
+        let orders_table = arena.alloc(FromClause::Table(TableRef {
+            schema: None,
+            name: "orders",
+            alias: None,
+        }));
+
+        let join = arena.alloc(JoinClause {
+            left: users_table,
+            join_type: JoinType::Inner,
+            right: orders_table,
+            condition: JoinCondition::None,
+        });
+        let from = arena.alloc(FromClause::Join(join));
+
+        let ambiguous_col = arena.alloc(Expr::Column(ColumnRef {
+            schema: None,
+            table: None,
+            column: "id",
+        }));
+        let lit_val = arena.alloc(Expr::Literal(Literal::Integer("1")));
+        let where_clause = arena.alloc(Expr::BinaryOp {
+            left: ambiguous_col,
+            op: BinaryOperator::Eq,
+            right: lit_val,
+        });
+
+        let select = arena.alloc(SelectStmt {
+            with: None,
+            distinct: Distinct::All,
+            columns: arena.alloc_slice_copy(&[SelectColumn::AllColumns]),
+            from: Some(from),
+            where_clause: Some(where_clause),
+            group_by: &[],
+            having: None,
+            order_by: &[],
+            limit: None,
+            offset: None,
+            set_op: None,
+            for_clause: None,
+        });
+
+        let result = planner.plan_select(select);
+        assert!(
+            result.is_err(),
+            "Should fail when column 'id' is ambiguous in WHERE clause"
+        );
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("ambiguous"),
+            "Error should mention ambiguous column: {}",
+            err_msg
+        );
+    }
+
+    #[test]
+    fn validate_qualified_column_not_ambiguous() {
+        use crate::records::types::DataType;
+        use crate::schema::{Catalog, ColumnDef};
+        use crate::sql::ast::{
+            ColumnRef, Distinct, FromClause, JoinClause, JoinCondition, JoinType, SelectColumn,
+            SelectStmt, TableRef,
+        };
+
+        let arena = Bump::new();
+        let mut catalog = Catalog::new();
+
+        let users_columns = vec![
+            ColumnDef::new("id", DataType::Int8),
+            ColumnDef::new("name", DataType::Text),
+        ];
+        catalog
+            .create_table("root", "users", users_columns)
+            .unwrap();
+
+        let orders_columns = vec![
+            ColumnDef::new("id", DataType::Int8),
+            ColumnDef::new("user_id", DataType::Int8),
+            ColumnDef::new("total", DataType::Float8),
+        ];
+        catalog
+            .create_table("root", "orders", orders_columns)
+            .unwrap();
+
+        let planner = Planner::new(&catalog, &arena);
+
+        let users_id = arena.alloc(Expr::Column(ColumnRef {
+            schema: None,
+            table: Some("users"),
+            column: "id",
+        }));
+        let orders_total = arena.alloc(Expr::Column(ColumnRef {
+            schema: None,
+            table: Some("orders"),
+            column: "total",
+        }));
+        let select_cols: &[SelectColumn] = arena.alloc_slice_copy(&[
+            SelectColumn::Expr {
+                expr: users_id,
+                alias: None,
+            },
+            SelectColumn::Expr {
+                expr: orders_total,
+                alias: None,
+            },
+        ]);
+
+        let users_table = arena.alloc(FromClause::Table(TableRef {
+            schema: None,
+            name: "users",
+            alias: None,
+        }));
+        let orders_table = arena.alloc(FromClause::Table(TableRef {
+            schema: None,
+            name: "orders",
+            alias: None,
+        }));
+
+        let join = arena.alloc(JoinClause {
+            left: users_table,
+            join_type: JoinType::Inner,
+            right: orders_table,
+            condition: JoinCondition::None,
+        });
+        let from = arena.alloc(FromClause::Join(join));
+
+        let select = arena.alloc(SelectStmt {
+            with: None,
+            distinct: Distinct::All,
+            columns: select_cols,
+            from: Some(from),
+            where_clause: None,
+            group_by: &[],
+            having: None,
+            order_by: &[],
+            limit: None,
+            offset: None,
+            set_op: None,
+            for_clause: None,
+        });
+
+        let result = planner.plan_select(select);
+        assert!(
+            result.is_ok(),
+            "Should succeed when column is qualified with table name: {:?}",
+            result.err()
+        );
+    }
+
+    #[test]
+    fn validate_unique_column_not_ambiguous() {
+        use crate::records::types::DataType;
+        use crate::schema::{Catalog, ColumnDef};
+        use crate::sql::ast::{
+            ColumnRef, Distinct, FromClause, JoinClause, JoinCondition, JoinType, SelectColumn,
+            SelectStmt, TableRef,
+        };
+
+        let arena = Bump::new();
+        let mut catalog = Catalog::new();
+
+        let users_columns = vec![
+            ColumnDef::new("id", DataType::Int8),
+            ColumnDef::new("name", DataType::Text),
+        ];
+        catalog
+            .create_table("root", "users", users_columns)
+            .unwrap();
+
+        let orders_columns = vec![
+            ColumnDef::new("order_id", DataType::Int8),
+            ColumnDef::new("user_id", DataType::Int8),
+            ColumnDef::new("total", DataType::Float8),
+        ];
+        catalog
+            .create_table("root", "orders", orders_columns)
+            .unwrap();
+
+        let planner = Planner::new(&catalog, &arena);
+
+        let name_col = arena.alloc(Expr::Column(ColumnRef {
+            schema: None,
+            table: None,
+            column: "name",
+        }));
+        let select_cols: &[SelectColumn] = arena.alloc_slice_copy(&[SelectColumn::Expr {
+            expr: name_col,
+            alias: None,
+        }]);
+
+        let users_table = arena.alloc(FromClause::Table(TableRef {
+            schema: None,
+            name: "users",
+            alias: None,
+        }));
+        let orders_table = arena.alloc(FromClause::Table(TableRef {
+            schema: None,
+            name: "orders",
+            alias: None,
+        }));
+
+        let join = arena.alloc(JoinClause {
+            left: users_table,
+            join_type: JoinType::Inner,
+            right: orders_table,
+            condition: JoinCondition::None,
+        });
+        let from = arena.alloc(FromClause::Join(join));
+
+        let select = arena.alloc(SelectStmt {
+            with: None,
+            distinct: Distinct::All,
+            columns: select_cols,
+            from: Some(from),
+            where_clause: None,
+            group_by: &[],
+            having: None,
+            order_by: &[],
+            limit: None,
+            offset: None,
+            set_op: None,
+            for_clause: None,
+        });
+
+        let result = planner.plan_select(select);
+        assert!(
+            result.is_ok(),
+            "Should succeed when column 'name' only exists in one table: {:?}",
+            result.err()
+        );
     }
 }
