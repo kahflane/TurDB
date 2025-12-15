@@ -71,6 +71,7 @@
 //! - Join performance: Depends on algorithm selection
 
 use crate::sql::adapter::BTreeCursorAdapter;
+use crate::sql::ast::JoinType;
 use crate::sql::decoder::SimpleDecoder;
 use crate::sql::predicate::CompiledPredicate;
 use crate::sql::state::{
@@ -1115,6 +1116,10 @@ impl<'a, S: RowSource> Executor<'a> for DynamicExecutor<'a, S> {
                 }
                 state.current_left_row = None;
                 state.right_index = 0;
+                state.left_matched = false;
+                state.right_matched = vec![false; state.right_rows.len()];
+                state.emitting_unmatched_right = false;
+                state.unmatched_right_idx = 0;
                 Ok(())
             }
             DynamicExecutor::GraceHashJoin(state) => {
@@ -1139,13 +1144,29 @@ impl<'a, S: RowSource> Executor<'a> for DynamicExecutor<'a, S> {
                     }
                     state.right.close()?;
                     state.partitioned = true;
+
+                    for p in 0..state.num_partitions {
+                        state.build_matched[p] = vec![false; state.left_partitions[p].len()];
+                    }
                 }
                 state.current_partition = 0;
                 state.current_probe_idx = 0;
                 state.current_match_idx = 0;
                 state.current_matches.clear();
                 state.partition_hash_table.clear();
-                state.partition_build_rows.clear();
+                state.partition_build_rows = std::mem::take(&mut state.left_partitions[0]);
+                for (idx, row) in state.partition_build_rows.iter().enumerate() {
+                    let hash = hash_keys_static(row, &state.left_key_indices);
+                    state
+                        .partition_hash_table
+                        .entry(hash)
+                        .or_insert_with(Vec::new)
+                        .push(idx);
+                }
+                state.probe_row_matched = false;
+                state.emitting_unmatched_build = false;
+                state.unmatched_build_partition = 0;
+                state.unmatched_build_idx = 0;
                 Ok(())
             }
             DynamicExecutor::HashAggregate(state) => {
@@ -1261,6 +1282,26 @@ impl<'a, S: RowSource> Executor<'a> for DynamicExecutor<'a, S> {
                 Ok(None)
             }
             DynamicExecutor::NestedLoopJoin(state) => loop {
+                if state.emitting_unmatched_right {
+                    while state.unmatched_right_idx < state.right_rows.len() {
+                        let idx = state.unmatched_right_idx;
+                        state.unmatched_right_idx += 1;
+                        if !state.right_matched[idx] {
+                            let right_row = &state.right_rows[idx];
+                            let mut combined: Vec<Value<'a>> =
+                                (0..state.left_col_count).map(|_| Value::Null).collect();
+                            combined.extend(
+                                right_row
+                                    .iter()
+                                    .map(|v| clone_value_ref_to_arena(v, state.arena)),
+                            );
+                            let allocated = state.arena.alloc_slice_fill_iter(combined);
+                            return Ok(Some(ExecutorRow::new(allocated)));
+                        }
+                    }
+                    return Ok(None);
+                }
+
                 if state.current_left_row.is_none() {
                     match state.left.next()? {
                         Some(row) => {
@@ -1268,15 +1309,25 @@ impl<'a, S: RowSource> Executor<'a> for DynamicExecutor<'a, S> {
                                 row.values.iter().map(clone_value_owned).collect();
                             state.current_left_row = Some(owned);
                             state.right_index = 0;
+                            state.left_matched = false;
                         }
-                        None => return Ok(None),
+                        None => {
+                            if state.join_type == JoinType::Right
+                                || state.join_type == JoinType::Full
+                            {
+                                state.emitting_unmatched_right = true;
+                                continue;
+                            }
+                            return Ok(None);
+                        }
                     }
                 }
 
                 let left_row = state.current_left_row.as_ref().unwrap();
 
                 while state.right_index < state.right_rows.len() {
-                    let right_row = &state.right_rows[state.right_index];
+                    let idx = state.right_index;
+                    let right_row = &state.right_rows[idx];
                     state.right_index += 1;
 
                     let should_join = if let Some(ref cond) = state.condition {
@@ -1293,6 +1344,8 @@ impl<'a, S: RowSource> Executor<'a> for DynamicExecutor<'a, S> {
                     };
 
                     if should_join {
+                        state.left_matched = true;
+                        state.right_matched[idx] = true;
                         let combined: Vec<Value<'a>> = left_row
                             .iter()
                             .chain(right_row.iter())
@@ -1302,12 +1355,73 @@ impl<'a, S: RowSource> Executor<'a> for DynamicExecutor<'a, S> {
                         return Ok(Some(ExecutorRow::new(allocated)));
                     }
                 }
+
+                if !state.left_matched
+                    && (state.join_type == JoinType::Left || state.join_type == JoinType::Full)
+                {
+                    let left_row = state.current_left_row.take().unwrap();
+                    let mut combined: Vec<Value<'a>> = left_row
+                        .iter()
+                        .map(|v| clone_value_ref_to_arena(v, state.arena))
+                        .collect();
+                    combined.extend((0..state.right_col_count).map(|_| Value::Null));
+                    let allocated = state.arena.alloc_slice_fill_iter(combined);
+                    return Ok(Some(ExecutorRow::new(allocated)));
+                }
+
                 state.current_left_row = None;
             },
             DynamicExecutor::GraceHashJoin(state) => loop {
+                if state.emitting_unmatched_build {
+                    while state.unmatched_build_idx < state.partition_build_rows.len() {
+                        let idx = state.unmatched_build_idx;
+                        state.unmatched_build_idx += 1;
+                        if !state.build_matched[state.unmatched_build_partition][idx] {
+                            let build_row = &state.partition_build_rows[idx];
+                            let mut combined: Vec<Value<'a>> = build_row
+                                .iter()
+                                .map(|v| clone_value_ref_to_arena(v, state.arena))
+                                .collect();
+                            for _ in 0..state.right_col_count {
+                                combined.push(Value::Null);
+                            }
+                            let allocated = state.arena.alloc_slice_fill_iter(combined);
+                            return Ok(Some(ExecutorRow::new(allocated)));
+                        }
+                    }
+                    state.emitting_unmatched_build = false;
+                    state.unmatched_build_partition += 1;
+
+                    if state.unmatched_build_partition >= state.num_partitions {
+                        return Ok(None);
+                    }
+
+                    state.partition_hash_table.clear();
+                    state.partition_build_rows =
+                        std::mem::take(&mut state.left_partitions[state.unmatched_build_partition]);
+                    for (idx, row) in state.partition_build_rows.iter().enumerate() {
+                        let hash = hash_keys_static(row, &state.left_key_indices);
+                        state
+                            .partition_hash_table
+                            .entry(hash)
+                            .or_insert_with(Vec::new)
+                            .push(idx);
+                    }
+                    state.current_partition = state.unmatched_build_partition;
+                    state.current_probe_idx = 0;
+                    state.current_match_idx = 0;
+                    state.current_matches.clear();
+                    state.probe_row_matched = false;
+                    continue;
+                }
+
                 if state.current_match_idx < state.current_matches.len() {
                     let build_idx = state.current_matches[state.current_match_idx];
                     state.current_match_idx += 1;
+                    state.probe_row_matched = true;
+                    if state.join_type == JoinType::Left || state.join_type == JoinType::Full {
+                        state.build_matched[state.current_partition][build_idx] = true;
+                    }
                     let build_row = &state.partition_build_rows[build_idx];
                     let probe_row = &state.right_partitions[state.current_partition]
                         [state.current_probe_idx - 1];
@@ -1321,10 +1435,29 @@ impl<'a, S: RowSource> Executor<'a> for DynamicExecutor<'a, S> {
                     return Ok(Some(ExecutorRow::new(allocated)));
                 }
 
+                if state.current_probe_idx > 0
+                    && !state.probe_row_matched
+                    && (state.join_type == JoinType::Right || state.join_type == JoinType::Full)
+                {
+                    let probe_row = &state.right_partitions[state.current_partition]
+                        [state.current_probe_idx - 1];
+                    let mut combined: Vec<Value<'a>> =
+                        (0..state.left_col_count).map(|_| Value::Null).collect();
+                    combined.extend(
+                        probe_row
+                            .iter()
+                            .map(|v| clone_value_ref_to_arena(v, state.arena)),
+                    );
+                    let allocated = state.arena.alloc_slice_fill_iter(combined);
+                    state.probe_row_matched = true;
+                    return Ok(Some(ExecutorRow::new(allocated)));
+                }
+
                 if state.current_probe_idx < state.right_partitions[state.current_partition].len() {
                     let probe_row =
                         &state.right_partitions[state.current_partition][state.current_probe_idx];
                     state.current_probe_idx += 1;
+                    state.probe_row_matched = false;
                     let hash = hash_keys_static(probe_row, &state.right_key_indices);
                     if let Some(matches) = state.partition_hash_table.get(&hash) {
                         state.current_matches = matches
@@ -1343,6 +1476,30 @@ impl<'a, S: RowSource> Executor<'a> for DynamicExecutor<'a, S> {
                     } else {
                         state.current_matches.clear();
                     }
+                    continue;
+                }
+
+                if state.current_probe_idx > 0
+                    && !state.probe_row_matched
+                    && (state.join_type == JoinType::Right || state.join_type == JoinType::Full)
+                {
+                    let probe_row = &state.right_partitions[state.current_partition]
+                        [state.current_probe_idx - 1];
+                    let mut combined: Vec<Value<'a>> =
+                        (0..state.left_col_count).map(|_| Value::Null).collect();
+                    combined.extend(
+                        probe_row
+                            .iter()
+                            .map(|v| clone_value_ref_to_arena(v, state.arena)),
+                    );
+                    let allocated = state.arena.alloc_slice_fill_iter(combined);
+                    state.probe_row_matched = true;
+                    return Ok(Some(ExecutorRow::new(allocated)));
+                }
+
+                if state.join_type == JoinType::Left || state.join_type == JoinType::Full {
+                    state.emitting_unmatched_build = true;
+                    state.unmatched_build_idx = 0;
                     continue;
                 }
 
@@ -1365,6 +1522,7 @@ impl<'a, S: RowSource> Executor<'a> for DynamicExecutor<'a, S> {
                 state.current_probe_idx = 0;
                 state.current_match_idx = 0;
                 state.current_matches.clear();
+                state.probe_row_matched = false;
             },
             DynamicExecutor::HashAggregate(state) => {
                 if !state.computed {
@@ -2663,6 +2821,7 @@ mod tests {
         let right_executor: DynamicExecutor<MockRowSource> =
             DynamicExecutor::TableScan(TableScanExecutor::new(right_source, &arena));
 
+        use crate::sql::ast::JoinType;
         let mut join_executor = DynamicExecutor::NestedLoopJoin(NestedLoopJoinState {
             left: Box::new(left_executor),
             right: Box::new(right_executor),
@@ -2672,6 +2831,13 @@ mod tests {
             right_rows: Vec::new(),
             right_index: 0,
             materialized: false,
+            join_type: JoinType::Cross,
+            left_matched: false,
+            right_matched: Vec::new(),
+            emitting_unmatched_right: false,
+            unmatched_right_idx: 0,
+            left_col_count: 2,
+            right_col_count: 2,
         });
 
         join_executor.open().unwrap();
@@ -2707,6 +2873,7 @@ mod tests {
         let right_executor: DynamicExecutor<MockRowSource> =
             DynamicExecutor::TableScan(TableScanExecutor::new(right_source, &arena));
 
+        use crate::sql::ast::JoinType;
         let mut join_executor = DynamicExecutor::GraceHashJoin(GraceHashJoinState {
             left: Box::new(left_executor),
             right: Box::new(right_executor),
@@ -2723,6 +2890,14 @@ mod tests {
             current_match_idx: 0,
             current_matches: Vec::new(),
             partitioned: false,
+            join_type: JoinType::Inner,
+            build_matched: (0..4).map(|_| Vec::new()).collect(),
+            probe_row_matched: false,
+            emitting_unmatched_build: false,
+            unmatched_build_partition: 0,
+            unmatched_build_idx: 0,
+            left_col_count: 2,
+            right_col_count: 2,
         });
 
         join_executor.open().unwrap();
@@ -2829,8 +3004,16 @@ mod tests {
             ("score".to_string(), 3),
         ];
 
-        let join_state =
-            builder.build_nested_loop_join(left_executor, right_executor, None, &column_map);
+        use crate::sql::ast::JoinType;
+        let join_state = builder.build_nested_loop_join(
+            left_executor,
+            right_executor,
+            None,
+            &column_map,
+            JoinType::Cross,
+            2,
+            2,
+        );
 
         let mut join_executor = DynamicExecutor::NestedLoopJoin(join_state);
         join_executor.open().unwrap();
@@ -2867,8 +3050,17 @@ mod tests {
         let right_executor: DynamicExecutor<MockRowSource> =
             DynamicExecutor::TableScan(TableScanExecutor::new(right_source, &arena));
 
-        let join_state =
-            builder.build_grace_hash_join(left_executor, right_executor, vec![0], vec![0], 4);
+        use crate::sql::ast::JoinType;
+        let join_state = builder.build_grace_hash_join(
+            left_executor,
+            right_executor,
+            vec![0],
+            vec![0],
+            4,
+            JoinType::Inner,
+            2,
+            2,
+        );
 
         let mut join_executor = DynamicExecutor::GraceHashJoin(join_state);
         join_executor.open().unwrap();
@@ -3947,6 +4139,442 @@ mod tests {
         assert!(
             predicate.evaluate(&row),
             "Negative inner product (-32) < -10.0 should be true"
+        );
+    }
+
+    #[test]
+    fn nested_loop_left_join_emits_unmatched_left_rows_with_nulls() {
+        use crate::sql::ast::{BinaryOperator, ColumnRef, Expr, JoinType};
+        let arena = Bump::new();
+        let ctx = ExecutionContext::new(&arena);
+        let builder = ExecutorBuilder::new(&ctx);
+
+        let left_rows: Vec<Vec<Value<'static>>> = vec![
+            vec![Value::Int(1), Value::Text(Cow::Owned("alice".to_string()))],
+            vec![Value::Int(2), Value::Text(Cow::Owned("bob".to_string()))],
+            vec![
+                Value::Int(3),
+                Value::Text(Cow::Owned("charlie".to_string())),
+            ],
+        ];
+        let right_rows: Vec<Vec<Value<'static>>> = vec![vec![Value::Int(1), Value::Int(100)]];
+
+        let left_source = MockRowSource::new(left_rows);
+        let right_source = MockRowSource::new(right_rows);
+
+        let left_executor: DynamicExecutor<MockRowSource> =
+            DynamicExecutor::TableScan(TableScanExecutor::new(left_source, &arena));
+        let right_executor: DynamicExecutor<MockRowSource> =
+            DynamicExecutor::TableScan(TableScanExecutor::new(right_source, &arena));
+
+        let column_map = vec![
+            ("id".to_string(), 0),
+            ("name".to_string(), 1),
+            ("user_id".to_string(), 2),
+            ("score".to_string(), 3),
+        ];
+
+        let id_col = arena.alloc(Expr::Column(ColumnRef {
+            schema: None,
+            table: None,
+            column: "id",
+        }));
+        let user_id_col = arena.alloc(Expr::Column(ColumnRef {
+            schema: None,
+            table: None,
+            column: "user_id",
+        }));
+        let join_condition = arena.alloc(Expr::BinaryOp {
+            left: id_col,
+            op: BinaryOperator::Eq,
+            right: user_id_col,
+        });
+
+        let join_state = builder.build_nested_loop_join(
+            left_executor,
+            right_executor,
+            Some(join_condition),
+            &column_map,
+            JoinType::Left,
+            2,
+            2,
+        );
+
+        let mut join_executor = DynamicExecutor::NestedLoopJoin(join_state);
+        join_executor.open().unwrap();
+
+        let mut results: Vec<Vec<Option<i64>>> = Vec::new();
+        while let Some(row) = join_executor.next().unwrap() {
+            let id = match row.get(0) {
+                Some(Value::Int(i)) => Some(*i),
+                _ => None,
+            };
+            let score = match row.get(3) {
+                Some(Value::Int(i)) => Some(*i),
+                Some(Value::Null) => None,
+                _ => panic!("Unexpected value type"),
+            };
+            results.push(vec![id, score]);
+        }
+        join_executor.close().unwrap();
+
+        assert_eq!(
+            results.len(),
+            3,
+            "LEFT JOIN should return 3 rows (all left rows)"
+        );
+        assert_eq!(
+            results[0],
+            vec![Some(1), Some(100)],
+            "First row should match"
+        );
+        assert_eq!(
+            results[1],
+            vec![Some(2), None],
+            "Second row should have NULL score"
+        );
+        assert_eq!(
+            results[2],
+            vec![Some(3), None],
+            "Third row should have NULL score"
+        );
+    }
+
+    #[test]
+    fn nested_loop_right_join_emits_unmatched_right_rows_with_nulls() {
+        use crate::sql::ast::{BinaryOperator, ColumnRef, Expr, JoinType};
+        let arena = Bump::new();
+        let ctx = ExecutionContext::new(&arena);
+        let builder = ExecutorBuilder::new(&ctx);
+
+        let left_rows: Vec<Vec<Value<'static>>> = vec![vec![
+            Value::Int(1),
+            Value::Text(Cow::Owned("alice".to_string())),
+        ]];
+        let right_rows: Vec<Vec<Value<'static>>> = vec![
+            vec![Value::Int(1), Value::Int(100)],
+            vec![Value::Int(2), Value::Int(200)],
+            vec![Value::Int(3), Value::Int(300)],
+        ];
+
+        let left_source = MockRowSource::new(left_rows);
+        let right_source = MockRowSource::new(right_rows);
+
+        let left_executor: DynamicExecutor<MockRowSource> =
+            DynamicExecutor::TableScan(TableScanExecutor::new(left_source, &arena));
+        let right_executor: DynamicExecutor<MockRowSource> =
+            DynamicExecutor::TableScan(TableScanExecutor::new(right_source, &arena));
+
+        let column_map = vec![
+            ("id".to_string(), 0),
+            ("name".to_string(), 1),
+            ("user_id".to_string(), 2),
+            ("score".to_string(), 3),
+        ];
+
+        let id_col = arena.alloc(Expr::Column(ColumnRef {
+            schema: None,
+            table: None,
+            column: "id",
+        }));
+        let user_id_col = arena.alloc(Expr::Column(ColumnRef {
+            schema: None,
+            table: None,
+            column: "user_id",
+        }));
+        let join_condition = arena.alloc(Expr::BinaryOp {
+            left: id_col,
+            op: BinaryOperator::Eq,
+            right: user_id_col,
+        });
+
+        let join_state = builder.build_nested_loop_join(
+            left_executor,
+            right_executor,
+            Some(join_condition),
+            &column_map,
+            JoinType::Right,
+            2,
+            2,
+        );
+
+        let mut join_executor = DynamicExecutor::NestedLoopJoin(join_state);
+        join_executor.open().unwrap();
+
+        let mut results: Vec<(Option<i64>, Option<i64>)> = Vec::new();
+        while let Some(row) = join_executor.next().unwrap() {
+            let id = match row.get(0) {
+                Some(Value::Int(i)) => Some(*i),
+                Some(Value::Null) => None,
+                _ => panic!("Unexpected value type for id"),
+            };
+            let score = match row.get(3) {
+                Some(Value::Int(i)) => Some(*i),
+                _ => None,
+            };
+            results.push((id, score));
+        }
+        join_executor.close().unwrap();
+
+        assert_eq!(
+            results.len(),
+            3,
+            "RIGHT JOIN should return 3 rows (all right rows)"
+        );
+        assert_eq!(results[0], (Some(1), Some(100)), "First row should match");
+        assert_eq!(
+            results[1],
+            (None, Some(200)),
+            "Second row should have NULL id"
+        );
+        assert_eq!(
+            results[2],
+            (None, Some(300)),
+            "Third row should have NULL id"
+        );
+    }
+
+    #[test]
+    fn nested_loop_full_join_emits_all_rows() {
+        use crate::sql::ast::{BinaryOperator, ColumnRef, Expr, JoinType};
+        let arena = Bump::new();
+        let ctx = ExecutionContext::new(&arena);
+        let builder = ExecutorBuilder::new(&ctx);
+
+        let left_rows: Vec<Vec<Value<'static>>> = vec![
+            vec![Value::Int(1), Value::Text(Cow::Owned("alice".to_string()))],
+            vec![Value::Int(2), Value::Text(Cow::Owned("bob".to_string()))],
+        ];
+        let right_rows: Vec<Vec<Value<'static>>> = vec![
+            vec![Value::Int(1), Value::Int(100)],
+            vec![Value::Int(3), Value::Int(300)],
+        ];
+
+        let left_source = MockRowSource::new(left_rows);
+        let right_source = MockRowSource::new(right_rows);
+
+        let left_executor: DynamicExecutor<MockRowSource> =
+            DynamicExecutor::TableScan(TableScanExecutor::new(left_source, &arena));
+        let right_executor: DynamicExecutor<MockRowSource> =
+            DynamicExecutor::TableScan(TableScanExecutor::new(right_source, &arena));
+
+        let column_map = vec![
+            ("id".to_string(), 0),
+            ("name".to_string(), 1),
+            ("user_id".to_string(), 2),
+            ("score".to_string(), 3),
+        ];
+
+        let id_col = arena.alloc(Expr::Column(ColumnRef {
+            schema: None,
+            table: None,
+            column: "id",
+        }));
+        let user_id_col = arena.alloc(Expr::Column(ColumnRef {
+            schema: None,
+            table: None,
+            column: "user_id",
+        }));
+        let join_condition = arena.alloc(Expr::BinaryOp {
+            left: id_col,
+            op: BinaryOperator::Eq,
+            right: user_id_col,
+        });
+
+        let join_state = builder.build_nested_loop_join(
+            left_executor,
+            right_executor,
+            Some(join_condition),
+            &column_map,
+            JoinType::Full,
+            2,
+            2,
+        );
+
+        let mut join_executor = DynamicExecutor::NestedLoopJoin(join_state);
+        join_executor.open().unwrap();
+
+        let mut count = 0;
+        while let Some(_row) = join_executor.next().unwrap() {
+            count += 1;
+        }
+        join_executor.close().unwrap();
+
+        assert_eq!(
+            count, 3,
+            "FULL JOIN should return 3 rows: 1 match + 1 unmatched left + 1 unmatched right"
+        );
+    }
+
+    #[test]
+    fn grace_hash_left_join_emits_unmatched_left_rows_with_nulls() {
+        use crate::sql::ast::JoinType;
+        let arena = Bump::new();
+        let ctx = ExecutionContext::new(&arena);
+        let builder = ExecutorBuilder::new(&ctx);
+
+        let left_rows: Vec<Vec<Value<'static>>> = vec![
+            vec![Value::Int(1), Value::Text(Cow::Owned("alice".to_string()))],
+            vec![Value::Int(2), Value::Text(Cow::Owned("bob".to_string()))],
+            vec![
+                Value::Int(3),
+                Value::Text(Cow::Owned("charlie".to_string())),
+            ],
+        ];
+        let right_rows: Vec<Vec<Value<'static>>> = vec![vec![Value::Int(1), Value::Int(100)]];
+
+        let left_source = MockRowSource::new(left_rows);
+        let right_source = MockRowSource::new(right_rows);
+
+        let left_executor: DynamicExecutor<MockRowSource> =
+            DynamicExecutor::TableScan(TableScanExecutor::new(left_source, &arena));
+        let right_executor: DynamicExecutor<MockRowSource> =
+            DynamicExecutor::TableScan(TableScanExecutor::new(right_source, &arena));
+
+        let join_state = builder.build_grace_hash_join(
+            left_executor,
+            right_executor,
+            vec![0],
+            vec![0],
+            4,
+            JoinType::Left,
+            2,
+            2,
+        );
+
+        let mut join_executor = DynamicExecutor::GraceHashJoin(join_state);
+        join_executor.open().unwrap();
+
+        let mut results: Vec<Vec<Option<i64>>> = Vec::new();
+        while let Some(row) = join_executor.next().unwrap() {
+            let id = match row.get(0) {
+                Some(Value::Int(i)) => Some(*i),
+                _ => None,
+            };
+            let score = match row.get(3) {
+                Some(Value::Int(i)) => Some(*i),
+                Some(Value::Null) => None,
+                _ => panic!("Unexpected value type for score"),
+            };
+            results.push(vec![id, score]);
+        }
+        join_executor.close().unwrap();
+
+        assert_eq!(
+            results.len(),
+            3,
+            "LEFT JOIN should return 3 rows (all left rows)"
+        );
+    }
+
+    #[test]
+    fn grace_hash_right_join_emits_unmatched_right_rows_with_nulls() {
+        use crate::sql::ast::JoinType;
+        let arena = Bump::new();
+        let ctx = ExecutionContext::new(&arena);
+        let builder = ExecutorBuilder::new(&ctx);
+
+        let left_rows: Vec<Vec<Value<'static>>> = vec![vec![
+            Value::Int(1),
+            Value::Text(Cow::Owned("alice".to_string())),
+        ]];
+        let right_rows: Vec<Vec<Value<'static>>> = vec![
+            vec![Value::Int(1), Value::Int(100)],
+            vec![Value::Int(2), Value::Int(200)],
+            vec![Value::Int(3), Value::Int(300)],
+        ];
+
+        let left_source = MockRowSource::new(left_rows);
+        let right_source = MockRowSource::new(right_rows);
+
+        let left_executor: DynamicExecutor<MockRowSource> =
+            DynamicExecutor::TableScan(TableScanExecutor::new(left_source, &arena));
+        let right_executor: DynamicExecutor<MockRowSource> =
+            DynamicExecutor::TableScan(TableScanExecutor::new(right_source, &arena));
+
+        let join_state = builder.build_grace_hash_join(
+            left_executor,
+            right_executor,
+            vec![0],
+            vec![0],
+            4,
+            JoinType::Right,
+            2,
+            2,
+        );
+
+        let mut join_executor = DynamicExecutor::GraceHashJoin(join_state);
+        join_executor.open().unwrap();
+
+        let mut results: Vec<Vec<Option<i64>>> = Vec::new();
+        while let Some(row) = join_executor.next().unwrap() {
+            let left_id = match row.get(0) {
+                Some(Value::Int(i)) => Some(*i),
+                Some(Value::Null) => None,
+                _ => panic!("Unexpected value type for left_id"),
+            };
+            let right_id = match row.get(2) {
+                Some(Value::Int(i)) => Some(*i),
+                _ => panic!("Unexpected value type for right_id"),
+            };
+            results.push(vec![left_id, right_id]);
+        }
+        join_executor.close().unwrap();
+
+        assert_eq!(
+            results.len(),
+            3,
+            "RIGHT JOIN should return 3 rows (all right rows)"
+        );
+    }
+
+    #[test]
+    fn grace_hash_full_join_emits_all_rows() {
+        use crate::sql::ast::JoinType;
+        let arena = Bump::new();
+        let ctx = ExecutionContext::new(&arena);
+        let builder = ExecutorBuilder::new(&ctx);
+
+        let left_rows: Vec<Vec<Value<'static>>> = vec![
+            vec![Value::Int(1), Value::Text(Cow::Owned("alice".to_string()))],
+            vec![Value::Int(2), Value::Text(Cow::Owned("bob".to_string()))],
+        ];
+        let right_rows: Vec<Vec<Value<'static>>> = vec![
+            vec![Value::Int(2), Value::Int(200)],
+            vec![Value::Int(3), Value::Int(300)],
+        ];
+
+        let left_source = MockRowSource::new(left_rows);
+        let right_source = MockRowSource::new(right_rows);
+
+        let left_executor: DynamicExecutor<MockRowSource> =
+            DynamicExecutor::TableScan(TableScanExecutor::new(left_source, &arena));
+        let right_executor: DynamicExecutor<MockRowSource> =
+            DynamicExecutor::TableScan(TableScanExecutor::new(right_source, &arena));
+
+        let join_state = builder.build_grace_hash_join(
+            left_executor,
+            right_executor,
+            vec![0],
+            vec![0],
+            4,
+            JoinType::Full,
+            2,
+            2,
+        );
+
+        let mut join_executor = DynamicExecutor::GraceHashJoin(join_state);
+        join_executor.open().unwrap();
+
+        let mut count = 0;
+        while join_executor.next().unwrap().is_some() {
+            count += 1;
+        }
+        join_executor.close().unwrap();
+
+        assert_eq!(
+            count, 3,
+            "FULL JOIN should return 3 rows: 1 match + 1 unmatched left + 1 unmatched right"
         );
     }
 }

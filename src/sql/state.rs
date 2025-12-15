@@ -1,4 +1,5 @@
 use crate::sql::adapter::BTreeCursorAdapter;
+use crate::sql::ast::JoinType;
 use crate::sql::executor::{AggregateFunction, DynamicExecutor, ExecutorRow, RowSource, SortKey};
 use crate::sql::predicate::CompiledPredicate;
 use crate::types::Value;
@@ -165,6 +166,13 @@ pub struct NestedLoopJoinState<'a, S: RowSource> {
     pub right_rows: Vec<Vec<Value<'static>>>,
     pub right_index: usize,
     pub materialized: bool,
+    pub join_type: JoinType,
+    pub left_matched: bool,
+    pub right_matched: Vec<bool>,
+    pub emitting_unmatched_right: bool,
+    pub unmatched_right_idx: usize,
+    pub left_col_count: usize,
+    pub right_col_count: usize,
 }
 
 pub struct GraceHashJoinState<'a, S: RowSource> {
@@ -183,6 +191,14 @@ pub struct GraceHashJoinState<'a, S: RowSource> {
     pub current_match_idx: usize,
     pub current_matches: Vec<usize>,
     pub partitioned: bool,
+    pub join_type: JoinType,
+    pub build_matched: Vec<Vec<bool>>,
+    pub probe_row_matched: bool,
+    pub emitting_unmatched_build: bool,
+    pub unmatched_build_partition: usize,
+    pub unmatched_build_idx: usize,
+    pub left_col_count: usize,
+    pub right_col_count: usize,
 }
 
 pub struct IndexScanState<'a> {

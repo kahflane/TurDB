@@ -476,9 +476,9 @@ fn parse_iso8601_interval(s: &str) -> Result<OwnedValue> {
             if c.is_ascii_digit() || c == '.' {
                 current_num.push(c);
             } else if !current_num.is_empty() {
-                let num: f64 = current_num
-                    .parse()
-                    .wrap_err_with(|| format!("invalid number in ISO interval time: '{}'", current_num))?;
+                let num: f64 = current_num.parse().wrap_err_with(|| {
+                    format!("invalid number in ISO interval time: '{}'", current_num)
+                })?;
                 current_num.clear();
 
                 match c.to_ascii_uppercase() {
@@ -514,13 +514,13 @@ fn parse_postgres_interval(s: &str) -> Result<OwnedValue> {
                     "month" | "months" | "mon" | "mons" => months += num as i32,
                     "week" | "weeks" => days += (num * 7.0) as i32,
                     "day" | "days" => days += num as i32,
-                    "hour" | "hours" | "hr" | "hrs" => micros += (num * 3600.0 * 1_000_000.0) as i64,
+                    "hour" | "hours" | "hr" | "hrs" => {
+                        micros += (num * 3600.0 * 1_000_000.0) as i64
+                    }
                     "minute" | "minutes" | "min" | "mins" => {
                         micros += (num * 60.0 * 1_000_000.0) as i64
                     }
-                    "second" | "seconds" | "sec" | "secs" => {
-                        micros += (num * 1_000_000.0) as i64
-                    }
+                    "second" | "seconds" | "sec" | "secs" => micros += (num * 1_000_000.0) as i64,
                     "millisecond" | "milliseconds" | "ms" => micros += (num * 1_000.0) as i64,
                     "microsecond" | "microseconds" | "us" => micros += num as i64,
                     _ => bail!("unknown interval unit: '{}'", unit),
