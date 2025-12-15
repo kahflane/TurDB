@@ -1344,4 +1344,86 @@ mod tests {
             err_msg
         );
     }
+
+    #[test]
+    fn test_create_index_with_expression() {
+        use crate::schema::IndexColumnDef;
+
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("test_db");
+
+        let db = Database::create(&db_path).unwrap();
+
+        db.execute("CREATE TABLE users (id INT, email TEXT)")
+            .unwrap();
+
+        let result = db.execute("CREATE INDEX idx_lower_email ON users (LOWER(email))");
+        assert!(
+            result.is_ok(),
+            "CREATE INDEX with expression should succeed"
+        );
+
+        let catalog = db.catalog.read();
+        let catalog = catalog.as_ref().unwrap();
+        let table = catalog.resolve_table("users").unwrap();
+
+        let idx = table
+            .indexes()
+            .iter()
+            .find(|i| i.name() == "idx_lower_email")
+            .expect("Index should exist");
+
+        assert!(
+            idx.has_expressions(),
+            "Index should have expression columns"
+        );
+
+        let col_defs = idx.column_defs();
+        assert_eq!(col_defs.len(), 1);
+        assert!(
+            matches!(&col_defs[0], IndexColumnDef::Expression(e) if e.contains("LOWER")),
+            "First column should be LOWER expression, got: {:?}",
+            col_defs[0]
+        );
+    }
+
+    #[test]
+    fn test_create_index_with_mixed_columns_and_expressions() {
+        use crate::schema::IndexColumnDef;
+
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("test_db");
+
+        let db = Database::create(&db_path).unwrap();
+
+        db.execute("CREATE TABLE users (id INT, email TEXT, tenant_id INT)")
+            .unwrap();
+
+        let result = db.execute("CREATE INDEX idx_tenant_lower ON users (tenant_id, LOWER(email))");
+        assert!(
+            result.is_ok(),
+            "CREATE INDEX with mixed columns/expressions should succeed"
+        );
+
+        let catalog = db.catalog.read();
+        let catalog = catalog.as_ref().unwrap();
+        let table = catalog.resolve_table("users").unwrap();
+
+        let idx = table
+            .indexes()
+            .iter()
+            .find(|i| i.name() == "idx_tenant_lower")
+            .expect("Index should exist");
+
+        let col_defs = idx.column_defs();
+        assert_eq!(col_defs.len(), 2);
+        assert!(
+            matches!(&col_defs[0], IndexColumnDef::Column(c) if c == "tenant_id"),
+            "First should be column tenant_id"
+        );
+        assert!(
+            matches!(&col_defs[1], IndexColumnDef::Expression(_)),
+            "Second should be expression"
+        );
+    }
 }
