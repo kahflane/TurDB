@@ -103,22 +103,24 @@ impl<'a> Value<'a> {
                 TypeAffinity::Text => Ok(Value::Text(Cow::Owned(f.to_string()))),
                 TypeAffinity::Blob => Ok(Value::Blob(Cow::Owned(f.to_le_bytes().to_vec()))),
             },
-            Value::Text(s) => match target {
-                TypeAffinity::Text => Ok(Value::Text(s.clone())),
-                TypeAffinity::Integer => {
-                    let parsed = s.trim().parse::<i64>().map_err(|e| {
-                        eyre::eyre!("cannot coerce text '{}' to integer: {}", s, e)
-                    })?;
-                    Ok(Value::Int(parsed))
+            Value::Text(s) => {
+                match target {
+                    TypeAffinity::Text => Ok(Value::Text(s.clone())),
+                    TypeAffinity::Integer => {
+                        let parsed = s.trim().parse::<i64>().map_err(|e| {
+                            eyre::eyre!("cannot coerce text '{}' to integer: {}", s, e)
+                        })?;
+                        Ok(Value::Int(parsed))
+                    }
+                    TypeAffinity::Real | TypeAffinity::Numeric => {
+                        let parsed = s.trim().parse::<f64>().map_err(|e| {
+                            eyre::eyre!("cannot coerce text '{}' to real: {}", s, e)
+                        })?;
+                        Ok(Value::Float(parsed))
+                    }
+                    TypeAffinity::Blob => Ok(Value::Blob(Cow::Owned(s.as_bytes().to_vec()))),
                 }
-                TypeAffinity::Real | TypeAffinity::Numeric => {
-                    let parsed = s.trim().parse::<f64>().map_err(|e| {
-                        eyre::eyre!("cannot coerce text '{}' to real: {}", s, e)
-                    })?;
-                    Ok(Value::Float(parsed))
-                }
-                TypeAffinity::Blob => Ok(Value::Blob(Cow::Owned(s.as_bytes().to_vec()))),
-            },
+            }
             Value::Blob(b) => match target {
                 TypeAffinity::Blob => Ok(Value::Blob(b.clone())),
                 TypeAffinity::Text => {
@@ -594,7 +596,9 @@ impl<'a> Value<'a> {
 
     /// Encodes this value to a byte-comparable key format.
     pub fn encode_to_key(&self, buf: &mut Vec<u8>) {
-        use crate::encoding::key::{type_prefix, encode_int, encode_float, encode_text, encode_blob};
+        use crate::encoding::key::{
+            encode_blob, encode_float, encode_int, encode_text, type_prefix,
+        };
 
         match self {
             Value::Null => buf.push(type_prefix::NULL),

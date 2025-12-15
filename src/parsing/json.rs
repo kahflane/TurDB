@@ -905,10 +905,7 @@ mod tests {
 
     #[test]
     fn parse_empty_array() {
-        assert_eq!(
-            parse_json("[]").unwrap().value,
-            JsonValue::Array(vec![])
-        );
+        assert_eq!(parse_json("[]").unwrap().value, JsonValue::Array(vec![]));
     }
 
     #[test]
@@ -926,10 +923,7 @@ mod tests {
 
     #[test]
     fn parse_empty_object() {
-        assert_eq!(
-            parse_json("{}").unwrap().value,
-            JsonValue::Object(vec![])
-        );
+        assert_eq!(parse_json("{}").unwrap().value, JsonValue::Object(vec![]));
     }
 
     #[test]
@@ -1096,10 +1090,7 @@ mod tests {
         let view = JsonbView::new(&bytes).unwrap();
         assert_eq!(view.root_type(), JSONB_TYPE_OBJECT);
         assert_eq!(view.object_len().unwrap(), 2);
-        assert_eq!(
-            view.get("name").unwrap(),
-            Some(JsonbValue::String("test"))
-        );
+        assert_eq!(view.get("name").unwrap(), Some(JsonbValue::String("test")));
         assert_eq!(view.get("value").unwrap(), Some(JsonbValue::Number(42.0)));
     }
 
@@ -1121,7 +1112,10 @@ mod tests {
 
         let nested_val = view.get("nested").unwrap().unwrap();
         if let JsonbValue::Object(nested_view) = nested_val {
-            assert_eq!(nested_view.get("inner").unwrap(), Some(JsonbValue::Bool(true)));
+            assert_eq!(
+                nested_view.get("inner").unwrap(),
+                Some(JsonbValue::Bool(true))
+            );
         } else {
             panic!("expected object");
         }

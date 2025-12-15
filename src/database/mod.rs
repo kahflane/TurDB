@@ -1086,7 +1086,11 @@ mod tests {
             .unwrap();
 
         let rows = db.query("SELECT * FROM users").unwrap();
-        assert_eq!(rows.len(), 2, "Both inserts should succeed with different emails");
+        assert_eq!(
+            rows.len(),
+            2,
+            "Both inserts should succeed with different emails"
+        );
     }
 
     #[test]
@@ -1103,10 +1107,7 @@ mod tests {
 
         let start = Instant::now();
         for i in 0..1000 {
-            let sql = format!(
-                "INSERT INTO users VALUES ({}, 'user{}@example.com')",
-                i, i
-            );
+            let sql = format!("INSERT INTO users VALUES ({}, 'user{}@example.com')", i, i);
             db.execute(&sql).unwrap();
         }
         let elapsed = start.elapsed();
@@ -1134,10 +1135,8 @@ mod tests {
         db.execute("CREATE TABLE users (id INT, email TEXT UNIQUE)")
             .unwrap();
 
-        db.execute("INSERT INTO users VALUES (1, NULL)")
-            .unwrap();
-        db.execute("INSERT INTO users VALUES (2, NULL)")
-            .unwrap();
+        db.execute("INSERT INTO users VALUES (1, NULL)").unwrap();
+        db.execute("INSERT INTO users VALUES (2, NULL)").unwrap();
 
         let rows = db.query("SELECT * FROM users").unwrap();
         assert_eq!(rows.len(), 2, "UNIQUE should allow multiple NULLs");
@@ -1153,15 +1152,16 @@ mod tests {
         db.execute("CREATE TABLE users (id INT PRIMARY KEY, name TEXT)")
             .unwrap();
 
-        db.execute("INSERT INTO users VALUES (1, 'Alice')")
-            .unwrap();
+        db.execute("INSERT INTO users VALUES (1, 'Alice')").unwrap();
 
         let result = db.execute("INSERT INTO users VALUES (1, 'Bob')");
 
         assert!(result.is_err(), "PRIMARY KEY should reject duplicate id");
         let err_msg = result.unwrap_err().to_string();
         assert!(
-            err_msg.contains("PRIMARY KEY") || err_msg.contains("UNIQUE") || err_msg.contains("unique"),
+            err_msg.contains("PRIMARY KEY")
+                || err_msg.contains("UNIQUE")
+                || err_msg.contains("unique"),
             "Error should mention constraint violation: {}",
             err_msg
         );
@@ -1184,7 +1184,10 @@ mod tests {
 
         let result = db.execute("UPDATE users SET email = 'alice@test.com' WHERE id = 2");
 
-        assert!(result.is_err(), "UNIQUE constraint should reject duplicate email on UPDATE");
+        assert!(
+            result.is_err(),
+            "UNIQUE constraint should reject duplicate email on UPDATE"
+        );
         let err_msg = result.unwrap_err().to_string();
         assert!(
             err_msg.contains("UNIQUE") || err_msg.contains("unique"),
@@ -1205,7 +1208,10 @@ mod tests {
 
         let result = db.execute("INSERT INTO users VALUES (1, -5)");
 
-        assert!(result.is_err(), "CHECK constraint should reject negative age");
+        assert!(
+            result.is_err(),
+            "CHECK constraint should reject negative age"
+        );
         let err_msg = result.unwrap_err().to_string();
         assert!(
             err_msg.contains("CHECK") || err_msg.contains("check"),
@@ -1243,7 +1249,10 @@ mod tests {
 
         let result = db.execute("UPDATE users SET age = -10 WHERE id = 1");
 
-        assert!(result.is_err(), "CHECK constraint should reject negative age on UPDATE");
+        assert!(
+            result.is_err(),
+            "CHECK constraint should reject negative age on UPDATE"
+        );
         let err_msg = result.unwrap_err().to_string();
         assert!(
             err_msg.contains("CHECK") || err_msg.contains("check"),
@@ -1268,10 +1277,15 @@ mod tests {
 
         let result = db.execute("INSERT INTO orders VALUES (1, 999)");
 
-        assert!(result.is_err(), "FOREIGN KEY constraint should reject missing reference");
+        assert!(
+            result.is_err(),
+            "FOREIGN KEY constraint should reject missing reference"
+        );
         let err_msg = result.unwrap_err().to_string();
         assert!(
-            err_msg.contains("FOREIGN KEY") || err_msg.contains("foreign key") || err_msg.contains("referenced"),
+            err_msg.contains("FOREIGN KEY")
+                || err_msg.contains("foreign key")
+                || err_msg.contains("referenced"),
             "Error should mention FOREIGN KEY constraint violation: {}",
             err_msg
         );
@@ -1293,7 +1307,11 @@ mod tests {
         db.execute("INSERT INTO orders VALUES (1, 1)").unwrap();
 
         let rows = db.query("SELECT * FROM orders").unwrap();
-        assert_eq!(rows.len(), 1, "Insert should succeed with valid foreign key");
+        assert_eq!(
+            rows.len(),
+            1,
+            "Insert should succeed with valid foreign key"
+        );
     }
 
     #[test]
@@ -1313,12 +1331,109 @@ mod tests {
 
         let result = db.execute("DELETE FROM users WHERE id = 1");
 
-        assert!(result.is_err(), "FOREIGN KEY constraint should block delete of referenced row");
+        assert!(
+            result.is_err(),
+            "FOREIGN KEY constraint should block delete of referenced row"
+        );
         let err_msg = result.unwrap_err().to_string();
         assert!(
-            err_msg.contains("referenced") || err_msg.contains("FOREIGN KEY") || err_msg.contains("foreign key"),
+            err_msg.contains("referenced")
+                || err_msg.contains("FOREIGN KEY")
+                || err_msg.contains("foreign key"),
             "Error should mention row is referenced: {}",
             err_msg
+        );
+    }
+
+    #[test]
+    fn test_create_table_with_geometric_types() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("test_db");
+
+        let db = Database::create(&db_path).unwrap();
+
+        let result =
+            db.execute("CREATE TABLE geo (id INT, location POINT, area CIRCLE, bounds BOX)");
+        assert!(
+            result.is_ok(),
+            "Should create table with geometric types: {:?}",
+            result.err()
+        );
+    }
+
+    #[test]
+    fn test_create_table_with_range_types() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("test_db");
+
+        let db = Database::create(&db_path).unwrap();
+
+        let result = db.execute(
+            "CREATE TABLE ranges (id INT, r1 INT4RANGE, r2 INT8RANGE, r3 DATERANGE, r4 TSRANGE)",
+        );
+        assert!(
+            result.is_ok(),
+            "Should create table with range types: {:?}",
+            result.err()
+        );
+    }
+
+    #[test]
+    fn test_create_table_with_network_types() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("test_db");
+
+        let db = Database::create(&db_path).unwrap();
+
+        let result = db.execute("CREATE TABLE network (id INT, mac MACADDR, ip INET)");
+        assert!(
+            result.is_ok(),
+            "Should create table with network types: {:?}",
+            result.err()
+        );
+    }
+
+    #[test]
+    fn test_interval_type_end_to_end() {
+        use crate::types::OwnedValue;
+
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("test_db");
+
+        let db = Database::create(&db_path).unwrap();
+
+        db.execute("CREATE TABLE events (id INT, name TEXT, duration INTERVAL)")
+            .unwrap();
+
+        db.execute("INSERT INTO events VALUES (1, 'meeting', '1 hour')")
+            .unwrap();
+        db.execute("INSERT INTO events VALUES (2, 'project', '2 years 3 months 5 days')")
+            .unwrap();
+        db.execute("INSERT INTO events VALUES (3, 'task', 'P1Y2M3D')")
+            .unwrap();
+
+        let rows = db.query("SELECT id, name, duration FROM events").unwrap();
+        assert_eq!(rows.len(), 3, "Should have 3 rows");
+
+        let duration1 = rows[0].get(2).expect("should have duration column");
+        assert!(
+            matches!(duration1, OwnedValue::Interval(micros, days, months) if *micros == 3_600_000_000 && *days == 0 && *months == 0),
+            "First interval should be 1 hour (3600000000 microseconds): got {:?}",
+            duration1
+        );
+
+        let duration2 = rows[1].get(2).expect("should have duration column");
+        assert!(
+            matches!(duration2, OwnedValue::Interval(_, days, months) if *days == 5 && *months == 27),
+            "Second interval should be 2 years 3 months 5 days: got {:?}",
+            duration2
+        );
+
+        let duration3 = rows[2].get(2).expect("should have duration column");
+        assert!(
+            matches!(duration3, OwnedValue::Interval(_, days, months) if *days == 3 && *months == 14),
+            "Third interval should be 1 year 2 months 3 days (ISO 8601): got {:?}",
+            duration3
         );
     }
 }
