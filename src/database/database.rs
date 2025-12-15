@@ -19,7 +19,7 @@ use std::path::{Path, PathBuf};
 pub struct Database {
     path: PathBuf,
     file_manager: RwLock<Option<FileManager>>,
-    catalog: RwLock<Option<Catalog>>,
+    pub(crate) catalog: RwLock<Option<Catalog>>,
     wal: Mutex<Option<Wal>>,
     wal_dir: PathBuf,
     next_row_id: std::sync::atomic::AtomicU64,
@@ -583,11 +583,65 @@ impl Database {
         Ok(ExecuteResult::CreateSchema { created: true })
     }
 
+    fn format_expr(expr: &crate::sql::ast::Expr<'_>) -> String {
+        use crate::sql::ast::{Expr, FunctionArgs, Literal};
+
+        match expr {
+            Expr::Column(col) => {
+                if let Some(table) = col.table {
+                    format!("{}.{}", table, col.column)
+                } else {
+                    col.column.to_string()
+                }
+            }
+            Expr::Literal(lit) => match lit {
+                Literal::Null => "NULL".to_string(),
+                Literal::Boolean(b) => {
+                    if *b {
+                        "TRUE".to_string()
+                    } else {
+                        "FALSE".to_string()
+                    }
+                }
+                Literal::Integer(i) => i.to_string(),
+                Literal::Float(f) => f.to_string(),
+                Literal::String(s) => format!("'{}'", s),
+                _ => format!("{:?}", lit),
+            },
+            Expr::Function(func) => {
+                let name = func.name.name;
+                let args = match func.args {
+                    FunctionArgs::None => String::new(),
+                    FunctionArgs::Star => "*".to_string(),
+                    FunctionArgs::Args(args) => args
+                        .iter()
+                        .map(|arg| Self::format_expr(arg.value))
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                };
+                format!("{}({})", name, args)
+            }
+            Expr::BinaryOp { left, op, right } => {
+                format!(
+                    "({} {:?} {})",
+                    Self::format_expr(left),
+                    op,
+                    Self::format_expr(right)
+                )
+            }
+            Expr::UnaryOp { op, expr } => {
+                format!("{:?} {}", op, Self::format_expr(expr))
+            }
+            _ => format!("{:?}", expr),
+        }
+    }
+
     fn execute_create_index(
         &self,
         create: &crate::sql::ast::CreateIndexStmt<'_>,
         _arena: &Bump,
     ) -> Result<ExecuteResult> {
+        use crate::schema::IndexColumnDef;
         use crate::sql::ast::Expr;
 
         self.ensure_catalog()?;
@@ -597,22 +651,22 @@ impl Database {
         let table_name = create.table.name;
         let index_name = create.name;
 
-        let columns: Vec<String> = create
+        let column_defs: Vec<IndexColumnDef> = create
             .columns
             .iter()
-            .filter_map(|c| {
+            .map(|c| {
                 if let Expr::Column(ref col) = c.expr {
-                    Some(col.column.to_string())
+                    IndexColumnDef::Column(col.column.to_string())
                 } else {
-                    None
+                    IndexColumnDef::Expression(Self::format_expr(c.expr))
                 }
             })
             .collect();
-        let key_column_count = columns.len() as u32;
+        let key_column_count = column_defs.len() as u32;
 
-        let index_def = crate::schema::table::IndexDef::new(
+        let index_def = crate::schema::table::IndexDef::new_expression(
             index_name.to_string(),
-            columns,
+            column_defs,
             create.unique,
             crate::schema::table::IndexType::BTree,
         );
