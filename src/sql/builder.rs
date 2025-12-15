@@ -1,4 +1,5 @@
 use crate::sql::adapter::BTreeCursorAdapter;
+use crate::sql::ast::JoinType;
 use crate::sql::context::ExecutionContext;
 use crate::sql::executor::{
     AggregateFunction, DynamicExecutor, RowSource, SortKey, TableScanExecutor,
@@ -259,12 +260,16 @@ impl<'a> ExecutorBuilder<'a> {
         ))
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn build_nested_loop_join<S: RowSource>(
         &self,
         left: DynamicExecutor<'a, S>,
         right: DynamicExecutor<'a, S>,
         condition: Option<&'a crate::sql::ast::Expr<'a>>,
         column_map: &[(String, usize)],
+        join_type: JoinType,
+        left_col_count: usize,
+        right_col_count: usize,
     ) -> NestedLoopJoinState<'a, S> {
         let compiled_condition =
             condition.map(|expr| CompiledPredicate::new(expr, column_map.to_vec()));
@@ -277,9 +282,17 @@ impl<'a> ExecutorBuilder<'a> {
             right_rows: Vec::new(),
             right_index: 0,
             materialized: false,
+            join_type,
+            left_matched: false,
+            right_matched: Vec::new(),
+            emitting_unmatched_right: false,
+            unmatched_right_idx: 0,
+            left_col_count,
+            right_col_count,
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn build_grace_hash_join<S: RowSource>(
         &self,
         left: DynamicExecutor<'a, S>,
@@ -287,6 +300,9 @@ impl<'a> ExecutorBuilder<'a> {
         left_key_indices: Vec<usize>,
         right_key_indices: Vec<usize>,
         num_partitions: usize,
+        join_type: JoinType,
+        left_col_count: usize,
+        right_col_count: usize,
     ) -> GraceHashJoinState<'a, S> {
         GraceHashJoinState {
             left: Box::new(left),
@@ -304,6 +320,14 @@ impl<'a> ExecutorBuilder<'a> {
             current_match_idx: 0,
             current_matches: Vec::new(),
             partitioned: false,
+            join_type,
+            build_matched: (0..num_partitions).map(|_| Vec::new()).collect(),
+            probe_row_matched: false,
+            emitting_unmatched_build: false,
+            unmatched_build_partition: 0,
+            unmatched_build_idx: 0,
+            left_col_count,
+            right_col_count,
         }
     }
 
