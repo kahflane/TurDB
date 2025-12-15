@@ -263,4 +263,20 @@ impl TableDef {
     pub fn column_index(&self, name: &str) -> Option<usize> {
         self.columns.iter().position(|c| c.name() == name)
     }
+
+    pub fn get_index(&self, name: &str) -> Option<&IndexDef> {
+        self.indexes.iter().find(|i| i.name() == name)
+    }
+
+    pub fn remove_index(&mut self, name: &str) -> Option<IndexDef> {
+        if let Some(pos) = self.indexes.iter().position(|i| i.name() == name) {
+            Some(self.indexes.remove(pos))
+        } else {
+            None
+        }
+    }
+
+    pub fn add_index(&mut self, index: IndexDef) {
+        self.indexes.push(index);
+    }
 }
