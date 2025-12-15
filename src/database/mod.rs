@@ -112,6 +112,11 @@ pub enum ExecuteResult {
     Delete { rows_affected: usize },
     Select { rows: Vec<Row> },
     Pragma { name: String, value: Option<String> },
+    Begin,
+    Commit,
+    Rollback,
+    Savepoint { name: String },
+    Release { name: String },
 }
 
 #[derive(Debug, Clone)]
@@ -1771,6 +1776,225 @@ mod tests {
         assert!(
             idx.where_clause().unwrap().contains("deleted_at"),
             "WHERE clause should reference deleted_at"
+        );
+    }
+
+    #[test]
+    fn test_begin_transaction() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("test_db");
+
+        let db = Database::create(&db_path).unwrap();
+
+        let result = db.execute("BEGIN").unwrap();
+        assert!(
+            matches!(result, ExecuteResult::Begin),
+            "BEGIN should return ExecuteResult::Begin"
+        );
+    }
+
+    #[test]
+    fn test_begin_transaction_with_isolation_level() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("test_db");
+
+        let db = Database::create(&db_path).unwrap();
+
+        let result = db
+            .execute("BEGIN TRANSACTION ISOLATION LEVEL SERIALIZABLE")
+            .unwrap();
+        assert!(
+            matches!(result, ExecuteResult::Begin),
+            "BEGIN with isolation level should return ExecuteResult::Begin"
+        );
+    }
+
+    #[test]
+    fn test_commit_transaction() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("test_db");
+
+        let db = Database::create(&db_path).unwrap();
+
+        db.execute("BEGIN").unwrap();
+        let result = db.execute("COMMIT").unwrap();
+        assert!(
+            matches!(result, ExecuteResult::Commit),
+            "COMMIT should return ExecuteResult::Commit"
+        );
+    }
+
+    #[test]
+    fn test_commit_without_begin_fails() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("test_db");
+
+        let db = Database::create(&db_path).unwrap();
+
+        let result = db.execute("COMMIT");
+        assert!(result.is_err(), "COMMIT without BEGIN should fail");
+    }
+
+    #[test]
+    fn test_rollback_transaction() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("test_db");
+
+        let db = Database::create(&db_path).unwrap();
+
+        db.execute("BEGIN").unwrap();
+        let result = db.execute("ROLLBACK").unwrap();
+        assert!(
+            matches!(result, ExecuteResult::Rollback),
+            "ROLLBACK should return ExecuteResult::Rollback"
+        );
+    }
+
+    #[test]
+    fn test_rollback_without_begin_fails() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("test_db");
+
+        let db = Database::create(&db_path).unwrap();
+
+        let result = db.execute("ROLLBACK");
+        assert!(result.is_err(), "ROLLBACK without BEGIN should fail");
+    }
+
+    #[test]
+    fn test_savepoint_creates_savepoint() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("test_db");
+
+        let db = Database::create(&db_path).unwrap();
+
+        db.execute("BEGIN").unwrap();
+        let result = db.execute("SAVEPOINT sp1").unwrap();
+        assert!(
+            matches!(result, ExecuteResult::Savepoint { name } if name == "sp1"),
+            "SAVEPOINT should return ExecuteResult::Savepoint with name"
+        );
+    }
+
+    #[test]
+    fn test_savepoint_outside_transaction_fails() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("test_db");
+
+        let db = Database::create(&db_path).unwrap();
+
+        let result = db.execute("SAVEPOINT sp1");
+        assert!(result.is_err(), "SAVEPOINT outside transaction should fail");
+    }
+
+    #[test]
+    #[ignore = "requires MVCC integration to track and rollback pending modifications"]
+    fn test_rollback_to_savepoint() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("test_db");
+
+        let db = Database::create(&db_path).unwrap();
+        db.execute("CREATE TABLE test (id INT)").unwrap();
+
+        db.execute("BEGIN").unwrap();
+        db.execute("INSERT INTO test VALUES (1)").unwrap();
+        db.execute("SAVEPOINT sp1").unwrap();
+        db.execute("INSERT INTO test VALUES (2)").unwrap();
+        db.execute("ROLLBACK TO SAVEPOINT sp1").unwrap();
+        db.execute("COMMIT").unwrap();
+
+        let rows = db.query("SELECT * FROM test").unwrap();
+        assert_eq!(
+            rows.len(),
+            1,
+            "ROLLBACK TO SAVEPOINT should undo changes after savepoint"
+        );
+    }
+
+    #[test]
+    fn test_release_savepoint() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("test_db");
+
+        let db = Database::create(&db_path).unwrap();
+
+        db.execute("BEGIN").unwrap();
+        db.execute("SAVEPOINT sp1").unwrap();
+        let result = db.execute("RELEASE SAVEPOINT sp1").unwrap();
+        assert!(
+            matches!(result, ExecuteResult::Release { name } if name == "sp1"),
+            "RELEASE SAVEPOINT should return ExecuteResult::Release with name"
+        );
+    }
+
+    #[test]
+    fn test_release_nonexistent_savepoint_fails() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("test_db");
+
+        let db = Database::create(&db_path).unwrap();
+
+        db.execute("BEGIN").unwrap();
+        let result = db.execute("RELEASE SAVEPOINT nonexistent");
+        assert!(result.is_err(), "RELEASE nonexistent savepoint should fail");
+    }
+
+    #[test]
+    #[ignore = "requires MVCC integration to track and rollback pending modifications"]
+    fn test_transaction_rollback_undoes_insert() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("test_db");
+
+        let db = Database::create(&db_path).unwrap();
+        db.execute("CREATE TABLE test (id INT, name TEXT)").unwrap();
+        db.execute("INSERT INTO test VALUES (1, 'existing')")
+            .unwrap();
+
+        db.execute("BEGIN").unwrap();
+        db.execute("INSERT INTO test VALUES (2, 'new')").unwrap();
+        db.execute("ROLLBACK").unwrap();
+
+        let rows = db.query("SELECT * FROM test").unwrap();
+        assert_eq!(
+            rows.len(),
+            1,
+            "ROLLBACK should undo INSERT within transaction"
+        );
+    }
+
+    #[test]
+    fn test_transaction_commit_persists_insert() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("test_db");
+
+        let db = Database::create(&db_path).unwrap();
+        db.execute("CREATE TABLE test (id INT, name TEXT)").unwrap();
+
+        db.execute("BEGIN").unwrap();
+        db.execute("INSERT INTO test VALUES (1, 'committed')")
+            .unwrap();
+        db.execute("COMMIT").unwrap();
+
+        let rows = db.query("SELECT * FROM test").unwrap();
+        assert_eq!(
+            rows.len(),
+            1,
+            "COMMIT should persist INSERT within transaction"
+        );
+    }
+
+    #[test]
+    fn test_nested_begin_fails() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("test_db");
+
+        let db = Database::create(&db_path).unwrap();
+
+        db.execute("BEGIN").unwrap();
+        let result = db.execute("BEGIN");
+        assert!(
+            result.is_err(),
+            "Nested BEGIN should fail (use SAVEPOINT instead)"
         );
     }
 }
