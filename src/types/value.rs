@@ -52,9 +52,11 @@
 //! ```
 
 use super::TypeAffinity;
+use bumpalo::Bump;
 use eyre::{bail, Result};
 use std::borrow::Cow;
 use std::cmp::Ordering;
+use std::hash::{Hash, Hasher};
 
 /// Runtime value representation for SQL values.
 #[derive(Debug, Clone, PartialEq)]
@@ -482,6 +484,259 @@ impl<'a> Value<'a> {
 
             (Value::Decimal { .. }, _) => Some(Ordering::Greater),
             (_, Value::Decimal { .. }) => Some(Ordering::Less),
+        }
+    }
+
+    /// Compares two values for sorting, treating NULL as less than any non-NULL value.
+    pub fn compare_for_sort(&self, other: &Value) -> Ordering {
+        self.compare(other).unwrap_or(Ordering::Equal)
+    }
+
+    /// Clones this value into an arena allocator with the arena's lifetime.
+    pub fn clone_to_arena<'b>(&self, arena: &'b Bump) -> Value<'b> {
+        match self {
+            Value::Null => Value::Null,
+            Value::Int(i) => Value::Int(*i),
+            Value::Float(f) => Value::Float(*f),
+            Value::Text(s) => Value::Text(Cow::Borrowed(arena.alloc_str(s))),
+            Value::Blob(b) => Value::Blob(Cow::Borrowed(arena.alloc_slice_copy(b))),
+            Value::Vector(v) => Value::Vector(Cow::Borrowed(arena.alloc_slice_copy(v))),
+            Value::Uuid(u) => Value::Uuid(*u),
+            Value::MacAddr(m) => Value::MacAddr(*m),
+            Value::Inet4(ip) => Value::Inet4(*ip),
+            Value::Inet6(ip) => Value::Inet6(*ip),
+            Value::Jsonb(b) => Value::Jsonb(Cow::Borrowed(arena.alloc_slice_copy(b))),
+            Value::TimestampTz {
+                micros,
+                offset_secs,
+            } => Value::TimestampTz {
+                micros: *micros,
+                offset_secs: *offset_secs,
+            },
+            Value::Interval {
+                micros,
+                days,
+                months,
+            } => Value::Interval {
+                micros: *micros,
+                days: *days,
+                months: *months,
+            },
+            Value::Point { x, y } => Value::Point { x: *x, y: *y },
+            Value::GeoBox { low, high } => Value::GeoBox {
+                low: *low,
+                high: *high,
+            },
+            Value::Circle { center, radius } => Value::Circle {
+                center: *center,
+                radius: *radius,
+            },
+            Value::Enum { type_id, ordinal } => Value::Enum {
+                type_id: *type_id,
+                ordinal: *ordinal,
+            },
+            Value::Decimal { digits, scale } => Value::Decimal {
+                digits: *digits,
+                scale: *scale,
+            },
+        }
+    }
+
+    /// Clones this value to a fully-owned static lifetime.
+    pub fn to_owned_static(&self) -> Value<'static> {
+        match self {
+            Value::Null => Value::Null,
+            Value::Int(i) => Value::Int(*i),
+            Value::Float(f) => Value::Float(*f),
+            Value::Text(s) => Value::Text(Cow::Owned(s.to_string())),
+            Value::Blob(b) => Value::Blob(Cow::Owned(b.to_vec())),
+            Value::Vector(v) => Value::Vector(Cow::Owned(v.to_vec())),
+            Value::Uuid(u) => Value::Uuid(*u),
+            Value::MacAddr(m) => Value::MacAddr(*m),
+            Value::Inet4(ip) => Value::Inet4(*ip),
+            Value::Inet6(ip) => Value::Inet6(*ip),
+            Value::Jsonb(b) => Value::Jsonb(Cow::Owned(b.to_vec())),
+            Value::TimestampTz {
+                micros,
+                offset_secs,
+            } => Value::TimestampTz {
+                micros: *micros,
+                offset_secs: *offset_secs,
+            },
+            Value::Interval {
+                micros,
+                days,
+                months,
+            } => Value::Interval {
+                micros: *micros,
+                days: *days,
+                months: *months,
+            },
+            Value::Point { x, y } => Value::Point { x: *x, y: *y },
+            Value::GeoBox { low, high } => Value::GeoBox {
+                low: *low,
+                high: *high,
+            },
+            Value::Circle { center, radius } => Value::Circle {
+                center: *center,
+                radius: *radius,
+            },
+            Value::Enum { type_id, ordinal } => Value::Enum {
+                type_id: *type_id,
+                ordinal: *ordinal,
+            },
+            Value::Decimal { digits, scale } => Value::Decimal {
+                digits: *digits,
+                scale: *scale,
+            },
+        }
+    }
+
+    /// Encodes this value to a byte-comparable key format.
+    pub fn encode_to_key(&self, buf: &mut Vec<u8>) {
+        use crate::encoding::key::{type_prefix, encode_int, encode_float, encode_text, encode_blob};
+
+        match self {
+            Value::Null => buf.push(type_prefix::NULL),
+            Value::Int(i) => encode_int(*i, buf),
+            Value::Float(f) => encode_float(*f, buf),
+            Value::Text(s) => encode_text(s, buf),
+            Value::Blob(b) => encode_blob(b, buf),
+            Value::Vector(v) => {
+                buf.push(type_prefix::VECTOR);
+                for f in v.iter() {
+                    buf.extend(f.to_bits().to_be_bytes());
+                }
+            }
+            Value::Uuid(u) => {
+                buf.push(type_prefix::UUID);
+                buf.extend(u);
+            }
+            Value::MacAddr(m) => {
+                buf.push(type_prefix::MACADDR);
+                buf.extend(m);
+            }
+            Value::Inet4(ip) => {
+                buf.push(type_prefix::INET);
+                buf.push(4);
+                buf.extend(ip);
+            }
+            Value::Inet6(ip) => {
+                buf.push(type_prefix::INET);
+                buf.push(6);
+                buf.extend(ip);
+            }
+            Value::Jsonb(b) => {
+                buf.push(type_prefix::BLOB);
+                buf.extend(b.iter());
+                buf.push(0);
+            }
+            Value::TimestampTz {
+                micros,
+                offset_secs,
+            } => {
+                buf.push(type_prefix::TIMESTAMPTZ);
+                buf.extend((*micros as u64 ^ (1u64 << 63)).to_be_bytes());
+                buf.extend((*offset_secs as u32 ^ (1u32 << 31)).to_be_bytes());
+            }
+            Value::Interval {
+                micros,
+                days,
+                months,
+            } => {
+                buf.push(type_prefix::INTERVAL);
+                buf.extend((*months as u32 ^ (1u32 << 31)).to_be_bytes());
+                buf.extend((*days as u32 ^ (1u32 << 31)).to_be_bytes());
+                buf.extend((*micros as u64 ^ (1u64 << 63)).to_be_bytes());
+            }
+            Value::Point { x, y } => {
+                buf.push(type_prefix::COMPOSITE);
+                encode_float(*x, buf);
+                encode_float(*y, buf);
+            }
+            Value::GeoBox { low, high } => {
+                buf.push(type_prefix::COMPOSITE);
+                encode_float(low.0, buf);
+                encode_float(low.1, buf);
+                encode_float(high.0, buf);
+                encode_float(high.1, buf);
+            }
+            Value::Circle { center, radius } => {
+                buf.push(type_prefix::COMPOSITE);
+                encode_float(center.0, buf);
+                encode_float(center.1, buf);
+                encode_float(*radius, buf);
+            }
+            Value::Enum { type_id, ordinal } => {
+                buf.push(type_prefix::ENUM);
+                buf.extend(type_id.to_be_bytes());
+                buf.extend(ordinal.to_be_bytes());
+            }
+            Value::Decimal { digits, scale } => {
+                buf.push(type_prefix::COMPOSITE);
+                buf.extend(digits.to_be_bytes());
+                buf.extend(scale.to_be_bytes());
+            }
+        }
+    }
+
+    /// Hashes this value for use in hash joins and grouping.
+    pub fn hash_to<H: Hasher>(&self, hasher: &mut H) {
+        match self {
+            Value::Null => 0u8.hash(hasher),
+            Value::Int(i) => i.hash(hasher),
+            Value::Float(f) => f.to_bits().hash(hasher),
+            Value::Text(s) => s.hash(hasher),
+            Value::Blob(b) => b.hash(hasher),
+            Value::Vector(v) => {
+                for f in v.iter() {
+                    f.to_bits().hash(hasher);
+                }
+            }
+            Value::Uuid(u) => u.hash(hasher),
+            Value::MacAddr(m) => m.hash(hasher),
+            Value::Inet4(ip) => ip.hash(hasher),
+            Value::Inet6(ip) => ip.hash(hasher),
+            Value::Jsonb(b) => b.hash(hasher),
+            Value::TimestampTz {
+                micros,
+                offset_secs,
+            } => {
+                micros.hash(hasher);
+                offset_secs.hash(hasher);
+            }
+            Value::Interval {
+                micros,
+                days,
+                months,
+            } => {
+                micros.hash(hasher);
+                days.hash(hasher);
+                months.hash(hasher);
+            }
+            Value::Point { x, y } => {
+                x.to_bits().hash(hasher);
+                y.to_bits().hash(hasher);
+            }
+            Value::GeoBox { low, high } => {
+                low.0.to_bits().hash(hasher);
+                low.1.to_bits().hash(hasher);
+                high.0.to_bits().hash(hasher);
+                high.1.to_bits().hash(hasher);
+            }
+            Value::Circle { center, radius } => {
+                center.0.to_bits().hash(hasher);
+                center.1.to_bits().hash(hasher);
+                radius.to_bits().hash(hasher);
+            }
+            Value::Enum { type_id, ordinal } => {
+                type_id.hash(hasher);
+                ordinal.hash(hasher);
+            }
+            Value::Decimal { digits, scale } => {
+                digits.hash(hasher);
+                scale.hash(hasher);
+            }
         }
     }
 }

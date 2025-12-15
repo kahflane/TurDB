@@ -109,7 +109,44 @@ pub use page::{validate_page, PageHeader, PageType};
 pub use wal::{Wal, WalFrameHeader, WalSegment};
 pub use wal_storage::WalStorage;
 
-use eyre::Result;
+use eyre::{ensure, Result};
+use zerocopy::{FromBytes, Immutable, KnownLayout};
+
+/// Parses a zerocopy struct from a byte slice with size validation.
+#[inline]
+pub fn parse_zerocopy<'a, T: FromBytes + KnownLayout + Immutable>(
+    bytes: &'a [u8],
+    type_name: &str,
+) -> Result<&'a T> {
+    let size = std::mem::size_of::<T>();
+    ensure!(
+        bytes.len() >= size,
+        "buffer too small for {}: {} < {}",
+        type_name,
+        bytes.len(),
+        size
+    );
+    T::ref_from_bytes(&bytes[..size])
+        .map_err(|e| eyre::eyre!("failed to parse {}: {:?}", type_name, e))
+}
+
+/// Parses a mutable zerocopy struct from a byte slice with size validation.
+#[inline]
+pub fn parse_zerocopy_mut<'a, T: FromBytes + KnownLayout + zerocopy::IntoBytes>(
+    bytes: &'a mut [u8],
+    type_name: &str,
+) -> Result<&'a mut T> {
+    let size = std::mem::size_of::<T>();
+    ensure!(
+        bytes.len() >= size,
+        "buffer too small for {}: {} < {}",
+        type_name,
+        bytes.len(),
+        size
+    );
+    T::mut_from_bytes(&mut bytes[..size])
+        .map_err(|e| eyre::eyre!("failed to parse {}: {:?}", type_name, e))
+}
 
 pub trait Storage {
     fn page(&self, page_no: u32) -> Result<&[u8]>;
