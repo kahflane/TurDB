@@ -248,10 +248,7 @@ impl DataType {
 
     /// Returns true if this is a network address type.
     pub fn is_network(&self) -> bool {
-        matches!(
-            self,
-            DataType::Inet4 | DataType::Inet6 | DataType::MacAddr
-        )
+        matches!(self, DataType::Inet4 | DataType::Inet6 | DataType::MacAddr)
     }
 }
 

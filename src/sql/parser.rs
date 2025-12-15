@@ -2434,6 +2434,114 @@ mod tests {
             panic!("Expected Select statement");
         }
     }
+
+    #[test]
+    fn parse_point_type() {
+        let arena = Bump::new();
+        let mut parser = Parser::new("CREATE TABLE geo (id INTEGER, loc POINT)", &arena);
+        let stmt = parser.parse_statement().unwrap();
+        if let Statement::CreateTable(ct) = stmt {
+            assert!(matches!(ct.columns[1].data_type, DataType::Point));
+        } else {
+            panic!("Expected CreateTable statement");
+        }
+    }
+
+    #[test]
+    fn parse_box_type() {
+        let arena = Bump::new();
+        let mut parser = Parser::new("CREATE TABLE geo (id INTEGER, bounds BOX)", &arena);
+        let stmt = parser.parse_statement().unwrap();
+        if let Statement::CreateTable(ct) = stmt {
+            assert!(matches!(ct.columns[1].data_type, DataType::Box));
+        } else {
+            panic!("Expected CreateTable statement");
+        }
+    }
+
+    #[test]
+    fn parse_circle_type() {
+        let arena = Bump::new();
+        let mut parser = Parser::new("CREATE TABLE geo (id INTEGER, area CIRCLE)", &arena);
+        let stmt = parser.parse_statement().unwrap();
+        if let Statement::CreateTable(ct) = stmt {
+            assert!(matches!(ct.columns[1].data_type, DataType::Circle));
+        } else {
+            panic!("Expected CreateTable statement");
+        }
+    }
+
+    #[test]
+    fn parse_macaddr_type() {
+        let arena = Bump::new();
+        let mut parser = Parser::new("CREATE TABLE net (id INTEGER, mac MACADDR)", &arena);
+        let stmt = parser.parse_statement().unwrap();
+        if let Statement::CreateTable(ct) = stmt {
+            assert!(matches!(ct.columns[1].data_type, DataType::MacAddr));
+        } else {
+            panic!("Expected CreateTable statement");
+        }
+    }
+
+    #[test]
+    fn parse_inet_type() {
+        let arena = Bump::new();
+        let mut parser = Parser::new("CREATE TABLE net (id INTEGER, ip INET)", &arena);
+        let stmt = parser.parse_statement().unwrap();
+        if let Statement::CreateTable(ct) = stmt {
+            assert!(matches!(ct.columns[1].data_type, DataType::Inet));
+        } else {
+            panic!("Expected CreateTable statement");
+        }
+    }
+
+    #[test]
+    fn parse_int4range_type() {
+        let arena = Bump::new();
+        let mut parser = Parser::new("CREATE TABLE ranges (id INTEGER, r INT4RANGE)", &arena);
+        let stmt = parser.parse_statement().unwrap();
+        if let Statement::CreateTable(ct) = stmt {
+            assert!(matches!(ct.columns[1].data_type, DataType::Int4Range));
+        } else {
+            panic!("Expected CreateTable statement");
+        }
+    }
+
+    #[test]
+    fn parse_int8range_type() {
+        let arena = Bump::new();
+        let mut parser = Parser::new("CREATE TABLE ranges (id INTEGER, r INT8RANGE)", &arena);
+        let stmt = parser.parse_statement().unwrap();
+        if let Statement::CreateTable(ct) = stmt {
+            assert!(matches!(ct.columns[1].data_type, DataType::Int8Range));
+        } else {
+            panic!("Expected CreateTable statement");
+        }
+    }
+
+    #[test]
+    fn parse_daterange_type() {
+        let arena = Bump::new();
+        let mut parser = Parser::new("CREATE TABLE ranges (id INTEGER, r DATERANGE)", &arena);
+        let stmt = parser.parse_statement().unwrap();
+        if let Statement::CreateTable(ct) = stmt {
+            assert!(matches!(ct.columns[1].data_type, DataType::DateRange));
+        } else {
+            panic!("Expected CreateTable statement");
+        }
+    }
+
+    #[test]
+    fn parse_tsrange_type() {
+        let arena = Bump::new();
+        let mut parser = Parser::new("CREATE TABLE ranges (id INTEGER, r TSRANGE)", &arena);
+        let stmt = parser.parse_statement().unwrap();
+        if let Statement::CreateTable(ct) = stmt {
+            assert!(matches!(ct.columns[1].data_type, DataType::TsRange));
+        } else {
+            panic!("Expected CreateTable statement");
+        }
+    }
 }
 
 pub struct Parser<'a> {
@@ -5019,6 +5127,42 @@ impl<'a> Parser<'a> {
                 self.advance();
                 let dim = self.parse_type_length()?;
                 Ok(DataType::Vector(dim))
+            }
+            Token::Keyword(Keyword::Point) => {
+                self.advance();
+                Ok(DataType::Point)
+            }
+            Token::Keyword(Keyword::Box) => {
+                self.advance();
+                Ok(DataType::Box)
+            }
+            Token::Keyword(Keyword::Circle) => {
+                self.advance();
+                Ok(DataType::Circle)
+            }
+            Token::Keyword(Keyword::Macaddr) => {
+                self.advance();
+                Ok(DataType::MacAddr)
+            }
+            Token::Keyword(Keyword::Inet) => {
+                self.advance();
+                Ok(DataType::Inet)
+            }
+            Token::Keyword(Keyword::Int4range) => {
+                self.advance();
+                Ok(DataType::Int4Range)
+            }
+            Token::Keyword(Keyword::Int8range) => {
+                self.advance();
+                Ok(DataType::Int8Range)
+            }
+            Token::Keyword(Keyword::Daterange) => {
+                self.advance();
+                Ok(DataType::DateRange)
+            }
+            Token::Keyword(Keyword::Tsrange) => {
+                self.advance();
+                Ok(DataType::TsRange)
             }
             Token::Ident(name) => {
                 self.advance();

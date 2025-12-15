@@ -289,7 +289,9 @@ fn bench_roundtrip(c: &mut Criterion) {
             )
             .unwrap();
             let result: String = conn
-                .query_row("SELECT name FROM test_varchar LIMIT 1", [], |row| row.get(0))
+                .query_row("SELECT name FROM test_varchar LIMIT 1", [], |row| {
+                    row.get(0)
+                })
                 .unwrap();
             conn.execute("DELETE FROM test_varchar", []).unwrap();
             black_box(result);

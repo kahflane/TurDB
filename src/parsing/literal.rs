@@ -348,9 +348,7 @@ impl LiteralParser {
             return Ok(ParsedLiteral::Bool(false));
         }
 
-        if (s.starts_with('\'') && s.ends_with('\''))
-            || (s.starts_with('"') && s.ends_with('"'))
-        {
+        if (s.starts_with('\'') && s.ends_with('\'')) || (s.starts_with('"') && s.ends_with('"')) {
             let inner = &s[1..s.len() - 1];
             return Ok(ParsedLiteral::Text(inner.to_string()));
         }
@@ -385,11 +383,15 @@ impl LiteralParser {
                 }
             }
             "int" | "integer" | "int4" | "int8" | "bigint" | "smallint" | "int2" => {
-                let i: i64 = s.parse().wrap_err_with(|| format!("invalid integer: '{}'", s))?;
+                let i: i64 = s
+                    .parse()
+                    .wrap_err_with(|| format!("invalid integer: '{}'", s))?;
                 Ok(OwnedValue::Int(i))
             }
             "float" | "float4" | "float8" | "double" | "real" => {
-                let f: f64 = s.parse().wrap_err_with(|| format!("invalid float: '{}'", s))?;
+                let f: f64 = s
+                    .parse()
+                    .wrap_err_with(|| format!("invalid float: '{}'", s))?;
                 Ok(OwnedValue::Float(f))
             }
             "bool" | "boolean" => {

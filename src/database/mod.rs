@@ -1086,7 +1086,11 @@ mod tests {
             .unwrap();
 
         let rows = db.query("SELECT * FROM users").unwrap();
-        assert_eq!(rows.len(), 2, "Both inserts should succeed with different emails");
+        assert_eq!(
+            rows.len(),
+            2,
+            "Both inserts should succeed with different emails"
+        );
     }
 
     #[test]
@@ -1103,10 +1107,7 @@ mod tests {
 
         let start = Instant::now();
         for i in 0..1000 {
-            let sql = format!(
-                "INSERT INTO users VALUES ({}, 'user{}@example.com')",
-                i, i
-            );
+            let sql = format!("INSERT INTO users VALUES ({}, 'user{}@example.com')", i, i);
             db.execute(&sql).unwrap();
         }
         let elapsed = start.elapsed();
@@ -1134,10 +1135,8 @@ mod tests {
         db.execute("CREATE TABLE users (id INT, email TEXT UNIQUE)")
             .unwrap();
 
-        db.execute("INSERT INTO users VALUES (1, NULL)")
-            .unwrap();
-        db.execute("INSERT INTO users VALUES (2, NULL)")
-            .unwrap();
+        db.execute("INSERT INTO users VALUES (1, NULL)").unwrap();
+        db.execute("INSERT INTO users VALUES (2, NULL)").unwrap();
 
         let rows = db.query("SELECT * FROM users").unwrap();
         assert_eq!(rows.len(), 2, "UNIQUE should allow multiple NULLs");
@@ -1153,15 +1152,16 @@ mod tests {
         db.execute("CREATE TABLE users (id INT PRIMARY KEY, name TEXT)")
             .unwrap();
 
-        db.execute("INSERT INTO users VALUES (1, 'Alice')")
-            .unwrap();
+        db.execute("INSERT INTO users VALUES (1, 'Alice')").unwrap();
 
         let result = db.execute("INSERT INTO users VALUES (1, 'Bob')");
 
         assert!(result.is_err(), "PRIMARY KEY should reject duplicate id");
         let err_msg = result.unwrap_err().to_string();
         assert!(
-            err_msg.contains("PRIMARY KEY") || err_msg.contains("UNIQUE") || err_msg.contains("unique"),
+            err_msg.contains("PRIMARY KEY")
+                || err_msg.contains("UNIQUE")
+                || err_msg.contains("unique"),
             "Error should mention constraint violation: {}",
             err_msg
         );
@@ -1184,7 +1184,10 @@ mod tests {
 
         let result = db.execute("UPDATE users SET email = 'alice@test.com' WHERE id = 2");
 
-        assert!(result.is_err(), "UNIQUE constraint should reject duplicate email on UPDATE");
+        assert!(
+            result.is_err(),
+            "UNIQUE constraint should reject duplicate email on UPDATE"
+        );
         let err_msg = result.unwrap_err().to_string();
         assert!(
             err_msg.contains("UNIQUE") || err_msg.contains("unique"),
@@ -1205,7 +1208,10 @@ mod tests {
 
         let result = db.execute("INSERT INTO users VALUES (1, -5)");
 
-        assert!(result.is_err(), "CHECK constraint should reject negative age");
+        assert!(
+            result.is_err(),
+            "CHECK constraint should reject negative age"
+        );
         let err_msg = result.unwrap_err().to_string();
         assert!(
             err_msg.contains("CHECK") || err_msg.contains("check"),
@@ -1243,7 +1249,10 @@ mod tests {
 
         let result = db.execute("UPDATE users SET age = -10 WHERE id = 1");
 
-        assert!(result.is_err(), "CHECK constraint should reject negative age on UPDATE");
+        assert!(
+            result.is_err(),
+            "CHECK constraint should reject negative age on UPDATE"
+        );
         let err_msg = result.unwrap_err().to_string();
         assert!(
             err_msg.contains("CHECK") || err_msg.contains("check"),
@@ -1268,10 +1277,15 @@ mod tests {
 
         let result = db.execute("INSERT INTO orders VALUES (1, 999)");
 
-        assert!(result.is_err(), "FOREIGN KEY constraint should reject missing reference");
+        assert!(
+            result.is_err(),
+            "FOREIGN KEY constraint should reject missing reference"
+        );
         let err_msg = result.unwrap_err().to_string();
         assert!(
-            err_msg.contains("FOREIGN KEY") || err_msg.contains("foreign key") || err_msg.contains("referenced"),
+            err_msg.contains("FOREIGN KEY")
+                || err_msg.contains("foreign key")
+                || err_msg.contains("referenced"),
             "Error should mention FOREIGN KEY constraint violation: {}",
             err_msg
         );
@@ -1293,7 +1307,11 @@ mod tests {
         db.execute("INSERT INTO orders VALUES (1, 1)").unwrap();
 
         let rows = db.query("SELECT * FROM orders").unwrap();
-        assert_eq!(rows.len(), 1, "Insert should succeed with valid foreign key");
+        assert_eq!(
+            rows.len(),
+            1,
+            "Insert should succeed with valid foreign key"
+        );
     }
 
     #[test]
@@ -1313,10 +1331,15 @@ mod tests {
 
         let result = db.execute("DELETE FROM users WHERE id = 1");
 
-        assert!(result.is_err(), "FOREIGN KEY constraint should block delete of referenced row");
+        assert!(
+            result.is_err(),
+            "FOREIGN KEY constraint should block delete of referenced row"
+        );
         let err_msg = result.unwrap_err().to_string();
         assert!(
-            err_msg.contains("referenced") || err_msg.contains("FOREIGN KEY") || err_msg.contains("foreign key"),
+            err_msg.contains("referenced")
+                || err_msg.contains("FOREIGN KEY")
+                || err_msg.contains("foreign key"),
             "Error should mention row is referenced: {}",
             err_msg
         );

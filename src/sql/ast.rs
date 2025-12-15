@@ -360,6 +360,15 @@ pub enum DataType<'a> {
     Jsonb,
     Vector(Option<u32>),
     Array(&'a DataType<'a>),
+    Point,
+    Box,
+    Circle,
+    MacAddr,
+    Inet,
+    Int4Range,
+    Int8Range,
+    DateRange,
+    TsRange,
     Custom(&'a str),
 }
 
