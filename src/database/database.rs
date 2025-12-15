@@ -473,8 +473,7 @@ impl Database {
                         }
                         ColumnConstraint::Check(expr) => {
                             if let Some(check_str) = Self::expr_to_string(expr) {
-                                column =
-                                    column.with_constraint(SchemaConstraint::Check(check_str));
+                                column = column.with_constraint(SchemaConstraint::Check(check_str));
                             }
                         }
                         ColumnConstraint::References {
@@ -527,7 +526,8 @@ impl Database {
                 true,
             )?;
 
-            let index_storage = file_manager.index_data_mut(schema_name, table_name, &index_name)?;
+            let index_storage =
+                file_manager.index_data_mut(schema_name, table_name, &index_name)?;
             index_storage.grow(2)?;
             crate::btree::BTree::create(index_storage, 1)?;
 
@@ -784,8 +784,7 @@ impl Database {
                         }
 
                         let ref_schema_name = "root";
-                        let ref_storage =
-                            file_manager.table_data_mut(ref_schema_name, fk_table)?;
+                        let ref_storage = file_manager.table_data_mut(ref_schema_name, fk_table)?;
                         let ref_btree = BTree::new(ref_storage, 1)?;
                         let ref_schema = create_record_schema(ref_columns);
                         let mut ref_cursor = ref_btree.cursor_first()?;
@@ -1141,10 +1140,8 @@ impl Database {
                     for constraint in col.constraints() {
                         if let Constraint::ForeignKey { table, column } = constraint {
                             if table == table_name {
-                                let ref_col_idx = columns
-                                    .iter()
-                                    .position(|c| c.name() == column)
-                                    .unwrap_or(0);
+                                let ref_col_idx =
+                                    columns.iter().position(|c| c.name() == column).unwrap_or(0);
                                 fk_references.push((
                                     schema_key.clone(),
                                     child_table_name.clone(),
@@ -1158,24 +1155,34 @@ impl Database {
             }
         }
 
-        let child_table_schemas: Vec<(String, String, Vec<crate::schema::table::ColumnDef>, usize)> =
-            fk_references
-                .iter()
-                .map(|(schema_key, child_name, fk_col_name, _ref_col_idx)| {
-                    let child_def = catalog.schemas().get(schema_key).unwrap().tables().get(child_name).unwrap();
-                    let fk_col_idx = child_def
-                        .columns()
-                        .iter()
-                        .position(|c| c.name() == fk_col_name)
-                        .unwrap_or(0);
-                    (
-                        schema_key.clone(),
-                        child_name.clone(),
-                        child_def.columns().to_vec(),
-                        fk_col_idx,
-                    )
-                })
-                .collect();
+        let child_table_schemas: Vec<(
+            String,
+            String,
+            Vec<crate::schema::table::ColumnDef>,
+            usize,
+        )> = fk_references
+            .iter()
+            .map(|(schema_key, child_name, fk_col_name, _ref_col_idx)| {
+                let child_def = catalog
+                    .schemas()
+                    .get(schema_key)
+                    .unwrap()
+                    .tables()
+                    .get(child_name)
+                    .unwrap();
+                let fk_col_idx = child_def
+                    .columns()
+                    .iter()
+                    .position(|c| c.name() == fk_col_name)
+                    .unwrap_or(0);
+                (
+                    schema_key.clone(),
+                    child_name.clone(),
+                    child_def.columns().to_vec(),
+                    fk_col_idx,
+                )
+            })
+            .collect();
 
         drop(catalog_guard);
 
@@ -1242,13 +1249,16 @@ impl Database {
                 while child_cursor.valid() {
                     let child_value = child_cursor.value()?;
                     let child_record = RecordView::new(child_value, &child_record_schema)?;
-                    let child_row = OwnedValue::extract_row_from_record(&child_record, child_columns)?;
+                    let child_row =
+                        OwnedValue::extract_row_from_record(&child_record, child_columns)?;
 
                     if let Some(child_fk_val) = child_row.get(*fk_col_idx) {
                         for (ref_col_idx, del_val) in &values_to_check {
-                            if let Some((_, _, _, matching_ref_idx)) = fk_references.iter().find(|(s, n, _, r)| {
-                                s == child_schema && n == child_name && r == ref_col_idx
-                            }) {
+                            if let Some((_, _, _, matching_ref_idx)) =
+                                fk_references.iter().find(|(s, n, _, r)| {
+                                    s == child_schema && n == child_name && r == ref_col_idx
+                                })
+                            {
                                 if matching_ref_idx == ref_col_idx && child_fk_val == del_val {
                                     bail!(
                                         "FOREIGN KEY constraint violated: row in '{}' is still referenced by '{}'",
