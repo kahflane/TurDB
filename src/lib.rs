@@ -85,6 +85,7 @@ pub mod database;
 pub mod encoding;
 pub mod hnsw;
 pub mod mvcc;
+pub mod parsing;
 pub mod records;
 pub mod schema;
 pub mod sql;

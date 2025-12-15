@@ -1,8 +1,7 @@
-//! # Data Types and Column Definitions
+//! # Data Types and Column Definitions for Records
 //!
-//! This module defines the core type system for TurDB records:
-//! - `DataType`: Enumeration of all supported column types
-//! - `ColumnDef`: Column definition with name and type
+//! This module re-exports `DataType` from the unified types module and provides
+//! records-specific types like `ColumnDef` for record building.
 //!
 //! ## Type Categories
 //!
@@ -30,85 +29,7 @@
 //! | inet4 | 4 |
 //! | inet6 | 16 |
 
-#[repr(u8)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DataType {
-    Bool = 0,
-    Int2 = 1,
-    Int4 = 2,
-    Int8 = 3,
-    Float4 = 4,
-    Float8 = 5,
-    Date = 6,
-    Time = 7,
-    Timestamp = 8,
-    TimestampTz = 9,
-    Uuid = 10,
-    MacAddr = 11,
-    Inet4 = 12,
-    Inet6 = 13,
-    Text = 20,
-    Blob = 21,
-    Vector = 22,
-    Jsonb = 23,
-    Varchar = 24,
-    Char = 25,
-    Decimal = 30,
-    Interval = 31,
-    Int4Range = 40,
-    Int8Range = 41,
-    DateRange = 42,
-    TimestampRange = 43,
-    Enum = 50,
-    Point = 60,
-    Box = 61,
-    Circle = 62,
-    Composite = 70,
-    Array = 71,
-}
-
-impl DataType {
-    pub fn fixed_size(&self) -> Option<usize> {
-        match self {
-            DataType::Bool => Some(1),
-            DataType::Int2 => Some(2),
-            DataType::Int4 => Some(4),
-            DataType::Int8 => Some(8),
-            DataType::Float4 => Some(4),
-            DataType::Float8 => Some(8),
-            DataType::Date => Some(4),
-            DataType::Time => Some(8),
-            DataType::Timestamp => Some(8),
-            DataType::TimestampTz => Some(12),
-            DataType::Uuid => Some(16),
-            DataType::MacAddr => Some(6),
-            DataType::Inet4 => Some(4),
-            DataType::Inet6 => Some(16),
-            DataType::Text => None,
-            DataType::Blob => None,
-            DataType::Vector => None,
-            DataType::Jsonb => None,
-            DataType::Varchar => None,
-            DataType::Char => None,
-            DataType::Decimal => None,
-            DataType::Interval => Some(16),
-            DataType::Int4Range => Some(9),
-            DataType::Int8Range => Some(17),
-            DataType::DateRange => Some(9),
-            DataType::TimestampRange => Some(17),
-            DataType::Enum => Some(4),
-            DataType::Point => Some(16),
-            DataType::Box => Some(32),
-            DataType::Circle => Some(24),
-            DataType::Composite => None,
-            DataType::Array => None,
-        }
-    }
-
-    pub fn is_variable(&self) -> bool {
-        self.fixed_size().is_none()
-    }
-}
+pub use crate::types::DataType;
 
 #[derive(Debug, Clone)]
 pub struct ColumnDef {

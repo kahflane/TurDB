@@ -188,11 +188,11 @@ fn bench_type_affinity(c: &mut Criterion) {
         (DataType::Int8, "int8"),
         (DataType::Float8, "float8"),
         (DataType::Text, "text"),
-        (DataType::Varchar(255), "varchar"),
+        (DataType::Varchar, "varchar"),
         (DataType::Blob, "blob"),
         (DataType::Timestamp, "timestamp"),
-        (DataType::Vector(128), "vector"),
-        (DataType::Array(Box::new(DataType::Int4)), "array"),
+        (DataType::Vector, "vector"),
+        (DataType::Array, "array"),
     ];
 
     for (dtype, name) in data_types {
