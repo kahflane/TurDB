@@ -230,6 +230,17 @@ impl Catalog {
         }
         bail!("index '{}' not found", index_name)
     }
+
+    pub fn table_by_id(&self, table_id: u64) -> Option<&TableDef> {
+        for schema in self.schemas.values() {
+            for table in schema.tables().values() {
+                if table.id() == table_id {
+                    return Some(table);
+                }
+            }
+        }
+        None
+    }
 }
 
 impl Default for Catalog {
