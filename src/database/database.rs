@@ -35,6 +35,7 @@ pub struct ActiveTransaction {
     pub read_only: bool,
     pub savepoints: SmallVec<[Savepoint; 4]>,
     pub write_entries: SmallVec<[WriteEntry; 16]>,
+    pub undo_data: SmallVec<[Option<Vec<u8>>; 16]>,
 }
 
 impl ActiveTransaction {
@@ -52,6 +53,7 @@ impl ActiveTransaction {
             read_only,
             savepoints: SmallVec::new(),
             write_entries: SmallVec::new(),
+            undo_data: SmallVec::new(),
         }
     }
 
@@ -68,22 +70,30 @@ impl ActiveTransaction {
 
     pub fn add_write_entry(&mut self, entry: WriteEntry) {
         self.write_entries.push(entry);
+        self.undo_data.push(None);
     }
 
-    pub fn rollback_to_savepoint(&mut self, idx: usize) -> Vec<WriteEntry> {
+    pub fn add_write_entry_with_undo(&mut self, entry: WriteEntry, undo: Vec<u8>) {
+        self.write_entries.push(entry);
+        self.undo_data.push(Some(undo));
+    }
+
+    pub fn rollback_to_savepoint(&mut self, idx: usize) -> (Vec<WriteEntry>, Vec<Option<Vec<u8>>>) {
         let savepoint = &self.savepoints[idx];
         let target_idx = savepoint.write_entry_idx;
         let entries_to_undo: Vec<WriteEntry> = self.write_entries.drain(target_idx..).collect();
+        let undo_to_apply: Vec<Option<Vec<u8>>> = self.undo_data.drain(target_idx..).collect();
         self.savepoints.truncate(idx + 1);
-        entries_to_undo
+        (entries_to_undo, undo_to_apply)
     }
 
     pub fn release_savepoint(&mut self, idx: usize) {
         self.savepoints.remove(idx);
     }
 
-    pub fn take_write_entries(&mut self) -> SmallVec<[WriteEntry; 16]> {
-        std::mem::take(&mut self.write_entries)
+    #[allow(clippy::type_complexity)]
+    pub fn take_write_entries(&mut self) -> (SmallVec<[WriteEntry; 16]>, SmallVec<[Option<Vec<u8>>; 16]>) {
+        (std::mem::take(&mut self.write_entries), std::mem::take(&mut self.undo_data))
     }
 }
 
@@ -1149,6 +1159,7 @@ impl Database {
         let table_name = update.table.name;
 
         let table_def = catalog.resolve_table(table_name)?.clone();
+        let table_id = table_def.id();
         let columns = table_def.columns().to_vec();
 
         drop(catalog_guard);
@@ -1179,7 +1190,7 @@ impl Database {
         let btree = BTree::new(storage, root_page)?;
         let mut cursor = btree.cursor_first()?;
 
-        let mut rows_to_update: Vec<(Vec<u8>, Vec<OwnedValue>)> = Vec::new();
+        let mut rows_to_update: Vec<(Vec<u8>, Vec<u8>, Vec<OwnedValue>)> = Vec::new();
 
         while cursor.valid() {
             let key = cursor.key()?;
@@ -1200,6 +1211,8 @@ impl Database {
             };
 
             if should_update {
+                let old_value = value.to_vec();
+
                 for (col_idx, value_expr) in &assignment_indices {
                     let new_value = Self::eval_literal(value_expr)?;
                     row_values[*col_idx] = new_value;
@@ -1224,7 +1237,7 @@ impl Database {
                     }
                 }
 
-                rows_to_update.push((key.to_vec(), row_values));
+                rows_to_update.push((key.to_vec(), old_value, row_values));
             }
 
             cursor.advance()?;
@@ -1247,7 +1260,7 @@ impl Database {
             let btree_for_check = BTree::new(storage_for_check, root_page)?;
             let mut check_cursor = btree_for_check.cursor_first()?;
 
-            for (update_key, updated_values) in &rows_to_update {
+            for (update_key, _old_value, updated_values) in &rows_to_update {
                 while check_cursor.valid() {
                     let existing_key = check_cursor.key()?;
 
@@ -1284,10 +1297,32 @@ impl Database {
         let storage = file_manager.table_data_mut(schema_name, table_name)?;
         let mut btree_mut = BTree::new(storage, root_page)?;
 
-        for (key, updated_values) in rows_to_update {
-            btree_mut.delete(&key)?;
-            let record_data = OwnedValue::build_record_from_values(&updated_values, &schema)?;
-            btree_mut.insert(&key, &record_data)?;
+        for (key, _old_value, updated_values) in &rows_to_update {
+            btree_mut.delete(key)?;
+            let record_data = OwnedValue::build_record_from_values(updated_values, &schema)?;
+            btree_mut.insert(key, &record_data)?;
+        }
+
+        drop(file_manager_guard);
+
+        {
+            let mut active_txn = self.active_txn.lock();
+            if let Some(ref mut txn) = *active_txn {
+                for (key, old_value, _updated_values) in rows_to_update {
+                    txn.add_write_entry_with_undo(
+                        WriteEntry {
+                            table_id: table_id as u32,
+                            key,
+                            page_id: 0,
+                            offset: 0,
+                            undo_page_id: None,
+                            undo_offset: None,
+                            is_insert: false,
+                        },
+                        old_value,
+                    );
+                }
+            }
         }
 
         Ok(ExecuteResult::Update { rows_affected })
@@ -1315,6 +1350,7 @@ impl Database {
         let table_name = delete.table.name;
 
         let table_def = catalog.resolve_table(table_name)?;
+        let table_id = table_def.id();
         let columns = table_def.columns().to_vec();
 
         let mut fk_references: Vec<(String, String, String, usize)> = Vec::new();
@@ -1385,7 +1421,7 @@ impl Database {
         let btree = BTree::new(storage, root_page)?;
         let mut cursor = btree.cursor_first()?;
 
-        let mut keys_to_delete: Vec<Vec<u8>> = Vec::new();
+        let mut rows_to_delete: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
         let mut values_to_check: Vec<(usize, OwnedValue)> = Vec::new();
 
         while cursor.valid() {
@@ -1407,7 +1443,7 @@ impl Database {
             };
 
             if should_delete {
-                keys_to_delete.push(key.to_vec());
+                rows_to_delete.push((key.to_vec(), value.to_vec()));
 
                 if !fk_references.is_empty() {
                     let record = RecordView::new(value, &schema)?;
@@ -1459,12 +1495,34 @@ impl Database {
             }
         }
 
-        let rows_affected = keys_to_delete.len();
+        let rows_affected = rows_to_delete.len();
         let storage = file_manager.table_data_mut(schema_name, table_name)?;
         let mut btree_mut = BTree::new(storage, root_page)?;
 
-        for key in keys_to_delete {
-            btree_mut.delete(&key)?;
+        for (key, _old_value) in &rows_to_delete {
+            btree_mut.delete(key)?;
+        }
+
+        drop(file_manager_guard);
+
+        {
+            let mut active_txn = self.active_txn.lock();
+            if let Some(ref mut txn) = *active_txn {
+                for (key, old_value) in rows_to_delete {
+                    txn.add_write_entry_with_undo(
+                        WriteEntry {
+                            table_id: table_id as u32,
+                            key,
+                            page_id: 0,
+                            offset: 0,
+                            undo_page_id: None,
+                            undo_offset: None,
+                            is_insert: false,
+                        },
+                        old_value,
+                    );
+                }
+            }
         }
 
         Ok(ExecuteResult::Delete { rows_affected })
@@ -1630,7 +1688,7 @@ impl Database {
     }
 
     fn finalize_transaction_commit(&self, mut txn: ActiveTransaction) -> Result<()> {
-        let write_entries = txn.take_write_entries();
+        let (write_entries, _undo_data) = txn.take_write_entries();
 
         for entry in write_entries.iter() {
             self.finalize_write_entry_commit(entry)?;
@@ -1658,10 +1716,10 @@ impl Database {
                 .find_savepoint(savepoint_name)
                 .ok_or_else(|| eyre::eyre!("savepoint '{}' does not exist", savepoint_name))?;
 
-            let entries_to_undo = txn.rollback_to_savepoint(sp_idx);
+            let (entries_to_undo, undo_data) = txn.rollback_to_savepoint(sp_idx);
 
             drop(active_txn);
-            self.undo_write_entries(&entries_to_undo)?;
+            self.undo_write_entries(&entries_to_undo, &undo_data)?;
 
             return Ok(ExecuteResult::Rollback);
         }
@@ -1671,21 +1729,23 @@ impl Database {
             .ok_or_else(|| eyre::eyre!("no transaction in progress"))?;
 
         let write_entries: Vec<WriteEntry> = txn.write_entries.iter().cloned().collect();
+        let undo_data: Vec<Option<Vec<u8>>> = txn.undo_data.iter().cloned().collect();
 
         drop(active_txn);
-        self.undo_write_entries(&write_entries)?;
+        self.undo_write_entries(&write_entries, &undo_data)?;
 
         Ok(ExecuteResult::Rollback)
     }
 
-    fn undo_write_entries(&self, entries: &[WriteEntry]) -> Result<()> {
-        for entry in entries.iter().rev() {
-            self.undo_write_entry(entry)?;
+    fn undo_write_entries(&self, entries: &[WriteEntry], undo_data: &[Option<Vec<u8>>]) -> Result<()> {
+        for (i, entry) in entries.iter().enumerate().rev() {
+            let undo = undo_data.get(i).and_then(|o| o.as_ref());
+            self.undo_write_entry(entry, undo)?;
         }
         Ok(())
     }
 
-    fn undo_write_entry(&self, entry: &WriteEntry) -> Result<()> {
+    fn undo_write_entry(&self, entry: &WriteEntry, undo_data: Option<&Vec<u8>>) -> Result<()> {
         self.ensure_file_manager()?;
 
         let mut file_manager_guard = self.file_manager.write();
@@ -1712,6 +1772,9 @@ impl Database {
 
         if entry.is_insert {
             btree.delete(&entry.key)?;
+        } else if let Some(old_value) = undo_data {
+            btree.delete(&entry.key)?;
+            btree.insert(&entry.key, old_value)?;
         }
 
         Ok(())
