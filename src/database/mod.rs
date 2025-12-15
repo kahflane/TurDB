@@ -1426,4 +1426,88 @@ mod tests {
             "Second should be expression"
         );
     }
+
+    #[test]
+    fn test_create_partial_index_with_where() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("test_db");
+
+        let db = Database::create(&db_path).unwrap();
+
+        db.execute("CREATE TABLE users (id INT, email TEXT, status TEXT)")
+            .unwrap();
+
+        let result =
+            db.execute("CREATE INDEX idx_active_users ON users (email) WHERE status = 'active'");
+        assert!(result.is_ok(), "CREATE INDEX with WHERE should succeed");
+
+        let catalog = db.catalog.read();
+        let catalog = catalog.as_ref().unwrap();
+        let table = catalog.resolve_table("users").unwrap();
+
+        let idx = table
+            .indexes()
+            .iter()
+            .find(|i| i.name() == "idx_active_users")
+            .expect("Index should exist");
+
+        assert!(idx.is_partial(), "Index should be partial");
+        assert!(
+            idx.where_clause().is_some(),
+            "Index should have WHERE clause"
+        );
+        let where_clause = idx.where_clause().unwrap();
+        assert!(
+            where_clause.contains("status") && where_clause.contains("active"),
+            "WHERE clause should reference status and active: {}",
+            where_clause
+        );
+    }
+
+    #[test]
+    fn test_create_partial_index_with_expression_and_where() {
+        use crate::schema::IndexColumnDef;
+
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("test_db");
+
+        let db = Database::create(&db_path).unwrap();
+
+        db.execute("CREATE TABLE users (id INT, email TEXT, deleted_at TIMESTAMP)")
+            .unwrap();
+
+        let result = db.execute(
+            "CREATE UNIQUE INDEX idx_unique_email ON users (LOWER(email)) WHERE deleted_at IS NULL",
+        );
+        assert!(
+            result.is_ok(),
+            "CREATE UNIQUE INDEX with WHERE should succeed"
+        );
+
+        let catalog = db.catalog.read();
+        let catalog = catalog.as_ref().unwrap();
+        let table = catalog.resolve_table("users").unwrap();
+
+        let idx = table
+            .indexes()
+            .iter()
+            .find(|i| i.name() == "idx_unique_email")
+            .expect("Index should exist");
+
+        assert!(idx.is_unique(), "Index should be unique");
+        assert!(idx.is_partial(), "Index should be partial");
+        assert!(idx.has_expressions(), "Index should have expressions");
+
+        let col_defs = idx.column_defs();
+        assert_eq!(col_defs.len(), 1);
+        assert!(
+            matches!(&col_defs[0], IndexColumnDef::Expression(e) if e.contains("LOWER")),
+            "Should have LOWER expression"
+        );
+
+        assert!(
+            idx.where_clause().unwrap().contains("deleted_at"),
+            "WHERE clause should reference deleted_at"
+        );
+    }
 }

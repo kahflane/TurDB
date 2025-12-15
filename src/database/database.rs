@@ -664,12 +664,16 @@ impl Database {
             .collect();
         let key_column_count = column_defs.len() as u32;
 
-        let index_def = crate::schema::table::IndexDef::new_expression(
+        let mut index_def = crate::schema::table::IndexDef::new_expression(
             index_name.to_string(),
             column_defs,
             create.unique,
             crate::schema::table::IndexType::BTree,
         );
+
+        if let Some(where_clause) = create.where_clause {
+            index_def = index_def.with_where_clause(Self::format_expr(where_clause));
+        }
 
         let mut catalog_guard = self.catalog.write();
         let catalog = catalog_guard.as_mut().unwrap();
