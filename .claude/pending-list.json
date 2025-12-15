@@ -166,7 +166,8 @@
       "files": ["tests/"],
       "effort": "1 week",
       "impact": "No integration test coverage",
-      "status": "pending"
+      "status": "completed",
+      "notes": "Created tests/integration_sql.rs with 65 tests covering DDL, DML, transactions, persistence, constraints, data types, aggregations, and edge cases. 48 pass, 17 fail (documenting areas needing implementation)."
     },
     {
       "id": 3,
