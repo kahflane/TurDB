@@ -1344,4 +1344,52 @@ mod tests {
             err_msg
         );
     }
+
+    #[test]
+    fn test_create_table_with_geometric_types() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("test_db");
+
+        let db = Database::create(&db_path).unwrap();
+
+        let result =
+            db.execute("CREATE TABLE geo (id INT, location POINT, area CIRCLE, bounds BOX)");
+        assert!(
+            result.is_ok(),
+            "Should create table with geometric types: {:?}",
+            result.err()
+        );
+    }
+
+    #[test]
+    fn test_create_table_with_range_types() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("test_db");
+
+        let db = Database::create(&db_path).unwrap();
+
+        let result = db.execute(
+            "CREATE TABLE ranges (id INT, r1 INT4RANGE, r2 INT8RANGE, r3 DATERANGE, r4 TSRANGE)",
+        );
+        assert!(
+            result.is_ok(),
+            "Should create table with range types: {:?}",
+            result.err()
+        );
+    }
+
+    #[test]
+    fn test_create_table_with_network_types() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("test_db");
+
+        let db = Database::create(&db_path).unwrap();
+
+        let result = db.execute("CREATE TABLE network (id INT, mac MACADDR, ip INET)");
+        assert!(
+            result.is_ok(),
+            "Should create table with network types: {:?}",
+            result.err()
+        );
+    }
 }
