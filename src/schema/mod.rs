@@ -139,6 +139,10 @@ impl Schema {
         self.tables.get(name)
     }
 
+    pub fn get_table_mut(&mut self, name: &str) -> Option<&mut TableDef> {
+        self.tables.get_mut(name)
+    }
+
     pub fn remove_table(&mut self, name: &str) -> Option<TableDef> {
         self.tables.remove(name)
     }
@@ -149,6 +153,10 @@ impl Schema {
 
     pub fn tables(&self) -> &HashMap<String, TableDef> {
         &self.tables
+    }
+
+    pub fn tables_mut(&mut self) -> &mut HashMap<String, TableDef> {
+        &mut self.tables
     }
 }
 

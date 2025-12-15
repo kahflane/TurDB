@@ -2,7 +2,19 @@
 
 ## Project Overview
 
-TurDB is a high-performance embedded database combining SQLite-inspired row storage with native vector search (HNSW). This Rust implementation prioritizes zero-copy operations, zero allocation during CRUD, and extreme memory efficiency.
+TurDB is an embedded database combining SQLite-inspired row storage with native vector search (HNSW). This Rust implementation prioritizes zero-copy operations, zero allocation during CRUD, and extreme memory efficiency.
+
+# Coding Style & File Structure Rules
+
+## 1. File Structure
+- **Max Length:** Strictly aim for files under 800 lines.
+- **Modularity:** Prefer many small modules over one large module.
+- **The "One Struct" Rule:** Major structs should usually have their own file.
+- **Barrels:** Use `mod.rs` (or file-named modules) primarily for `pub mod` and `pub use` re-exports to create a clean public API. Avoid putting core logic in the root of a module.
+
+## 2. Idiomatic Separation
+- **Tests:** Unit tests (`#[cfg(test)]`) go at the bottom of the file. If tests exceed 200 lines, move them to a `tests/` directory (integration style) or a separate `_tests.rs` submodule.
+
 
 ## Core Principles
 

@@ -4,7 +4,7 @@
 
 use super::table::{ColumnDef, TableDef};
 use super::{Schema, SchemaId, TableId};
-use eyre::{ensure, Result};
+use eyre::{bail, ensure, Result};
 use std::collections::HashMap;
 
 #[derive(Debug)]
@@ -195,6 +195,40 @@ impl Catalog {
         self.schemas
             .get(schema_name)
             .and_then(|s| s.get_table(table_name))
+    }
+
+    pub fn get_table_mut(&mut self, schema_name: &str, table_name: &str) -> Option<&mut TableDef> {
+        let schema_name = if schema_name.is_empty() {
+            &self.default_schema
+        } else {
+            schema_name
+        };
+
+        self.schemas
+            .get_mut(schema_name)
+            .and_then(|s| s.get_table_mut(table_name))
+    }
+
+    pub fn find_index(&self, index_name: &str) -> Option<(&str, &str, &crate::schema::IndexDef)> {
+        for (schema_name, schema) in &self.schemas {
+            for (table_name, table) in schema.tables() {
+                if let Some(index) = table.get_index(index_name) {
+                    return Some((schema_name, table_name, index));
+                }
+            }
+        }
+        None
+    }
+
+    pub fn remove_index(&mut self, index_name: &str) -> Result<()> {
+        for schema in self.schemas.values_mut() {
+            for table in schema.tables_mut().values_mut() {
+                if table.remove_index(index_name).is_some() {
+                    return Ok(());
+                }
+            }
+        }
+        bail!("index '{}' not found", index_name)
     }
 }
 
