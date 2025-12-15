@@ -1318,6 +1318,58 @@ impl<'a> Planner<'a> {
             .collect()
     }
 
+    pub fn find_applicable_indexes_with_predicate<'t>(
+        &self,
+        table: &'t crate::schema::TableDef,
+        filter_columns: &[&str],
+        query_predicate: Option<&str>,
+    ) -> Vec<&'t crate::schema::IndexDef> {
+        table
+            .indexes()
+            .iter()
+            .filter(|idx| {
+                if idx.columns().is_empty() {
+                    return false;
+                }
+                let column_matches = idx
+                    .columns()
+                    .first()
+                    .map(|first_col| filter_columns.contains(&first_col.as_str()))
+                    .unwrap_or(false);
+
+                if !column_matches {
+                    return false;
+                }
+
+                if let Some(where_clause) = idx.where_clause() {
+                    match query_predicate {
+                        Some(pred) => self.predicate_implies_where_clause(pred, where_clause),
+                        None => false,
+                    }
+                } else {
+                    true
+                }
+            })
+            .collect()
+    }
+
+    fn predicate_implies_where_clause(&self, query_predicate: &str, index_where: &str) -> bool {
+        let norm_query = Self::normalize_predicate(query_predicate);
+        let norm_index = Self::normalize_predicate(index_where);
+
+        norm_query.contains(&norm_index)
+    }
+
+    fn normalize_predicate(predicate: &str) -> String {
+        predicate
+            .replace("(", "")
+            .replace(")", "")
+            .replace(" Eq ", " = ")
+            .replace(" = ", "=")
+            .replace("'", "")
+            .to_lowercase()
+    }
+
     pub fn select_best_index<'t>(
         &self,
         table: &'t crate::schema::TableDef,
@@ -2909,6 +2961,77 @@ mod tests {
         let candidates = planner.find_applicable_indexes(&table, &filter_columns);
 
         assert!(candidates.iter().any(|idx| idx.name() == "idx_name_email"));
+    }
+
+    #[test]
+    fn partial_index_not_applicable_without_predicate() {
+        use crate::schema::{IndexDef, IndexType, TableDef};
+
+        let arena = Bump::new();
+        let catalog = Catalog::new();
+        let planner = Planner::new(&catalog, &arena);
+
+        let partial_index =
+            IndexDef::new("idx_active_email", vec!["email"], false, IndexType::BTree)
+                .with_where_clause("status = 'active'".to_string());
+
+        let table =
+            TableDef::new(1, "users", vec![]).with_index(partial_index);
+
+        let filter_columns: Vec<&str> = vec!["email"];
+        let candidates = planner.find_applicable_indexes_with_predicate(&table, &filter_columns, None);
+
+        assert!(
+            candidates.is_empty(),
+            "Partial index should not be applicable without matching predicate"
+        );
+    }
+
+    #[test]
+    fn partial_index_applicable_with_matching_predicate() {
+        use crate::schema::{IndexDef, IndexType, TableDef};
+
+        let arena = Bump::new();
+        let catalog = Catalog::new();
+        let planner = Planner::new(&catalog, &arena);
+
+        let partial_index =
+            IndexDef::new("idx_active_email", vec!["email"], false, IndexType::BTree)
+                .with_where_clause("status = 'active'".to_string());
+
+        let table =
+            TableDef::new(1, "users", vec![]).with_index(partial_index);
+
+        let filter_columns: Vec<&str> = vec!["email", "status"];
+        let query_predicate = Some("(status Eq 'active')");
+        let candidates =
+            planner.find_applicable_indexes_with_predicate(&table, &filter_columns, query_predicate);
+
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].name(), "idx_active_email");
+    }
+
+    #[test]
+    fn regular_index_applicable_regardless_of_predicate() {
+        use crate::schema::{IndexDef, IndexType, TableDef};
+
+        let arena = Bump::new();
+        let catalog = Catalog::new();
+        let planner = Planner::new(&catalog, &arena);
+
+        let regular_index = IndexDef::new("idx_email", vec!["email"], false, IndexType::BTree);
+
+        let table =
+            TableDef::new(1, "users", vec![]).with_index(regular_index);
+
+        let filter_columns: Vec<&str> = vec!["email"];
+        let candidates_no_pred =
+            planner.find_applicable_indexes_with_predicate(&table, &filter_columns, None);
+        let candidates_with_pred =
+            planner.find_applicable_indexes_with_predicate(&table, &filter_columns, Some("status = 'foo'"));
+
+        assert_eq!(candidates_no_pred.len(), 1);
+        assert_eq!(candidates_with_pred.len(), 1);
     }
 
     #[test]
