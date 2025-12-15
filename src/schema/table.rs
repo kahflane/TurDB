@@ -167,11 +167,42 @@ impl ColumnDef {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub enum IndexColumnDef {
+    Column(String),
+    Expression(String),
+}
+
+impl IndexColumnDef {
+    pub fn is_column(&self) -> bool {
+        matches!(self, IndexColumnDef::Column(_))
+    }
+
+    pub fn is_expression(&self) -> bool {
+        matches!(self, IndexColumnDef::Expression(_))
+    }
+
+    pub fn as_column(&self) -> Option<&str> {
+        match self {
+            IndexColumnDef::Column(c) => Some(c),
+            IndexColumnDef::Expression(_) => None,
+        }
+    }
+
+    pub fn as_expression(&self) -> Option<&str> {
+        match self {
+            IndexColumnDef::Column(_) => None,
+            IndexColumnDef::Expression(e) => Some(e),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct IndexDef {
     name: String,
-    columns: Vec<String>,
+    column_defs: Vec<IndexColumnDef>,
     is_unique: bool,
     index_type: IndexType,
+    where_clause: Option<String>,
 }
 
 impl IndexDef {
@@ -183,18 +214,49 @@ impl IndexDef {
     ) -> Self {
         Self {
             name: name.into(),
-            columns: columns.into_iter().map(|c| c.into()).collect(),
+            column_defs: columns
+                .into_iter()
+                .map(|c| IndexColumnDef::Column(c.into()))
+                .collect(),
             is_unique,
             index_type,
+            where_clause: None,
         }
+    }
+
+    pub fn new_expression(
+        name: impl Into<String>,
+        column_defs: Vec<IndexColumnDef>,
+        is_unique: bool,
+        index_type: IndexType,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            column_defs,
+            is_unique,
+            index_type,
+            where_clause: None,
+        }
+    }
+
+    pub fn with_where_clause(mut self, predicate: String) -> Self {
+        self.where_clause = Some(predicate);
+        self
     }
 
     pub fn name(&self) -> &str {
         &self.name
     }
 
-    pub fn columns(&self) -> &[String] {
-        &self.columns
+    pub fn columns(&self) -> Vec<String> {
+        self.column_defs
+            .iter()
+            .filter_map(|cd| cd.as_column().map(|s| s.to_string()))
+            .collect()
+    }
+
+    pub fn column_defs(&self) -> &[IndexColumnDef] {
+        &self.column_defs
     }
 
     pub fn is_unique(&self) -> bool {
@@ -203,6 +265,18 @@ impl IndexDef {
 
     pub fn index_type(&self) -> IndexType {
         self.index_type
+    }
+
+    pub fn has_expressions(&self) -> bool {
+        self.column_defs.iter().any(|cd| cd.is_expression())
+    }
+
+    pub fn is_partial(&self) -> bool {
+        self.where_clause.is_some()
+    }
+
+    pub fn where_clause(&self) -> Option<&str> {
+        self.where_clause.as_deref()
     }
 }
 
@@ -278,5 +352,120 @@ impl TableDef {
 
     pub fn add_index(&mut self, index: IndexDef) {
         self.indexes.push(index);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn index_def_supports_expression_columns() {
+        let expr_index = IndexDef::new_expression(
+            "idx_lower_email",
+            vec![IndexColumnDef::Expression("LOWER(email)".to_string())],
+            false,
+            IndexType::BTree,
+        );
+
+        assert_eq!(expr_index.name(), "idx_lower_email");
+        assert!(!expr_index.is_unique());
+        assert_eq!(expr_index.index_type(), IndexType::BTree);
+
+        let cols = expr_index.column_defs();
+        assert_eq!(cols.len(), 1);
+        assert!(matches!(&cols[0], IndexColumnDef::Expression(e) if e == "LOWER(email)"));
+    }
+
+    #[test]
+    fn index_def_supports_mixed_columns_and_expressions() {
+        let mixed_index = IndexDef::new_expression(
+            "idx_mixed",
+            vec![
+                IndexColumnDef::Column("tenant_id".to_string()),
+                IndexColumnDef::Expression("LOWER(email)".to_string()),
+            ],
+            true,
+            IndexType::BTree,
+        );
+
+        assert_eq!(mixed_index.name(), "idx_mixed");
+        assert!(mixed_index.is_unique());
+
+        let cols = mixed_index.column_defs();
+        assert_eq!(cols.len(), 2);
+        assert!(matches!(&cols[0], IndexColumnDef::Column(c) if c == "tenant_id"));
+        assert!(matches!(&cols[1], IndexColumnDef::Expression(e) if e == "LOWER(email)"));
+    }
+
+    #[test]
+    fn index_def_columns_returns_column_names_only() {
+        let mixed_index = IndexDef::new_expression(
+            "idx_mixed",
+            vec![
+                IndexColumnDef::Column("tenant_id".to_string()),
+                IndexColumnDef::Expression("LOWER(email)".to_string()),
+                IndexColumnDef::Column("status".to_string()),
+            ],
+            false,
+            IndexType::BTree,
+        );
+
+        let column_names = mixed_index.columns();
+        assert_eq!(column_names.len(), 2);
+        assert_eq!(column_names[0], "tenant_id");
+        assert_eq!(column_names[1], "status");
+    }
+
+    #[test]
+    fn index_def_backward_compatibility() {
+        let simple_index = IndexDef::new("idx_email", vec!["email"], false, IndexType::BTree);
+
+        assert_eq!(simple_index.name(), "idx_email");
+        assert_eq!(simple_index.columns(), &["email".to_string()]);
+
+        let cols = simple_index.column_defs();
+        assert_eq!(cols.len(), 1);
+        assert!(matches!(&cols[0], IndexColumnDef::Column(c) if c == "email"));
+    }
+
+    #[test]
+    fn index_def_supports_partial_index_where_clause() {
+        let partial_index =
+            IndexDef::new("idx_active_users", vec!["email"], false, IndexType::BTree)
+                .with_where_clause("status = 'active'".to_string());
+
+        assert_eq!(partial_index.name(), "idx_active_users");
+        assert!(!partial_index.is_unique());
+        assert!(partial_index.is_partial());
+        assert_eq!(partial_index.where_clause(), Some("status = 'active'"));
+    }
+
+    #[test]
+    fn index_def_non_partial_has_no_where_clause() {
+        let regular_index = IndexDef::new("idx_email", vec!["email"], false, IndexType::BTree);
+
+        assert!(!regular_index.is_partial());
+        assert_eq!(regular_index.where_clause(), None);
+    }
+
+    #[test]
+    fn index_def_partial_with_expression_columns() {
+        let partial_expr_index = IndexDef::new_expression(
+            "idx_lower_active",
+            vec![IndexColumnDef::Expression("LOWER(email)".to_string())],
+            true,
+            IndexType::BTree,
+        )
+        .with_where_clause("deleted_at IS NULL".to_string());
+
+        assert_eq!(partial_expr_index.name(), "idx_lower_active");
+        assert!(partial_expr_index.is_unique());
+        assert!(partial_expr_index.is_partial());
+        assert!(partial_expr_index.has_expressions());
+        assert_eq!(
+            partial_expr_index.where_clause(),
+            Some("deleted_at IS NULL")
+        );
     }
 }

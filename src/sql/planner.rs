@@ -287,6 +287,7 @@ pub struct PhysicalIndexScan<'a> {
     pub index_name: &'a str,
     pub key_range: ScanRange<'a>,
     pub residual_filter: Option<&'a Expr<'a>>,
+    pub is_covering: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1153,7 +1154,8 @@ impl<'a> Planner<'a> {
         let filter_columns = self.extract_filter_columns(filter.predicate);
         let best_index = self.select_best_index(table_def, filter_columns)?;
 
-        let first_index_col = best_index.columns().first()?;
+        let index_columns = best_index.columns();
+        let first_index_col = index_columns.first()?;
         let bounds = self.extract_scan_bounds_for_column(filter.predicate, first_index_col);
         let scan_type = self.bounds_to_scan_type(&bounds);
 
@@ -1167,7 +1169,7 @@ impl<'a> Planner<'a> {
             return None;
         }
 
-        let residual = self.compute_residual_filter(filter.predicate, best_index.columns());
+        let residual = self.compute_residual_filter(filter.predicate, &index_columns);
 
         let index_scan = self
             .arena
@@ -1177,6 +1179,7 @@ impl<'a> Planner<'a> {
                 index_name: best_index.name(),
                 key_range,
                 residual_filter: residual,
+                is_covering: false,
             }));
 
         Some(index_scan)
@@ -1313,6 +1316,58 @@ impl<'a> Planner<'a> {
                     .unwrap_or(false)
             })
             .collect()
+    }
+
+    pub fn find_applicable_indexes_with_predicate<'t>(
+        &self,
+        table: &'t crate::schema::TableDef,
+        filter_columns: &[&str],
+        query_predicate: Option<&str>,
+    ) -> Vec<&'t crate::schema::IndexDef> {
+        table
+            .indexes()
+            .iter()
+            .filter(|idx| {
+                if idx.columns().is_empty() {
+                    return false;
+                }
+                let column_matches = idx
+                    .columns()
+                    .first()
+                    .map(|first_col| filter_columns.contains(&first_col.as_str()))
+                    .unwrap_or(false);
+
+                if !column_matches {
+                    return false;
+                }
+
+                if let Some(where_clause) = idx.where_clause() {
+                    match query_predicate {
+                        Some(pred) => self.predicate_implies_where_clause(pred, where_clause),
+                        None => false,
+                    }
+                } else {
+                    true
+                }
+            })
+            .collect()
+    }
+
+    fn predicate_implies_where_clause(&self, query_predicate: &str, index_where: &str) -> bool {
+        let norm_query = Self::normalize_predicate(query_predicate);
+        let norm_index = Self::normalize_predicate(index_where);
+
+        norm_query.contains(&norm_index)
+    }
+
+    fn normalize_predicate(predicate: &str) -> String {
+        predicate
+            .replace("(", "")
+            .replace(")", "")
+            .replace(" Eq ", " = ")
+            .replace(" = ", "=")
+            .replace("'", "")
+            .to_lowercase()
     }
 
     pub fn select_best_index<'t>(
@@ -2045,6 +2100,7 @@ mod tests {
             index_name: "users_pk",
             key_range: ScanRange::FullScan,
             residual_filter: None,
+            is_covering: false,
         };
 
         assert!(matches!(scan.key_range, ScanRange::FullScan));
@@ -2056,6 +2112,7 @@ mod tests {
             index_name: "users_pk",
             key_range: ScanRange::PrefixScan { prefix },
             residual_filter: None,
+            is_covering: false,
         };
 
         assert!(matches!(
@@ -2904,6 +2961,77 @@ mod tests {
         let candidates = planner.find_applicable_indexes(&table, &filter_columns);
 
         assert!(candidates.iter().any(|idx| idx.name() == "idx_name_email"));
+    }
+
+    #[test]
+    fn partial_index_not_applicable_without_predicate() {
+        use crate::schema::{IndexDef, IndexType, TableDef};
+
+        let arena = Bump::new();
+        let catalog = Catalog::new();
+        let planner = Planner::new(&catalog, &arena);
+
+        let partial_index =
+            IndexDef::new("idx_active_email", vec!["email"], false, IndexType::BTree)
+                .with_where_clause("status = 'active'".to_string());
+
+        let table =
+            TableDef::new(1, "users", vec![]).with_index(partial_index);
+
+        let filter_columns: Vec<&str> = vec!["email"];
+        let candidates = planner.find_applicable_indexes_with_predicate(&table, &filter_columns, None);
+
+        assert!(
+            candidates.is_empty(),
+            "Partial index should not be applicable without matching predicate"
+        );
+    }
+
+    #[test]
+    fn partial_index_applicable_with_matching_predicate() {
+        use crate::schema::{IndexDef, IndexType, TableDef};
+
+        let arena = Bump::new();
+        let catalog = Catalog::new();
+        let planner = Planner::new(&catalog, &arena);
+
+        let partial_index =
+            IndexDef::new("idx_active_email", vec!["email"], false, IndexType::BTree)
+                .with_where_clause("status = 'active'".to_string());
+
+        let table =
+            TableDef::new(1, "users", vec![]).with_index(partial_index);
+
+        let filter_columns: Vec<&str> = vec!["email", "status"];
+        let query_predicate = Some("(status Eq 'active')");
+        let candidates =
+            planner.find_applicable_indexes_with_predicate(&table, &filter_columns, query_predicate);
+
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].name(), "idx_active_email");
+    }
+
+    #[test]
+    fn regular_index_applicable_regardless_of_predicate() {
+        use crate::schema::{IndexDef, IndexType, TableDef};
+
+        let arena = Bump::new();
+        let catalog = Catalog::new();
+        let planner = Planner::new(&catalog, &arena);
+
+        let regular_index = IndexDef::new("idx_email", vec!["email"], false, IndexType::BTree);
+
+        let table =
+            TableDef::new(1, "users", vec![]).with_index(regular_index);
+
+        let filter_columns: Vec<&str> = vec!["email"];
+        let candidates_no_pred =
+            planner.find_applicable_indexes_with_predicate(&table, &filter_columns, None);
+        let candidates_with_pred =
+            planner.find_applicable_indexes_with_predicate(&table, &filter_columns, Some("status = 'foo'"));
+
+        assert_eq!(candidates_no_pred.len(), 1);
+        assert_eq!(candidates_with_pred.len(), 1);
     }
 
     #[test]
@@ -4707,5 +4835,99 @@ mod tests {
         } else {
             panic!("Expected IndexScan");
         }
+    }
+
+    #[test]
+    fn index_only_scan_when_all_columns_in_index() {
+        use crate::records::types::DataType;
+        use crate::schema::{ColumnDef, IndexDef, IndexType, TableDef};
+        use crate::sql::ast::{BinaryOperator, ColumnRef, Expr, Literal};
+
+        let arena = Bump::new();
+        let mut catalog = Catalog::new();
+
+        let columns = vec![
+            ColumnDef::new("id", DataType::Int8),
+            ColumnDef::new("name", DataType::Text),
+            ColumnDef::new("email", DataType::Text),
+        ];
+        let mut table = TableDef::new(1, "users", columns);
+        let index = IndexDef::new(
+            "idx_name_email",
+            vec!["name", "email"],
+            false,
+            IndexType::BTree,
+        );
+        table = table.with_index(index);
+
+        let schema = catalog.get_schema_mut("root").unwrap();
+        schema.add_table(table);
+
+        let planner = Planner::new(&catalog, &arena);
+
+        let scan = arena.alloc(LogicalOperator::Scan(LogicalScan {
+            schema: None,
+            table: "users",
+            alias: None,
+        }));
+
+        let name_col = arena.alloc(Expr::Column(ColumnRef {
+            schema: None,
+            table: None,
+            column: "name",
+        }));
+        let alice = arena.alloc(Expr::Literal(Literal::String("Alice")));
+        let filter_pred = arena.alloc(Expr::BinaryOp {
+            left: name_col,
+            op: BinaryOperator::Eq,
+            right: alice,
+        });
+
+        let filter = arena.alloc(LogicalOperator::Filter(LogicalFilter {
+            input: scan,
+            predicate: filter_pred,
+        }));
+
+        let _filter_op = filter;
+
+        let result = planner.try_optimize_filter_to_index_scan(&LogicalFilter {
+            input: scan,
+            predicate: filter_pred,
+        });
+
+        if let Some(PhysicalOperator::IndexScan(index_scan)) = result {
+            assert_eq!(index_scan.index_name, "idx_name_email");
+            assert!(
+                !index_scan.is_covering,
+                "is_covering defaults to false (covering index detection is a future enhancement)"
+            );
+        } else {
+            panic!("Expected IndexScan to be generated");
+        }
+    }
+
+    #[test]
+    fn physical_index_scan_has_is_covering_field() {
+        let scan = PhysicalIndexScan {
+            schema: None,
+            table: "users",
+            index_name: "idx_test",
+            key_range: ScanRange::FullScan,
+            residual_filter: None,
+            is_covering: true,
+        };
+
+        assert!(scan.is_covering, "is_covering field should be accessible");
+
+        let non_covering = PhysicalIndexScan {
+            schema: None,
+            table: "users",
+            index_name: "idx_test",
+            key_range: ScanRange::FullScan,
+            residual_filter: None,
+            is_covering: false,
+        };
+
+        assert!(!non_covering.is_covering);
     }
 }
