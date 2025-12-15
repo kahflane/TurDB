@@ -79,6 +79,9 @@
 //! - `sql`: Lexer, parser, planner, executor
 //! - `transaction`: MVCC and WAL
 
+#[macro_use]
+mod macros;
+
 pub mod btree;
 pub mod constraints;
 pub mod database;
