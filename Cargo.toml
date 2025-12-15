@@ -13,6 +13,7 @@ zerocopy = { version = "0.8", features = ["derive"] }
 bumpalo = { version = "3.14", features = ["collections"] }
 smallvec = "1.11"
 hashbrown = "0.14"
+paste = "1.0"
 phf = { version = "0.11", features = ["macros"] }
 crc = "3.0"
 
