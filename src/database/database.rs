@@ -934,6 +934,14 @@ impl Database {
                 key::encode_float(*y, buf);
                 key::encode_float(*r, buf);
             }
+            OwnedValue::Decimal(digits, scale) => {
+                let divisor = 10i128.pow(*scale as u32);
+                let float_val = *digits as f64 / divisor as f64;
+                key::encode_float(float_val, buf);
+            }
+            OwnedValue::Enum(type_id, ordinal) => {
+                key::encode_enum(*type_id as u32, *ordinal as u32, buf);
+            }
         }
     }
 
