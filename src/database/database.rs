@@ -3,6 +3,7 @@ use crate::database::row::Row;
 use crate::database::{CheckpointInfo, ExecuteResult, RecoveryInfo};
 use crate::parsing::{parse_binary_blob, parse_hex_blob, parse_interval, parse_uuid, parse_vector};
 use crate::schema::{Catalog, ColumnDef as SchemaColumnDef};
+use crate::sql::ast::IsolationLevel;
 use crate::sql::builder::ExecutorBuilder;
 use crate::sql::context::ExecutionContext;
 use crate::sql::executor::{Executor, StreamingBTreeSource};
@@ -14,7 +15,77 @@ use bumpalo::Bump;
 use eyre::{bail, ensure, Result, WrapErr};
 use hashbrown::HashSet;
 use parking_lot::{Mutex, RwLock};
+use smallvec::SmallVec;
 use std::path::{Path, PathBuf};
+
+#[derive(Debug, Clone)]
+pub struct Savepoint {
+    pub name: String,
+    pub write_set_idx: usize,
+}
+
+#[derive(Debug)]
+#[allow(dead_code)]
+pub struct TransactionState {
+    pub isolation_level: Option<IsolationLevel>,
+    pub read_only: bool,
+    pub savepoints: SmallVec<[Savepoint; 4]>,
+    pub pending_inserts: Vec<PendingOperation>,
+    pub pending_updates: Vec<PendingOperation>,
+    pub pending_deletes: Vec<PendingOperation>,
+}
+
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub struct PendingOperation {
+    pub table_name: String,
+    pub row_id: u64,
+    pub data: Vec<u8>,
+}
+
+impl TransactionState {
+    pub fn new(isolation_level: Option<IsolationLevel>, read_only: bool) -> Self {
+        Self {
+            isolation_level,
+            read_only,
+            savepoints: SmallVec::new(),
+            pending_inserts: Vec::new(),
+            pending_updates: Vec::new(),
+            pending_deletes: Vec::new(),
+        }
+    }
+
+    pub fn create_savepoint(&mut self, name: String) {
+        let write_set_idx =
+            self.pending_inserts.len() + self.pending_updates.len() + self.pending_deletes.len();
+        self.savepoints.push(Savepoint {
+            name,
+            write_set_idx,
+        });
+    }
+
+    pub fn find_savepoint(&self, name: &str) -> Option<usize> {
+        self.savepoints.iter().position(|sp| sp.name == name)
+    }
+
+    pub fn rollback_to_savepoint(&mut self, idx: usize) {
+        let savepoint = &self.savepoints[idx];
+        let target_idx = savepoint.write_set_idx;
+        self.pending_inserts
+            .truncate(target_idx.min(self.pending_inserts.len()));
+        self.pending_updates.truncate(
+            target_idx
+                .saturating_sub(self.pending_inserts.len())
+                .min(self.pending_updates.len()),
+        );
+        self.pending_deletes.truncate(0);
+        self.savepoints.truncate(idx + 1);
+    }
+
+    pub fn release_savepoint(&mut self, idx: usize) {
+        self.savepoints.remove(idx);
+    }
+}
 
 pub struct Database {
     path: PathBuf,
@@ -28,6 +99,7 @@ pub struct Database {
     closed: std::sync::atomic::AtomicBool,
     wal_enabled: std::sync::atomic::AtomicBool,
     dirty_pages: Mutex<HashSet<u32>>,
+    transaction_state: Mutex<Option<TransactionState>>,
 }
 
 impl Database {
@@ -85,6 +157,7 @@ impl Database {
             closed: AtomicBool::new(false),
             wal_enabled: AtomicBool::new(false),
             dirty_pages: Mutex::new(HashSet::new()),
+            transaction_state: Mutex::new(None),
         };
 
         let recovery_info = RecoveryInfo {
@@ -136,6 +209,7 @@ impl Database {
             closed: AtomicBool::new(false),
             wal_enabled: AtomicBool::new(false),
             dirty_pages: Mutex::new(HashSet::new()),
+            transaction_state: Mutex::new(None),
         })
     }
 
@@ -436,6 +510,11 @@ impl Database {
                 }
             }
             Statement::Pragma(pragma) => self.execute_pragma(pragma),
+            Statement::Begin(begin) => self.execute_begin(begin),
+            Statement::Commit => self.execute_commit(),
+            Statement::Rollback(rollback) => self.execute_rollback(rollback),
+            Statement::Savepoint(savepoint) => self.execute_savepoint(savepoint),
+            Statement::Release(release) => self.execute_release(release),
             _ => bail!("unsupported statement type"),
         }
     }
@@ -1494,6 +1573,81 @@ impl Database {
             }
             _ => bail!("unknown PRAGMA: {}", name),
         }
+    }
+
+    fn execute_begin(&self, begin: &crate::sql::ast::BeginStmt) -> Result<ExecuteResult> {
+        let mut txn_state = self.transaction_state.lock();
+        if txn_state.is_some() {
+            bail!("transaction already in progress, use SAVEPOINT for nested transactions");
+        }
+        let read_only = begin.read_only.unwrap_or(false);
+        *txn_state = Some(TransactionState::new(begin.isolation_level, read_only));
+        Ok(ExecuteResult::Begin)
+    }
+
+    fn execute_commit(&self) -> Result<ExecuteResult> {
+        let mut txn_state = self.transaction_state.lock();
+        if txn_state.is_none() {
+            bail!("no transaction in progress");
+        }
+        *txn_state = None;
+        Ok(ExecuteResult::Commit)
+    }
+
+    fn execute_rollback(
+        &self,
+        rollback: &crate::sql::ast::RollbackStmt<'_>,
+    ) -> Result<ExecuteResult> {
+        let mut txn_state = self.transaction_state.lock();
+
+        if let Some(savepoint_name) = rollback.savepoint {
+            let state = txn_state
+                .as_mut()
+                .ok_or_else(|| eyre::eyre!("no transaction in progress"))?;
+
+            let sp_idx = state
+                .find_savepoint(savepoint_name)
+                .ok_or_else(|| eyre::eyre!("savepoint '{}' does not exist", savepoint_name))?;
+
+            state.rollback_to_savepoint(sp_idx);
+            return Ok(ExecuteResult::Rollback);
+        }
+
+        if txn_state.is_none() {
+            bail!("no transaction in progress");
+        }
+        *txn_state = None;
+        Ok(ExecuteResult::Rollback)
+    }
+
+    fn execute_savepoint(
+        &self,
+        savepoint: &crate::sql::ast::SavepointStmt<'_>,
+    ) -> Result<ExecuteResult> {
+        let mut txn_state = self.transaction_state.lock();
+        let state = txn_state
+            .as_mut()
+            .ok_or_else(|| eyre::eyre!("no transaction in progress"))?;
+
+        let name = savepoint.name.to_string();
+        state.create_savepoint(name.clone());
+        Ok(ExecuteResult::Savepoint { name })
+    }
+
+    fn execute_release(&self, release: &crate::sql::ast::ReleaseStmt<'_>) -> Result<ExecuteResult> {
+        let mut txn_state = self.transaction_state.lock();
+        let state = txn_state
+            .as_mut()
+            .ok_or_else(|| eyre::eyre!("no transaction in progress"))?;
+
+        let sp_idx = state
+            .find_savepoint(release.name)
+            .ok_or_else(|| eyre::eyre!("savepoint '{}' does not exist", release.name))?;
+
+        state.release_savepoint(sp_idx);
+        Ok(ExecuteResult::Release {
+            name: release.name.to_string(),
+        })
     }
 
     fn evaluate_check_expression(
