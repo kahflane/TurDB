@@ -57,7 +57,7 @@ fn create_sqlite_connection(dir: &tempfile::TempDir) -> Connection {
          PRAGMA cache_size=-65536;
          PRAGMA temp_store=MEMORY;",
     )
-        .unwrap();
+    .unwrap();
 
     conn
 }
@@ -70,7 +70,7 @@ fn create_sqlite_test_database(row_count: usize) -> (tempfile::TempDir, Connecti
         "CREATE TABLE users (id INTEGER, name TEXT, age INTEGER, score REAL)",
         [],
     )
-        .unwrap();
+    .unwrap();
 
     for i in 0..row_count {
         conn.execute(
@@ -82,7 +82,7 @@ fn create_sqlite_test_database(row_count: usize) -> (tempfile::TempDir, Connecti
                 (i as f64) * 0.1
             ],
         )
-            .unwrap();
+        .unwrap();
     }
 
     (dir, conn)
@@ -128,7 +128,7 @@ fn bench_insert_comparison(c: &mut Criterion) {
                         "CREATE TABLE users (id INTEGER, name TEXT, age INTEGER)",
                         [],
                     )
-                        .unwrap();
+                    .unwrap();
                     (dir, conn)
                 },
                 |(_dir, conn)| {
@@ -137,7 +137,7 @@ fn bench_insert_comparison(c: &mut Criterion) {
                             "INSERT INTO users VALUES (?1, ?2, ?3)",
                             params![i as i64, format!("user{}", i), 20 + (i % 60) as i64],
                         )
-                            .unwrap();
+                        .unwrap();
                     }
                     conn
                 },
@@ -191,7 +191,7 @@ fn bench_insert_prepared_comparison(c: &mut Criterion) {
                             "CREATE TABLE users (id INTEGER, name TEXT, age INTEGER)",
                             [],
                         )
-                            .unwrap();
+                        .unwrap();
                         (dir, conn)
                     },
                     |(_dir, conn)| {
@@ -205,7 +205,7 @@ fn bench_insert_prepared_comparison(c: &mut Criterion) {
                                     format!("user{}", i),
                                     20 + (i % 60) as i64
                                 ])
-                                    .unwrap();
+                                .unwrap();
                             }
                         }
                         conn
@@ -390,7 +390,7 @@ fn bench_large_text_comparison(c: &mut Criterion) {
                 "INSERT INTO docs VALUES (?1, ?2)",
                 params![counter as i64, &large_text],
             )
-                .unwrap();
+            .unwrap();
             counter += 1;
         });
     });
@@ -422,7 +422,7 @@ fn bench_large_text_comparison(c: &mut Criterion) {
                 "INSERT INTO docs VALUES (?1, ?2)",
                 params![i as i64, &large_text],
             )
-                .unwrap();
+            .unwrap();
         }
 
         b.iter(|| {
@@ -474,7 +474,7 @@ fn bench_lifecycle_comparison(c: &mut Criterion) {
                      PRAGMA synchronous=OFF;
                      PRAGMA mmap_size=268435456;",
                 )
-                    .unwrap();
+                .unwrap();
                 (dir, conn)
             },
         );
@@ -509,7 +509,7 @@ fn bench_lifecycle_comparison(c: &mut Criterion) {
                  PRAGMA synchronous=OFF;
                  PRAGMA mmap_size=268435456;",
             )
-                .unwrap();
+            .unwrap();
             conn.execute("CREATE TABLE test (id INTEGER, value TEXT)", [])
                 .unwrap();
             for i in 0..100 {
@@ -517,7 +517,7 @@ fn bench_lifecycle_comparison(c: &mut Criterion) {
                     "INSERT INTO test VALUES (?1, ?2)",
                     params![i as i64, format!("val{}", i)],
                 )
-                    .unwrap();
+                .unwrap();
             }
         }
 
@@ -528,7 +528,7 @@ fn bench_lifecycle_comparison(c: &mut Criterion) {
                  PRAGMA synchronous=OFF;
                  PRAGMA mmap_size=268435456;",
             )
-                .unwrap();
+            .unwrap();
             black_box(conn)
         });
     });
@@ -580,12 +580,12 @@ fn bench_insert_wal_comparison(c: &mut Criterion) {
                              PRAGMA mmap_size=268435456;
                              PRAGMA cache_size=-65536;",
                     )
-                        .unwrap();
+                    .unwrap();
                     conn.execute(
                         "CREATE TABLE users (id INTEGER, name TEXT, age INTEGER)",
                         [],
                     )
-                        .unwrap();
+                    .unwrap();
                     (dir, conn)
                 },
                 |(_dir, conn)| {
@@ -594,7 +594,7 @@ fn bench_insert_wal_comparison(c: &mut Criterion) {
                             "INSERT INTO users VALUES (?1, ?2, ?3)",
                             params![i as i64, format!("user{}", i), 20 + (i % 60) as i64],
                         )
-                            .unwrap();
+                        .unwrap();
                     }
                     conn
                 },
@@ -620,8 +620,10 @@ fn bench_unique_constraint_comparison(c: &mut Criterion) {
                         let dir = tempdir().unwrap();
                         let db_path = dir.path().join("bench_db");
                         let db = Database::create(&db_path).unwrap();
-                        db.execute("CREATE TABLE users (id INT PRIMARY KEY, name TEXT, email TEXT UNIQUE)")
-                            .unwrap();
+                        db.execute(
+                            "CREATE TABLE users (id INT PRIMARY KEY, name TEXT, email TEXT UNIQUE)",
+                        )
+                        .unwrap();
                         (dir, db)
                     },
                     |(_dir, db)| {
