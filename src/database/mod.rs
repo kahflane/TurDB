@@ -2023,11 +2023,7 @@ mod tests {
         db.execute("ROLLBACK").unwrap();
 
         let rows = db.query("SELECT * FROM test").unwrap();
-        assert_eq!(
-            rows.len(),
-            2,
-            "ROLLBACK should restore deleted row"
-        );
+        assert_eq!(rows.len(), 2, "ROLLBACK should restore deleted row");
     }
 
     #[test]
@@ -2076,7 +2072,8 @@ mod tests {
 
         let db = Database::create(&db_path).unwrap();
         db.execute("CREATE TABLE test (id INT, name TEXT)").unwrap();
-        db.execute("INSERT INTO test VALUES (1, 'original')").unwrap();
+        db.execute("INSERT INTO test VALUES (1, 'original')")
+            .unwrap();
 
         db.execute("BEGIN").unwrap();
         db.execute("UPDATE test SET name = 'modified' WHERE id = 1")
@@ -2105,7 +2102,8 @@ mod tests {
 
         let db = Database::create(&db_path).unwrap();
         db.execute("CREATE TABLE test (id INT, name TEXT)").unwrap();
-        db.execute("INSERT INTO test VALUES (1, 'original')").unwrap();
+        db.execute("INSERT INTO test VALUES (1, 'original')")
+            .unwrap();
 
         db.execute("BEGIN").unwrap();
         db.execute("UPDATE test SET name = 'first_update' WHERE id = 1")
@@ -2130,6 +2128,48 @@ mod tests {
         db.execute("COMMIT").unwrap();
         let rows = db.query("SELECT id, name FROM test").unwrap();
         let name = get_text_value(&rows[0].values[1]);
-        assert_eq!(name, "first_update", "After COMMIT, first_update should persist");
+        assert_eq!(
+            name, "first_update",
+            "After COMMIT, first_update should persist"
+        );
+    }
+
+    #[test]
+    fn test_wal_recovery_returns_frames_recovered() {
+        use crate::storage::{Wal, PAGE_SIZE};
+
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("test_db");
+
+        {
+            let db = Database::create(&db_path).unwrap();
+            db.execute("CREATE TABLE users (id INT, name TEXT)")
+                .unwrap();
+            drop(db);
+        }
+
+        let wal_dir = db_path.join("wal");
+        std::fs::create_dir_all(&wal_dir).unwrap();
+        let mut wal = Wal::create(&wal_dir).expect("should create WAL");
+
+        let page_data = vec![42u8; PAGE_SIZE];
+        wal.write_frame(0, 10, &page_data)
+            .expect("should write frame");
+
+        drop(wal);
+
+        let (db, recovery_info) = Database::open_with_recovery(&db_path).unwrap();
+
+        assert!(
+            recovery_info.frames_recovered > 0,
+            "expected frames_recovered > 0 when WAL has frames, got {}",
+            recovery_info.frames_recovered
+        );
+        assert!(
+            recovery_info.wal_size_bytes > 0,
+            "expected wal_size_bytes > 0"
+        );
+
+        drop(db);
     }
 }
