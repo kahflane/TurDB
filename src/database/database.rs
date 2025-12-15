@@ -254,6 +254,8 @@ impl Database {
     }
 
     pub fn query(&self, sql: &str) -> Result<Vec<Row>> {
+        use crate::sql::ast::{Distinct, Statement};
+
         self.ensure_catalog()?;
         self.ensure_file_manager()?;
 
@@ -263,6 +265,9 @@ impl Database {
         let stmt = parser
             .parse_statement()
             .wrap_err("failed to parse SQL statement")?;
+
+        let is_distinct =
+            matches!(&stmt, Statement::Select(select) if select.distinct == Distinct::Distinct);
 
         let catalog_guard = self.catalog.read();
         let catalog = catalog_guard.as_ref().unwrap();
@@ -376,6 +381,27 @@ impl Database {
             bail!("unsupported query plan type - only table scans currently supported")
         };
 
+        let rows = if is_distinct {
+            let mut seen: std::collections::HashSet<Vec<u64>> = std::collections::HashSet::new();
+            rows.into_iter()
+                .filter(|row| {
+                    let key: Vec<u64> = row
+                        .values
+                        .iter()
+                        .map(|v| {
+                            use std::hash::{Hash, Hasher};
+                            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                            format!("{:?}", v).hash(&mut hasher);
+                            hasher.finish()
+                        })
+                        .collect();
+                    seen.insert(key)
+                })
+                .collect()
+        } else {
+            rows
+        };
+
         Ok(rows)
     }
 
@@ -404,6 +430,8 @@ impl Database {
                 use crate::sql::ast::ObjectType;
                 match drop.object_type {
                     ObjectType::Table => self.execute_drop_table(drop),
+                    ObjectType::Index => self.execute_drop_index(drop),
+                    ObjectType::Schema => self.execute_drop_schema_stmt(drop),
                     _ => bail!("unsupported DROP statement type: {:?}", drop.object_type),
                 }
             }
@@ -1323,6 +1351,57 @@ impl Database {
         self.save_catalog()?;
 
         Ok(ExecuteResult::DropTable { dropped: true })
+    }
+
+    fn execute_drop_index(
+        &self,
+        drop_stmt: &crate::sql::ast::DropStmt<'_>,
+    ) -> Result<ExecuteResult> {
+        self.ensure_catalog()?;
+
+        let mut catalog_guard = self.catalog.write();
+        let catalog = catalog_guard.as_mut().unwrap();
+
+        for index_ref in drop_stmt.names.iter() {
+            let index_name = index_ref.name;
+
+            if catalog.find_index(index_name).is_some() {
+                catalog.remove_index(index_name)?;
+            } else if !drop_stmt.if_exists {
+                bail!("index '{}' not found", index_name);
+            }
+        }
+
+        drop(catalog_guard);
+        self.save_catalog()?;
+
+        Ok(ExecuteResult::DropIndex { dropped: true })
+    }
+
+    fn execute_drop_schema_stmt(
+        &self,
+        drop_stmt: &crate::sql::ast::DropStmt<'_>,
+    ) -> Result<ExecuteResult> {
+        self.ensure_catalog()?;
+        self.ensure_file_manager()?;
+
+        let mut catalog_guard = self.catalog.write();
+        let catalog = catalog_guard.as_mut().unwrap();
+
+        for schema_ref in drop_stmt.names.iter() {
+            let schema_name = schema_ref.name;
+
+            if catalog.schema_exists(schema_name) {
+                catalog.drop_schema(schema_name)?;
+            } else if !drop_stmt.if_exists {
+                bail!("schema '{}' not found", schema_name);
+            }
+        }
+
+        drop(catalog_guard);
+        self.save_catalog()?;
+
+        Ok(ExecuteResult::DropSchema { dropped: true })
     }
 
     fn execute_pragma(&self, pragma: &crate::sql::ast::PragmaStmt<'_>) -> Result<ExecuteResult> {

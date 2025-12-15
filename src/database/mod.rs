@@ -105,6 +105,8 @@ pub enum ExecuteResult {
     CreateSchema { created: bool },
     CreateIndex { created: bool },
     DropTable { dropped: bool },
+    DropIndex { dropped: bool },
+    DropSchema { dropped: bool },
     Insert { rows_affected: usize },
     Update { rows_affected: usize },
     Delete { rows_affected: usize },
@@ -1434,6 +1436,175 @@ mod tests {
             matches!(duration3, OwnedValue::Interval(_, days, months) if *days == 3 && *months == 14),
             "Third interval should be 1 year 2 months 3 days (ISO 8601): got {:?}",
             duration3
+        );
+    }
+
+    #[test]
+    fn test_drop_index() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("test_db");
+
+        let db = Database::create(&db_path).unwrap();
+
+        db.execute("CREATE TABLE users (id INT, name TEXT)")
+            .unwrap();
+        db.execute("CREATE INDEX idx_users_name ON users(name)")
+            .unwrap();
+
+        let result = db.execute("DROP INDEX idx_users_name");
+        assert!(
+            result.is_ok(),
+            "DROP INDEX should succeed: {:?}",
+            result.err()
+        );
+
+        assert!(
+            matches!(result.unwrap(), ExecuteResult::DropIndex { dropped: true }),
+            "Should return DropIndex with dropped: true"
+        );
+    }
+
+    #[test]
+    fn test_drop_index_if_exists_nonexistent() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("test_db");
+
+        let db = Database::create(&db_path).unwrap();
+
+        db.execute("CREATE TABLE users (id INT, name TEXT)")
+            .unwrap();
+
+        let result = db.execute("DROP INDEX IF EXISTS nonexistent_idx");
+        assert!(
+            result.is_ok(),
+            "DROP INDEX IF EXISTS on nonexistent index should succeed"
+        );
+    }
+
+    #[test]
+    fn test_drop_index_nonexistent_fails() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("test_db");
+
+        let db = Database::create(&db_path).unwrap();
+
+        db.execute("CREATE TABLE users (id INT, name TEXT)")
+            .unwrap();
+
+        let result = db.execute("DROP INDEX nonexistent_idx");
+        assert!(
+            result.is_err(),
+            "DROP INDEX on nonexistent index should fail"
+        );
+        assert!(
+            result.unwrap_err().to_string().contains("not found"),
+            "Error should mention index not found"
+        );
+    }
+
+    #[test]
+    fn test_drop_schema_execution() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("test_db");
+
+        let db = Database::create(&db_path).unwrap();
+
+        db.execute("CREATE SCHEMA test_schema").unwrap();
+
+        let result = db.execute("DROP SCHEMA test_schema");
+        assert!(
+            result.is_ok(),
+            "DROP SCHEMA should succeed: {:?}",
+            result.err()
+        );
+
+        assert!(
+            matches!(result.unwrap(), ExecuteResult::DropSchema { dropped: true }),
+            "Should return DropSchema with dropped: true"
+        );
+    }
+
+    #[test]
+    fn test_drop_schema_if_exists_nonexistent() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("test_db");
+
+        let db = Database::create(&db_path).unwrap();
+
+        let result = db.execute("DROP SCHEMA IF EXISTS nonexistent_schema");
+        assert!(
+            result.is_ok(),
+            "DROP SCHEMA IF EXISTS on nonexistent schema should succeed"
+        );
+    }
+
+    #[test]
+    fn test_select_distinct() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("test_db");
+
+        let db = Database::create(&db_path).unwrap();
+
+        db.execute("CREATE TABLE items (category TEXT, name TEXT)")
+            .unwrap();
+        db.execute("INSERT INTO items VALUES ('fruit', 'apple')")
+            .unwrap();
+        db.execute("INSERT INTO items VALUES ('fruit', 'banana')")
+            .unwrap();
+        db.execute("INSERT INTO items VALUES ('vegetable', 'carrot')")
+            .unwrap();
+        db.execute("INSERT INTO items VALUES ('fruit', 'apple')")
+            .unwrap();
+
+        let rows = db.query("SELECT DISTINCT category FROM items").unwrap();
+        assert_eq!(rows.len(), 2, "DISTINCT should remove duplicate categories");
+    }
+
+    #[test]
+    fn test_select_distinct_multiple_columns() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("test_db");
+
+        let db = Database::create(&db_path).unwrap();
+
+        db.execute("CREATE TABLE items (category TEXT, name TEXT)")
+            .unwrap();
+        db.execute("INSERT INTO items VALUES ('fruit', 'apple')")
+            .unwrap();
+        db.execute("INSERT INTO items VALUES ('fruit', 'apple')")
+            .unwrap();
+        db.execute("INSERT INTO items VALUES ('fruit', 'banana')")
+            .unwrap();
+        db.execute("INSERT INTO items VALUES ('vegetable', 'carrot')")
+            .unwrap();
+
+        let rows = db
+            .query("SELECT DISTINCT category, name FROM items")
+            .unwrap();
+        assert_eq!(
+            rows.len(),
+            3,
+            "DISTINCT should remove duplicate category+name combinations"
+        );
+    }
+
+    #[test]
+    fn test_select_distinct_all_same() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("test_db");
+
+        let db = Database::create(&db_path).unwrap();
+
+        db.execute("CREATE TABLE items (value INT)").unwrap();
+        db.execute("INSERT INTO items VALUES (1)").unwrap();
+        db.execute("INSERT INTO items VALUES (1)").unwrap();
+        db.execute("INSERT INTO items VALUES (1)").unwrap();
+
+        let rows = db.query("SELECT DISTINCT value FROM items").unwrap();
+        assert_eq!(
+            rows.len(),
+            1,
+            "DISTINCT with all same values should return 1 row"
         );
     }
 }
