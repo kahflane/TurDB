@@ -3117,17 +3117,31 @@ impl<'a> Parser<'a> {
     fn parse_from_clause(&mut self) -> Result<&'a FromClause<'a>> {
         let mut left = self.parse_table_ref()?;
 
-        while let Some(join_type) = self.parse_join_type() {
-            let right = self.parse_table_ref()?;
-            let condition = self.parse_join_condition()?;
+        loop {
+            if let Some(join_type) = self.parse_join_type() {
+                let right = self.parse_table_ref()?;
+                let condition = self.parse_join_condition()?;
 
-            let join = self.arena.alloc(JoinClause {
-                left,
-                join_type,
-                right,
-                condition,
-            });
-            left = self.arena.alloc(FromClause::Join(join));
+                let join = self.arena.alloc(JoinClause {
+                    left,
+                    join_type,
+                    right,
+                    condition,
+                });
+                left = self.arena.alloc(FromClause::Join(join));
+            } else if self.consume_token(&Token::Comma) {
+                let right = self.parse_table_ref()?;
+
+                let join = self.arena.alloc(JoinClause {
+                    left,
+                    join_type: JoinType::Cross,
+                    right,
+                    condition: JoinCondition::None,
+                });
+                left = self.arena.alloc(FromClause::Join(join));
+            } else {
+                break;
+            }
         }
 
         Ok(left)
