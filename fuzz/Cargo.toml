@@ -1,0 +1,36 @@
+[package]
+name = "turdb-fuzz"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+arbitrary = { version = "1.3", features = ["derive"] }
+
+[dependencies.turdb]
+path = ".."
+
+[[bin]]
+name = "fuzz_decoder"
+path = "fuzz_targets/fuzz_decoder.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_record_builder"
+path = "fuzz_targets/fuzz_record_builder.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_array"
+path = "fuzz_targets/fuzz_array.rs"
+test = false
+doc = false
+bench = false

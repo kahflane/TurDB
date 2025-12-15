@@ -171,8 +171,362 @@ impl<'a> ConstraintValidator<'a> {
             DataType::Text | DataType::Varchar | DataType::Char => {
                 OwnedValue::Text(default_str.to_string())
             }
-            _ => OwnedValue::Text(default_str.to_string()),
+            DataType::Uuid => Self::parse_uuid_default(default_str),
+            DataType::Date => Self::parse_date_default(default_str),
+            DataType::Time => Self::parse_time_default(default_str),
+            DataType::Timestamp => Self::parse_timestamp_default(default_str),
+            DataType::TimestampTz => Self::parse_timestamptz_default(default_str),
+            DataType::Interval => Self::parse_interval_default(default_str),
+            DataType::Point => Self::parse_point_default(default_str),
+            DataType::Box => Self::parse_box_default(default_str),
+            DataType::Circle => Self::parse_circle_default(default_str),
+            DataType::Vector => Self::parse_vector_default(default_str),
+            DataType::Jsonb => Self::parse_jsonb_default(default_str),
+            DataType::MacAddr => Self::parse_macaddr_default(default_str),
+            DataType::Inet4 => Self::parse_inet4_default(default_str),
+            DataType::Inet6 => Self::parse_inet6_default(default_str),
+            DataType::Decimal => Self::parse_decimal_default(default_str),
+            DataType::Enum
+            | DataType::Composite
+            | DataType::Array
+            | DataType::Int4Range
+            | DataType::Int8Range
+            | DataType::DateRange
+            | DataType::TimestampRange
+            | DataType::Blob => OwnedValue::Text(default_str.to_string()),
         }
+    }
+
+    fn parse_uuid_default(s: &str) -> OwnedValue {
+        let hex_str: String = s.chars().filter(|c| c.is_ascii_hexdigit()).collect();
+        if hex_str.len() != 32 {
+            return OwnedValue::Null;
+        }
+        let mut bytes = [0u8; 16];
+        for i in 0..16 {
+            let byte_str = &hex_str[i * 2..i * 2 + 2];
+            bytes[i] = match u8::from_str_radix(byte_str, 16) {
+                Ok(b) => b,
+                Err(_) => return OwnedValue::Null,
+            };
+        }
+        OwnedValue::Uuid(bytes)
+    }
+
+    fn parse_date_default(s: &str) -> OwnedValue {
+        let parts: Vec<&str> = s.split('-').collect();
+        if parts.len() != 3 {
+            return OwnedValue::Null;
+        }
+        let year: i32 = match parts[0].parse() {
+            Ok(y) => y,
+            Err(_) => return OwnedValue::Null,
+        };
+        let month: u32 = match parts[1].parse() {
+            Ok(m) => m,
+            Err(_) => return OwnedValue::Null,
+        };
+        let day: u32 = match parts[2].parse() {
+            Ok(d) => d,
+            Err(_) => return OwnedValue::Null,
+        };
+        let days = Self::days_from_ymd(year, month, day);
+        OwnedValue::Date(days)
+    }
+
+    fn days_from_ymd(year: i32, month: u32, day: u32) -> i32 {
+        let a = (14 - month as i32) / 12;
+        let y = year + 4800 - a;
+        let m = month as i32 + 12 * a - 3;
+        let jdn = day as i32 + (153 * m + 2) / 5 + 365 * y + y / 4 - y / 100 + y / 400 - 32045;
+        jdn - 2440588
+    }
+
+    fn parse_time_default(s: &str) -> OwnedValue {
+        let parts: Vec<&str> = s.split(':').collect();
+        if parts.len() < 2 {
+            return OwnedValue::Null;
+        }
+        let hour: i64 = match parts[0].parse() {
+            Ok(h) => h,
+            Err(_) => return OwnedValue::Null,
+        };
+        let minute: i64 = match parts[1].parse() {
+            Ok(m) => m,
+            Err(_) => return OwnedValue::Null,
+        };
+        let (second, micros_frac) = if parts.len() > 2 {
+            let sec_parts: Vec<&str> = parts[2].split('.').collect();
+            let sec: i64 = sec_parts[0].parse().unwrap_or(0);
+            let frac = if sec_parts.len() > 1 {
+                let frac_str = sec_parts[1];
+                let padded = format!("{:0<6}", frac_str);
+                padded[..6].parse::<i64>().unwrap_or(0)
+            } else {
+                0
+            };
+            (sec, frac)
+        } else {
+            (0, 0)
+        };
+        let micros = hour * 3_600_000_000 + minute * 60_000_000 + second * 1_000_000 + micros_frac;
+        OwnedValue::Time(micros)
+    }
+
+    fn parse_timestamp_default(s: &str) -> OwnedValue {
+        let datetime_parts: Vec<&str> = s.split(&[' ', 'T'][..]).collect();
+        if datetime_parts.is_empty() {
+            return OwnedValue::Null;
+        }
+        let date_val = Self::parse_date_default(datetime_parts[0]);
+        let days = match date_val {
+            OwnedValue::Date(d) => d,
+            _ => return OwnedValue::Null,
+        };
+        let time_micros = if datetime_parts.len() > 1 {
+            match Self::parse_time_default(datetime_parts[1]) {
+                OwnedValue::Time(t) => t,
+                _ => 0,
+            }
+        } else {
+            0
+        };
+        let epoch_micros = (days as i64) * 86_400_000_000 + time_micros;
+        OwnedValue::Timestamp(epoch_micros)
+    }
+
+    fn parse_timestamptz_default(s: &str) -> OwnedValue {
+        let ts_val = Self::parse_timestamp_default(s);
+        match ts_val {
+            OwnedValue::Timestamp(micros) => OwnedValue::TimestampTz(micros, 0),
+            _ => OwnedValue::Null,
+        }
+    }
+
+    fn parse_interval_default(s: &str) -> OwnedValue {
+        let lower = s.to_lowercase();
+        let mut months = 0i32;
+        let mut days = 0i32;
+        let mut micros = 0i64;
+        let tokens: Vec<&str> = lower.split_whitespace().collect();
+        let mut i = 0;
+        while i < tokens.len() {
+            if let Ok(num) = tokens[i].parse::<i64>() {
+                if i + 1 < tokens.len() {
+                    let unit = tokens[i + 1];
+                    if unit.starts_with("year") {
+                        months += (num * 12) as i32;
+                    } else if unit.starts_with("month") {
+                        months += num as i32;
+                    } else if unit.starts_with("day") {
+                        days += num as i32;
+                    } else if unit.starts_with("hour") {
+                        micros += num * 3_600_000_000;
+                    } else if unit.starts_with("minute") || unit.starts_with("min") {
+                        micros += num * 60_000_000;
+                    } else if unit.starts_with("second") || unit.starts_with("sec") {
+                        micros += num * 1_000_000;
+                    }
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            } else {
+                i += 1;
+            }
+        }
+        OwnedValue::Interval(micros, days, months)
+    }
+
+    fn parse_point_default(s: &str) -> OwnedValue {
+        let stripped = s.trim().trim_matches(|c| c == '(' || c == ')');
+        let parts: Vec<&str> = stripped.split(',').collect();
+        if parts.len() != 2 {
+            return OwnedValue::Null;
+        }
+        let x: f64 = match parts[0].trim().parse() {
+            Ok(v) => v,
+            Err(_) => return OwnedValue::Null,
+        };
+        let y: f64 = match parts[1].trim().parse() {
+            Ok(v) => v,
+            Err(_) => return OwnedValue::Null,
+        };
+        OwnedValue::Point(x, y)
+    }
+
+    fn parse_box_default(s: &str) -> OwnedValue {
+        let stripped = s.replace(&['(', ')', ' '][..], "");
+        let coords: Vec<f64> = stripped.split(',').filter_map(|p| p.parse().ok()).collect();
+        if coords.len() != 4 {
+            return OwnedValue::Null;
+        }
+        OwnedValue::Box((coords[0], coords[1]), (coords[2], coords[3]))
+    }
+
+    fn parse_circle_default(s: &str) -> OwnedValue {
+        let stripped = s
+            .trim()
+            .trim_matches(|c| c == '<' || c == '>')
+            .replace(&['(', ')'][..], "");
+        let parts: Vec<f64> = stripped.split(',').filter_map(|p| p.trim().parse().ok()).collect();
+        if parts.len() != 3 {
+            return OwnedValue::Null;
+        }
+        OwnedValue::Circle((parts[0], parts[1]), parts[2])
+    }
+
+    fn parse_vector_default(s: &str) -> OwnedValue {
+        let stripped = s.trim().trim_matches(|c| c == '[' || c == ']');
+        let floats: Vec<f32> = stripped
+            .split(',')
+            .filter_map(|p| p.trim().parse().ok())
+            .collect();
+        if floats.is_empty() {
+            return OwnedValue::Null;
+        }
+        OwnedValue::Vector(floats)
+    }
+
+    fn parse_jsonb_default(s: &str) -> OwnedValue {
+        use crate::records::jsonb::JsonbBuilder;
+        let trimmed = s.trim();
+        if trimmed == "null" {
+            return OwnedValue::Jsonb(JsonbBuilder::new_null().build());
+        }
+        if trimmed == "true" {
+            return OwnedValue::Jsonb(JsonbBuilder::new_bool(true).build());
+        }
+        if trimmed == "false" {
+            return OwnedValue::Jsonb(JsonbBuilder::new_bool(false).build());
+        }
+        if let Ok(n) = trimmed.parse::<f64>() {
+            return OwnedValue::Jsonb(JsonbBuilder::new_number(n).build());
+        }
+        if trimmed.starts_with('"') && trimmed.ends_with('"') && trimmed.len() >= 2 {
+            let inner = &trimmed[1..trimmed.len() - 1];
+            return OwnedValue::Jsonb(JsonbBuilder::new_string(inner).build());
+        }
+        OwnedValue::Text(s.to_string())
+    }
+
+    fn parse_macaddr_default(s: &str) -> OwnedValue {
+        let hex_parts: Vec<&str> = s.split(':').collect();
+        if hex_parts.len() != 6 {
+            let hex_parts: Vec<&str> = s.split('-').collect();
+            if hex_parts.len() != 6 {
+                return OwnedValue::Null;
+            }
+            return Self::parse_macaddr_parts(&hex_parts);
+        }
+        Self::parse_macaddr_parts(&hex_parts)
+    }
+
+    fn parse_macaddr_parts(parts: &[&str]) -> OwnedValue {
+        let mut bytes = [0u8; 6];
+        for (i, part) in parts.iter().enumerate() {
+            bytes[i] = match u8::from_str_radix(part, 16) {
+                Ok(b) => b,
+                Err(_) => return OwnedValue::Null,
+            };
+        }
+        OwnedValue::MacAddr(bytes)
+    }
+
+    fn parse_inet4_default(s: &str) -> OwnedValue {
+        let parts: Vec<&str> = s.split('/').next().unwrap_or(s).split('.').collect();
+        if parts.len() != 4 {
+            return OwnedValue::Null;
+        }
+        let mut bytes = [0u8; 4];
+        for (i, part) in parts.iter().enumerate() {
+            bytes[i] = match part.parse() {
+                Ok(b) => b,
+                Err(_) => return OwnedValue::Null,
+            };
+        }
+        OwnedValue::Inet4(bytes)
+    }
+
+    fn parse_inet6_default(s: &str) -> OwnedValue {
+        let addr_str = s.split('/').next().unwrap_or(s);
+        if addr_str == "::1" {
+            let mut bytes = [0u8; 16];
+            bytes[15] = 1;
+            return OwnedValue::Inet6(bytes);
+        }
+        if addr_str == "::" {
+            return OwnedValue::Inet6([0u8; 16]);
+        }
+        let parts: Vec<&str> = addr_str.split("::").collect();
+        let mut bytes = [0u8; 16];
+        if parts.len() == 2 {
+            let left_groups: Vec<u16> = parts[0]
+                .split(':')
+                .filter(|p| !p.is_empty())
+                .filter_map(|p| u16::from_str_radix(p, 16).ok())
+                .collect();
+            let right_groups: Vec<u16> = parts[1]
+                .split(':')
+                .filter(|p| !p.is_empty())
+                .filter_map(|p| u16::from_str_radix(p, 16).ok())
+                .collect();
+            for (i, &group) in left_groups.iter().enumerate() {
+                let idx = i * 2;
+                bytes[idx] = (group >> 8) as u8;
+                bytes[idx + 1] = group as u8;
+            }
+            let start_right = 16 - right_groups.len() * 2;
+            for (i, &group) in right_groups.iter().enumerate() {
+                let idx = start_right + i * 2;
+                bytes[idx] = (group >> 8) as u8;
+                bytes[idx + 1] = group as u8;
+            }
+        } else {
+            let groups: Vec<u16> = addr_str
+                .split(':')
+                .filter_map(|p| u16::from_str_radix(p, 16).ok())
+                .collect();
+            if groups.len() != 8 {
+                return OwnedValue::Null;
+            }
+            for (i, &group) in groups.iter().enumerate() {
+                let idx = i * 2;
+                bytes[idx] = (group >> 8) as u8;
+                bytes[idx + 1] = group as u8;
+            }
+        }
+        OwnedValue::Inet6(bytes)
+    }
+
+    fn parse_decimal_default(s: &str) -> OwnedValue {
+        let trimmed = s.trim();
+        let parts: Vec<&str> = trimmed.split('.').collect();
+        let (int_part, frac_part, scale) = if parts.len() == 2 {
+            (parts[0], parts[1], parts[1].len() as i16)
+        } else {
+            (parts[0], "", 0)
+        };
+        let int_val: i128 = match int_part.parse() {
+            Ok(v) => v,
+            Err(_) => return OwnedValue::Null,
+        };
+        let frac_val: i128 = if !frac_part.is_empty() {
+            match frac_part.parse() {
+                Ok(v) => v,
+                Err(_) => return OwnedValue::Null,
+            }
+        } else {
+            0
+        };
+        let multiplier = 10i128.pow(scale as u32);
+        let is_negative = int_val < 0;
+        let digits = if is_negative {
+            int_val * multiplier - frac_val
+        } else {
+            int_val * multiplier + frac_val
+        };
+        OwnedValue::Decimal(digits, scale)
     }
 
     pub fn validate_insert(&self, values: &mut Vec<OwnedValue>) -> Result<()> {
@@ -954,5 +1308,159 @@ mod tests {
 
         let result = validator.validate_delete(&values, is_referenced_checker);
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_parse_uuid_default() {
+        let result = ConstraintValidator::parse_uuid_default("123e4567-e89b-12d3-a456-426614174000");
+        assert!(matches!(result, OwnedValue::Uuid(_)));
+        if let OwnedValue::Uuid(bytes) = result {
+            assert_eq!(bytes[0], 0x12);
+            assert_eq!(bytes[1], 0x3e);
+        }
+    }
+
+    #[test]
+    fn test_parse_uuid_default_invalid() {
+        let result = ConstraintValidator::parse_uuid_default("invalid-uuid");
+        assert!(matches!(result, OwnedValue::Null));
+    }
+
+    #[test]
+    fn test_parse_date_default() {
+        let result = ConstraintValidator::parse_date_default("2023-12-25");
+        assert!(matches!(result, OwnedValue::Date(_)));
+        if let OwnedValue::Date(days) = result {
+            assert!(days > 0);
+        }
+    }
+
+    #[test]
+    fn test_parse_time_default() {
+        let result = ConstraintValidator::parse_time_default("12:30:45");
+        assert!(matches!(result, OwnedValue::Time(_)));
+        if let OwnedValue::Time(micros) = result {
+            assert_eq!(micros, 12 * 3_600_000_000 + 30 * 60_000_000 + 45 * 1_000_000);
+        }
+    }
+
+    #[test]
+    fn test_parse_timestamp_default() {
+        let result = ConstraintValidator::parse_timestamp_default("2023-12-25 12:30:45");
+        assert!(matches!(result, OwnedValue::Timestamp(_)));
+    }
+
+    #[test]
+    fn test_parse_interval_default() {
+        let result = ConstraintValidator::parse_interval_default("1 year 2 months 3 days");
+        assert!(matches!(result, OwnedValue::Interval(_, _, _)));
+        if let OwnedValue::Interval(micros, days, months) = result {
+            assert_eq!(months, 14);
+            assert_eq!(days, 3);
+            assert_eq!(micros, 0);
+        }
+    }
+
+    #[test]
+    fn test_parse_point_default() {
+        let result = ConstraintValidator::parse_point_default("(1.5, 2.5)");
+        assert!(matches!(result, OwnedValue::Point(_, _)));
+        if let OwnedValue::Point(x, y) = result {
+            assert!((x - 1.5).abs() < f64::EPSILON);
+            assert!((y - 2.5).abs() < f64::EPSILON);
+        }
+    }
+
+    #[test]
+    fn test_parse_vector_default() {
+        let result = ConstraintValidator::parse_vector_default("[1.0, 2.0, 3.0]");
+        assert!(matches!(result, OwnedValue::Vector(_)));
+        if let OwnedValue::Vector(v) = result {
+            assert_eq!(v.len(), 3);
+            assert!((v[0] - 1.0).abs() < f32::EPSILON);
+            assert!((v[1] - 2.0).abs() < f32::EPSILON);
+            assert!((v[2] - 3.0).abs() < f32::EPSILON);
+        }
+    }
+
+    #[test]
+    fn test_parse_jsonb_default_null() {
+        let result = ConstraintValidator::parse_jsonb_default("null");
+        assert!(matches!(result, OwnedValue::Jsonb(_)));
+    }
+
+    #[test]
+    fn test_parse_jsonb_default_bool() {
+        let result = ConstraintValidator::parse_jsonb_default("true");
+        assert!(matches!(result, OwnedValue::Jsonb(_)));
+    }
+
+    #[test]
+    fn test_parse_jsonb_default_number() {
+        let result = ConstraintValidator::parse_jsonb_default("42");
+        assert!(matches!(result, OwnedValue::Jsonb(_)));
+    }
+
+    #[test]
+    fn test_parse_macaddr_default() {
+        let result = ConstraintValidator::parse_macaddr_default("00:11:22:33:44:55");
+        assert!(matches!(result, OwnedValue::MacAddr(_)));
+        if let OwnedValue::MacAddr(bytes) = result {
+            assert_eq!(bytes, [0x00, 0x11, 0x22, 0x33, 0x44, 0x55]);
+        }
+    }
+
+    #[test]
+    fn test_parse_inet4_default() {
+        let result = ConstraintValidator::parse_inet4_default("192.168.1.1");
+        assert!(matches!(result, OwnedValue::Inet4(_)));
+        if let OwnedValue::Inet4(bytes) = result {
+            assert_eq!(bytes, [192, 168, 1, 1]);
+        }
+    }
+
+    #[test]
+    fn test_parse_inet6_default_loopback() {
+        let result = ConstraintValidator::parse_inet6_default("::1");
+        assert!(matches!(result, OwnedValue::Inet6(_)));
+        if let OwnedValue::Inet6(bytes) = result {
+            assert_eq!(bytes[15], 1);
+            for &b in &bytes[0..15] {
+                assert_eq!(b, 0);
+            }
+        }
+    }
+
+    #[test]
+    fn test_parse_decimal_default() {
+        let result = ConstraintValidator::parse_decimal_default("123.45");
+        assert!(matches!(result, OwnedValue::Decimal(_, _)));
+        if let OwnedValue::Decimal(digits, scale) = result {
+            assert_eq!(digits, 12345);
+            assert_eq!(scale, 2);
+        }
+    }
+
+    #[test]
+    fn test_parse_box_default() {
+        let result = ConstraintValidator::parse_box_default("((1,2),(3,4))");
+        assert!(matches!(result, OwnedValue::Box(_, _)));
+        if let OwnedValue::Box(p1, p2) = result {
+            assert!((p1.0 - 1.0).abs() < f64::EPSILON);
+            assert!((p1.1 - 2.0).abs() < f64::EPSILON);
+            assert!((p2.0 - 3.0).abs() < f64::EPSILON);
+            assert!((p2.1 - 4.0).abs() < f64::EPSILON);
+        }
+    }
+
+    #[test]
+    fn test_parse_circle_default() {
+        let result = ConstraintValidator::parse_circle_default("<(1,2),5>");
+        assert!(matches!(result, OwnedValue::Circle(_, _)));
+        if let OwnedValue::Circle(center, radius) = result {
+            assert!((center.0 - 1.0).abs() < f64::EPSILON);
+            assert!((center.1 - 2.0).abs() < f64::EPSILON);
+            assert!((radius - 5.0).abs() < f64::EPSILON);
+        }
     }
 }
