@@ -1995,4 +1995,136 @@ mod tests {
             "Nested BEGIN should fail (use SAVEPOINT instead)"
         );
     }
+
+    #[test]
+    fn test_transaction_rollback_undoes_delete() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("test_db");
+
+        let db = Database::create(&db_path).unwrap();
+        db.execute("CREATE TABLE test (id INT, name TEXT)").unwrap();
+        db.execute("INSERT INTO test VALUES (1, 'first')").unwrap();
+        db.execute("INSERT INTO test VALUES (2, 'second')").unwrap();
+
+        let rows = db.query("SELECT * FROM test").unwrap();
+        assert_eq!(rows.len(), 2, "Should have 2 rows before transaction");
+
+        db.execute("BEGIN").unwrap();
+        db.execute("DELETE FROM test WHERE id = 1").unwrap();
+
+        let rows = db.query("SELECT * FROM test").unwrap();
+        assert_eq!(rows.len(), 1, "Should have 1 row after DELETE");
+
+        db.execute("ROLLBACK").unwrap();
+
+        let rows = db.query("SELECT * FROM test").unwrap();
+        assert_eq!(
+            rows.len(),
+            2,
+            "ROLLBACK should restore deleted row"
+        );
+    }
+
+    #[test]
+    fn test_rollback_to_savepoint_undoes_delete() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("test_db");
+
+        let db = Database::create(&db_path).unwrap();
+        db.execute("CREATE TABLE test (id INT, name TEXT)").unwrap();
+        db.execute("INSERT INTO test VALUES (1, 'first')").unwrap();
+        db.execute("INSERT INTO test VALUES (2, 'second')").unwrap();
+
+        db.execute("BEGIN").unwrap();
+        db.execute("INSERT INTO test VALUES (3, 'third')").unwrap();
+        db.execute("SAVEPOINT sp1").unwrap();
+        db.execute("DELETE FROM test WHERE id = 1").unwrap();
+
+        let rows = db.query("SELECT * FROM test").unwrap();
+        assert_eq!(rows.len(), 2, "Should have 2 rows after DELETE");
+
+        db.execute("ROLLBACK TO SAVEPOINT sp1").unwrap();
+
+        let rows = db.query("SELECT * FROM test").unwrap();
+        assert_eq!(
+            rows.len(),
+            3,
+            "ROLLBACK TO SAVEPOINT should restore deleted row but keep INSERT before savepoint"
+        );
+
+        db.execute("COMMIT").unwrap();
+        let rows = db.query("SELECT * FROM test").unwrap();
+        assert_eq!(rows.len(), 3, "After COMMIT, should still have 3 rows");
+    }
+
+    fn get_text_value(value: &OwnedValue) -> &str {
+        match value {
+            OwnedValue::Text(s) => s,
+            _ => panic!("Expected Text value, got {:?}", value),
+        }
+    }
+
+    #[test]
+    fn test_transaction_rollback_undoes_update() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("test_db");
+
+        let db = Database::create(&db_path).unwrap();
+        db.execute("CREATE TABLE test (id INT, name TEXT)").unwrap();
+        db.execute("INSERT INTO test VALUES (1, 'original')").unwrap();
+
+        db.execute("BEGIN").unwrap();
+        db.execute("UPDATE test SET name = 'modified' WHERE id = 1")
+            .unwrap();
+
+        let rows = db.query("SELECT id, name FROM test").unwrap();
+        assert_eq!(rows.len(), 1);
+        let name = get_text_value(&rows[0].values[1]);
+        assert_eq!(name, "modified", "Name should be modified after UPDATE");
+
+        db.execute("ROLLBACK").unwrap();
+
+        let rows = db.query("SELECT id, name FROM test").unwrap();
+        assert_eq!(rows.len(), 1);
+        let name = get_text_value(&rows[0].values[1]);
+        assert_eq!(
+            name, "original",
+            "ROLLBACK should restore original value after UPDATE"
+        );
+    }
+
+    #[test]
+    fn test_rollback_to_savepoint_undoes_update() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("test_db");
+
+        let db = Database::create(&db_path).unwrap();
+        db.execute("CREATE TABLE test (id INT, name TEXT)").unwrap();
+        db.execute("INSERT INTO test VALUES (1, 'original')").unwrap();
+
+        db.execute("BEGIN").unwrap();
+        db.execute("UPDATE test SET name = 'first_update' WHERE id = 1")
+            .unwrap();
+        db.execute("SAVEPOINT sp1").unwrap();
+        db.execute("UPDATE test SET name = 'second_update' WHERE id = 1")
+            .unwrap();
+
+        let rows = db.query("SELECT id, name FROM test").unwrap();
+        let name = get_text_value(&rows[0].values[1]);
+        assert_eq!(name, "second_update");
+
+        db.execute("ROLLBACK TO SAVEPOINT sp1").unwrap();
+
+        let rows = db.query("SELECT id, name FROM test").unwrap();
+        let name = get_text_value(&rows[0].values[1]);
+        assert_eq!(
+            name, "first_update",
+            "ROLLBACK TO SAVEPOINT should restore to savepoint state"
+        );
+
+        db.execute("COMMIT").unwrap();
+        let rows = db.query("SELECT id, name FROM test").unwrap();
+        let name = get_text_value(&rows[0].values[1]);
+        assert_eq!(name, "first_update", "After COMMIT, first_update should persist");
+    }
 }
