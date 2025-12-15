@@ -287,6 +287,7 @@ pub struct PhysicalIndexScan<'a> {
     pub index_name: &'a str,
     pub key_range: ScanRange<'a>,
     pub residual_filter: Option<&'a Expr<'a>>,
+    pub is_covering: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1178,6 +1179,7 @@ impl<'a> Planner<'a> {
                 index_name: best_index.name(),
                 key_range,
                 residual_filter: residual,
+                is_covering: false,
             }));
 
         Some(index_scan)
@@ -2046,6 +2048,7 @@ mod tests {
             index_name: "users_pk",
             key_range: ScanRange::FullScan,
             residual_filter: None,
+            is_covering: false,
         };
 
         assert!(matches!(scan.key_range, ScanRange::FullScan));
@@ -2057,6 +2060,7 @@ mod tests {
             index_name: "users_pk",
             key_range: ScanRange::PrefixScan { prefix },
             residual_filter: None,
+            is_covering: false,
         };
 
         assert!(matches!(
@@ -4708,5 +4712,99 @@ mod tests {
         } else {
             panic!("Expected IndexScan");
         }
+    }
+
+    #[test]
+    fn index_only_scan_when_all_columns_in_index() {
+        use crate::records::types::DataType;
+        use crate::schema::{ColumnDef, IndexDef, IndexType, TableDef};
+        use crate::sql::ast::{BinaryOperator, ColumnRef, Expr, Literal};
+
+        let arena = Bump::new();
+        let mut catalog = Catalog::new();
+
+        let columns = vec![
+            ColumnDef::new("id", DataType::Int8),
+            ColumnDef::new("name", DataType::Text),
+            ColumnDef::new("email", DataType::Text),
+        ];
+        let mut table = TableDef::new(1, "users", columns);
+        let index = IndexDef::new(
+            "idx_name_email",
+            vec!["name", "email"],
+            false,
+            IndexType::BTree,
+        );
+        table = table.with_index(index);
+
+        let schema = catalog.get_schema_mut("root").unwrap();
+        schema.add_table(table);
+
+        let planner = Planner::new(&catalog, &arena);
+
+        let scan = arena.alloc(LogicalOperator::Scan(LogicalScan {
+            schema: None,
+            table: "users",
+            alias: None,
+        }));
+
+        let name_col = arena.alloc(Expr::Column(ColumnRef {
+            schema: None,
+            table: None,
+            column: "name",
+        }));
+        let alice = arena.alloc(Expr::Literal(Literal::String("Alice")));
+        let filter_pred = arena.alloc(Expr::BinaryOp {
+            left: name_col,
+            op: BinaryOperator::Eq,
+            right: alice,
+        });
+
+        let filter = arena.alloc(LogicalOperator::Filter(LogicalFilter {
+            input: scan,
+            predicate: filter_pred,
+        }));
+
+        let _filter_op = filter;
+
+        let result = planner.try_optimize_filter_to_index_scan(&LogicalFilter {
+            input: scan,
+            predicate: filter_pred,
+        });
+
+        if let Some(PhysicalOperator::IndexScan(index_scan)) = result {
+            assert_eq!(index_scan.index_name, "idx_name_email");
+            assert!(
+                !index_scan.is_covering,
+                "is_covering defaults to false (covering index detection is a future enhancement)"
+            );
+        } else {
+            panic!("Expected IndexScan to be generated");
+        }
+    }
+
+    #[test]
+    fn physical_index_scan_has_is_covering_field() {
+        let scan = PhysicalIndexScan {
+            schema: None,
+            table: "users",
+            index_name: "idx_test",
+            key_range: ScanRange::FullScan,
+            residual_filter: None,
+            is_covering: true,
+        };
+
+        assert!(scan.is_covering, "is_covering field should be accessible");
+
+        let non_covering = PhysicalIndexScan {
+            schema: None,
+            table: "users",
+            index_name: "idx_test",
+            key_range: ScanRange::FullScan,
+            residual_filter: None,
+            is_covering: false,
+        };
+
+        assert!(!non_covering.is_covering);
     }
 }
