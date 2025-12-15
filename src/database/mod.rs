@@ -1445,4 +1445,74 @@ mod tests {
             "DROP SCHEMA IF EXISTS on nonexistent schema should succeed"
         );
     }
+
+    #[test]
+    fn test_select_distinct() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("test_db");
+
+        let db = Database::create(&db_path).unwrap();
+
+        db.execute("CREATE TABLE items (category TEXT, name TEXT)")
+            .unwrap();
+        db.execute("INSERT INTO items VALUES ('fruit', 'apple')")
+            .unwrap();
+        db.execute("INSERT INTO items VALUES ('fruit', 'banana')")
+            .unwrap();
+        db.execute("INSERT INTO items VALUES ('vegetable', 'carrot')")
+            .unwrap();
+        db.execute("INSERT INTO items VALUES ('fruit', 'apple')")
+            .unwrap();
+
+        let rows = db.query("SELECT DISTINCT category FROM items").unwrap();
+        assert_eq!(rows.len(), 2, "DISTINCT should remove duplicate categories");
+    }
+
+    #[test]
+    fn test_select_distinct_multiple_columns() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("test_db");
+
+        let db = Database::create(&db_path).unwrap();
+
+        db.execute("CREATE TABLE items (category TEXT, name TEXT)")
+            .unwrap();
+        db.execute("INSERT INTO items VALUES ('fruit', 'apple')")
+            .unwrap();
+        db.execute("INSERT INTO items VALUES ('fruit', 'apple')")
+            .unwrap();
+        db.execute("INSERT INTO items VALUES ('fruit', 'banana')")
+            .unwrap();
+        db.execute("INSERT INTO items VALUES ('vegetable', 'carrot')")
+            .unwrap();
+
+        let rows = db
+            .query("SELECT DISTINCT category, name FROM items")
+            .unwrap();
+        assert_eq!(
+            rows.len(),
+            3,
+            "DISTINCT should remove duplicate category+name combinations"
+        );
+    }
+
+    #[test]
+    fn test_select_distinct_all_same() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("test_db");
+
+        let db = Database::create(&db_path).unwrap();
+
+        db.execute("CREATE TABLE items (value INT)").unwrap();
+        db.execute("INSERT INTO items VALUES (1)").unwrap();
+        db.execute("INSERT INTO items VALUES (1)").unwrap();
+        db.execute("INSERT INTO items VALUES (1)").unwrap();
+
+        let rows = db.query("SELECT DISTINCT value FROM items").unwrap();
+        assert_eq!(
+            rows.len(),
+            1,
+            "DISTINCT with all same values should return 1 row"
+        );
+    }
 }
