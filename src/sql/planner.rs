@@ -99,6 +99,40 @@ use crate::sql::ast::{Expr, JoinType, Literal, Statement};
 use bumpalo::Bump;
 use eyre::{bail, Result};
 
+#[derive(Debug, Clone)]
+pub enum TableSource<'a> {
+    Table {
+        schema: Option<&'a str>,
+        name: &'a str,
+        alias: Option<&'a str>,
+        def: &'a TableDef,
+    },
+    Subquery {
+        alias: &'a str,
+        output_schema: OutputSchema<'a>,
+    },
+}
+
+impl<'a> TableSource<'a> {
+    pub fn effective_name(&self) -> &'a str {
+        match self {
+            TableSource::Table { alias, name, .. } => alias.unwrap_or(name),
+            TableSource::Subquery { alias, .. } => alias,
+        }
+    }
+
+    pub fn has_column(&self, col_name: &str) -> bool {
+        match self {
+            TableSource::Table { def, .. } => {
+                def.columns().iter().any(|c| c.name().eq_ignore_ascii_case(col_name))
+            }
+            TableSource::Subquery { output_schema, .. } => {
+                output_schema.columns.iter().any(|c| c.name.eq_ignore_ascii_case(col_name))
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct OutputColumn<'a> {
     pub name: &'a str,
@@ -142,6 +176,7 @@ pub enum LogicalOperator<'a> {
     Insert(LogicalInsert<'a>),
     Update(LogicalUpdate<'a>),
     Delete(LogicalDelete<'a>),
+    Subquery(LogicalSubquery<'a>),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -241,6 +276,13 @@ pub struct LogicalDelete<'a> {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub struct LogicalSubquery<'a> {
+    pub plan: &'a LogicalOperator<'a>,
+    pub alias: &'a str,
+    pub output_schema: OutputSchema<'a>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct LogicalPlan<'a> {
     pub root: &'a LogicalOperator<'a>,
 }
@@ -257,6 +299,7 @@ pub enum PhysicalOperator<'a> {
     SortedAggregate(PhysicalSortedAggregate<'a>),
     SortExec(PhysicalSortExec<'a>),
     LimitExec(PhysicalLimitExec<'a>),
+    SubqueryExec(PhysicalSubqueryExec<'a>),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -361,6 +404,13 @@ pub struct PhysicalLimitExec<'a> {
     pub input: &'a PhysicalOperator<'a>,
     pub limit: Option<u64>,
     pub offset: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct PhysicalSubqueryExec<'a> {
+    pub child_plan: &'a PhysicalOperator<'a>,
+    pub alias: &'a str,
+    pub output_schema: OutputSchema<'a>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -534,8 +584,15 @@ impl<'a> Planner<'a> {
                 Ok(scan)
             }
             FromClause::Join(join) => self.plan_join(join),
-            FromClause::Subquery { query: _, alias: _ } => {
-                bail!("subqueries in FROM clause not yet implemented")
+            FromClause::Subquery { query, alias } => {
+                let subquery_plan = self.plan_select(query)?;
+                let output_schema = self.compute_logical_output_schema(subquery_plan.root)?;
+                let subquery_op = self.arena.alloc(LogicalOperator::Subquery(LogicalSubquery {
+                    plan: subquery_plan.root,
+                    alias,
+                    output_schema,
+                }));
+                Ok(subquery_op)
             }
             FromClause::Lateral {
                 subquery: _,
@@ -668,10 +725,7 @@ impl<'a> Planner<'a> {
         self.catalog.resolve_table(table_name).map(|_| ())
     }
 
-    fn collect_tables_in_scope(
-        &self,
-        op: &'a LogicalOperator<'a>,
-    ) -> Vec<(Option<&'a str>, &'a str, Option<&'a str>, &'a TableDef)> {
+    fn collect_tables_in_scope(&self, op: &'a LogicalOperator<'a>) -> Vec<TableSource<'a>> {
         let mut tables = Vec::new();
         self.collect_tables_recursive(op, &mut tables);
         tables
@@ -680,7 +734,7 @@ impl<'a> Planner<'a> {
     fn collect_tables_recursive(
         &self,
         op: &'a LogicalOperator<'a>,
-        tables: &mut Vec<(Option<&'a str>, &'a str, Option<&'a str>, &'a TableDef)>,
+        tables: &mut Vec<TableSource<'a>>,
     ) {
         match op {
             LogicalOperator::Scan(scan) => {
@@ -690,7 +744,12 @@ impl<'a> Planner<'a> {
                     scan.table
                 };
                 if let Ok(table_def) = self.catalog.resolve_table(table_name) {
-                    tables.push((scan.schema, scan.table, scan.alias, table_def));
+                    tables.push(TableSource::Table {
+                        schema: scan.schema,
+                        name: scan.table,
+                        alias: scan.alias,
+                        def: table_def,
+                    });
                 }
             }
             LogicalOperator::Join(join) => {
@@ -712,6 +771,12 @@ impl<'a> Planner<'a> {
             LogicalOperator::Limit(limit) => {
                 self.collect_tables_recursive(limit.input, tables);
             }
+            LogicalOperator::Subquery(subq) => {
+                tables.push(TableSource::Subquery {
+                    alias: subq.alias,
+                    output_schema: subq.output_schema.clone(),
+                });
+            }
             _ => {}
         }
     }
@@ -719,23 +784,14 @@ impl<'a> Planner<'a> {
     fn validate_column_in_scope(
         &self,
         col_ref: &crate::sql::ast::ColumnRef<'a>,
-        tables: &[(Option<&'a str>, &'a str, Option<&'a str>, &'a TableDef)],
+        tables: &[TableSource<'a>],
     ) -> Result<()> {
         if col_ref.table.is_some() {
-            for (_schema, table_name, alias, table_def) in tables {
-                let col_table = col_ref.table.unwrap();
-                let matches_table = if let Some(al) = alias {
-                    col_table.eq_ignore_ascii_case(al)
-                } else {
-                    col_table.eq_ignore_ascii_case(table_name)
-                };
-
-                if matches_table {
-                    for col in table_def.columns() {
-                        if col.name().eq_ignore_ascii_case(col_ref.column) {
-                            return Ok(());
-                        }
-                    }
+            let col_table = col_ref.table.unwrap();
+            for source in tables {
+                let matches_table = source.effective_name().eq_ignore_ascii_case(col_table);
+                if matches_table && source.has_column(col_ref.column) {
+                    return Ok(());
                 }
             }
 
@@ -746,13 +802,9 @@ impl<'a> Planner<'a> {
             )
         } else {
             let mut matching_tables: Vec<&str> = Vec::new();
-            for (_schema, table_name, alias, table_def) in tables {
-                for col in table_def.columns() {
-                    if col.name().eq_ignore_ascii_case(col_ref.column) {
-                        let tbl_name = if let Some(al) = alias { al } else { table_name };
-                        matching_tables.push(tbl_name);
-                        break;
-                    }
+            for source in tables {
+                if source.has_column(col_ref.column) {
+                    matching_tables.push(source.effective_name());
                 }
             }
 
@@ -774,7 +826,7 @@ impl<'a> Planner<'a> {
     fn validate_expr_columns(
         &self,
         expr: &Expr<'a>,
-        tables: &[(Option<&'a str>, &'a str, Option<&'a str>, &'a TableDef)],
+        tables: &[TableSource<'a>],
     ) -> Result<()> {
         match expr {
             Expr::Column(col_ref) => self.validate_column_in_scope(col_ref, tables),
@@ -832,7 +884,7 @@ impl<'a> Planner<'a> {
     fn validate_select_columns(
         &self,
         columns: &'a [crate::sql::ast::SelectColumn<'a>],
-        tables: &[(Option<&'a str>, &'a str, Option<&'a str>, &'a TableDef)],
+        tables: &[TableSource<'a>],
     ) -> Result<()> {
         use crate::sql::ast::SelectColumn;
 
@@ -843,13 +895,9 @@ impl<'a> Planner<'a> {
                 }
                 SelectColumn::AllColumns => {}
                 SelectColumn::TableAllColumns(table_name) => {
-                    let found = tables.iter().any(|(_, t, alias, _)| {
-                        if let Some(al) = alias {
-                            table_name.eq_ignore_ascii_case(al)
-                        } else {
-                            table_name.eq_ignore_ascii_case(t)
-                        }
-                    });
+                    let found = tables
+                        .iter()
+                        .any(|source| source.effective_name().eq_ignore_ascii_case(table_name));
                     if !found {
                         bail!("table '{}' not found in FROM clause", table_name);
                     }
@@ -932,17 +980,12 @@ impl<'a> Planner<'a> {
         };
         let table_def = self.catalog.resolve_table(table_name)?;
 
-        let tables_in_scope: Vec<(
-            Option<&'a str>,
-            &'a str,
-            Option<&'a str>,
-            &'a crate::schema::TableDef,
-        )> = vec![(
-            update.table.schema,
-            update.table.name,
-            update.table.alias,
-            table_def,
-        )];
+        let tables_in_scope: Vec<TableSource<'a>> = vec![TableSource::Table {
+            schema: update.table.schema,
+            name: update.table.name,
+            alias: update.table.alias,
+            def: table_def,
+        }];
 
         for assign in update.assignments {
             let col_exists = table_def
@@ -1169,6 +1212,132 @@ impl<'a> Planner<'a> {
                     columns: columns.into_bump_slice(),
                 })
             }
+            PhysicalOperator::SubqueryExec(subq) => Ok(subq.output_schema.clone()),
+        }
+    }
+
+    fn compute_logical_output_schema(
+        &self,
+        op: &'a LogicalOperator<'a>,
+    ) -> Result<OutputSchema<'a>> {
+        match op {
+            LogicalOperator::Scan(scan) => {
+                let table_name = if let Some(schema) = scan.schema {
+                    self.arena.alloc_str(&format!("{}.{}", schema, scan.table))
+                } else {
+                    scan.table
+                };
+                let table_def = self.catalog.resolve_table(table_name)?;
+                let mut columns = bumpalo::collections::Vec::new_in(self.arena);
+
+                for col in table_def.columns() {
+                    columns.push(OutputColumn {
+                        name: self.arena.alloc_str(col.name()),
+                        data_type: col.data_type(),
+                        nullable: col.is_nullable(),
+                    });
+                }
+
+                Ok(OutputSchema {
+                    columns: columns.into_bump_slice(),
+                })
+            }
+            LogicalOperator::Project(project) => {
+                let input_schema = self.compute_logical_output_schema(project.input)?;
+
+                if project.expressions.is_empty() {
+                    return Ok(input_schema);
+                }
+
+                let mut columns = bumpalo::collections::Vec::new_in(self.arena);
+
+                for (i, expr) in project.expressions.iter().enumerate() {
+                    let (name, data_type, nullable) = self.infer_expr_type(expr, &input_schema)?;
+                    let col_name = if let Some(alias) = project.aliases.get(i).and_then(|a| *a) {
+                        alias
+                    } else {
+                        name
+                    };
+                    columns.push(OutputColumn {
+                        name: col_name,
+                        data_type,
+                        nullable,
+                    });
+                }
+
+                Ok(OutputSchema {
+                    columns: columns.into_bump_slice(),
+                })
+            }
+            LogicalOperator::Filter(filter) => self.compute_logical_output_schema(filter.input),
+            LogicalOperator::Sort(sort) => self.compute_logical_output_schema(sort.input),
+            LogicalOperator::Limit(limit) => self.compute_logical_output_schema(limit.input),
+            LogicalOperator::Join(join) => {
+                let left_schema = self.compute_logical_output_schema(join.left)?;
+                let right_schema = self.compute_logical_output_schema(join.right)?;
+                let mut columns = bumpalo::collections::Vec::new_in(self.arena);
+
+                for col in left_schema.columns {
+                    columns.push(*col);
+                }
+                for col in right_schema.columns {
+                    columns.push(*col);
+                }
+
+                Ok(OutputSchema {
+                    columns: columns.into_bump_slice(),
+                })
+            }
+            LogicalOperator::Aggregate(agg) => {
+                let mut columns = bumpalo::collections::Vec::new_in(self.arena);
+                let input_schema = self.compute_logical_output_schema(agg.input)?;
+
+                for group_expr in agg.group_by.iter() {
+                    let (name, data_type, nullable) =
+                        self.infer_expr_type(group_expr, &input_schema)?;
+                    columns.push(OutputColumn {
+                        name,
+                        data_type,
+                        nullable,
+                    });
+                }
+
+                for agg_expr in agg.aggregates.iter() {
+                    if let Expr::Function(func) = agg_expr {
+                        let name = self.arena.alloc_str(func.name.name);
+                        let data_type = match func.name.name.to_lowercase().as_str() {
+                            "count" => DataType::Int8,
+                            "avg" => DataType::Float8,
+                            "sum" | "min" | "max" => {
+                                if let crate::sql::ast::FunctionArgs::Args(args) = func.args {
+                                    if let Some(first_arg) = args.first() {
+                                        let (_, dt, _) = self.infer_expr_type(first_arg.value, &input_schema)?;
+                                        dt
+                                    } else {
+                                        DataType::Int8
+                                    }
+                                } else {
+                                    DataType::Int8
+                                }
+                            }
+                            _ => DataType::Text,
+                        };
+                        columns.push(OutputColumn {
+                            name,
+                            data_type,
+                            nullable: true,
+                        });
+                    }
+                }
+
+                Ok(OutputSchema {
+                    columns: columns.into_bump_slice(),
+                })
+            }
+            LogicalOperator::Subquery(subq) => Ok(subq.output_schema.clone()),
+            LogicalOperator::Values(_) | LogicalOperator::Insert(_) | LogicalOperator::Update(_) | LogicalOperator::Delete(_) => {
+                Ok(OutputSchema::empty())
+            }
         }
     }
 
@@ -1363,6 +1532,17 @@ impl<'a> Planner<'a> {
                 bail!(
                     "Delete operator cannot be converted to physical plan - DML handled separately"
                 )
+            }
+            LogicalOperator::Subquery(subq) => {
+                let child_plan = self.logical_to_physical(subq.plan)?;
+                let physical =
+                    self.arena
+                        .alloc(PhysicalOperator::SubqueryExec(PhysicalSubqueryExec {
+                            child_plan,
+                            alias: subq.alias,
+                            output_schema: subq.output_schema.clone(),
+                        }));
+                Ok(physical)
             }
         }
     }
@@ -1805,6 +1985,7 @@ impl<'a> Planner<'a> {
             LogicalOperator::Insert(_) => 0,
             LogicalOperator::Update(_) => 0,
             LogicalOperator::Delete(_) => 0,
+            LogicalOperator::Subquery(subq) => self.estimate_cardinality(subq.plan),
         }
     }
 

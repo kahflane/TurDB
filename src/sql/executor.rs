@@ -178,6 +178,83 @@ pub trait RowSource {
     fn next_row(&mut self) -> Result<Option<Vec<Value<'static>>>>;
 }
 
+pub struct MaterializedRowSource {
+    rows: Vec<Vec<crate::types::OwnedValue>>,
+    current: usize,
+}
+
+impl MaterializedRowSource {
+    pub fn new(rows: Vec<Vec<crate::types::OwnedValue>>) -> Self {
+        Self { rows, current: 0 }
+    }
+
+    fn owned_to_static_value(owned: &crate::types::OwnedValue) -> Value<'static> {
+        use std::borrow::Cow;
+        match owned {
+            crate::types::OwnedValue::Null => Value::Null,
+            crate::types::OwnedValue::Bool(b) => Value::Int(if *b { 1 } else { 0 }),
+            crate::types::OwnedValue::Int(i) => Value::Int(*i),
+            crate::types::OwnedValue::Float(f) => Value::Float(*f),
+            crate::types::OwnedValue::Text(s) => Value::Text(Cow::Owned(s.clone())),
+            crate::types::OwnedValue::Blob(b) => Value::Blob(Cow::Owned(b.clone())),
+            crate::types::OwnedValue::Vector(v) => Value::Vector(Cow::Owned(v.clone())),
+            crate::types::OwnedValue::Uuid(u) => Value::Uuid(*u),
+            crate::types::OwnedValue::MacAddr(m) => Value::MacAddr(*m),
+            crate::types::OwnedValue::Inet4(ip) => Value::Inet4(*ip),
+            crate::types::OwnedValue::Inet6(ip) => Value::Inet6(*ip),
+            crate::types::OwnedValue::Jsonb(b) => Value::Jsonb(Cow::Owned(b.clone())),
+            crate::types::OwnedValue::Date(d) => Value::Int(*d as i64),
+            crate::types::OwnedValue::Time(t) => Value::Int(*t),
+            crate::types::OwnedValue::Timestamp(ts) => Value::Int(*ts),
+            crate::types::OwnedValue::TimestampTz(micros, offset_secs) => Value::TimestampTz {
+                micros: *micros,
+                offset_secs: *offset_secs,
+            },
+            crate::types::OwnedValue::Interval(micros, days, months) => Value::Interval {
+                micros: *micros,
+                days: *days,
+                months: *months,
+            },
+            crate::types::OwnedValue::Point(x, y) => Value::Point { x: *x, y: *y },
+            crate::types::OwnedValue::Box(low, high) => Value::GeoBox {
+                low: *low,
+                high: *high,
+            },
+            crate::types::OwnedValue::Circle(center, radius) => Value::Circle {
+                center: *center,
+                radius: *radius,
+            },
+            crate::types::OwnedValue::Enum(type_id, ordinal) => Value::Enum {
+                type_id: *type_id,
+                ordinal: *ordinal,
+            },
+            crate::types::OwnedValue::Decimal(digits, scale) => Value::Decimal {
+                digits: *digits,
+                scale: *scale,
+            },
+        }
+    }
+}
+
+impl RowSource for MaterializedRowSource {
+    fn reset(&mut self) -> Result<()> {
+        self.current = 0;
+        Ok(())
+    }
+
+    fn next_row(&mut self) -> Result<Option<Vec<Value<'static>>>> {
+        if self.current >= self.rows.len() {
+            return Ok(None);
+        }
+        let row: Vec<Value<'static>> = self.rows[self.current]
+            .iter()
+            .map(Self::owned_to_static_value)
+            .collect();
+        self.current += 1;
+        Ok(Some(row))
+    }
+}
+
 impl RowSource for BTreeCursorAdapter {
     fn reset(&mut self) -> Result<()> {
         self.current = 0;
