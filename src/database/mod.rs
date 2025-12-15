@@ -1888,7 +1888,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires MVCC integration to track and rollback pending modifications"]
     fn test_rollback_to_savepoint() {
         let dir = tempdir().unwrap();
         let db_path = dir.path().join("test_db");
@@ -1940,7 +1939,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires MVCC integration to track and rollback pending modifications"]
     fn test_transaction_rollback_undoes_insert() {
         let dir = tempdir().unwrap();
         let db_path = dir.path().join("test_db");
