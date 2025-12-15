@@ -91,5 +91,5 @@ pub mod schema;
 pub mod sql;
 pub mod storage;
 pub mod types;
-
-pub use database::{CheckpointInfo, Database, ExecuteResult, OwnedValue, RecoveryInfo, Row};
+pub use database::{CheckpointInfo, Database, ExecuteResult, RecoveryInfo, Row};
+pub use types::OwnedValue;
