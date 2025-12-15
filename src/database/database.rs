@@ -11,7 +11,9 @@ use crate::sql::executor::{Executor, StreamingBTreeSource};
 use crate::sql::planner::Planner;
 use crate::sql::predicate::CompiledPredicate;
 use crate::sql::Parser;
-use crate::storage::{FileManager, Wal, WalStorage};
+use crate::storage::{
+    FileManager, MmapStorage, TableFileHeader, Wal, WalStorage, FILE_HEADER_SIZE,
+};
 use bumpalo::Bump;
 use eyre::{bail, ensure, Result, WrapErr};
 use hashbrown::HashSet;
@@ -92,8 +94,13 @@ impl ActiveTransaction {
     }
 
     #[allow(clippy::type_complexity)]
-    pub fn take_write_entries(&mut self) -> (SmallVec<[WriteEntry; 16]>, SmallVec<[Option<Vec<u8>>; 16]>) {
-        (std::mem::take(&mut self.write_entries), std::mem::take(&mut self.undo_data))
+    pub fn take_write_entries(
+        &mut self,
+    ) -> (SmallVec<[WriteEntry; 16]>, SmallVec<[Option<Vec<u8>>; 16]>) {
+        (
+            std::mem::take(&mut self.write_entries),
+            std::mem::take(&mut self.undo_data),
+        )
     }
 }
 
@@ -143,15 +150,17 @@ impl Database {
 
         let wal_dir = path.join("wal");
 
-        let wal_size_bytes = if wal_dir.exists() {
-            let segment_path = wal_dir.join("wal.000001");
-            if segment_path.exists() {
-                std::fs::metadata(&segment_path)
-                    .map(|m| m.len())
-                    .unwrap_or(0)
-            } else {
-                0
-            }
+        let segment_path = wal_dir.join("wal.000001");
+        let wal_size_bytes = if segment_path.exists() {
+            std::fs::metadata(&segment_path)
+                .map(|m| m.len())
+                .unwrap_or(0)
+        } else {
+            0
+        };
+
+        let frames_recovered = if wal_size_bytes > 0 {
+            Self::recover_all_tables(&path, &wal_dir)?
         } else {
             0
         };
@@ -173,7 +182,7 @@ impl Database {
         };
 
         let recovery_info = RecoveryInfo {
-            frames_recovered: 0,
+            frames_recovered,
             wal_size_bytes,
         };
 
@@ -235,6 +244,92 @@ impl Database {
         } else {
             Self::create(path)
         }
+    }
+
+    fn recover_all_tables(db_path: &Path, wal_dir: &Path) -> Result<u32> {
+        use std::fs;
+
+        let mut wal = Wal::open(wal_dir)
+            .wrap_err_with(|| format!("failed to open WAL for recovery at {:?}", wal_dir))?;
+
+        let mut total_frames = 0u32;
+
+        for entry in fs::read_dir(db_path).wrap_err("failed to read database directory")? {
+            let entry = entry.wrap_err("failed to read directory entry")?;
+            let path = entry.path();
+
+            if path.is_dir() {
+                total_frames += Self::recover_schema_tables(&path, &mut wal)
+                    .wrap_err_with(|| format!("failed to recover tables in schema {:?}", path))?;
+            }
+        }
+
+        if total_frames > 0 {
+            wal.truncate()
+                .wrap_err("failed to truncate WAL after recovery")?;
+        }
+
+        Ok(total_frames)
+    }
+
+    fn recover_schema_tables(schema_path: &Path, wal: &mut Wal) -> Result<u32> {
+        use std::fs;
+        use std::io::Read;
+
+        let mut total_frames = 0u32;
+
+        for entry in fs::read_dir(schema_path).wrap_err("failed to read schema directory")? {
+            let entry = entry.wrap_err("failed to read directory entry")?;
+            let path = entry.path();
+
+            if path.extension().map(|e| e == "tbd").unwrap_or(false) {
+                let mut header_bytes = [0u8; FILE_HEADER_SIZE];
+                let mut file = fs::File::open(&path).wrap_err_with(|| {
+                    format!("failed to open table file {:?} for recovery", path)
+                })?;
+
+                if file
+                    .read(&mut header_bytes)
+                    .wrap_err("failed to read table header")?
+                    < FILE_HEADER_SIZE
+                {
+                    continue;
+                }
+
+                let header = match TableFileHeader::from_bytes(&header_bytes) {
+                    Ok(h) => h,
+                    Err(_) => continue,
+                };
+
+                let table_id = header.table_id();
+                if table_id == 0 {
+                    continue;
+                }
+
+                let mut storage = MmapStorage::open(&path).wrap_err_with(|| {
+                    format!("failed to open storage {:?} for WAL recovery", path)
+                })?;
+
+                let frames = wal
+                    .recover_for_file(&mut storage, table_id)
+                    .wrap_err_with(|| {
+                        format!(
+                            "failed to recover WAL frames for table_id={} from {:?}",
+                            table_id, path
+                        )
+                    })?;
+
+                if frames > 0 {
+                    storage.sync().wrap_err_with(|| {
+                        format!("failed to sync storage {:?} after recovery", path)
+                    })?;
+                }
+
+                total_frames += frames;
+            }
+        }
+
+        Ok(total_frames)
     }
 
     fn ensure_file_manager(&self) -> Result<()> {
@@ -1737,7 +1832,11 @@ impl Database {
         Ok(ExecuteResult::Rollback)
     }
 
-    fn undo_write_entries(&self, entries: &[WriteEntry], undo_data: &[Option<Vec<u8>>]) -> Result<()> {
+    fn undo_write_entries(
+        &self,
+        entries: &[WriteEntry],
+        undo_data: &[Option<Vec<u8>>],
+    ) -> Result<()> {
         for (i, entry) in entries.iter().enumerate().rev() {
             let undo = undo_data.get(i).and_then(|o| o.as_ref());
             self.undo_write_entry(entry, undo)?;
