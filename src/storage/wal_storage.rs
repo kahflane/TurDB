@@ -71,7 +71,7 @@
 
 use super::{MmapStorage, Storage, Wal, PAGE_SIZE};
 use eyre::{ensure, Result, WrapErr};
-use hashbrown::HashSet;
+use hashbrown::{HashMap, HashSet};
 use parking_lot::Mutex;
 
 pub struct WalStorage<'a> {
@@ -129,6 +129,119 @@ impl<'a> WalStorage<'a> {
 
     pub fn inner_storage(&self) -> &MmapStorage {
         self.storage
+    }
+
+    pub fn with_file_id(
+        storage: &'a mut MmapStorage,
+        dirty_pages: &'a Mutex<HashMap<u64, HashSet<u32>>>,
+        file_id: u64,
+    ) -> WalStorageMulti<'a> {
+        WalStorageMulti::new(storage, dirty_pages, file_id)
+    }
+
+    pub fn flush_wal_for_file(
+        dirty_pages: &Mutex<HashMap<u64, HashSet<u32>>>,
+        storage: &MmapStorage,
+        wal: &mut Wal,
+        file_id: u64,
+    ) -> Result<u32> {
+        let dirty: Vec<u32> = {
+            let mut guard = dirty_pages.lock();
+            match guard.get_mut(&file_id) {
+                Some(pages) => {
+                    if pages.is_empty() {
+                        return Ok(0);
+                    }
+                    pages.drain().collect()
+                }
+                None => return Ok(0),
+            }
+        };
+
+        let db_size = storage.page_count();
+        let mut frames_written = 0;
+
+        for page_no in dirty {
+            let page_data = storage.page(page_no)?;
+
+            ensure!(
+                page_data.len() == PAGE_SIZE,
+                "page {} has unexpected size {} (expected {})",
+                page_no,
+                page_data.len(),
+                PAGE_SIZE
+            );
+
+            wal.write_frame_with_file_id(page_no, db_size, page_data, file_id)
+                .wrap_err_with(|| {
+                    format!(
+                        "failed to write page {} (file_id={}) to WAL",
+                        page_no, file_id
+                    )
+                })?;
+
+            frames_written += 1;
+        }
+
+        Ok(frames_written)
+    }
+}
+
+pub struct WalStorageMulti<'a> {
+    storage: &'a mut MmapStorage,
+    dirty_pages: &'a Mutex<HashMap<u64, HashSet<u32>>>,
+    file_id: u64,
+}
+
+impl<'a> WalStorageMulti<'a> {
+    pub fn new(
+        storage: &'a mut MmapStorage,
+        dirty_pages: &'a Mutex<HashMap<u64, HashSet<u32>>>,
+        file_id: u64,
+    ) -> Self {
+        Self {
+            storage,
+            dirty_pages,
+            file_id,
+        }
+    }
+
+    pub fn dirty_page_count(&self) -> usize {
+        let guard = self.dirty_pages.lock();
+        guard.get(&self.file_id).map(|s| s.len()).unwrap_or(0)
+    }
+
+    pub fn inner_storage(&self) -> &MmapStorage {
+        self.storage
+    }
+}
+
+impl<'a> Storage for WalStorageMulti<'a> {
+    fn page(&self, page_no: u32) -> Result<&[u8]> {
+        self.storage.page(page_no)
+    }
+
+    fn page_mut(&mut self, page_no: u32) -> Result<&mut [u8]> {
+        let mut guard = self.dirty_pages.lock();
+        guard.entry(self.file_id).or_default().insert(page_no);
+        drop(guard);
+        self.storage.page_mut(page_no)
+    }
+
+    fn grow(&mut self, new_page_count: u32) -> Result<()> {
+        self.storage.grow(new_page_count)
+    }
+
+    fn page_count(&self) -> u32 {
+        self.storage.page_count()
+    }
+
+    fn sync(&self) -> Result<()> {
+        self.storage.sync()
+    }
+
+    fn prefetch_pages(&self, start_page: u32, count: u32) {
+        self.storage.prefetch_pages(start_page, count)
     }
 }
 
@@ -272,6 +385,75 @@ mod tests {
         wal_storage.grow(20).expect("should grow");
 
         assert_eq!(wal_storage.page_count(), 20);
+    }
+
+    #[test]
+    fn wal_storage_multi_file_tracks_pages_separately() {
+        use hashbrown::HashMap;
+
+        let dir = tempdir().expect("should create temp dir");
+        let db_path1 = dir.path().join("table1.tbd");
+        let db_path2 = dir.path().join("table2.tbd");
+        let wal_dir = dir.path().join("wal");
+
+        let mut storage1 = MmapStorage::create(&db_path1, 10).expect("should create storage1");
+        let mut storage2 = MmapStorage::create(&db_path2, 10).expect("should create storage2");
+        let mut wal = Wal::create(&wal_dir).expect("should create WAL");
+
+        let dirty_pages: Mutex<HashMap<u64, HashSet<u32>>> = Mutex::new(HashMap::new());
+
+        let file_id_1 = 1u64;
+        let file_id_2 = 2u64;
+
+        {
+            let mut wal_storage1 = WalStorage::with_file_id(&mut storage1, &dirty_pages, file_id_1);
+            let page = wal_storage1.page_mut(5).expect("should get page");
+            page[0] = 0xAA;
+        }
+
+        {
+            let mut wal_storage2 = WalStorage::with_file_id(&mut storage2, &dirty_pages, file_id_2);
+            let page = wal_storage2.page_mut(5).expect("should get page");
+            page[0] = 0xBB;
+        }
+
+        {
+            let guard = dirty_pages.lock();
+            assert!(guard
+                .get(&file_id_1)
+                .map(|s| s.contains(&5))
+                .unwrap_or(false));
+            assert!(guard
+                .get(&file_id_2)
+                .map(|s| s.contains(&5))
+                .unwrap_or(false));
+        }
+
+        WalStorage::flush_wal_for_file(&dirty_pages, &storage1, &mut wal, file_id_1)
+            .expect("should flush file 1");
+        WalStorage::flush_wal_for_file(&dirty_pages, &storage2, &mut wal, file_id_2)
+            .expect("should flush file 2");
+
+        drop(wal);
+
+        let mut wal = Wal::open(&wal_dir).expect("should reopen WAL");
+        let mut new_storage1 = MmapStorage::create(&db_path1, 10).expect("should create storage1");
+        let mut new_storage2 = MmapStorage::create(&db_path2, 10).expect("should create storage2");
+
+        wal.recover_for_file(&mut new_storage1, file_id_1)
+            .expect("should recover file 1");
+        wal.recover_for_file(&mut new_storage2, file_id_2)
+            .expect("should recover file 2");
+
+        let page1 = new_storage1
+            .page(5)
+            .expect("should read page from storage1");
+        let page2 = new_storage2
+            .page(5)
+            .expect("should read page from storage2");
+
+        assert_eq!(page1[0], 0xAA, "storage1 page 5 should have 0xAA");
+        assert_eq!(page2[0], 0xBB, "storage2 page 5 should have 0xBB");
     }
 
     #[test]

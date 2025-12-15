@@ -2023,11 +2023,7 @@ mod tests {
         db.execute("ROLLBACK").unwrap();
 
         let rows = db.query("SELECT * FROM test").unwrap();
-        assert_eq!(
-            rows.len(),
-            2,
-            "ROLLBACK should restore deleted row"
-        );
+        assert_eq!(rows.len(), 2, "ROLLBACK should restore deleted row");
     }
 
     #[test]
@@ -2076,7 +2072,8 @@ mod tests {
 
         let db = Database::create(&db_path).unwrap();
         db.execute("CREATE TABLE test (id INT, name TEXT)").unwrap();
-        db.execute("INSERT INTO test VALUES (1, 'original')").unwrap();
+        db.execute("INSERT INTO test VALUES (1, 'original')")
+            .unwrap();
 
         db.execute("BEGIN").unwrap();
         db.execute("UPDATE test SET name = 'modified' WHERE id = 1")
@@ -2105,7 +2102,8 @@ mod tests {
 
         let db = Database::create(&db_path).unwrap();
         db.execute("CREATE TABLE test (id INT, name TEXT)").unwrap();
-        db.execute("INSERT INTO test VALUES (1, 'original')").unwrap();
+        db.execute("INSERT INTO test VALUES (1, 'original')")
+            .unwrap();
 
         db.execute("BEGIN").unwrap();
         db.execute("UPDATE test SET name = 'first_update' WHERE id = 1")
@@ -2130,6 +2128,9 @@ mod tests {
         db.execute("COMMIT").unwrap();
         let rows = db.query("SELECT id, name FROM test").unwrap();
         let name = get_text_value(&rows[0].values[1]);
-        assert_eq!(name, "first_update", "After COMMIT, first_update should persist");
+        assert_eq!(
+            name, "first_update",
+            "After COMMIT, first_update should persist"
+        );
     }
 }

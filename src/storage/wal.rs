@@ -104,23 +104,41 @@ const CRC64: Crc<u64> = Crc::<u64>::new(&CRC_64_ECMA_182);
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, IntoBytes, FromBytes, Immutable)]
 pub struct WalFrameHeader {
+    pub file_id: u64,
     pub page_no: u32,
     pub db_size: u32,
     pub salt1: u32,
     pub salt2: u32,
     pub checksum: u64,
-    _reserved: [u8; 8],
 }
 
 impl WalFrameHeader {
     pub fn new(page_no: u32, db_size: u32, salt1: u32, salt2: u32, checksum: u64) -> Self {
         Self {
+            file_id: 0,
             page_no,
             db_size,
             salt1,
             salt2,
             checksum,
-            _reserved: [0; 8],
+        }
+    }
+
+    pub fn new_with_file_id(
+        page_no: u32,
+        db_size: u32,
+        salt1: u32,
+        salt2: u32,
+        checksum: u64,
+        file_id: u64,
+    ) -> Self {
+        Self {
+            file_id,
+            page_no,
+            db_size,
+            salt1,
+            salt2,
+            checksum,
         }
     }
 }
@@ -128,6 +146,7 @@ impl WalFrameHeader {
 pub fn compute_checksum(header: &WalFrameHeader, page_data: &[u8]) -> u64 {
     let mut digest = CRC64.digest();
 
+    digest.update(&header.file_id.to_le_bytes());
     digest.update(&header.page_no.to_le_bytes());
     digest.update(&header.db_size.to_le_bytes());
     digest.update(&header.salt1.to_le_bytes());
@@ -157,7 +176,7 @@ pub struct Wal {
     #[allow(dead_code)]
     dir: PathBuf,
     current_segment: Mutex<WalSegment>,
-    page_index: RwLock<HashMap<u32, (u64, u64)>>,
+    page_index: RwLock<HashMap<(u64, u32), (u64, u64)>>,
     read_mmap: RwLock<Option<(u64, Mmap)>>,
     salt1: u32,
     salt2: u32,
@@ -246,7 +265,7 @@ impl Wal {
                     salt2 = header.salt2;
                     first_frame = false;
                 }
-                page_index.insert(header.page_no, (segment_num, offset));
+                page_index.insert((header.file_id, header.page_no), (segment_num, offset));
                 offset += (WAL_FRAME_HEADER_SIZE + PAGE_SIZE) as u64;
             }
         }
@@ -284,6 +303,49 @@ impl Wal {
 
             let page_mut = storage.page_mut(header.page_no).wrap_err_with(|| {
                 format!("failed to get page {} for WAL recovery", header.page_no)
+            })?;
+
+            page_mut.copy_from_slice(&page_data);
+            frames_applied += 1;
+        }
+
+        Ok(frames_applied)
+    }
+
+    pub fn recover_for_file(
+        &mut self,
+        storage: &mut super::MmapStorage,
+        file_id: u64,
+    ) -> Result<u32> {
+        let segment_path = self.dir.join("wal.000001");
+
+        if !segment_path.exists() {
+            return Ok(0);
+        }
+
+        let mut segment = WalSegment::open(&segment_path, 1)?;
+        let mut frames_applied = 0;
+
+        while let Ok((header, page_data)) = segment.read_frame() {
+            if header.file_id != file_id {
+                continue;
+            }
+
+            if header.page_no >= storage.page_count() {
+                let required_pages = header.db_size.max(header.page_no + 1);
+                storage.grow(required_pages).wrap_err_with(|| {
+                    format!(
+                        "failed to grow storage to {} pages during WAL recovery for file_id={}",
+                        required_pages, file_id
+                    )
+                })?;
+            }
+
+            let page_mut = storage.page_mut(header.page_no).wrap_err_with(|| {
+                format!(
+                    "failed to get page {} for WAL recovery (file_id={})",
+                    header.page_no, file_id
+                )
             })?;
 
             page_mut.copy_from_slice(&page_data);
@@ -334,9 +396,9 @@ impl Wal {
         self.current_offset() >= threshold_bytes
     }
 
-    pub fn read_page(&self, page_no: u32) -> Result<Option<Vec<u8>>> {
+    pub fn read_page(&self, file_id: u64, page_no: u32) -> Result<Option<Vec<u8>>> {
         let index = self.page_index.read();
-        let (segment_num, offset) = match index.get(&page_no) {
+        let (segment_num, offset) = match index.get(&(file_id, page_no)) {
             Some(&(seg, off)) => (seg, off),
             None => return Ok(None),
         };
@@ -396,6 +458,16 @@ impl Wal {
     }
 
     pub fn write_frame(&mut self, page_no: u32, db_size: u32, page_data: &[u8]) -> Result<()> {
+        self.write_frame_with_file_id(page_no, db_size, page_data, 0)
+    }
+
+    pub fn write_frame_with_file_id(
+        &mut self,
+        page_no: u32,
+        db_size: u32,
+        page_data: &[u8],
+        file_id: u64,
+    ) -> Result<()> {
         ensure!(
             page_data.len() == PAGE_SIZE,
             "page data must be exactly {} bytes, got {}",
@@ -408,7 +480,8 @@ impl Wal {
                 .wrap_err("failed to rotate WAL segment during write_frame")?;
         }
 
-        let header = WalFrameHeader::new(page_no, db_size, self.salt1, self.salt2, 0);
+        let header =
+            WalFrameHeader::new_with_file_id(page_no, db_size, self.salt1, self.salt2, 0, file_id);
         let checksum = compute_checksum(&header, page_data);
         let mut header_with_checksum = header;
         header_with_checksum.checksum = checksum;
@@ -423,7 +496,7 @@ impl Wal {
         }
 
         let mut index = self.page_index.write();
-        index.insert(page_no, (segment_num, current_offset));
+        index.insert((file_id, page_no), (segment_num, current_offset));
         drop(index);
 
         let mut mmap = self.read_mmap.write();
@@ -595,6 +668,24 @@ mod tests {
     }
 
     #[test]
+    fn wal_frame_header_stores_file_id() {
+        let header = WalFrameHeader::new_with_file_id(42, 100, 0x1234, 0x5678, 0xABCD, 999);
+        assert_eq!(header.file_id, 999);
+        assert_eq!(header.page_no, 42);
+        assert_eq!(header.db_size, 100);
+    }
+
+    #[test]
+    fn wal_frame_header_file_id_roundtrip() {
+        let original = WalFrameHeader::new_with_file_id(5, 10, 100, 200, 0, 0xDEADBEEF_CAFEBABE);
+        let bytes = original.as_bytes();
+        let parsed = WalFrameHeader::read_from_bytes(bytes).expect("should parse");
+
+        assert_eq!(parsed.file_id, 0xDEADBEEF_CAFEBABE);
+        assert_eq!(parsed.page_no, original.page_no);
+    }
+
+    #[test]
     fn wal_segment_creates_new_file() {
         let temp_dir = std::env::temp_dir().join("turdb_test_wal_segment");
         std::fs::create_dir_all(&temp_dir).unwrap();
@@ -696,6 +787,37 @@ mod tests {
 
         let expected_offset = WAL_FRAME_HEADER_SIZE + PAGE_SIZE;
         assert_eq!(wal.current_offset(), expected_offset as u64);
+
+        std::fs::remove_dir_all(&temp_dir).ok();
+    }
+
+    #[test]
+    fn write_frame_with_file_id_stores_file_id() {
+        use super::super::PAGE_SIZE;
+
+        let temp_dir = std::env::temp_dir().join("turdb_test_write_frame_file_id");
+        let wal_dir = temp_dir.join("wal");
+
+        if temp_dir.exists() {
+            std::fs::remove_dir_all(&temp_dir).ok();
+        }
+
+        let mut wal = Wal::create(&wal_dir).expect("should create WAL");
+
+        let page_data = vec![77u8; PAGE_SIZE];
+        let file_id = 0xDEADBEEF_12345678u64;
+
+        wal.write_frame_with_file_id(5, 10, &page_data, file_id)
+            .expect("should write frame");
+
+        drop(wal);
+
+        let mut segment = WalSegment::open(&wal_dir.join("wal.000001"), 1).expect("should open");
+        let (header, _data) = segment.read_frame().expect("should read frame");
+
+        assert_eq!(header.file_id, file_id);
+        assert_eq!(header.page_no, 5);
+        assert_eq!(header.db_size, 10);
 
         std::fs::remove_dir_all(&temp_dir).ok();
     }
@@ -1087,7 +1209,7 @@ mod tests {
 
         let wal = Wal::create(&wal_dir).expect("should create WAL");
 
-        let page = wal.read_page(42).expect("should read page");
+        let page = wal.read_page(0, 42).expect("should read page");
         assert!(page.is_none());
 
         std::fs::remove_dir_all(&temp_dir).ok();
@@ -1110,7 +1232,7 @@ mod tests {
         wal.write_frame(5, 10, &page_data)
             .expect("should write frame");
 
-        let read_data = wal.read_page(5).expect("should read page");
+        let read_data = wal.read_page(0, 5).expect("should read page");
         assert!(read_data.is_some());
 
         let read_data = read_data.unwrap();
@@ -1146,7 +1268,7 @@ mod tests {
         wal.write_frame(3, 10, &page_data_3)
             .expect("should write frame 3");
 
-        let read_data = wal.read_page(3).expect("should read page");
+        let read_data = wal.read_page(0, 3).expect("should read page");
         assert!(read_data.is_some());
 
         let read_data = read_data.unwrap();
@@ -1177,12 +1299,12 @@ mod tests {
         wal.write_frame(2, 10, &page_data)
             .expect("should write frame");
 
-        let read_before = wal.read_page(2).expect("should read page");
+        let read_before = wal.read_page(0, 2).expect("should read page");
         assert!(read_before.is_some());
 
         wal.checkpoint(&mut storage).expect("should checkpoint");
 
-        let read_after = wal.read_page(2).expect("should read page");
+        let read_after = wal.read_page(0, 2).expect("should read page");
         assert!(read_after.is_none());
 
         std::fs::remove_dir_all(&temp_dir).ok();
@@ -1363,7 +1485,7 @@ mod tests {
 
         wal.rotate_segment().expect("should rotate segment");
 
-        let read_page = wal.read_page(1).expect("should read page");
+        let read_page = wal.read_page(0, 1).expect("should read page");
         assert!(
             read_page.is_some(),
             "should still be able to read page from old segment"
@@ -1398,7 +1520,7 @@ mod tests {
         );
 
         for i in 0..frames_needed {
-            let read_page = wal.read_page(i as u32).expect("should read page");
+            let read_page = wal.read_page(0, i as u32).expect("should read page");
             assert!(read_page.is_some(), "should be able to read page {}", i);
             assert_eq!(read_page.unwrap()[0], (i % 256) as u8);
         }
