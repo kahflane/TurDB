@@ -71,6 +71,7 @@
 
 use super::search::{beam_search, greedy_search, Candidate, HnswSearchContext};
 use super::NodeId;
+use smallvec::SmallVec;
 
 pub fn select_level(random_value: f64, ml: f64) -> u8 {
     let level = (-random_value.ln() * ml).floor() as u8;
@@ -189,8 +190,8 @@ where
         return Vec::new();
     }
 
-    let mut selected = Vec::with_capacity(max_neighbors);
-    let mut remaining: Vec<&Candidate> = candidates.iter().collect();
+    let mut selected: SmallVec<[NodeId; 32]> = SmallVec::new();
+    let mut remaining: SmallVec<[&Candidate; 64]> = candidates.iter().collect();
 
     remaining.sort_by(|a, b| {
         a.distance
@@ -228,7 +229,7 @@ where
         }
     }
 
-    selected
+    selected.into_vec()
 }
 
 pub fn prune_neighbors(
@@ -240,7 +241,7 @@ pub fn prune_neighbors(
         return current_neighbors.to_vec();
     }
 
-    let mut with_distances: Vec<(NodeId, f32)> = current_neighbors
+    let mut with_distances: SmallVec<[(NodeId, f32); 32]> = current_neighbors
         .iter()
         .map(|&n| (n, compute_distance(n)))
         .collect();
