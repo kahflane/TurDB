@@ -1088,7 +1088,12 @@ impl<'a> Parser<'a> {
             }
             Token::String(s) => {
                 self.advance();
-                Ok(Expr::Literal(Literal::String(s)))
+                let unescaped = if s.contains("''") {
+                    self.arena.alloc_str(&s.replace("''", "'"))
+                } else {
+                    s
+                };
+                Ok(Expr::Literal(Literal::String(unescaped)))
             }
             Token::HexNumber(s) => {
                 self.advance();

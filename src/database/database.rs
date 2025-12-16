@@ -13,13 +13,25 @@ use crate::sql::Parser;
 use crate::storage::{
     FileManager, MmapStorage, TableFileHeader, Wal, WalStorage, FILE_HEADER_SIZE,
 };
-use crate::types::{create_column_map, create_record_schema, owned_values_to_values, OwnedValue};
+use crate::types::{
+    create_column_map, create_record_schema, owned_values_to_values, DataType, OwnedValue, Value,
+};
 use bumpalo::Bump;
 use eyre::{bail, ensure, Result, WrapErr};
 use hashbrown::HashSet;
 use parking_lot::{Mutex, RwLock};
 use smallvec::SmallVec;
 use std::path::{Path, PathBuf};
+
+fn convert_value_with_type(val: &Value<'_>, col_type: DataType) -> OwnedValue {
+    match (val, col_type) {
+        (Value::Int(i), DataType::Bool) => OwnedValue::Bool(*i != 0),
+        (Value::Int(i), DataType::Date) => OwnedValue::Date(*i as i32),
+        (Value::Int(i), DataType::Time) => OwnedValue::Time(*i),
+        (Value::Int(i), DataType::Timestamp) => OwnedValue::Timestamp(*i),
+        _ => OwnedValue::from(val),
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct Savepoint {
@@ -438,6 +450,8 @@ impl Database {
     pub fn query(&self, sql: &str) -> Result<Vec<Row>> {
         use crate::sql::ast::{Distinct, Statement};
 
+        eprintln!("DEBUG query: executing sql = '{}'", sql);
+
         self.ensure_catalog()?;
         self.ensure_file_manager()?;
 
@@ -471,7 +485,32 @@ impl Database {
                 PhysicalOperator::ProjectExec(project) => find_table_scan(project.input),
                 PhysicalOperator::LimitExec(limit) => find_table_scan(limit.input),
                 PhysicalOperator::SortExec(sort) => find_table_scan(sort.input),
+                PhysicalOperator::HashAggregate(agg) => find_table_scan(agg.input),
+                PhysicalOperator::SortedAggregate(agg) => find_table_scan(agg.input),
                 _ => None,
+            }
+        }
+
+        fn has_filter<'a>(op: &'a crate::sql::planner::PhysicalOperator<'a>) -> bool {
+            use crate::sql::planner::PhysicalOperator;
+            match op {
+                PhysicalOperator::FilterExec(_) => true,
+                PhysicalOperator::ProjectExec(project) => has_filter(project.input),
+                PhysicalOperator::LimitExec(limit) => has_filter(limit.input),
+                PhysicalOperator::SortExec(sort) => has_filter(sort.input),
+                _ => false,
+            }
+        }
+
+        fn has_aggregate<'a>(op: &'a crate::sql::planner::PhysicalOperator<'a>) -> bool {
+            use crate::sql::planner::PhysicalOperator;
+            match op {
+                PhysicalOperator::HashAggregate(_) | PhysicalOperator::SortedAggregate(_) => true,
+                PhysicalOperator::ProjectExec(project) => has_aggregate(project.input),
+                PhysicalOperator::LimitExec(limit) => has_aggregate(limit.input),
+                PhysicalOperator::SortExec(sort) => has_aggregate(sort.input),
+                PhysicalOperator::FilterExec(filter) => has_aggregate(filter.input),
+                _ => false,
             }
         }
 
@@ -520,7 +559,19 @@ impl Database {
 
             let column_types: Vec<_> = table_def.columns().iter().map(|c| c.data_type()).collect();
 
-            let projections = find_projections(physical_plan.root, table_def);
+            let plan_has_filter = has_filter(physical_plan.root);
+            let plan_has_aggregate = has_aggregate(physical_plan.root);
+            let needs_all_columns = plan_has_filter || plan_has_aggregate;
+            eprintln!(
+                "DEBUG query: plan_has_filter = {}, plan_has_aggregate = {}, needs_all_columns = {}",
+                plan_has_filter, plan_has_aggregate, needs_all_columns
+            );
+            let projections = if needs_all_columns {
+                None
+            } else {
+                find_projections(physical_plan.root, table_def)
+            };
+            eprintln!("DEBUG query: projections = {:?}", projections);
 
             let storage = file_manager
                 .table_data(schema_name, table_name)
@@ -542,9 +593,25 @@ impl Database {
 
             let ctx = ExecutionContext::new(&arena);
             let builder = ExecutorBuilder::new(&ctx);
-            let mut executor = builder
-                .build_with_source(&physical_plan, source)
-                .wrap_err("failed to build executor")?;
+
+            let all_columns_map: Vec<(String, usize)> = table_def
+                .columns()
+                .iter()
+                .enumerate()
+                .map(|(idx, col)| (col.name().to_lowercase(), idx))
+                .collect();
+
+            let mut executor = if needs_all_columns {
+                builder
+                    .build_with_source_and_column_map(&physical_plan, source, &all_columns_map)
+                    .wrap_err("failed to build executor")?
+            } else {
+                builder
+                    .build_with_source(&physical_plan, source)
+                    .wrap_err("failed to build executor")?
+            };
+
+            let output_columns = physical_plan.output_schema.columns;
 
             let mut rows = Vec::new();
             executor.open()?;
@@ -554,7 +621,18 @@ impl Database {
                     "DEBUG query: row from executor has {} values",
                     row.values.len()
                 );
-                let owned: Vec<OwnedValue> = row.values.iter().map(OwnedValue::from).collect();
+                let owned: Vec<OwnedValue> = row
+                    .values
+                    .iter()
+                    .enumerate()
+                    .map(|(idx, val)| {
+                        let col_type = output_columns
+                            .get(idx)
+                            .map(|c| c.data_type)
+                            .unwrap_or(DataType::Int8);
+                        convert_value_with_type(val, col_type)
+                    })
+                    .collect();
                 rows.push(Row::new(owned));
             }
             executor.close()?;
@@ -919,6 +997,10 @@ impl Database {
             create.unique,
         )?;
 
+        let index_storage = file_manager.index_data_mut(schema_name, table_name, index_name)?;
+        index_storage.grow(2)?;
+        crate::btree::BTree::create(index_storage, 1)?;
+
         self.save_catalog()?;
         self.save_meta()?;
 
@@ -969,6 +1051,34 @@ impl Database {
                     Some((idx, index_name, is_pk))
                 } else {
                     None
+                }
+            })
+            .collect();
+
+        let unique_column_index_names: HashSet<&str> = unique_columns
+            .iter()
+            .map(|(_, name, _)| name.as_str())
+            .collect();
+
+        let unique_indexes: Vec<(Vec<usize>, String)> = table_def
+            .indexes()
+            .iter()
+            .filter(|idx| idx.is_unique())
+            .filter(|idx| !unique_column_index_names.contains(idx.name()))
+            .filter_map(|idx| {
+                let col_indices: Vec<usize> = idx
+                    .columns()
+                    .iter()
+                    .filter_map(|col_name| {
+                        columns
+                            .iter()
+                            .position(|c| c.name().eq_ignore_ascii_case(col_name))
+                    })
+                    .collect();
+                if col_indices.is_empty() {
+                    None
+                } else {
+                    Some((col_indices, idx.name().to_string()))
                 }
             })
             .collect();
@@ -1119,6 +1229,40 @@ impl Database {
                 }
             }
 
+            for (col_indices, index_name) in &unique_indexes {
+                let all_non_null = col_indices
+                    .iter()
+                    .all(|&idx| values.get(idx).map(|v| !v.is_null()).unwrap_or(false));
+
+                if all_non_null {
+                    if file_manager.index_exists(schema_name, table_name, index_name) {
+                        let index_storage =
+                            file_manager.index_data_mut(schema_name, table_name, index_name)?;
+                        let index_btree = BTree::new(index_storage, root_page)?;
+
+                        let mut key_buf = Vec::with_capacity(64);
+                        for &col_idx in col_indices {
+                            if let Some(value) = values.get(col_idx) {
+                                Self::encode_value_as_key(value, &mut key_buf);
+                            }
+                        }
+
+                        if index_btree.search(&key_buf)?.is_some() {
+                            let col_names: Vec<&str> = col_indices
+                                .iter()
+                                .filter_map(|&idx| columns.get(idx).map(|c| c.name()))
+                                .collect();
+                            bail!(
+                                "UNIQUE constraint violated on index '{}' (columns: {}) in table '{}': value already exists",
+                                index_name,
+                                col_names.join(", "),
+                                table_name
+                            );
+                        }
+                    }
+                }
+            }
+
             let table_storage = file_manager.table_data_mut(schema_name, table_name)?;
             let row_id = self.next_row_id.fetch_add(1, Ordering::Relaxed);
             let row_key = Self::generate_row_key(row_id);
@@ -1160,6 +1304,31 @@ impl Database {
 
                         let mut key_buf = Vec::with_capacity(64);
                         Self::encode_value_as_key(value, &mut key_buf);
+
+                        let row_id_bytes = row_id.to_be_bytes();
+
+                        let mut index_btree = BTree::new(index_storage, root_page)?;
+                        index_btree.insert(&key_buf, &row_id_bytes)?;
+                    }
+                }
+            }
+
+            for (col_indices, index_name) in &unique_indexes {
+                let all_non_null = col_indices
+                    .iter()
+                    .all(|&idx| values.get(idx).map(|v| !v.is_null()).unwrap_or(false));
+
+                if all_non_null {
+                    if file_manager.index_exists(schema_name, table_name, index_name) {
+                        let index_storage =
+                            file_manager.index_data_mut(schema_name, table_name, index_name)?;
+
+                        let mut key_buf = Vec::with_capacity(64);
+                        for &col_idx in col_indices {
+                            if let Some(value) = values.get(col_idx) {
+                                Self::encode_value_as_key(value, &mut key_buf);
+                            }
+                        }
 
                         let row_id_bytes = row_id.to_be_bytes();
 
@@ -1626,6 +1795,8 @@ impl Database {
         let mut catalog_guard = self.catalog.write();
         let catalog = catalog_guard.as_mut().unwrap();
 
+        let mut actually_dropped = false;
+
         for table_ref in drop_stmt.names.iter() {
             let schema_name = table_ref.schema.unwrap_or("root");
             let table_name = table_ref.name;
@@ -1633,6 +1804,7 @@ impl Database {
             if let Some(schema) = catalog.get_schema_mut(schema_name) {
                 if schema.table_exists(table_name) {
                     schema.remove_table(table_name);
+                    actually_dropped = true;
                 } else if !drop_stmt.if_exists {
                     bail!(
                         "table '{}' not found in schema '{}'",
@@ -1644,15 +1816,21 @@ impl Database {
                 bail!("schema '{}' not found", schema_name);
             }
 
-            let mut file_manager_guard = self.file_manager.write();
-            let file_manager = file_manager_guard.as_mut().unwrap();
-            let _ = file_manager.drop_table(schema_name, table_name);
+            if actually_dropped {
+                let mut file_manager_guard = self.file_manager.write();
+                let file_manager = file_manager_guard.as_mut().unwrap();
+                let _ = file_manager.drop_table(schema_name, table_name);
+            }
         }
 
         drop(catalog_guard);
-        self.save_catalog()?;
+        if actually_dropped {
+            self.save_catalog()?;
+        }
 
-        Ok(ExecuteResult::DropTable { dropped: true })
+        Ok(ExecuteResult::DropTable {
+            dropped: actually_dropped,
+        })
     }
 
     fn execute_drop_index(
