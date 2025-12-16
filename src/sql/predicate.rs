@@ -14,16 +14,7 @@ impl<'a> CompiledPredicate<'a> {
     }
 
     pub fn evaluate(&self, row: &ExecutorRow<'a>) -> bool {
-        #[cfg(test)]
-        eprintln!(
-            "DEBUG predicate: evaluating with column_map={:?}, row.len={}",
-            self.column_map,
-            row.values.len()
-        );
-        let result = self.eval_expr(self.expr, row);
-        #[cfg(test)]
-        eprintln!("DEBUG predicate: result = {}", result);
-        result
+        self.eval_expr(self.expr, row)
     }
 
     fn eval_expr(&self, expr: &crate::sql::ast::Expr<'a>, row: &ExecutorRow<'a>) -> bool {
@@ -1255,5 +1246,40 @@ impl<'a> CompiledPredicate<'a> {
             (Some(Ordering::Equal), BinaryOperator::GtEq) => true,
             _ => false,
         }
+    }
+
+    pub fn evaluate_to_value(&self, row: &ExecutorRow<'a>) -> Option<Value<'a>> {
+        self.eval_value(self.expr, row)
+    }
+}
+
+pub struct CompiledProjection<'a> {
+    expressions: Vec<&'a crate::sql::ast::Expr<'a>>,
+    column_map: Vec<(String, usize)>,
+}
+
+impl<'a> CompiledProjection<'a> {
+    pub fn new(
+        expressions: Vec<&'a crate::sql::ast::Expr<'a>>,
+        column_map: Vec<(String, usize)>,
+    ) -> Self {
+        Self {
+            expressions,
+            column_map,
+        }
+    }
+
+    pub fn evaluate(&self, row: &ExecutorRow<'a>) -> Vec<Option<Value<'a>>> {
+        self.expressions
+            .iter()
+            .map(|expr| {
+                let pred = CompiledPredicate::new(expr, self.column_map.clone());
+                pred.evaluate_to_value(row)
+            })
+            .collect()
+    }
+
+    pub fn expression_count(&self) -> usize {
+        self.expressions.len()
     }
 }

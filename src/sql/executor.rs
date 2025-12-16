@@ -76,7 +76,7 @@ use crate::sql::decoder::SimpleDecoder;
 use crate::sql::predicate::CompiledPredicate;
 use crate::sql::state::{
     AggregateState, GraceHashJoinState, HashAggregateState, IndexScanState, LimitState,
-    NestedLoopJoinState, SortState,
+    NestedLoopJoinState, SortState, WindowState,
 };
 use crate::sql::util::{
     allocate_value_to_arena, clone_value_owned, clone_value_ref_to_arena, compare_values_for_sort,
@@ -1156,11 +1156,17 @@ pub enum DynamicExecutor<'a, S: RowSource> {
     IndexScan(IndexScanState<'a>),
     Filter(Box<DynamicExecutor<'a, S>>, CompiledPredicate<'a>),
     Project(Box<DynamicExecutor<'a, S>>, Vec<usize>, &'a Bump),
+    ProjectExpr(
+        Box<DynamicExecutor<'a, S>>,
+        crate::sql::predicate::CompiledProjection<'a>,
+        &'a Bump,
+    ),
     Limit(LimitState<'a, S>),
     Sort(SortState<'a, S>),
     NestedLoopJoin(NestedLoopJoinState<'a, S>),
     GraceHashJoin(GraceHashJoinState<'a, S>),
     HashAggregate(HashAggregateState<'a, S>),
+    Window(WindowState<'a, S>),
 }
 
 impl<'a, S: RowSource> Executor<'a> for DynamicExecutor<'a, S> {
@@ -1174,6 +1180,7 @@ impl<'a, S: RowSource> Executor<'a> for DynamicExecutor<'a, S> {
             }
             DynamicExecutor::Filter(child, _) => child.open(),
             DynamicExecutor::Project(child, _, _) => child.open(),
+            DynamicExecutor::ProjectExpr(child, _, _) => child.open(),
             DynamicExecutor::Limit(state) => {
                 state.skipped = 0;
                 state.returned = 0;
@@ -1259,6 +1266,13 @@ impl<'a, S: RowSource> Executor<'a> for DynamicExecutor<'a, S> {
                 state.computed = false;
                 state.child.open()
             }
+            DynamicExecutor::Window(state) => {
+                state.rows.clear();
+                state.window_results.clear();
+                state.iter_idx = 0;
+                state.computed = false;
+                state.child.open()
+            }
         }
     }
 
@@ -1299,6 +1313,19 @@ impl<'a, S: RowSource> Executor<'a> for DynamicExecutor<'a, S> {
                     let projected: &'a [Value<'a>] = arena.alloc_slice_fill_iter(
                         projections.iter().map(|&idx| match row.get(idx) {
                             Some(v) => ExecutorRow::clone_value_to_arena(v, arena),
+                            None => Value::Null,
+                        }),
+                    );
+                    Ok(Some(ExecutorRow::new(projected)))
+                }
+                None => Ok(None),
+            },
+            DynamicExecutor::ProjectExpr(child, projection, arena) => match child.next()? {
+                Some(row) => {
+                    let values = projection.evaluate(&row);
+                    let projected: &'a [Value<'a>] = arena.alloc_slice_fill_iter(
+                        values.into_iter().map(|opt_val| match opt_val {
+                            Some(v) => ExecutorRow::clone_value_to_arena(&v, arena),
                             None => Value::Null,
                         }),
                     );
@@ -1656,6 +1683,36 @@ impl<'a, S: RowSource> Executor<'a> for DynamicExecutor<'a, S> {
                 }
                 Ok(None)
             }
+            DynamicExecutor::Window(state) => {
+                if !state.computed {
+                    while let Some(row) = state.child.next()? {
+                        let owned: Vec<Value<'static>> =
+                            row.values.iter().map(clone_value_owned).collect();
+                        state.rows.push(owned);
+                    }
+                    state.compute_window_functions();
+                    state.computed = true;
+                }
+
+                if state.iter_idx < state.rows.len() {
+                    let values = &state.rows[state.iter_idx];
+                    let window_vals = &state.window_results[state.iter_idx];
+                    state.iter_idx += 1;
+
+                    let mut result_values: Vec<Value<'a>> = values
+                        .iter()
+                        .map(|v| clone_value_ref_to_arena(v, state.arena))
+                        .collect();
+
+                    for &wval in window_vals.iter() {
+                        result_values.push(Value::Int(wval));
+                    }
+
+                    let allocated = state.arena.alloc_slice_fill_iter(result_values);
+                    return Ok(Some(ExecutorRow::new(allocated)));
+                }
+                Ok(None)
+            }
         }
     }
 
@@ -1668,11 +1725,13 @@ impl<'a, S: RowSource> Executor<'a> for DynamicExecutor<'a, S> {
             }
             DynamicExecutor::Filter(child, _) => child.close(),
             DynamicExecutor::Project(child, _, _) => child.close(),
+            DynamicExecutor::ProjectExpr(child, _, _) => child.close(),
             DynamicExecutor::Limit(state) => state.child.close(),
             DynamicExecutor::Sort(state) => state.child.close(),
             DynamicExecutor::NestedLoopJoin(state) => state.left.close(),
             DynamicExecutor::GraceHashJoin(_) => Ok(()),
             DynamicExecutor::HashAggregate(state) => state.child.close(),
+            DynamicExecutor::Window(state) => state.child.close(),
         }
     }
 }
