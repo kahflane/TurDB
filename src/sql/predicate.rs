@@ -14,7 +14,16 @@ impl<'a> CompiledPredicate<'a> {
     }
 
     pub fn evaluate(&self, row: &ExecutorRow<'a>) -> bool {
-        self.eval_expr(self.expr, row)
+        #[cfg(test)]
+        eprintln!(
+            "DEBUG predicate: evaluating with column_map={:?}, row.len={}",
+            self.column_map,
+            row.values.len()
+        );
+        let result = self.eval_expr(self.expr, row);
+        #[cfg(test)]
+        eprintln!("DEBUG predicate: result = {}", result);
+        result
     }
 
     fn eval_expr(&self, expr: &crate::sql::ast::Expr<'a>, row: &ExecutorRow<'a>) -> bool {

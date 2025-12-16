@@ -35,6 +35,15 @@ impl<'a> ExecutorBuilder<'a> {
         self.build_operator(plan.root, source, &column_map)
     }
 
+    pub fn build_with_source_and_column_map<S: RowSource>(
+        &self,
+        plan: &crate::sql::planner::PhysicalPlan<'a>,
+        source: S,
+        column_map: &[(String, usize)],
+    ) -> eyre::Result<DynamicExecutor<'a, S>> {
+        self.build_operator(plan.root, source, column_map)
+    }
+
     fn build_operator<S: RowSource>(
         &self,
         op: &'a crate::sql::planner::PhysicalOperator<'a>,
@@ -53,8 +62,31 @@ impl<'a> ExecutorBuilder<'a> {
                 Ok(DynamicExecutor::Filter(Box::new(child), predicate))
             }
             PhysicalOperator::ProjectExec(project) => {
+                use crate::sql::ast::Expr;
+
                 let child = self.build_operator(project.input, source, column_map)?;
-                let projections: Vec<usize> = (0..project.expressions.len()).collect();
+                let projections: Vec<usize> = if project.expressions.is_empty() {
+                    (0..column_map.len()).collect()
+                } else {
+                    project
+                        .expressions
+                        .iter()
+                        .enumerate()
+                        .map(|(default_idx, expr)| {
+                            if let Expr::Column(col_ref) = expr {
+                                column_map
+                                    .iter()
+                                    .find(|(name, _)| {
+                                        name.eq_ignore_ascii_case(col_ref.column)
+                                    })
+                                    .map(|(_, idx)| *idx)
+                                    .unwrap_or(default_idx)
+                            } else {
+                                default_idx
+                            }
+                        })
+                        .collect()
+                };
                 #[cfg(test)]
                 eprintln!(
                     "DEBUG ProjectExec: expressions.len() = {}, projections = {:?}",

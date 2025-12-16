@@ -177,11 +177,40 @@ pub mod type_prefix {
     pub const MAX_KEY: u8 = 0xFF;
 }
 
-pub fn encode_null(buf: &mut Vec<u8>) {
+pub trait KeyBuffer {
+    fn push(&mut self, byte: u8);
+    fn extend_from_slice(&mut self, bytes: &[u8]);
+}
+
+impl KeyBuffer for Vec<u8> {
+    #[inline]
+    fn push(&mut self, byte: u8) {
+        Vec::push(self, byte);
+    }
+
+    #[inline]
+    fn extend_from_slice(&mut self, bytes: &[u8]) {
+        self.extend(bytes);
+    }
+}
+
+impl<A: smallvec::Array<Item = u8>> KeyBuffer for smallvec::SmallVec<A> {
+    #[inline]
+    fn push(&mut self, byte: u8) {
+        smallvec::SmallVec::push(self, byte);
+    }
+
+    #[inline]
+    fn extend_from_slice(&mut self, bytes: &[u8]) {
+        self.extend(bytes.iter().copied());
+    }
+}
+
+pub fn encode_null<B: KeyBuffer>(buf: &mut B) {
     buf.push(type_prefix::NULL);
 }
 
-pub fn encode_bool(b: bool, buf: &mut Vec<u8>) {
+pub fn encode_bool<B: KeyBuffer>(b: bool, buf: &mut B) {
     buf.push(if b {
         type_prefix::TRUE
     } else {
@@ -189,19 +218,19 @@ pub fn encode_bool(b: bool, buf: &mut Vec<u8>) {
     });
 }
 
-pub fn encode_int(n: i64, buf: &mut Vec<u8>) {
+pub fn encode_int<B: KeyBuffer>(n: i64, buf: &mut B) {
     if n < 0 {
         buf.push(type_prefix::NEG_INT);
-        buf.extend((n as u64).to_be_bytes());
+        buf.extend_from_slice(&(n as u64).to_be_bytes());
     } else if n == 0 {
         buf.push(type_prefix::ZERO);
     } else {
         buf.push(type_prefix::POS_INT);
-        buf.extend((n as u64).to_be_bytes());
+        buf.extend_from_slice(&(n as u64).to_be_bytes());
     }
 }
 
-pub fn encode_float(f: f64, buf: &mut Vec<u8>) {
+pub fn encode_float<B: KeyBuffer>(f: f64, buf: &mut B) {
     if f.is_nan() {
         buf.push(type_prefix::NAN);
     } else if f == f64::NEG_INFINITY {
@@ -210,72 +239,72 @@ pub fn encode_float(f: f64, buf: &mut Vec<u8>) {
         buf.push(type_prefix::POS_INFINITY);
     } else if f < 0.0 {
         buf.push(type_prefix::NEG_FLOAT);
-        buf.extend((!f.to_bits()).to_be_bytes());
+        buf.extend_from_slice(&(!f.to_bits()).to_be_bytes());
     } else if f == 0.0 {
         buf.push(type_prefix::ZERO);
     } else {
         buf.push(type_prefix::POS_FLOAT);
-        buf.extend((f.to_bits() ^ (1u64 << 63)).to_be_bytes());
+        buf.extend_from_slice(&(f.to_bits() ^ (1u64 << 63)).to_be_bytes());
     }
 }
 
-pub fn encode_text(s: &str, buf: &mut Vec<u8>) {
+pub fn encode_text<B: KeyBuffer>(s: &str, buf: &mut B) {
     buf.push(type_prefix::TEXT);
     encode_escaped_bytes(s.as_bytes(), buf);
 }
 
-pub fn encode_blob(data: &[u8], buf: &mut Vec<u8>) {
+pub fn encode_blob<B: KeyBuffer>(data: &[u8], buf: &mut B) {
     buf.push(type_prefix::BLOB);
     encode_escaped_bytes(data, buf);
 }
 
-pub fn encode_date(days: i32, buf: &mut Vec<u8>) {
+pub fn encode_date<B: KeyBuffer>(days: i32, buf: &mut B) {
     buf.push(type_prefix::DATE);
-    buf.extend(((days as u32) ^ (1u32 << 31)).to_be_bytes());
+    buf.extend_from_slice(&((days as u32) ^ (1u32 << 31)).to_be_bytes());
 }
 
-pub fn encode_timestamp(micros: i64, buf: &mut Vec<u8>) {
+pub fn encode_timestamp<B: KeyBuffer>(micros: i64, buf: &mut B) {
     buf.push(type_prefix::TIMESTAMP);
-    buf.extend(((micros as u64) ^ (1u64 << 63)).to_be_bytes());
+    buf.extend_from_slice(&((micros as u64) ^ (1u64 << 63)).to_be_bytes());
 }
 
-pub fn encode_uuid(uuid: &[u8; 16], buf: &mut Vec<u8>) {
+pub fn encode_uuid<B: KeyBuffer>(uuid: &[u8; 16], buf: &mut B) {
     buf.push(type_prefix::UUID);
-    buf.extend(uuid);
+    buf.extend_from_slice(uuid);
 }
 
-pub fn encode_time(micros: i64, buf: &mut Vec<u8>) {
+pub fn encode_time<B: KeyBuffer>(micros: i64, buf: &mut B) {
     buf.push(type_prefix::TIME);
-    buf.extend(((micros as u64) ^ (1u64 << 63)).to_be_bytes());
+    buf.extend_from_slice(&((micros as u64) ^ (1u64 << 63)).to_be_bytes());
 }
 
-pub fn encode_timestamptz(micros: i64, tz_offset_mins: i16, buf: &mut Vec<u8>) {
+pub fn encode_timestamptz<B: KeyBuffer>(micros: i64, tz_offset_mins: i16, buf: &mut B) {
     buf.push(type_prefix::TIMESTAMPTZ);
-    buf.extend(((micros as u64) ^ (1u64 << 63)).to_be_bytes());
-    buf.extend(((tz_offset_mins as u16) ^ (1u16 << 15)).to_be_bytes());
+    buf.extend_from_slice(&((micros as u64) ^ (1u64 << 63)).to_be_bytes());
+    buf.extend_from_slice(&((tz_offset_mins as u16) ^ (1u16 << 15)).to_be_bytes());
 }
 
-pub fn encode_interval(months: i32, days: i32, micros: i64, buf: &mut Vec<u8>) {
+pub fn encode_interval<B: KeyBuffer>(months: i32, days: i32, micros: i64, buf: &mut B) {
     buf.push(type_prefix::INTERVAL);
-    buf.extend(((months as u32) ^ (1u32 << 31)).to_be_bytes());
-    buf.extend(((days as u32) ^ (1u32 << 31)).to_be_bytes());
-    buf.extend(((micros as u64) ^ (1u64 << 63)).to_be_bytes());
+    buf.extend_from_slice(&((months as u32) ^ (1u32 << 31)).to_be_bytes());
+    buf.extend_from_slice(&((days as u32) ^ (1u32 << 31)).to_be_bytes());
+    buf.extend_from_slice(&((micros as u64) ^ (1u64 << 63)).to_be_bytes());
 }
 
-pub fn encode_inet(is_ipv6: bool, addr: &[u8], prefix_len: u8, buf: &mut Vec<u8>) {
+pub fn encode_inet<B: KeyBuffer>(is_ipv6: bool, addr: &[u8], prefix_len: u8, buf: &mut B) {
     buf.push(type_prefix::INET);
     buf.push(if is_ipv6 { 1 } else { 0 });
     buf.push(prefix_len);
     if is_ipv6 {
-        buf.extend(&addr[..16]);
+        buf.extend_from_slice(&addr[..16]);
     } else {
-        buf.extend(&addr[..4]);
+        buf.extend_from_slice(&addr[..4]);
     }
 }
 
-pub fn encode_macaddr(addr: &[u8; 6], buf: &mut Vec<u8>) {
+pub fn encode_macaddr<B: KeyBuffer>(addr: &[u8; 6], buf: &mut B) {
     buf.push(type_prefix::MACADDR);
-    buf.extend(addr);
+    buf.extend_from_slice(addr);
 }
 
 pub fn encode_tuple<F>(elements: &[F], buf: &mut Vec<u8>, encode_elem: impl Fn(&F, &mut Vec<u8>)) {
@@ -322,9 +351,9 @@ pub fn encode_domain<F>(
     encode_val(value, buf);
 }
 
-pub fn encode_vector(dimensions: &[f32], buf: &mut Vec<u8>) {
+pub fn encode_vector<B: KeyBuffer>(dimensions: &[f32], buf: &mut B) {
     buf.push(type_prefix::VECTOR);
-    buf.extend((dimensions.len() as u32).to_be_bytes());
+    buf.extend_from_slice(&(dimensions.len() as u32).to_be_bytes());
     for &dim in dimensions {
         let bits = dim.to_bits();
         let encoded = if dim < 0.0 {
@@ -332,7 +361,7 @@ pub fn encode_vector(dimensions: &[f32], buf: &mut Vec<u8>) {
         } else {
             bits ^ (1u32 << 31)
         };
-        buf.extend(encoded.to_be_bytes());
+        buf.extend_from_slice(&encoded.to_be_bytes());
     }
 }
 
@@ -347,10 +376,10 @@ pub fn encode_array<F>(elements: &[F], buf: &mut Vec<u8>, encode_elem: impl Fn(&
     buf.push(0x00);
 }
 
-pub fn encode_enum(type_id: u32, ordinal: u32, buf: &mut Vec<u8>) {
+pub fn encode_enum<B: KeyBuffer>(type_id: u32, ordinal: u32, buf: &mut B) {
     buf.push(type_prefix::ENUM);
-    buf.extend(type_id.to_be_bytes());
-    buf.extend(ordinal.to_be_bytes());
+    buf.extend_from_slice(&type_id.to_be_bytes());
+    buf.extend_from_slice(&ordinal.to_be_bytes());
 }
 
 pub fn encode_composite<F>(
@@ -380,7 +409,7 @@ pub enum JsonValue<'a> {
     Object(&'a [(&'a str, JsonValue<'a>)]),
 }
 
-pub fn encode_json(json: &JsonValue, buf: &mut Vec<u8>) {
+pub fn encode_json<B: KeyBuffer>(json: &JsonValue, buf: &mut B) {
     match json {
         JsonValue::Null => buf.push(type_prefix::JSON_NULL),
         JsonValue::Bool(false) => buf.push(type_prefix::JSON_FALSE),
@@ -388,9 +417,9 @@ pub fn encode_json(json: &JsonValue, buf: &mut Vec<u8>) {
         JsonValue::Number(n) => {
             buf.push(type_prefix::JSON_NUMBER);
             if *n < 0.0 {
-                buf.extend((!n.to_bits()).to_be_bytes());
+                buf.extend_from_slice(&(!n.to_bits()).to_be_bytes());
             } else {
-                buf.extend((n.to_bits() ^ (1u64 << 63)).to_be_bytes());
+                buf.extend_from_slice(&(n.to_bits() ^ (1u64 << 63)).to_be_bytes());
             }
         }
         JsonValue::String(s) => {
@@ -421,7 +450,7 @@ pub fn encode_json(json: &JsonValue, buf: &mut Vec<u8>) {
     }
 }
 
-fn encode_escaped_bytes(data: &[u8], buf: &mut Vec<u8>) {
+fn encode_escaped_bytes<B: KeyBuffer>(data: &[u8], buf: &mut B) {
     for &byte in data {
         match byte {
             0x00 => {
@@ -452,7 +481,7 @@ pub enum Value<'a> {
     Uuid(&'a [u8; 16]),
 }
 
-pub fn encode_value(value: &Value, buf: &mut Vec<u8>) {
+pub fn encode_value<B: KeyBuffer>(value: &Value, buf: &mut B) {
     match value {
         Value::Null => encode_null(buf),
         Value::Bool(b) => encode_bool(*b, buf),
@@ -544,26 +573,26 @@ pub fn decode_key(data: &[u8]) -> Result<(DecodedKey, usize)> {
         type_prefix::ZERO => Ok((DecodedKey::Int(0), 1)),
         type_prefix::NEG_INT => {
             ensure!(data.len() >= 9, "truncated negative integer");
-            let bytes: [u8; 8] = data[1..9].try_into().unwrap(); // INVARIANT: length validated by ensure above
+            let bytes: [u8; 8] = data[1..9].try_into().unwrap(); // SAFETY: length validated by ensure above
             let val = i64::from_be_bytes(bytes);
             Ok((DecodedKey::Int(val), 9))
         }
         type_prefix::POS_INT => {
             ensure!(data.len() >= 9, "truncated positive integer");
-            let bytes: [u8; 8] = data[1..9].try_into().unwrap(); // INVARIANT: length validated by ensure above
+            let bytes: [u8; 8] = data[1..9].try_into().unwrap(); // SAFETY: length validated by ensure above
             let val = u64::from_be_bytes(bytes) as i64;
             Ok((DecodedKey::Int(val), 9))
         }
         type_prefix::NEG_FLOAT => {
             ensure!(data.len() >= 9, "truncated negative float");
-            let bytes: [u8; 8] = data[1..9].try_into().unwrap(); // INVARIANT: length validated by ensure above
+            let bytes: [u8; 8] = data[1..9].try_into().unwrap(); // SAFETY: length validated by ensure above
             let bits = !u64::from_be_bytes(bytes);
             let val = f64::from_bits(bits);
             Ok((DecodedKey::Float(val), 9))
         }
         type_prefix::POS_FLOAT => {
             ensure!(data.len() >= 9, "truncated positive float");
-            let bytes: [u8; 8] = data[1..9].try_into().unwrap(); // INVARIANT: length validated by ensure above
+            let bytes: [u8; 8] = data[1..9].try_into().unwrap(); // SAFETY: length validated by ensure above
             let bits = u64::from_be_bytes(bytes) ^ (1u64 << 63);
             let val = f64::from_bits(bits);
             Ok((DecodedKey::Float(val), 9))
@@ -580,29 +609,29 @@ pub fn decode_key(data: &[u8]) -> Result<(DecodedKey, usize)> {
         }
         type_prefix::DATE => {
             ensure!(data.len() >= 5, "truncated date");
-            let bytes: [u8; 4] = data[1..5].try_into().unwrap(); // INVARIANT: length validated by ensure above
+            let bytes: [u8; 4] = data[1..5].try_into().unwrap(); // SAFETY: length validated by ensure above
             let encoded = u32::from_be_bytes(bytes);
             let days = (encoded ^ (1u32 << 31)) as i32;
             Ok((DecodedKey::Date(days), 5))
         }
         type_prefix::TIME => {
             ensure!(data.len() >= 9, "truncated time");
-            let bytes: [u8; 8] = data[1..9].try_into().unwrap(); // INVARIANT: length validated by ensure above
+            let bytes: [u8; 8] = data[1..9].try_into().unwrap(); // SAFETY: length validated by ensure above
             let encoded = u64::from_be_bytes(bytes);
             let micros = (encoded ^ (1u64 << 63)) as i64;
             Ok((DecodedKey::Time(micros), 9))
         }
         type_prefix::TIMESTAMP => {
             ensure!(data.len() >= 9, "truncated timestamp");
-            let bytes: [u8; 8] = data[1..9].try_into().unwrap(); // INVARIANT: length validated by ensure above
+            let bytes: [u8; 8] = data[1..9].try_into().unwrap(); // SAFETY: length validated by ensure above
             let encoded = u64::from_be_bytes(bytes);
             let micros = (encoded ^ (1u64 << 63)) as i64;
             Ok((DecodedKey::Timestamp(micros), 9))
         }
         type_prefix::TIMESTAMPTZ => {
             ensure!(data.len() >= 11, "truncated timestamptz");
-            let ts_bytes: [u8; 8] = data[1..9].try_into().unwrap(); // INVARIANT: length validated by ensure above
-            let tz_bytes: [u8; 2] = data[9..11].try_into().unwrap(); // INVARIANT: length validated by ensure above
+            let ts_bytes: [u8; 8] = data[1..9].try_into().unwrap(); // SAFETY: length validated by ensure above
+            let tz_bytes: [u8; 2] = data[9..11].try_into().unwrap(); // SAFETY: length validated by ensure above
             let encoded_ts = u64::from_be_bytes(ts_bytes);
             let encoded_tz = u16::from_be_bytes(tz_bytes);
             let micros = (encoded_ts ^ (1u64 << 63)) as i64;
@@ -617,9 +646,9 @@ pub fn decode_key(data: &[u8]) -> Result<(DecodedKey, usize)> {
         }
         type_prefix::INTERVAL => {
             ensure!(data.len() >= 17, "truncated interval");
-            let m_bytes: [u8; 4] = data[1..5].try_into().unwrap(); // INVARIANT: length validated by ensure above
-            let d_bytes: [u8; 4] = data[5..9].try_into().unwrap(); // INVARIANT: length validated by ensure above
-            let u_bytes: [u8; 8] = data[9..17].try_into().unwrap(); // INVARIANT: length validated by ensure above
+            let m_bytes: [u8; 4] = data[1..5].try_into().unwrap(); // SAFETY: length validated by ensure above
+            let d_bytes: [u8; 4] = data[5..9].try_into().unwrap(); // SAFETY: length validated by ensure above
+            let u_bytes: [u8; 8] = data[9..17].try_into().unwrap(); // SAFETY: length validated by ensure above
             let months = (u32::from_be_bytes(m_bytes) ^ (1u32 << 31)) as i32;
             let days = (u32::from_be_bytes(d_bytes) ^ (1u32 << 31)) as i32;
             let micros = (u64::from_be_bytes(u_bytes) ^ (1u64 << 63)) as i64;
@@ -634,7 +663,7 @@ pub fn decode_key(data: &[u8]) -> Result<(DecodedKey, usize)> {
         }
         type_prefix::UUID => {
             ensure!(data.len() >= 17, "truncated uuid");
-            let bytes: [u8; 16] = data[1..17].try_into().unwrap(); // INVARIANT: length validated by ensure above
+            let bytes: [u8; 16] = data[1..17].try_into().unwrap(); // SAFETY: length validated by ensure above
             Ok((DecodedKey::Uuid(bytes), 17))
         }
         type_prefix::INET => {
@@ -655,7 +684,7 @@ pub fn decode_key(data: &[u8]) -> Result<(DecodedKey, usize)> {
         }
         type_prefix::MACADDR => {
             ensure!(data.len() >= 7, "truncated macaddr");
-            let bytes: [u8; 6] = data[1..7].try_into().unwrap(); // INVARIANT: length validated by ensure above
+            let bytes: [u8; 6] = data[1..7].try_into().unwrap(); // SAFETY: length validated by ensure above
             Ok((DecodedKey::MacAddr(bytes), 7))
         }
         type_prefix::ARRAY => {
@@ -700,19 +729,19 @@ pub fn decode_key(data: &[u8]) -> Result<(DecodedKey, usize)> {
         }
         type_prefix::ENUM => {
             ensure!(data.len() >= 9, "truncated enum");
-            let type_id = u32::from_be_bytes(data[1..5].try_into().unwrap()); // INVARIANT: length validated by ensure above
-            let ordinal = u32::from_be_bytes(data[5..9].try_into().unwrap()); // INVARIANT: length validated by ensure above
+            let type_id = u32::from_be_bytes(data[1..5].try_into().unwrap()); // SAFETY: length validated by ensure above
+            let ordinal = u32::from_be_bytes(data[5..9].try_into().unwrap()); // SAFETY: length validated by ensure above
             Ok((DecodedKey::Enum { type_id, ordinal }, 9))
         }
         type_prefix::COMPOSITE => {
             ensure!(data.len() >= 5, "truncated composite");
-            let type_id = u32::from_be_bytes(data[1..5].try_into().unwrap()); // INVARIANT: length validated by ensure above
+            let type_id = u32::from_be_bytes(data[1..5].try_into().unwrap()); // SAFETY: length validated by ensure above
             let (fields, consumed) = decode_composite_fields(&data[5..])?;
             Ok((DecodedKey::Composite { type_id, fields }, 5 + consumed))
         }
         type_prefix::DOMAIN => {
             ensure!(data.len() >= 5, "truncated domain");
-            let type_id = u32::from_be_bytes(data[1..5].try_into().unwrap()); // INVARIANT: length validated by ensure above
+            let type_id = u32::from_be_bytes(data[1..5].try_into().unwrap()); // SAFETY: length validated by ensure above
             let (value, consumed) = decode_key(&data[5..])?;
             Ok((
                 DecodedKey::Domain {
@@ -724,7 +753,7 @@ pub fn decode_key(data: &[u8]) -> Result<(DecodedKey, usize)> {
         }
         type_prefix::VECTOR => {
             ensure!(data.len() >= 5, "truncated vector");
-            let dim_count = u32::from_be_bytes(data[1..5].try_into().unwrap()) as usize; // INVARIANT: length validated by ensure above
+            let dim_count = u32::from_be_bytes(data[1..5].try_into().unwrap()) as usize; // SAFETY: length validated by ensure above
             ensure!(
                 data.len() >= 5 + dim_count * 4,
                 "truncated vector dimensions"
@@ -732,7 +761,7 @@ pub fn decode_key(data: &[u8]) -> Result<(DecodedKey, usize)> {
             let mut dimensions = Vec::with_capacity(dim_count);
             for i in 0..dim_count {
                 let start = 5 + i * 4;
-                let encoded = u32::from_be_bytes(data[start..start + 4].try_into().unwrap()); // INVARIANT: length validated by ensure above
+                let encoded = u32::from_be_bytes(data[start..start + 4].try_into().unwrap()); // SAFETY: length validated by ensure above
                 let bits = if encoded & (1u32 << 31) != 0 {
                     encoded ^ (1u32 << 31)
                 } else {
@@ -845,7 +874,7 @@ fn decode_json(data: &[u8]) -> Result<(DecodedJson, usize)> {
         type_prefix::JSON_TRUE => Ok((DecodedJson::Bool(true), 1)),
         type_prefix::JSON_NUMBER => {
             ensure!(data.len() >= 9, "truncated json number");
-            let bytes: [u8; 8] = data[1..9].try_into().unwrap(); // INVARIANT: length validated by ensure above
+            let bytes: [u8; 8] = data[1..9].try_into().unwrap(); // SAFETY: length validated by ensure above
             let encoded = u64::from_be_bytes(bytes);
             let bits = if encoded & (1u64 << 63) != 0 {
                 encoded ^ (1u64 << 63)
