@@ -450,8 +450,6 @@ impl Database {
     pub fn query(&self, sql: &str) -> Result<Vec<Row>> {
         use crate::sql::ast::{Distinct, Statement};
 
-        eprintln!("DEBUG query: executing sql = '{}'", sql);
-
         self.ensure_catalog()?;
         self.ensure_file_manager()?;
 
@@ -562,16 +560,11 @@ impl Database {
             let plan_has_filter = has_filter(physical_plan.root);
             let plan_has_aggregate = has_aggregate(physical_plan.root);
             let needs_all_columns = plan_has_filter || plan_has_aggregate;
-            eprintln!(
-                "DEBUG query: plan_has_filter = {}, plan_has_aggregate = {}, needs_all_columns = {}",
-                plan_has_filter, plan_has_aggregate, needs_all_columns
-            );
             let projections = if needs_all_columns {
                 None
             } else {
                 find_projections(physical_plan.root, table_def)
             };
-            eprintln!("DEBUG query: projections = {:?}", projections);
 
             let storage = file_manager
                 .table_data(schema_name, table_name)
@@ -616,11 +609,6 @@ impl Database {
             let mut rows = Vec::new();
             executor.open()?;
             while let Some(row) = executor.next()? {
-                #[cfg(test)]
-                eprintln!(
-                    "DEBUG query: row from executor has {} values",
-                    row.values.len()
-                );
                 let owned: Vec<OwnedValue> = row
                     .values
                     .iter()
@@ -1116,6 +1104,7 @@ impl Database {
         let file_manager = file_manager_guard.as_mut().unwrap();
 
         let mut count = 0;
+        let mut key_buf = Vec::with_capacity(64);
 
         for row_exprs in rows.iter() {
             let mut values: Vec<OwnedValue> = row_exprs
@@ -1213,7 +1202,7 @@ impl Database {
                             file_manager.index_data_mut(schema_name, table_name, index_name)?;
                         let index_btree = BTree::new(index_storage, root_page)?;
 
-                        let mut key_buf = Vec::with_capacity(64);
+                        key_buf.clear();
                         Self::encode_value_as_key(value, &mut key_buf);
 
                         if index_btree.search(&key_buf)?.is_some() {
@@ -1234,31 +1223,31 @@ impl Database {
                     .iter()
                     .all(|&idx| values.get(idx).map(|v| !v.is_null()).unwrap_or(false));
 
-                if all_non_null {
-                    if file_manager.index_exists(schema_name, table_name, index_name) {
-                        let index_storage =
-                            file_manager.index_data_mut(schema_name, table_name, index_name)?;
-                        let index_btree = BTree::new(index_storage, root_page)?;
+                if all_non_null
+                    && file_manager.index_exists(schema_name, table_name, index_name)
+                {
+                    let index_storage =
+                        file_manager.index_data_mut(schema_name, table_name, index_name)?;
+                    let index_btree = BTree::new(index_storage, root_page)?;
 
-                        let mut key_buf = Vec::with_capacity(64);
-                        for &col_idx in col_indices {
-                            if let Some(value) = values.get(col_idx) {
-                                Self::encode_value_as_key(value, &mut key_buf);
-                            }
+                    key_buf.clear();
+                    for &col_idx in col_indices {
+                        if let Some(value) = values.get(col_idx) {
+                            Self::encode_value_as_key(value, &mut key_buf);
                         }
+                    }
 
-                        if index_btree.search(&key_buf)?.is_some() {
-                            let col_names: Vec<&str> = col_indices
-                                .iter()
-                                .filter_map(|&idx| columns.get(idx).map(|c| c.name()))
-                                .collect();
-                            bail!(
-                                "UNIQUE constraint violated on index '{}' (columns: {}) in table '{}': value already exists",
-                                index_name,
-                                col_names.join(", "),
-                                table_name
-                            );
-                        }
+                    if index_btree.search(&key_buf)?.is_some() {
+                        let col_names: Vec<&str> = col_indices
+                            .iter()
+                            .filter_map(|&idx| columns.get(idx).map(|c| c.name()))
+                            .collect();
+                        bail!(
+                            "UNIQUE constraint violated on index '{}' (columns: {}) in table '{}': value already exists",
+                            index_name,
+                            col_names.join(", "),
+                            table_name
+                        );
                     }
                 }
             }
@@ -1302,7 +1291,7 @@ impl Database {
                         let index_storage =
                             file_manager.index_data_mut(schema_name, table_name, index_name)?;
 
-                        let mut key_buf = Vec::with_capacity(64);
+                        key_buf.clear();
                         Self::encode_value_as_key(value, &mut key_buf);
 
                         let row_id_bytes = row_id.to_be_bytes();
@@ -1318,23 +1307,23 @@ impl Database {
                     .iter()
                     .all(|&idx| values.get(idx).map(|v| !v.is_null()).unwrap_or(false));
 
-                if all_non_null {
-                    if file_manager.index_exists(schema_name, table_name, index_name) {
-                        let index_storage =
-                            file_manager.index_data_mut(schema_name, table_name, index_name)?;
+                if all_non_null
+                    && file_manager.index_exists(schema_name, table_name, index_name)
+                {
+                    let index_storage =
+                        file_manager.index_data_mut(schema_name, table_name, index_name)?;
 
-                        let mut key_buf = Vec::with_capacity(64);
-                        for &col_idx in col_indices {
-                            if let Some(value) = values.get(col_idx) {
-                                Self::encode_value_as_key(value, &mut key_buf);
-                            }
+                    key_buf.clear();
+                    for &col_idx in col_indices {
+                        if let Some(value) = values.get(col_idx) {
+                            Self::encode_value_as_key(value, &mut key_buf);
                         }
-
-                        let row_id_bytes = row_id.to_be_bytes();
-
-                        let mut index_btree = BTree::new(index_storage, root_page)?;
-                        index_btree.insert(&key_buf, &row_id_bytes)?;
                     }
+
+                    let row_id_bytes = row_id.to_be_bytes();
+
+                    let mut index_btree = BTree::new(index_storage, root_page)?;
+                    index_btree.insert(&key_buf, &row_id_bytes)?;
                 }
             }
 

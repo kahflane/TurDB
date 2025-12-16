@@ -858,7 +858,7 @@ mod data_type_tests {
         let db = Database::create(dir.path().join("test_db")).unwrap();
         db.execute("CREATE TABLE nums (r REAL, f FLOAT, d DOUBLE PRECISION)")
             .unwrap();
-        db.execute("INSERT INTO nums VALUES (3.14, 2.718, 1.41421356)")
+        db.execute("INSERT INTO nums VALUES (3.25, 2.5, 1.75)")
             .unwrap();
 
         let rows = db.query("SELECT * FROM nums").unwrap();
@@ -866,7 +866,7 @@ mod data_type_tests {
 
         match &rows[0].values[0] {
             OwnedValue::Float(v) => {
-                assert!((*v - 3.14).abs() < 0.001, "REAL SHOULD store 3.14")
+                assert!((*v - 3.25).abs() < 0.001, "REAL should store 3.25")
             }
             other => panic!("Expected Float for REAL, got {:?}", other),
         }
