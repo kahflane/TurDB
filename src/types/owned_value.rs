@@ -94,6 +94,69 @@ impl<'a> From<Value<'a>> for OwnedValue {
     }
 }
 
+impl From<i64> for OwnedValue {
+    fn from(v: i64) -> Self {
+        OwnedValue::Int(v)
+    }
+}
+
+impl From<i32> for OwnedValue {
+    fn from(v: i32) -> Self {
+        OwnedValue::Int(v as i64)
+    }
+}
+
+impl From<f64> for OwnedValue {
+    fn from(v: f64) -> Self {
+        OwnedValue::Float(v)
+    }
+}
+
+impl From<f32> for OwnedValue {
+    fn from(v: f32) -> Self {
+        OwnedValue::Float(v as f64)
+    }
+}
+
+impl From<bool> for OwnedValue {
+    fn from(v: bool) -> Self {
+        OwnedValue::Bool(v)
+    }
+}
+
+impl From<String> for OwnedValue {
+    fn from(v: String) -> Self {
+        OwnedValue::Text(v)
+    }
+}
+
+impl From<&str> for OwnedValue {
+    fn from(v: &str) -> Self {
+        OwnedValue::Text(v.to_string())
+    }
+}
+
+impl From<Vec<u8>> for OwnedValue {
+    fn from(v: Vec<u8>) -> Self {
+        OwnedValue::Blob(v)
+    }
+}
+
+impl From<&[u8]> for OwnedValue {
+    fn from(v: &[u8]) -> Self {
+        OwnedValue::Blob(v.to_vec())
+    }
+}
+
+impl<T: Into<OwnedValue>> From<Option<T>> for OwnedValue {
+    fn from(v: Option<T>) -> Self {
+        match v {
+            Some(val) => val.into(),
+            None => OwnedValue::Null,
+        }
+    }
+}
+
 fn format_decimal(digits: i128, scale: i16) -> String {
     if scale <= 0 {
         format!("{}", digits)
