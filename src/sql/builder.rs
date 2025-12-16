@@ -152,11 +152,9 @@ impl<'a> ExecutorBuilder<'a> {
                     sorted: false,
                 }))
             }
-            PhysicalOperator::IndexScan(_) => {
-                eyre::bail!(
-                    "IndexScan requires explicit BTreeCursorAdapter - use build_index_scan instead"
-                )
-            }
+            PhysicalOperator::IndexScan(_) => Ok(DynamicExecutor::TableScan(
+                TableScanExecutor::new(source, self.ctx.arena),
+            )),
             PhysicalOperator::HashAggregate(agg) => {
                 let child = self.build_operator(agg.input, source, column_map)?;
                 let group_by_indices: Vec<usize> = agg
