@@ -222,3 +222,254 @@ impl<'a> IndexScanState<'a> {
         }
     }
 }
+
+use crate::sql::planner::WindowFunctionDef;
+
+pub struct WindowState<'a, S: RowSource> {
+    pub child: Box<DynamicExecutor<'a, S>>,
+    pub window_functions: &'a [WindowFunctionDef<'a>],
+    pub arena: &'a Bump,
+    pub rows: Vec<Vec<Value<'static>>>,
+    pub window_results: Vec<Vec<i64>>,
+    pub iter_idx: usize,
+    pub computed: bool,
+    pub column_map: Vec<(String, usize)>,
+}
+
+impl<'a, S: RowSource> WindowState<'a, S> {
+    pub fn new(
+        child: Box<DynamicExecutor<'a, S>>,
+        window_functions: &'a [WindowFunctionDef<'a>],
+        arena: &'a Bump,
+    ) -> Self {
+        Self {
+            child,
+            window_functions,
+            arena,
+            rows: Vec::new(),
+            window_results: Vec::new(),
+            iter_idx: 0,
+            computed: false,
+            column_map: Vec::new(),
+        }
+    }
+
+    pub fn new_with_column_map(
+        child: Box<DynamicExecutor<'a, S>>,
+        window_functions: &'a [WindowFunctionDef<'a>],
+        arena: &'a Bump,
+        column_map: Vec<(String, usize)>,
+    ) -> Self {
+        Self {
+            child,
+            window_functions,
+            arena,
+            rows: Vec::new(),
+            window_results: Vec::new(),
+            iter_idx: 0,
+            computed: false,
+            column_map,
+        }
+    }
+
+    pub fn compute_window_functions(&mut self) {
+        let num_rows = self.rows.len();
+        let num_funcs = self.window_functions.len();
+
+        self.window_results = vec![vec![0i64; num_funcs]; num_rows];
+
+        for (func_idx, window_func) in self.window_functions.iter().enumerate() {
+            let func_name = window_func.function_name.to_ascii_lowercase();
+
+            let partitions = self.get_partitions(window_func);
+
+            for partition_indices in partitions {
+                let sorted_indices =
+                    self.get_sorted_indices_for_partition(window_func, &partition_indices);
+
+                match func_name.as_str() {
+                    "row_number" => {
+                        for (rank, &orig_idx) in sorted_indices.iter().enumerate() {
+                            self.window_results[orig_idx][func_idx] = (rank + 1) as i64;
+                        }
+                    }
+                    "rank" => {
+                        let mut current_rank = 1i64;
+                        for (sorted_pos, &orig_idx) in sorted_indices.iter().enumerate() {
+                            if sorted_pos == 0 {
+                                self.window_results[orig_idx][func_idx] = 1;
+                            } else {
+                                let prev_orig_idx = sorted_indices[sorted_pos - 1];
+                                if self.compare_row_values(prev_orig_idx, orig_idx, window_func) {
+                                    self.window_results[orig_idx][func_idx] = current_rank;
+                                } else {
+                                    current_rank = (sorted_pos + 1) as i64;
+                                    self.window_results[orig_idx][func_idx] = current_rank;
+                                }
+                            }
+                        }
+                    }
+                    "dense_rank" => {
+                        let mut current_rank = 1i64;
+                        for (sorted_pos, &orig_idx) in sorted_indices.iter().enumerate() {
+                            if sorted_pos == 0 {
+                                self.window_results[orig_idx][func_idx] = 1;
+                            } else {
+                                let prev_orig_idx = sorted_indices[sorted_pos - 1];
+                                if self.compare_row_values(prev_orig_idx, orig_idx, window_func) {
+                                    self.window_results[orig_idx][func_idx] = current_rank;
+                                } else {
+                                    current_rank += 1;
+                                    self.window_results[orig_idx][func_idx] = current_rank;
+                                }
+                            }
+                        }
+                    }
+                    _ => {
+                        for &row_idx in &partition_indices {
+                            self.window_results[row_idx][func_idx] = 0;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn get_partitions(&self, window_func: &WindowFunctionDef<'a>) -> Vec<Vec<usize>> {
+        let num_rows = self.rows.len();
+
+        if window_func.partition_by.is_empty() {
+            return vec![(0..num_rows).collect()];
+        }
+
+        let mut partition_map: hashbrown::HashMap<Vec<u8>, Vec<usize>> = hashbrown::HashMap::new();
+
+        for row_idx in 0..num_rows {
+            let key = self.get_partition_key(row_idx, window_func);
+            partition_map.entry(key).or_default().push(row_idx);
+        }
+
+        partition_map.into_values().collect()
+    }
+
+    fn get_partition_key(&self, row_idx: usize, window_func: &WindowFunctionDef<'a>) -> Vec<u8> {
+        let mut key = Vec::new();
+
+        for partition_expr in window_func.partition_by.iter() {
+            if let crate::sql::ast::Expr::Column(col_ref) = partition_expr {
+                if let Some(col_idx) = self.find_column_index(col_ref.column) {
+                    if let Some(val) = self.rows.get(row_idx).and_then(|r| r.get(col_idx)) {
+                        match val {
+                            Value::Int(i) => key.extend(i.to_be_bytes()),
+                            Value::Float(f) => key.extend(f.to_be_bytes()),
+                            Value::Text(t) => {
+                                key.extend(t.as_bytes());
+                                key.push(0);
+                            }
+                            Value::Blob(b) => {
+                                key.extend(b.as_ref());
+                                key.push(0);
+                            }
+                            Value::Null => key.push(0xFF),
+                            _ => {}
+                        }
+                    }
+                }
+            }
+        }
+
+        key
+    }
+
+    fn get_sorted_indices_for_partition(
+        &self,
+        window_func: &WindowFunctionDef<'a>,
+        partition_indices: &[usize],
+    ) -> Vec<usize> {
+        let mut indices: Vec<usize> = partition_indices.to_vec();
+
+        if window_func.order_by.is_empty() {
+            return indices;
+        }
+
+        indices.sort_by(|&a, &b| {
+            for sort_key in window_func.order_by.iter() {
+                if let crate::sql::ast::Expr::Column(col_ref) = sort_key.expr {
+                    if let Some(col_idx) = self.find_column_index(col_ref.column) {
+                        let val_a = self.rows.get(a).and_then(|r| r.get(col_idx));
+                        let val_b = self.rows.get(b).and_then(|r| r.get(col_idx));
+
+                        let cmp = match (val_a, val_b) {
+                            (Some(Value::Int(ia)), Some(Value::Int(ib))) => ia.cmp(ib),
+                            (Some(Value::Float(fa)), Some(Value::Float(fb))) => {
+                                fa.partial_cmp(fb).unwrap_or(std::cmp::Ordering::Equal)
+                            }
+                            (Some(Value::Text(ta)), Some(Value::Text(tb))) => ta.cmp(tb),
+                            _ => std::cmp::Ordering::Equal,
+                        };
+
+                        let cmp = if sort_key.ascending {
+                            cmp
+                        } else {
+                            cmp.reverse()
+                        };
+
+                        if cmp != std::cmp::Ordering::Equal {
+                            return cmp;
+                        }
+                    }
+                }
+            }
+            std::cmp::Ordering::Equal
+        });
+
+        indices
+    }
+
+    fn compare_row_values(
+        &self,
+        idx1: usize,
+        idx2: usize,
+        window_func: &WindowFunctionDef<'a>,
+    ) -> bool {
+        if window_func.order_by.is_empty() {
+            return false;
+        }
+
+        for sort_key in window_func.order_by.iter() {
+            if let crate::sql::ast::Expr::Column(col_ref) = sort_key.expr {
+                if let Some(col_idx) = self.find_column_index(col_ref.column) {
+                    let val1 = self.rows.get(idx1).and_then(|r| r.get(col_idx));
+                    let val2 = self.rows.get(idx2).and_then(|r| r.get(col_idx));
+
+                    match (val1, val2) {
+                        (Some(Value::Int(a)), Some(Value::Int(b))) => {
+                            if a != b {
+                                return false;
+                            }
+                        }
+                        (Some(Value::Float(a)), Some(Value::Float(b))) => {
+                            if (a - b).abs() > f64::EPSILON {
+                                return false;
+                            }
+                        }
+                        (Some(Value::Text(a)), Some(Value::Text(b))) => {
+                            if a != b {
+                                return false;
+                            }
+                        }
+                        _ => return false,
+                    }
+                }
+            }
+        }
+        true
+    }
+
+    fn find_column_index(&self, col_name: &str) -> Option<usize> {
+        self.column_map
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case(col_name))
+            .map(|(_, idx)| *idx)
+    }
+}

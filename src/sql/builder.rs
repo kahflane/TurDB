@@ -7,7 +7,7 @@ use crate::sql::executor::{
 use crate::sql::predicate::CompiledPredicate;
 use crate::sql::state::{
     GraceHashJoinState, HashAggregateState, IndexScanState, LimitState, NestedLoopJoinState,
-    SortState,
+    SortState, WindowState,
 };
 
 pub struct ExecutorBuilder<'a> {
@@ -62,40 +62,65 @@ impl<'a> ExecutorBuilder<'a> {
                 Ok(DynamicExecutor::Filter(Box::new(child), predicate))
             }
             PhysicalOperator::ProjectExec(project) => {
-                use crate::sql::ast::Expr;
+                use crate::sql::ast::{Expr, FunctionCall};
+                use crate::sql::predicate::CompiledProjection;
+
+                let window_functions = self.find_window_functions_in_input(project.input);
+                let base_col_count =
+                    self.count_base_columns_before_window(project.input, column_map.len());
 
                 let child = self.build_operator(project.input, source, column_map)?;
-                let projections: Vec<usize> = if project.expressions.is_empty() {
-                    (0..column_map.len()).collect()
+
+                let has_complex_expressions = project.expressions.iter().any(|expr| {
+                    !matches!(expr, Expr::Column(_)) && !matches!(expr, Expr::Function(_))
+                });
+
+                if has_complex_expressions && !project.expressions.is_empty() {
+                    let expressions: Vec<&'a Expr<'a>> = project.expressions.to_vec();
+                    let projection = CompiledProjection::new(expressions, column_map.to_vec());
+                    Ok(DynamicExecutor::ProjectExpr(
+                        Box::new(child),
+                        projection,
+                        self.ctx.arena,
+                    ))
                 } else {
-                    project
-                        .expressions
-                        .iter()
-                        .enumerate()
-                        .map(|(default_idx, expr)| {
-                            if let Expr::Column(col_ref) = expr {
-                                column_map
-                                    .iter()
-                                    .find(|(name, _)| name.eq_ignore_ascii_case(col_ref.column))
-                                    .map(|(_, idx)| *idx)
-                                    .unwrap_or(default_idx)
-                            } else {
-                                default_idx
-                            }
-                        })
-                        .collect()
-                };
-                #[cfg(test)]
-                eprintln!(
-                    "DEBUG ProjectExec: expressions.len() = {}, projections = {:?}",
-                    project.expressions.len(),
-                    projections
-                );
-                Ok(DynamicExecutor::Project(
-                    Box::new(child),
-                    projections,
-                    self.ctx.arena,
-                ))
+                    let projections: Vec<usize> = if project.expressions.is_empty() {
+                        (0..column_map.len()).collect()
+                    } else {
+                        project
+                            .expressions
+                            .iter()
+                            .enumerate()
+                            .map(|(default_idx, expr)| {
+                                if let Expr::Column(col_ref) = expr {
+                                    column_map
+                                        .iter()
+                                        .find(|(name, _)| name.eq_ignore_ascii_case(col_ref.column))
+                                        .map(|(_, idx)| *idx)
+                                        .unwrap_or(default_idx)
+                                } else if let Expr::Function(FunctionCall {
+                                    over: Some(_), ..
+                                }) = expr
+                                {
+                                    if let Some(window_idx) =
+                                        self.find_window_function_index(expr, window_functions)
+                                    {
+                                        base_col_count + window_idx
+                                    } else {
+                                        default_idx
+                                    }
+                                } else {
+                                    default_idx
+                                }
+                            })
+                            .collect()
+                    };
+                    Ok(DynamicExecutor::Project(
+                        Box::new(child),
+                        projections,
+                        self.ctx.arena,
+                    ))
+                }
             }
             PhysicalOperator::LimitExec(limit) => {
                 let child = self.build_operator(limit.input, source, column_map)?;
@@ -127,11 +152,9 @@ impl<'a> ExecutorBuilder<'a> {
                     sorted: false,
                 }))
             }
-            PhysicalOperator::IndexScan(_) => {
-                eyre::bail!(
-                    "IndexScan requires explicit BTreeCursorAdapter - use build_index_scan instead"
-                )
-            }
+            PhysicalOperator::IndexScan(_) => Ok(DynamicExecutor::TableScan(
+                TableScanExecutor::new(source, self.ctx.arena),
+            )),
             PhysicalOperator::HashAggregate(agg) => {
                 let child = self.build_operator(agg.input, source, column_map)?;
                 let group_by_indices: Vec<usize> = agg
@@ -270,10 +293,16 @@ impl<'a> ExecutorBuilder<'a> {
                     "GraceHashJoin requires two sources - use build_grace_hash_join instead"
                 )
             }
-            PhysicalOperator::SubqueryExec(_) => {
-                Ok(DynamicExecutor::TableScan(TableScanExecutor::new(
-                    source,
+            PhysicalOperator::SubqueryExec(_) => Ok(DynamicExecutor::TableScan(
+                TableScanExecutor::new(source, self.ctx.arena),
+            )),
+            PhysicalOperator::WindowExec(window) => {
+                let child = self.build_operator(window.input, source, column_map)?;
+                Ok(DynamicExecutor::Window(WindowState::new_with_column_map(
+                    Box::new(child),
+                    window.window_functions,
                     self.ctx.arena,
+                    column_map.to_vec(),
                 )))
             }
             PhysicalOperator::SetOpExec(_) => {
@@ -387,5 +416,69 @@ impl<'a> ExecutorBuilder<'a> {
             result_iter: None,
             computed: false,
         }
+    }
+
+    fn find_window_functions_in_input(
+        &self,
+        op: &'a crate::sql::planner::PhysicalOperator<'a>,
+    ) -> &'a [crate::sql::planner::WindowFunctionDef<'a>] {
+        use crate::sql::planner::PhysicalOperator;
+
+        match op {
+            PhysicalOperator::WindowExec(window) => window.window_functions,
+            PhysicalOperator::FilterExec(filter) => {
+                self.find_window_functions_in_input(filter.input)
+            }
+            PhysicalOperator::SortExec(sort) => self.find_window_functions_in_input(sort.input),
+            PhysicalOperator::LimitExec(limit) => self.find_window_functions_in_input(limit.input),
+            _ => &[],
+        }
+    }
+
+    fn count_base_columns_before_window(
+        &self,
+        op: &'a crate::sql::planner::PhysicalOperator<'a>,
+        default: usize,
+    ) -> usize {
+        use crate::sql::planner::PhysicalOperator;
+
+        match op {
+            PhysicalOperator::WindowExec(window) => {
+                self.count_base_columns_before_window(window.input, default)
+            }
+            PhysicalOperator::TableScan(_) => default,
+            PhysicalOperator::FilterExec(filter) => {
+                self.count_base_columns_before_window(filter.input, default)
+            }
+            PhysicalOperator::SortExec(sort) => {
+                self.count_base_columns_before_window(sort.input, default)
+            }
+            PhysicalOperator::LimitExec(limit) => {
+                self.count_base_columns_before_window(limit.input, default)
+            }
+            _ => default,
+        }
+    }
+
+    fn find_window_function_index(
+        &self,
+        expr: &crate::sql::ast::Expr<'a>,
+        window_functions: &[crate::sql::planner::WindowFunctionDef<'a>],
+    ) -> Option<usize> {
+        use crate::sql::ast::{Expr, FunctionCall};
+
+        if let Expr::Function(FunctionCall {
+            name,
+            over: Some(_),
+            ..
+        }) = expr
+        {
+            for (idx, wf) in window_functions.iter().enumerate() {
+                if wf.function_name.eq_ignore_ascii_case(name.name) {
+                    return Some(idx);
+                }
+            }
+        }
+        None
     }
 }

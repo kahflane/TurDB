@@ -495,6 +495,7 @@ impl Database {
 
         enum PlanSource<'a> {
             TableScan(&'a crate::sql::planner::PhysicalTableScan<'a>),
+            IndexScan(&'a crate::sql::planner::PhysicalIndexScan<'a>),
             Subquery(&'a crate::sql::planner::PhysicalSubqueryExec<'a>),
             NestedLoopJoin(&'a crate::sql::planner::PhysicalNestedLoopJoin<'a>),
             GraceHashJoin(&'a crate::sql::planner::PhysicalGraceHashJoin<'a>),
@@ -520,6 +521,7 @@ impl Database {
             }
             match op {
                 PhysicalOperator::TableScan(scan) => Some(PlanSource::TableScan(scan)),
+                PhysicalOperator::IndexScan(scan) => Some(PlanSource::IndexScan(scan)),
                 PhysicalOperator::SubqueryExec(subq) => Some(PlanSource::Subquery(subq)),
                 PhysicalOperator::NestedLoopJoin(join) => Some(PlanSource::NestedLoopJoin(join)),
                 PhysicalOperator::GraceHashJoin(join) => Some(PlanSource::GraceHashJoin(join)),
@@ -530,7 +532,7 @@ impl Database {
                 PhysicalOperator::SortExec(sort) => find_plan_source(sort.input),
                 PhysicalOperator::HashAggregate(agg) => find_plan_source(agg.input),
                 PhysicalOperator::SortedAggregate(agg) => find_plan_source(agg.input),
-                _ => None,
+                PhysicalOperator::WindowExec(window) => find_plan_source(window.input),
             }
         }
 
@@ -547,6 +549,7 @@ impl Database {
                 PhysicalOperator::HashAggregate(agg) => find_table_scan(agg.input),
                 PhysicalOperator::SortedAggregate(agg) => find_table_scan(agg.input),
                 PhysicalOperator::SubqueryExec(subq) => find_table_scan(subq.child_plan),
+                PhysicalOperator::WindowExec(window) => find_table_scan(window.input),
                 _ => None,
             }
         }
@@ -563,6 +566,7 @@ impl Database {
                 PhysicalOperator::SortExec(sort) => find_nested_subquery(sort.input),
                 PhysicalOperator::HashAggregate(agg) => find_nested_subquery(agg.input),
                 PhysicalOperator::SortedAggregate(agg) => find_nested_subquery(agg.input),
+                PhysicalOperator::WindowExec(window) => find_nested_subquery(window.input),
                 _ => None,
             }
         }
@@ -574,6 +578,7 @@ impl Database {
                 PhysicalOperator::ProjectExec(project) => has_filter(project.input),
                 PhysicalOperator::LimitExec(limit) => has_filter(limit.input),
                 PhysicalOperator::SortExec(sort) => has_filter(sort.input),
+                PhysicalOperator::WindowExec(window) => has_filter(window.input),
                 _ => false,
             }
         }
@@ -586,6 +591,19 @@ impl Database {
                 PhysicalOperator::LimitExec(limit) => has_aggregate(limit.input),
                 PhysicalOperator::SortExec(sort) => has_aggregate(sort.input),
                 PhysicalOperator::FilterExec(filter) => has_aggregate(filter.input),
+                PhysicalOperator::WindowExec(window) => has_aggregate(window.input),
+                _ => false,
+            }
+        }
+
+        fn has_window<'a>(op: &'a crate::sql::planner::PhysicalOperator<'a>) -> bool {
+            use crate::sql::planner::PhysicalOperator;
+            match op {
+                PhysicalOperator::WindowExec(_) => true,
+                PhysicalOperator::ProjectExec(project) => has_window(project.input),
+                PhysicalOperator::LimitExec(limit) => has_window(limit.input),
+                PhysicalOperator::SortExec(sort) => has_window(sort.input),
+                PhysicalOperator::FilterExec(filter) => has_window(filter.input),
                 _ => false,
             }
         }
@@ -744,7 +762,8 @@ impl Database {
 
                 let plan_has_filter = has_filter(physical_plan.root);
                 let plan_has_aggregate = has_aggregate(physical_plan.root);
-                let needs_all_columns = plan_has_filter || plan_has_aggregate;
+                let plan_has_window = has_window(physical_plan.root);
+                let needs_all_columns = plan_has_filter || plan_has_aggregate || plan_has_window;
                 let projections = if needs_all_columns {
                     None
                 } else {
@@ -788,6 +807,71 @@ impl Database {
                         .build_with_source(&physical_plan, source)
                         .wrap_err("failed to build executor")?
                 };
+
+                let output_columns = physical_plan.output_schema.columns;
+
+                let mut rows = Vec::new();
+                executor.open()?;
+                while let Some(row) = executor.next()? {
+                    let owned: Vec<OwnedValue> = row
+                        .values
+                        .iter()
+                        .enumerate()
+                        .map(|(idx, val)| {
+                            let col_type = output_columns
+                                .get(idx)
+                                .map(|c| c.data_type)
+                                .unwrap_or(DataType::Int8);
+                            convert_value_with_type(val, col_type)
+                        })
+                        .collect();
+                    rows.push(Row::new(owned));
+                }
+                executor.close()?;
+                rows
+            }
+            Some(PlanSource::IndexScan(scan)) => {
+                let schema_name = scan.schema.unwrap_or("root");
+                let table_name = scan.table;
+
+                let table_def = catalog
+                    .resolve_table(table_name)
+                    .wrap_err_with(|| format!("table '{}' not found", table_name))?;
+
+                let column_types: Vec<_> =
+                    table_def.columns().iter().map(|c| c.data_type()).collect();
+
+                let storage = file_manager
+                    .table_data(schema_name, table_name)
+                    .wrap_err_with(|| {
+                        format!(
+                            "failed to open table storage for {}.{}",
+                            schema_name, table_name
+                        )
+                    })?;
+
+                let root_page = 1u32;
+                let source = StreamingBTreeSource::from_btree_scan_with_projections(
+                    storage,
+                    root_page,
+                    column_types,
+                    None,
+                )
+                .wrap_err("failed to create table scan for index scan fallback")?;
+
+                let ctx = ExecutionContext::new(&arena);
+                let builder = ExecutorBuilder::new(&ctx);
+
+                let all_columns_map: Vec<(String, usize)> = table_def
+                    .columns()
+                    .iter()
+                    .enumerate()
+                    .map(|(idx, col)| (col.name().to_lowercase(), idx))
+                    .collect();
+
+                let mut executor = builder
+                    .build_with_source_and_column_map(&physical_plan, source, &all_columns_map)
+                    .wrap_err("failed to build executor for index scan")?;
 
                 let output_columns = physical_plan.output_schema.columns;
 
@@ -1101,6 +1185,7 @@ impl Database {
                     PhysicalOperator::SortExec(s) => find_table_scan_for_set(s.input),
                     PhysicalOperator::SubqueryExec(sub) => find_table_scan_for_set(sub.child_plan),
                     PhysicalOperator::SetOpExec(set) => find_table_scan_for_set(set.left),
+                    PhysicalOperator::WindowExec(w) => find_table_scan_for_set(w.input),
                     _ => None,
                 }
             }
@@ -1288,6 +1373,144 @@ impl Database {
         }
 
         execute_branch_for_set_op(&self.path, op, catalog, file_manager)
+    }
+
+    fn execute_select_internal(
+        &self,
+        select_stmt: &crate::sql::ast::SelectStmt<'_>,
+    ) -> Result<Vec<Row>> {
+        use crate::sql::ast::{Distinct, Statement};
+
+        self.ensure_catalog()?;
+        self.ensure_file_manager()?;
+
+        let arena = Bump::new();
+        let stmt = Statement::Select(select_stmt);
+
+        let is_distinct = select_stmt.distinct == Distinct::Distinct;
+
+        let catalog_guard = self.catalog.read();
+        let catalog = catalog_guard.as_ref().unwrap();
+        let planner = Planner::new(catalog, &arena);
+        let physical_plan = planner
+            .create_physical_plan(&stmt)
+            .wrap_err("failed to create query plan for INSERT...SELECT")?;
+
+        let mut file_manager_guard = self.file_manager.write();
+        let file_manager = file_manager_guard.as_mut().unwrap();
+
+        fn find_table_scan<'a>(
+            op: &'a crate::sql::planner::PhysicalOperator<'a>,
+        ) -> Option<&'a crate::sql::planner::PhysicalTableScan<'a>> {
+            use crate::sql::planner::PhysicalOperator;
+            match op {
+                PhysicalOperator::TableScan(scan) => Some(scan),
+                PhysicalOperator::FilterExec(filter) => find_table_scan(filter.input),
+                PhysicalOperator::ProjectExec(project) => find_table_scan(project.input),
+                PhysicalOperator::LimitExec(limit) => find_table_scan(limit.input),
+                PhysicalOperator::SortExec(sort) => find_table_scan(sort.input),
+                PhysicalOperator::HashAggregate(agg) => find_table_scan(agg.input),
+                PhysicalOperator::SortedAggregate(agg) => find_table_scan(agg.input),
+                PhysicalOperator::WindowExec(window) => find_table_scan(window.input),
+                _ => None,
+            }
+        }
+
+        let table_scan = find_table_scan(physical_plan.root);
+
+        let rows = if let Some(scan) = table_scan {
+            let schema_name = scan.schema.unwrap_or("root");
+            let table_name = scan.table;
+
+            let table_def = catalog
+                .resolve_table(table_name)
+                .wrap_err_with(|| format!("table '{}' not found", table_name))?;
+
+            let column_types: Vec<_> = table_def.columns().iter().map(|c| c.data_type()).collect();
+
+            let storage = file_manager
+                .table_data(schema_name, table_name)
+                .wrap_err_with(|| {
+                    format!(
+                        "failed to open table storage for {}.{}",
+                        schema_name, table_name
+                    )
+                })?;
+
+            let root_page = 1u32;
+            let source = StreamingBTreeSource::from_btree_scan_with_projections(
+                storage,
+                root_page,
+                column_types,
+                None,
+            )
+            .wrap_err("failed to create table scan for INSERT...SELECT")?;
+
+            let output_column_types: Vec<DataType> = physical_plan
+                .output_schema
+                .columns
+                .iter()
+                .map(|c| c.data_type)
+                .collect();
+
+            let source_column_map: Vec<(String, usize)> = table_def
+                .columns()
+                .iter()
+                .enumerate()
+                .map(|(idx, col)| (col.name().to_string(), idx))
+                .collect();
+
+            let ctx = ExecutionContext::new(&arena);
+            let builder = ExecutorBuilder::new(&ctx);
+            let mut executor = builder
+                .build_with_source_and_column_map(&physical_plan, source, &source_column_map)
+                .wrap_err("failed to build executor for INSERT...SELECT")?;
+
+            let mut rows = Vec::new();
+            executor.open()?;
+            while let Some(row) = executor.next()? {
+                let owned: Vec<OwnedValue> = row
+                    .values
+                    .iter()
+                    .enumerate()
+                    .map(|(idx, val)| {
+                        let col_type = output_column_types
+                            .get(idx)
+                            .copied()
+                            .unwrap_or(DataType::Int8);
+                        convert_value_with_type(val, col_type)
+                    })
+                    .collect();
+                rows.push(Row::new(owned));
+            }
+            executor.close()?;
+            rows
+        } else {
+            bail!("INSERT...SELECT query plan must have a table scan")
+        };
+
+        let rows = if is_distinct {
+            let mut seen: std::collections::HashSet<Vec<u64>> = std::collections::HashSet::new();
+            rows.into_iter()
+                .filter(|row| {
+                    let key: Vec<u64> = row
+                        .values
+                        .iter()
+                        .map(|v| {
+                            use std::hash::{Hash, Hasher};
+                            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                            format!("{:?}", v).hash(&mut hasher);
+                            hasher.finish()
+                        })
+                        .collect();
+                    seen.insert(key)
+                })
+                .collect()
+        } else {
+            rows
+        };
+
+        Ok(rows)
     }
 
     pub fn execute(&self, sql: &str) -> Result<ExecuteResult> {
@@ -1724,15 +1947,36 @@ impl Database {
 
         let schema = create_record_schema(&columns);
 
-        let rows = match &insert.source {
-            crate::sql::ast::InsertSource::Values(values) => values,
-            _ => bail!("only VALUES insert supported"),
-        };
-
-        let root_page = 1u32;
-
         let column_types: Vec<crate::records::types::DataType> =
             columns.iter().map(|c| c.data_type()).collect();
+
+        let rows_to_insert: Vec<Vec<OwnedValue>> = match &insert.source {
+            crate::sql::ast::InsertSource::Values(values) => {
+                let mut result = Vec::with_capacity(values.len());
+                for row_exprs in values.iter() {
+                    let row: Vec<OwnedValue> = row_exprs
+                        .iter()
+                        .zip(column_types.iter())
+                        .map(|(expr, data_type)| {
+                            Database::eval_literal_with_type(expr, Some(data_type))
+                        })
+                        .collect::<Result<Vec<_>>>()?;
+                    result.push(row);
+                }
+                result
+            }
+            crate::sql::ast::InsertSource::Select(select_stmt) => {
+                drop(catalog_guard);
+                let select_rows = self.execute_select_internal(select_stmt)?;
+                select_rows.into_iter().map(|row| row.values).collect()
+            }
+            crate::sql::ast::InsertSource::Default => {
+                bail!("DEFAULT VALUES insert not supported")
+            }
+        };
+
+        let catalog_guard = self.catalog.read();
+        let root_page = 1u32;
         let validator = ConstraintValidator::new(&table_def_for_validator);
 
         drop(catalog_guard);
@@ -1742,13 +1986,10 @@ impl Database {
 
         let mut count = 0;
         let mut key_buf: SmallVec<[u8; 64]> = SmallVec::new();
+        let mut returned_rows: Option<Vec<Row>> = insert.returning.map(|_| Vec::new());
 
-        for row_exprs in rows.iter() {
-            let mut values: Vec<OwnedValue> = row_exprs
-                .iter()
-                .zip(column_types.iter())
-                .map(|(expr, data_type)| Database::eval_literal_with_type(expr, Some(data_type)))
-                .collect::<Result<Vec<_>>>()?;
+        for row_values in rows_to_insert.iter() {
+            let mut values: Vec<OwnedValue> = row_values.clone();
 
             validator.validate_insert(&mut values)?;
 
@@ -1828,6 +2069,9 @@ impl Database {
                 }
             }
 
+            let mut has_conflict = false;
+            let mut conflicting_key: Option<Vec<u8>> = None;
+
             for (col_idx, index_name, is_pk) in &unique_columns {
                 if let Some(value) = values.get(*col_idx) {
                     if value.is_null() {
@@ -1842,47 +2086,152 @@ impl Database {
                         key_buf.clear();
                         Self::encode_value_as_key(value, &mut key_buf);
 
-                        if index_btree.search(&key_buf)?.is_some() {
-                            let constraint_type = if *is_pk { "PRIMARY KEY" } else { "UNIQUE" };
-                            bail!(
-                                "{} constraint violated on column '{}' in table '{}': value already exists",
-                                constraint_type,
-                                columns[*col_idx].name(),
-                                table_name
-                            );
+                        if let Some(handle) = index_btree.search(&key_buf)? {
+                            if insert.on_conflict.is_some() {
+                                has_conflict = true;
+                                let row_key_bytes = index_btree.get_value(&handle)?;
+                                conflicting_key = Some(row_key_bytes.to_vec());
+                                break;
+                            } else {
+                                let constraint_type = if *is_pk { "PRIMARY KEY" } else { "UNIQUE" };
+                                bail!(
+                                    "{} constraint violated on column '{}' in table '{}': value already exists",
+                                    constraint_type,
+                                    columns[*col_idx].name(),
+                                    table_name
+                                );
+                            }
                         }
                     }
                 }
             }
 
-            for (col_indices, index_name) in &unique_indexes {
-                let all_non_null = col_indices
-                    .iter()
-                    .all(|&idx| values.get(idx).map(|v| !v.is_null()).unwrap_or(false));
+            if !has_conflict {
+                for (col_indices, index_name) in &unique_indexes {
+                    let all_non_null = col_indices
+                        .iter()
+                        .all(|&idx| values.get(idx).map(|v| !v.is_null()).unwrap_or(false));
 
-                if all_non_null && file_manager.index_exists(schema_name, table_name, index_name) {
-                    let index_storage =
-                        file_manager.index_data_mut(schema_name, table_name, index_name)?;
-                    let index_btree = BTree::new(index_storage, root_page)?;
+                    if all_non_null
+                        && file_manager.index_exists(schema_name, table_name, index_name)
+                    {
+                        let index_storage =
+                            file_manager.index_data_mut(schema_name, table_name, index_name)?;
+                        let index_btree = BTree::new(index_storage, root_page)?;
 
-                    key_buf.clear();
-                    for &col_idx in col_indices {
-                        if let Some(value) = values.get(col_idx) {
-                            Self::encode_value_as_key(value, &mut key_buf);
+                        key_buf.clear();
+                        for &col_idx in col_indices {
+                            if let Some(value) = values.get(col_idx) {
+                                Self::encode_value_as_key(value, &mut key_buf);
+                            }
+                        }
+
+                        if let Some(handle) = index_btree.search(&key_buf)? {
+                            if insert.on_conflict.is_some() {
+                                has_conflict = true;
+                                let row_key_bytes = index_btree.get_value(&handle)?;
+                                conflicting_key = Some(row_key_bytes.to_vec());
+                                break;
+                            } else {
+                                let col_names: SmallVec<[&str; 8]> = col_indices
+                                    .iter()
+                                    .filter_map(|&idx| columns.get(idx).map(|c| c.name()))
+                                    .collect();
+                                bail!(
+                                    "UNIQUE constraint violated on index '{}' (columns: {}) in table '{}': value already exists",
+                                    index_name,
+                                    col_names.join(", "),
+                                    table_name
+                                );
+                            }
                         }
                     }
+                }
+            }
 
-                    if index_btree.search(&key_buf)?.is_some() {
-                        let col_names: SmallVec<[&str; 8]> = col_indices
-                            .iter()
-                            .filter_map(|&idx| columns.get(idx).map(|c| c.name()))
-                            .collect();
-                        bail!(
-                            "UNIQUE constraint violated on index '{}' (columns: {}) in table '{}': value already exists",
-                            index_name,
-                            col_names.join(", "),
-                            table_name
-                        );
+            if has_conflict {
+                use crate::sql::ast::OnConflictAction;
+
+                if let Some(on_conflict) = insert.on_conflict {
+                    match on_conflict.action {
+                        OnConflictAction::DoNothing => {
+                            continue;
+                        }
+                        OnConflictAction::DoUpdate(assignments) => {
+                            if let Some(existing_key) = conflicting_key {
+                                let table_storage =
+                                    file_manager.table_data_mut(schema_name, table_name)?;
+                                let btree = BTree::new(table_storage, root_page)?;
+
+                                if let Some(handle) = btree.search(&existing_key)? {
+                                    let existing_value = btree.get_value(&handle)?;
+                                    let record = crate::records::RecordView::new(existing_value, &schema)?;
+                                    let mut existing_values =
+                                        OwnedValue::extract_row_from_record(&record, &columns)?;
+
+                                    for assignment in assignments.iter() {
+                                        if let Some(col_idx) = columns
+                                            .iter()
+                                            .position(|c| {
+                                                c.name()
+                                                    .eq_ignore_ascii_case(assignment.column.column)
+                                            })
+                                        {
+                                            let new_value = Self::eval_literal(assignment.value)?;
+                                            existing_values[col_idx] = new_value;
+                                        }
+                                    }
+
+                                    let updated_record =
+                                        OwnedValue::build_record_from_values(&existing_values, &schema)?;
+
+                                    let table_storage =
+                                        file_manager.table_data_mut(schema_name, table_name)?;
+                                    let mut btree_mut = BTree::new(table_storage, root_page)?;
+                                    btree_mut.delete(&existing_key)?;
+                                    btree_mut.insert(&existing_key, &updated_record)?;
+
+                                    count += 1;
+
+                                    if let Some(ref mut rows) = returned_rows {
+                                        let returning_cols = insert.returning.unwrap();
+                                        let row_values: Vec<OwnedValue> = returning_cols
+                                            .iter()
+                                            .flat_map(|col| match col {
+                                                crate::sql::ast::SelectColumn::AllColumns => {
+                                                    existing_values.clone()
+                                                }
+                                                crate::sql::ast::SelectColumn::TableAllColumns(_) => {
+                                                    existing_values.clone()
+                                                }
+                                                crate::sql::ast::SelectColumn::Expr { expr, .. } => {
+                                                    if let crate::sql::ast::Expr::Column(col_ref) =
+                                                        expr
+                                                    {
+                                                        columns
+                                                            .iter()
+                                                            .position(|c| {
+                                                                c.name().eq_ignore_ascii_case(
+                                                                    col_ref.column,
+                                                                )
+                                                            })
+                                                            .and_then(|idx| {
+                                                                existing_values.get(idx).cloned()
+                                                            })
+                                                            .map(|v| vec![v])
+                                                            .unwrap_or_default()
+                                                    } else {
+                                                        vec![]
+                                                    }
+                                                }
+                                            })
+                                            .collect();
+                                        rows.push(Row::new(row_values));
+                                    }
+                                }
+                            }
+                            continue;
+                        }
                     }
                 }
             }
@@ -1961,10 +2310,35 @@ impl Database {
             }
 
             count += 1;
+
+            if let Some(ref mut rows) = returned_rows {
+                let returning_cols = insert.returning.unwrap();
+                let row_values: Vec<OwnedValue> = returning_cols
+                    .iter()
+                    .flat_map(|col| match col {
+                        crate::sql::ast::SelectColumn::AllColumns => values.clone(),
+                        crate::sql::ast::SelectColumn::TableAllColumns(_) => values.clone(),
+                        crate::sql::ast::SelectColumn::Expr { expr, .. } => {
+                            if let crate::sql::ast::Expr::Column(col_ref) = expr {
+                                columns
+                                    .iter()
+                                    .position(|c| c.name().eq_ignore_ascii_case(col_ref.column))
+                                    .and_then(|idx| values.get(idx).cloned())
+                                    .map(|v| vec![v])
+                                    .unwrap_or_default()
+                            } else {
+                                vec![]
+                            }
+                        }
+                    })
+                    .collect();
+                rows.push(Row::new(row_values));
+            }
         }
 
         Ok(ExecuteResult::Insert {
             rows_affected: count,
+            returned: returned_rows,
         })
     }
 
@@ -2176,6 +2550,37 @@ impl Database {
         }
 
         let rows_affected = rows_to_update.len();
+
+        let returned_rows: Option<Vec<Row>> = update.returning.map(|returning_cols| {
+            rows_to_update
+                .iter()
+                .map(|(_key, _old_value, updated_values)| {
+                    let row_values: Vec<OwnedValue> = returning_cols
+                        .iter()
+                        .flat_map(|col| match col {
+                            crate::sql::ast::SelectColumn::AllColumns => updated_values.clone(),
+                            crate::sql::ast::SelectColumn::TableAllColumns(_) => {
+                                updated_values.clone()
+                            }
+                            crate::sql::ast::SelectColumn::Expr { expr, .. } => {
+                                if let crate::sql::ast::Expr::Column(col_ref) = expr {
+                                    columns
+                                        .iter()
+                                        .position(|c| c.name().eq_ignore_ascii_case(col_ref.column))
+                                        .and_then(|idx| updated_values.get(idx).cloned())
+                                        .map(|v| vec![v])
+                                        .unwrap_or_default()
+                                } else {
+                                    vec![]
+                                }
+                            }
+                        })
+                        .collect();
+                    Row::new(row_values)
+                })
+                .collect()
+        });
+
         let storage = file_manager.table_data_mut(schema_name, table_name)?;
         let mut btree_mut = BTree::new(storage, root_page)?;
 
@@ -2207,7 +2612,10 @@ impl Database {
             }
         }
 
-        Ok(ExecuteResult::Update { rows_affected })
+        Ok(ExecuteResult::Update {
+            rows_affected,
+            returned: returned_rows,
+        })
     }
 
     fn execute_delete(
@@ -2300,17 +2708,17 @@ impl Database {
         let btree = BTree::new(storage, root_page)?;
         let mut cursor = btree.cursor_first()?;
 
-        let mut rows_to_delete: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        let mut rows_to_delete: Vec<(Vec<u8>, Vec<u8>, Vec<OwnedValue>)> = Vec::new();
         let mut values_to_check: Vec<(usize, OwnedValue)> = Vec::new();
 
         while cursor.valid() {
             let key = cursor.key()?;
             let value = cursor.value()?;
 
-            let should_delete = if let Some(ref pred) = predicate {
-                let record = RecordView::new(value, &schema)?;
-                let row_values = OwnedValue::extract_row_from_record(&record, &columns)?;
+            let record = RecordView::new(value, &schema)?;
+            let row_values = OwnedValue::extract_row_from_record(&record, &columns)?;
 
+            let should_delete = if let Some(ref pred) = predicate {
                 use crate::sql::executor::ExecutorRow;
 
                 let values = owned_values_to_values(&row_values);
@@ -2322,17 +2730,14 @@ impl Database {
             };
 
             if should_delete {
-                rows_to_delete.push((key.to_vec(), value.to_vec()));
-
                 if !fk_references.is_empty() {
-                    let record = RecordView::new(value, &schema)?;
-                    let row_values = OwnedValue::extract_row_from_record(&record, &columns)?;
                     for (_, _, _, ref_col_idx) in &fk_references {
                         if let Some(v) = row_values.get(*ref_col_idx) {
                             values_to_check.push((*ref_col_idx, v.clone()));
                         }
                     }
                 }
+                rows_to_delete.push((key.to_vec(), value.to_vec(), row_values));
             }
 
             cursor.advance()?;
@@ -2375,10 +2780,40 @@ impl Database {
         }
 
         let rows_affected = rows_to_delete.len();
+
+        let returned_rows: Option<Vec<Row>> = if let Some(returning_cols) = delete.returning {
+            let mut rows = Vec::with_capacity(rows_to_delete.len());
+            for (_key, _old_value, deleted_values) in &rows_to_delete {
+                let row_values: Vec<OwnedValue> = returning_cols
+                    .iter()
+                    .flat_map(|col| match col {
+                        crate::sql::ast::SelectColumn::AllColumns => deleted_values.clone(),
+                        crate::sql::ast::SelectColumn::TableAllColumns(_) => deleted_values.clone(),
+                        crate::sql::ast::SelectColumn::Expr { expr, .. } => {
+                            if let crate::sql::ast::Expr::Column(col_ref) = expr {
+                                columns
+                                    .iter()
+                                    .position(|c| c.name().eq_ignore_ascii_case(col_ref.column))
+                                    .and_then(|idx| deleted_values.get(idx).cloned())
+                                    .map(|v| vec![v])
+                                    .unwrap_or_default()
+                            } else {
+                                vec![]
+                            }
+                        }
+                    })
+                    .collect();
+                rows.push(Row::new(row_values));
+            }
+            Some(rows)
+        } else {
+            None
+        };
+
         let storage = file_manager.table_data_mut(schema_name, table_name)?;
         let mut btree_mut = BTree::new(storage, root_page)?;
 
-        for (key, _old_value) in &rows_to_delete {
+        for (key, _old_value, _row_values) in &rows_to_delete {
             btree_mut.delete(key)?;
         }
 
@@ -2387,7 +2822,7 @@ impl Database {
         {
             let mut active_txn = self.active_txn.lock();
             if let Some(ref mut txn) = *active_txn {
-                for (key, old_value) in rows_to_delete {
+                for (key, old_value, _row_values) in rows_to_delete {
                     txn.add_write_entry_with_undo(
                         WriteEntry {
                             table_id: table_id as u32,
@@ -2404,7 +2839,10 @@ impl Database {
             }
         }
 
-        Ok(ExecuteResult::Delete { rows_affected })
+        Ok(ExecuteResult::Delete {
+            rows_affected,
+            returned: returned_rows,
+        })
     }
 
     fn execute_drop_table(

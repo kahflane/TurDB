@@ -180,6 +180,7 @@ pub enum LogicalOperator<'a> {
     Delete(LogicalDelete<'a>),
     Subquery(LogicalSubquery<'a>),
     SetOp(LogicalSetOp<'a>),
+    Window(LogicalWindow<'a>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -301,6 +302,21 @@ pub struct LogicalSubquery<'a> {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub struct LogicalWindow<'a> {
+    pub input: &'a LogicalOperator<'a>,
+    pub window_functions: &'a [WindowFunctionDef<'a>],
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct WindowFunctionDef<'a> {
+    pub function_name: &'a str,
+    pub args: &'a [&'a Expr<'a>],
+    pub partition_by: &'a [&'a Expr<'a>],
+    pub order_by: &'a [SortKey<'a>],
+    pub alias: Option<&'a str>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct LogicalPlan<'a> {
     pub root: &'a LogicalOperator<'a>,
 }
@@ -319,6 +335,7 @@ pub enum PhysicalOperator<'a> {
     LimitExec(PhysicalLimitExec<'a>),
     SubqueryExec(PhysicalSubqueryExec<'a>),
     SetOpExec(PhysicalSetOpExec<'a>),
+    WindowExec(PhysicalWindowExec<'a>),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -438,6 +455,12 @@ pub struct PhysicalSubqueryExec<'a> {
     pub child_plan: &'a PhysicalOperator<'a>,
     pub alias: &'a str,
     pub output_schema: OutputSchema<'a>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct PhysicalWindowExec<'a> {
+    pub input: &'a PhysicalOperator<'a>,
+    pub window_functions: &'a [WindowFunctionDef<'a>],
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -644,13 +667,18 @@ impl<'a> Planner<'a> {
             }
         }
 
+        let has_window_functions = self.select_has_window_functions(select.columns);
+
+        if has_window_functions {
+            let window_functions = self.extract_window_functions(select.columns);
+            let window = self.arena.alloc(LogicalOperator::Window(LogicalWindow {
+                input: current,
+                window_functions,
+            }));
+            current = window;
+        }
+
         let (exprs, aliases) = self.extract_select_expressions(select.columns);
-        #[cfg(test)]
-        eprintln!(
-            "DEBUG plan_select: columns.len()={}, exprs.len()={}",
-            select.columns.len(),
-            exprs.len()
-        );
         let project = self.arena.alloc(LogicalOperator::Project(LogicalProject {
             input: current,
             expressions: exprs,
@@ -928,6 +956,83 @@ impl<'a> Planner<'a> {
         false
     }
 
+    fn is_window_function(&self, expr: &Expr<'a>) -> bool {
+        if let Expr::Function(func) = expr {
+            func.over.is_some()
+        } else {
+            false
+        }
+    }
+
+    fn select_has_window_functions(
+        &self,
+        columns: &'a [crate::sql::ast::SelectColumn<'a>],
+    ) -> bool {
+        use crate::sql::ast::SelectColumn;
+
+        for col in columns {
+            if let SelectColumn::Expr { expr, .. } = col {
+                if self.is_window_function(expr) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    fn extract_window_functions(
+        &self,
+        columns: &'a [crate::sql::ast::SelectColumn<'a>],
+    ) -> &'a [WindowFunctionDef<'a>] {
+        use crate::sql::ast::{NullsOrder, OrderDirection, SelectColumn};
+
+        let mut window_funcs = bumpalo::collections::Vec::new_in(self.arena);
+
+        for col in columns {
+            if let SelectColumn::Expr {
+                expr: Expr::Function(func),
+                alias,
+            } = col
+            {
+                if let Some(window_spec) = &func.over {
+                    let order_by_keys: &[SortKey<'a>] = {
+                        let mut keys = bumpalo::collections::Vec::new_in(self.arena);
+                        for item in window_spec.order_by.iter() {
+                            keys.push(SortKey {
+                                expr: item.expr,
+                                ascending: matches!(item.direction, OrderDirection::Asc),
+                                nulls_first: matches!(item.nulls, NullsOrder::First),
+                            });
+                        }
+                        keys.into_bump_slice()
+                    };
+
+                    let args: &[&Expr<'a>] = match &func.args {
+                        crate::sql::ast::FunctionArgs::Args(func_args) => {
+                            let mut arg_exprs = bumpalo::collections::Vec::new_in(self.arena);
+                            for arg in func_args.iter() {
+                                arg_exprs.push(arg.value);
+                            }
+                            arg_exprs.into_bump_slice()
+                        }
+                        crate::sql::ast::FunctionArgs::Star => &[],
+                        crate::sql::ast::FunctionArgs::None => &[],
+                    };
+
+                    window_funcs.push(WindowFunctionDef {
+                        function_name: func.name.name,
+                        args,
+                        partition_by: window_spec.partition_by,
+                        order_by: order_by_keys,
+                        alias: *alias,
+                    });
+                }
+            }
+        }
+
+        window_funcs.into_bump_slice()
+    }
+
     fn extract_select_expressions(
         &self,
         columns: &'a [crate::sql::ast::SelectColumn<'a>],
@@ -938,8 +1043,6 @@ impl<'a> Planner<'a> {
         let mut aliases = bumpalo::collections::Vec::new_in(self.arena);
 
         for col in columns {
-            #[cfg(test)]
-            eprintln!("DEBUG extract_select_expressions: col={:?}", col);
             match col {
                 SelectColumn::Expr { expr, alias } => {
                     exprs.push(*expr);
@@ -1474,6 +1577,27 @@ impl<'a> Planner<'a> {
             }
             PhysicalOperator::SubqueryExec(subq) => Ok(subq.output_schema.clone()),
             PhysicalOperator::SetOpExec(set_op) => self.compute_output_schema(set_op.left),
+            PhysicalOperator::WindowExec(window) => {
+                let input_schema = self.compute_output_schema(window.input)?;
+                let mut columns = bumpalo::collections::Vec::new_in(self.arena);
+
+                for col in input_schema.columns {
+                    columns.push(*col);
+                }
+
+                for window_func in window.window_functions.iter() {
+                    let name = window_func.alias.unwrap_or(window_func.function_name);
+                    columns.push(OutputColumn {
+                        name,
+                        data_type: crate::records::types::DataType::Int8,
+                        nullable: false,
+                    });
+                }
+
+                Ok(OutputSchema {
+                    columns: columns.into_bump_slice(),
+                })
+            }
         }
     }
 
@@ -1598,6 +1722,27 @@ impl<'a> Planner<'a> {
             }
             LogicalOperator::Subquery(subq) => Ok(subq.output_schema.clone()),
             LogicalOperator::SetOp(set_op) => self.compute_logical_output_schema(set_op.left),
+            LogicalOperator::Window(window) => {
+                let input_schema = self.compute_logical_output_schema(window.input)?;
+                let mut columns = bumpalo::collections::Vec::new_in(self.arena);
+
+                for col in input_schema.columns {
+                    columns.push(*col);
+                }
+
+                for window_func in window.window_functions.iter() {
+                    let name = window_func.alias.unwrap_or(window_func.function_name);
+                    columns.push(OutputColumn {
+                        name,
+                        data_type: DataType::Int8,
+                        nullable: false,
+                    });
+                }
+
+                Ok(OutputSchema {
+                    columns: columns.into_bump_slice(),
+                })
+            }
             LogicalOperator::Values(_)
             | LogicalOperator::Insert(_)
             | LogicalOperator::Update(_)
@@ -1632,7 +1777,33 @@ impl<'a> Planner<'a> {
                 };
                 Ok((self.arena.alloc_str(name), data_type, true))
             }
-            Expr::BinaryOp { .. } => Ok((self.arena.alloc_str("?column?"), DataType::Bool, true)),
+            Expr::BinaryOp { left, op, right } => {
+                use crate::sql::ast::BinaryOperator;
+                let data_type = match op {
+                    BinaryOperator::Plus
+                    | BinaryOperator::Minus
+                    | BinaryOperator::Multiply
+                    | BinaryOperator::Divide
+                    | BinaryOperator::Modulo
+                    | BinaryOperator::Power
+                    | BinaryOperator::BitwiseAnd
+                    | BinaryOperator::BitwiseOr
+                    | BinaryOperator::BitwiseXor
+                    | BinaryOperator::LeftShift
+                    | BinaryOperator::RightShift => {
+                        let (_, left_type, _) = self.infer_expr_type(left, input_schema)?;
+                        let (_, right_type, _) = self.infer_expr_type(right, input_schema)?;
+                        if left_type == DataType::Float8 || right_type == DataType::Float8 {
+                            DataType::Float8
+                        } else {
+                            left_type
+                        }
+                    }
+                    BinaryOperator::Concat => DataType::Text,
+                    _ => DataType::Bool,
+                };
+                Ok((self.arena.alloc_str("?column?"), data_type, true))
+            }
             Expr::UnaryOp { expr, .. } => self.infer_expr_type(expr, input_schema),
             Expr::Function(func) => {
                 let name = self.arena.alloc_str(func.name.name);
@@ -1819,6 +1990,16 @@ impl<'a> Planner<'a> {
                 }));
                 Ok(physical)
             }
+            LogicalOperator::Window(window) => {
+                let input = self.logical_to_physical(window.input)?;
+                let physical = self
+                    .arena
+                    .alloc(PhysicalOperator::WindowExec(PhysicalWindowExec {
+                        input,
+                        window_functions: window.window_functions,
+                    }));
+                Ok(physical)
+            }
         }
     }
 
@@ -1873,56 +2054,16 @@ impl<'a> Planner<'a> {
 
     fn try_optimize_filter_to_index_scan(
         &self,
-        filter: &LogicalFilter<'a>,
+        _filter: &LogicalFilter<'a>,
     ) -> Option<&'a PhysicalOperator<'a>> {
-        let scan = match filter.input {
-            LogicalOperator::Scan(s) => s,
-            _ => return None,
-        };
-
-        let table_name = if let Some(schema) = scan.schema {
-            let full_name = self.arena.alloc_str(&format!("{}.{}", schema, scan.table));
-            full_name
-        } else {
-            scan.table
-        };
-
-        let table_def = self.catalog.resolve_table(table_name).ok()?;
-
-        let filter_columns = self.extract_filter_columns(filter.predicate);
-        let best_index = self.select_best_index(table_def, filter_columns)?;
-
-        let index_columns = best_index.columns();
-        let first_index_col = index_columns.first()?;
-        let bounds = self.extract_scan_bounds_for_column(filter.predicate, first_index_col);
-        let scan_type = self.bounds_to_scan_type(&bounds);
-
-        if scan_type == ScanBoundType::Full {
-            return None;
-        }
-
-        let key_range = self.encode_scan_bounds(&bounds);
-
-        if matches!(key_range, ScanRange::FullScan) {
-            return None;
-        }
-
-        let residual = self.compute_residual_filter(filter.predicate, &index_columns);
-
-        let index_scan = self
-            .arena
-            .alloc(PhysicalOperator::IndexScan(PhysicalIndexScan {
-                schema: scan.schema,
-                table: scan.table,
-                index_name: best_index.name(),
-                key_range,
-                residual_filter: residual,
-                is_covering: false,
-            }));
-
-        Some(index_scan)
+        None
+        // TODO: Re-enable IndexScan optimization once executor supports it
+        // The executor doesn't currently support IndexScan properly - it needs
+        // explicit BTreeCursorAdapter setup via build_index_scan method.
+        // For now, fall back to TableScan + FilterExec which works correctly.
     }
 
+    #[allow(dead_code)]
     fn compute_residual_filter(
         &self,
         predicate: &'a Expr<'a>,
@@ -1971,6 +2112,7 @@ impl<'a> Planner<'a> {
         }
     }
 
+    #[allow(dead_code)]
     fn predicate_uses_index_column(&self, expr: &Expr<'a>, index_columns: &[String]) -> bool {
         match expr {
             Expr::Column(col_ref) => index_columns
@@ -2276,6 +2418,7 @@ impl<'a> Planner<'a> {
                     SetOpKind::Except => left_card / 2,
                 }
             }
+            LogicalOperator::Window(window) => self.estimate_cardinality(window.input),
         }
     }
 
@@ -2459,6 +2602,7 @@ impl<'a> Planner<'a> {
         }
     }
 
+    #[allow(dead_code)]
     fn encode_literal_to_bytes(&self, expr: &Expr<'a>) -> Option<&'a [u8]> {
         match expr {
             Expr::Literal(lit) => {
@@ -2506,6 +2650,7 @@ impl<'a> Planner<'a> {
         }
     }
 
+    #[allow(dead_code)]
     fn encode_int_to_arena(&self, n: i64, buf: &mut bumpalo::collections::Vec<'a, u8>) {
         use crate::encoding::key::type_prefix;
         if n < 0 {
@@ -2519,6 +2664,7 @@ impl<'a> Planner<'a> {
         }
     }
 
+    #[allow(dead_code)]
     fn encode_float_to_arena(&self, f: f64, buf: &mut bumpalo::collections::Vec<'a, u8>) {
         use crate::encoding::key::type_prefix;
         if f.is_nan() {
@@ -2538,6 +2684,7 @@ impl<'a> Planner<'a> {
         }
     }
 
+    #[allow(dead_code)]
     fn encode_text_to_arena(&self, s: &str, buf: &mut bumpalo::collections::Vec<'a, u8>) {
         use crate::encoding::key::type_prefix;
         buf.push(type_prefix::TEXT);
@@ -2558,6 +2705,7 @@ impl<'a> Planner<'a> {
         buf.push(0x00);
     }
 
+    #[allow(dead_code)]
     fn encode_scan_bounds(&self, bounds: &ColumnScanBounds<'a>) -> ScanRange<'a> {
         if let Some(point) = bounds.point_value {
             if let Some(encoded) = self.encode_literal_to_bytes(point.value) {
