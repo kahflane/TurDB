@@ -447,6 +447,26 @@ impl Database {
         self.next_index_id.fetch_add(1, Ordering::AcqRel)
     }
 
+    /// Prepares a SQL statement for execution with parameters.
+    ///
+    /// The SQL can contain parameter placeholders:
+    /// - `?` for anonymous parameters (bound in order)
+    /// - `$1`, `$2`, etc. for positional parameters
+    ///
+    /// Returns a `PreparedStatement` that can be bound with values and executed.
+    pub fn prepare(&self, sql: &str) -> Result<super::PreparedStatement> {
+        use super::prepared::count_parameters;
+
+        let arena = Bump::new();
+        let mut parser = Parser::new(sql, &arena);
+        parser
+            .parse_statement()
+            .wrap_err_with(|| format!("failed to parse SQL for prepared statement: {}", sql))?;
+
+        let param_count = count_parameters(sql);
+        Ok(super::PreparedStatement::new(sql.to_string(), param_count))
+    }
+
     pub fn query(&self, sql: &str) -> Result<Vec<Row>> {
         use crate::sql::ast::{Distinct, Statement};
 
@@ -1840,9 +1860,7 @@ impl Database {
                     .iter()
                     .all(|&idx| values.get(idx).map(|v| !v.is_null()).unwrap_or(false));
 
-                if all_non_null
-                    && file_manager.index_exists(schema_name, table_name, index_name)
-                {
+                if all_non_null && file_manager.index_exists(schema_name, table_name, index_name) {
                     let index_storage =
                         file_manager.index_data_mut(schema_name, table_name, index_name)?;
                     let index_btree = BTree::new(index_storage, root_page)?;
@@ -1924,9 +1942,7 @@ impl Database {
                     .iter()
                     .all(|&idx| values.get(idx).map(|v| !v.is_null()).unwrap_or(false));
 
-                if all_non_null
-                    && file_manager.index_exists(schema_name, table_name, index_name)
-                {
+                if all_non_null && file_manager.index_exists(schema_name, table_name, index_name) {
                     let index_storage =
                         file_manager.index_data_mut(schema_name, table_name, index_name)?;
 

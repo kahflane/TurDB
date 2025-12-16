@@ -76,9 +76,7 @@ impl<'a> ExecutorBuilder<'a> {
                             if let Expr::Column(col_ref) = expr {
                                 column_map
                                     .iter()
-                                    .find(|(name, _)| {
-                                        name.eq_ignore_ascii_case(col_ref.column)
-                                    })
+                                    .find(|(name, _)| name.eq_ignore_ascii_case(col_ref.column))
                                     .map(|(_, idx)| *idx)
                                     .unwrap_or(default_idx)
                             } else {
