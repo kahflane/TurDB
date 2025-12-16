@@ -941,6 +941,123 @@ fn bench_foreign_key_delete_comparison(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_subquery_comparison(c: &mut Criterion) {
+    let mut group = c.benchmark_group("subquery_comparison");
+
+    for count in [100, 1000, 10000].iter() {
+        group.throughput(Throughput::Elements(*count as u64));
+
+        let (_turdb_dir, turdb) = create_turdb_test_database(*count);
+        let (_sqlite_dir, sqlite_conn) = create_sqlite_test_database(*count);
+
+        group.bench_with_input(
+            BenchmarkId::new("turdb_subquery", count),
+            count,
+            |b, _count| {
+                b.iter(|| {
+                    let rows = turdb
+                        .query(black_box(
+                            "SELECT s.id, s.name FROM (SELECT id, name FROM users) AS s",
+                        ))
+                        .unwrap();
+                    black_box(rows.len())
+                });
+            },
+        );
+
+        group.bench_with_input(
+            BenchmarkId::new("sqlite_subquery", count),
+            count,
+            |b, _count| {
+                b.iter(|| {
+                    let mut stmt = sqlite_conn
+                        .prepare_cached("SELECT s.id, s.name FROM (SELECT id, name FROM users) AS s")
+                        .unwrap();
+                    let rows: Vec<_> = stmt
+                        .query_map([], |row| {
+                            Ok((
+                                row.get::<_, i64>(0).unwrap(),
+                                row.get::<_, String>(1).unwrap(),
+                            ))
+                        })
+                        .unwrap()
+                        .collect();
+                    black_box(rows.len())
+                });
+            },
+        );
+
+        group.bench_with_input(
+            BenchmarkId::new("turdb_direct_scan", count),
+            count,
+            |b, _count| {
+                b.iter(|| {
+                    let rows = turdb
+                        .query(black_box("SELECT id, name FROM users"))
+                        .unwrap();
+                    black_box(rows.len())
+                });
+            },
+        );
+
+        group.bench_with_input(
+            BenchmarkId::new("sqlite_direct_scan", count),
+            count,
+            |b, _count| {
+                b.iter(|| {
+                    let mut stmt = sqlite_conn
+                        .prepare_cached("SELECT id, name FROM users")
+                        .unwrap();
+                    let rows: Vec<_> = stmt
+                        .query_map([], |row| {
+                            Ok((
+                                row.get::<_, i64>(0).unwrap(),
+                                row.get::<_, String>(1).unwrap(),
+                            ))
+                        })
+                        .unwrap()
+                        .collect();
+                    black_box(rows.len())
+                });
+            },
+        );
+    }
+
+    group.finish();
+}
+
+fn bench_nested_subquery_comparison(c: &mut Criterion) {
+    let mut group = c.benchmark_group("nested_subquery_comparison");
+
+    for count in [100, 1000].iter() {
+        group.throughput(Throughput::Elements(*count as u64));
+
+        let (_turdb_dir, _turdb) = create_turdb_test_database(*count);
+        let (_sqlite_dir, sqlite_conn) = create_sqlite_test_database(*count);
+
+        group.bench_with_input(
+            BenchmarkId::new("sqlite_nested_2_levels", count),
+            count,
+            |b, _count| {
+                b.iter(|| {
+                    let mut stmt = sqlite_conn
+                        .prepare_cached(
+                            "SELECT t.id FROM (SELECT s.id FROM (SELECT id FROM users) AS s) AS t",
+                        )
+                        .unwrap();
+                    let rows: Vec<_> = stmt
+                        .query_map([], |row| Ok(row.get::<_, i64>(0).unwrap()))
+                        .unwrap()
+                        .collect();
+                    black_box(rows.len())
+                });
+            },
+        );
+    }
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_insert_comparison,
@@ -955,6 +1072,8 @@ criterion_group!(
     bench_check_constraint_comparison,
     bench_foreign_key_insert_comparison,
     bench_foreign_key_delete_comparison,
+    bench_subquery_comparison,
+    bench_nested_subquery_comparison,
 );
 
 criterion_main!(benches);
