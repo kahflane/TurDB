@@ -971,7 +971,9 @@ fn bench_subquery_comparison(c: &mut Criterion) {
             |b, _count| {
                 b.iter(|| {
                     let mut stmt = sqlite_conn
-                        .prepare_cached("SELECT s.id, s.name FROM (SELECT id, name FROM users) AS s")
+                        .prepare_cached(
+                            "SELECT s.id, s.name FROM (SELECT id, name FROM users) AS s",
+                        )
                         .unwrap();
                     let rows: Vec<_> = stmt
                         .query_map([], |row| {

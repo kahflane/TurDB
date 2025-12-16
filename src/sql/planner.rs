@@ -123,12 +123,14 @@ impl<'a> TableSource<'a> {
 
     pub fn has_column(&self, col_name: &str) -> bool {
         match self {
-            TableSource::Table { def, .. } => {
-                def.columns().iter().any(|c| c.name().eq_ignore_ascii_case(col_name))
-            }
-            TableSource::Subquery { output_schema, .. } => {
-                output_schema.columns.iter().any(|c| c.name.eq_ignore_ascii_case(col_name))
-            }
+            TableSource::Table { def, .. } => def
+                .columns()
+                .iter()
+                .any(|c| c.name().eq_ignore_ascii_case(col_name)),
+            TableSource::Subquery { output_schema, .. } => output_schema
+                .columns
+                .iter()
+                .any(|c| c.name.eq_ignore_ascii_case(col_name)),
         }
     }
 }
@@ -177,6 +179,7 @@ pub enum LogicalOperator<'a> {
     Update(LogicalUpdate<'a>),
     Delete(LogicalDelete<'a>),
     Subquery(LogicalSubquery<'a>),
+    Window(LogicalWindow<'a>),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -283,6 +286,21 @@ pub struct LogicalSubquery<'a> {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub struct LogicalWindow<'a> {
+    pub input: &'a LogicalOperator<'a>,
+    pub window_functions: &'a [WindowFunctionDef<'a>],
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct WindowFunctionDef<'a> {
+    pub function_name: &'a str,
+    pub args: &'a [&'a Expr<'a>],
+    pub partition_by: &'a [&'a Expr<'a>],
+    pub order_by: &'a [SortKey<'a>],
+    pub alias: Option<&'a str>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct LogicalPlan<'a> {
     pub root: &'a LogicalOperator<'a>,
 }
@@ -300,6 +318,7 @@ pub enum PhysicalOperator<'a> {
     SortExec(PhysicalSortExec<'a>),
     LimitExec(PhysicalLimitExec<'a>),
     SubqueryExec(PhysicalSubqueryExec<'a>),
+    WindowExec(PhysicalWindowExec<'a>),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -411,6 +430,12 @@ pub struct PhysicalSubqueryExec<'a> {
     pub child_plan: &'a PhysicalOperator<'a>,
     pub alias: &'a str,
     pub output_schema: OutputSchema<'a>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct PhysicalWindowExec<'a> {
+    pub input: &'a PhysicalOperator<'a>,
+    pub window_functions: &'a [WindowFunctionDef<'a>],
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -526,13 +551,18 @@ impl<'a> Planner<'a> {
             }
         }
 
+        let has_window_functions = self.select_has_window_functions(select.columns);
+
+        if has_window_functions {
+            let window_functions = self.extract_window_functions(select.columns);
+            let window = self.arena.alloc(LogicalOperator::Window(LogicalWindow {
+                input: current,
+                window_functions,
+            }));
+            current = window;
+        }
+
         let (exprs, aliases) = self.extract_select_expressions(select.columns);
-        #[cfg(test)]
-        eprintln!(
-            "DEBUG plan_select: columns.len()={}, exprs.len()={}",
-            select.columns.len(),
-            exprs.len()
-        );
         let project = self.arena.alloc(LogicalOperator::Project(LogicalProject {
             input: current,
             expressions: exprs,
@@ -678,6 +708,83 @@ impl<'a> Planner<'a> {
         false
     }
 
+    fn is_window_function(&self, expr: &Expr<'a>) -> bool {
+        if let Expr::Function(func) = expr {
+            func.over.is_some()
+        } else {
+            false
+        }
+    }
+
+    fn select_has_window_functions(
+        &self,
+        columns: &'a [crate::sql::ast::SelectColumn<'a>],
+    ) -> bool {
+        use crate::sql::ast::SelectColumn;
+
+        for col in columns {
+            if let SelectColumn::Expr { expr, .. } = col {
+                if self.is_window_function(expr) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    fn extract_window_functions(
+        &self,
+        columns: &'a [crate::sql::ast::SelectColumn<'a>],
+    ) -> &'a [WindowFunctionDef<'a>] {
+        use crate::sql::ast::{NullsOrder, OrderDirection, SelectColumn};
+
+        let mut window_funcs = bumpalo::collections::Vec::new_in(self.arena);
+
+        for col in columns {
+            if let SelectColumn::Expr {
+                expr: Expr::Function(func),
+                alias,
+            } = col
+            {
+                if let Some(window_spec) = &func.over {
+                    let order_by_keys: &[SortKey<'a>] = {
+                        let mut keys = bumpalo::collections::Vec::new_in(self.arena);
+                        for item in window_spec.order_by.iter() {
+                            keys.push(SortKey {
+                                expr: item.expr,
+                                ascending: matches!(item.direction, OrderDirection::Asc),
+                                nulls_first: matches!(item.nulls, NullsOrder::First),
+                            });
+                        }
+                        keys.into_bump_slice()
+                    };
+
+                    let args: &[&Expr<'a>] = match &func.args {
+                        crate::sql::ast::FunctionArgs::Args(func_args) => {
+                            let mut arg_exprs = bumpalo::collections::Vec::new_in(self.arena);
+                            for arg in func_args.iter() {
+                                arg_exprs.push(arg.value);
+                            }
+                            arg_exprs.into_bump_slice()
+                        }
+                        crate::sql::ast::FunctionArgs::Star => &[],
+                        crate::sql::ast::FunctionArgs::None => &[],
+                    };
+
+                    window_funcs.push(WindowFunctionDef {
+                        function_name: func.name.name,
+                        args,
+                        partition_by: window_spec.partition_by,
+                        order_by: order_by_keys,
+                        alias: *alias,
+                    });
+                }
+            }
+        }
+
+        window_funcs.into_bump_slice()
+    }
+
     fn extract_select_expressions(
         &self,
         columns: &'a [crate::sql::ast::SelectColumn<'a>],
@@ -688,8 +795,6 @@ impl<'a> Planner<'a> {
         let mut aliases = bumpalo::collections::Vec::new_in(self.arena);
 
         for col in columns {
-            #[cfg(test)]
-            eprintln!("DEBUG extract_select_expressions: col={:?}", col);
             match col {
                 SelectColumn::Expr { expr, alias } => {
                     exprs.push(*expr);
@@ -837,11 +942,7 @@ impl<'a> Planner<'a> {
         }
     }
 
-    fn validate_expr_columns(
-        &self,
-        expr: &Expr<'a>,
-        tables: &[TableSource<'a>],
-    ) -> Result<()> {
+    fn validate_expr_columns(&self, expr: &Expr<'a>, tables: &[TableSource<'a>]) -> Result<()> {
         match expr {
             Expr::Column(col_ref) => self.validate_column_in_scope(col_ref, tables),
             Expr::BinaryOp { left, right, .. } => {
@@ -1227,6 +1328,27 @@ impl<'a> Planner<'a> {
                 })
             }
             PhysicalOperator::SubqueryExec(subq) => Ok(subq.output_schema.clone()),
+            PhysicalOperator::WindowExec(window) => {
+                let input_schema = self.compute_output_schema(window.input)?;
+                let mut columns = bumpalo::collections::Vec::new_in(self.arena);
+
+                for col in input_schema.columns {
+                    columns.push(*col);
+                }
+
+                for window_func in window.window_functions.iter() {
+                    let name = window_func.alias.unwrap_or(window_func.function_name);
+                    columns.push(OutputColumn {
+                        name,
+                        data_type: crate::records::types::DataType::Int8,
+                        nullable: false,
+                    });
+                }
+
+                Ok(OutputSchema {
+                    columns: columns.into_bump_slice(),
+                })
+            }
         }
     }
 
@@ -1325,7 +1447,8 @@ impl<'a> Planner<'a> {
                             "sum" | "min" | "max" => {
                                 if let crate::sql::ast::FunctionArgs::Args(args) = func.args {
                                     if let Some(first_arg) = args.first() {
-                                        let (_, dt, _) = self.infer_expr_type(first_arg.value, &input_schema)?;
+                                        let (_, dt, _) =
+                                            self.infer_expr_type(first_arg.value, &input_schema)?;
                                         dt
                                     } else {
                                         DataType::Int8
@@ -1349,9 +1472,31 @@ impl<'a> Planner<'a> {
                 })
             }
             LogicalOperator::Subquery(subq) => Ok(subq.output_schema.clone()),
-            LogicalOperator::Values(_) | LogicalOperator::Insert(_) | LogicalOperator::Update(_) | LogicalOperator::Delete(_) => {
-                Ok(OutputSchema::empty())
+            LogicalOperator::Window(window) => {
+                let input_schema = self.compute_logical_output_schema(window.input)?;
+                let mut columns = bumpalo::collections::Vec::new_in(self.arena);
+
+                for col in input_schema.columns {
+                    columns.push(*col);
+                }
+
+                for window_func in window.window_functions.iter() {
+                    let name = window_func.alias.unwrap_or(window_func.function_name);
+                    columns.push(OutputColumn {
+                        name,
+                        data_type: DataType::Int8,
+                        nullable: false,
+                    });
+                }
+
+                Ok(OutputSchema {
+                    columns: columns.into_bump_slice(),
+                })
             }
+            LogicalOperator::Values(_)
+            | LogicalOperator::Insert(_)
+            | LogicalOperator::Update(_)
+            | LogicalOperator::Delete(_) => Ok(OutputSchema::empty()),
         }
     }
 
@@ -1382,7 +1527,33 @@ impl<'a> Planner<'a> {
                 };
                 Ok((self.arena.alloc_str(name), data_type, true))
             }
-            Expr::BinaryOp { .. } => Ok((self.arena.alloc_str("?column?"), DataType::Bool, true)),
+            Expr::BinaryOp { left, op, right } => {
+                use crate::sql::ast::BinaryOperator;
+                let data_type = match op {
+                    BinaryOperator::Plus
+                    | BinaryOperator::Minus
+                    | BinaryOperator::Multiply
+                    | BinaryOperator::Divide
+                    | BinaryOperator::Modulo
+                    | BinaryOperator::Power
+                    | BinaryOperator::BitwiseAnd
+                    | BinaryOperator::BitwiseOr
+                    | BinaryOperator::BitwiseXor
+                    | BinaryOperator::LeftShift
+                    | BinaryOperator::RightShift => {
+                        let (_, left_type, _) = self.infer_expr_type(left, input_schema)?;
+                        let (_, right_type, _) = self.infer_expr_type(right, input_schema)?;
+                        if left_type == DataType::Float8 || right_type == DataType::Float8 {
+                            DataType::Float8
+                        } else {
+                            left_type
+                        }
+                    }
+                    BinaryOperator::Concat => DataType::Text,
+                    _ => DataType::Bool,
+                };
+                Ok((self.arena.alloc_str("?column?"), data_type, true))
+            }
             Expr::UnaryOp { expr, .. } => self.infer_expr_type(expr, input_schema),
             Expr::Function(func) => {
                 let name = self.arena.alloc_str(func.name.name);
@@ -1556,6 +1727,16 @@ impl<'a> Planner<'a> {
                             alias: subq.alias,
                             output_schema: subq.output_schema.clone(),
                         }));
+                Ok(physical)
+            }
+            LogicalOperator::Window(window) => {
+                let input = self.logical_to_physical(window.input)?;
+                let physical = self
+                    .arena
+                    .alloc(PhysicalOperator::WindowExec(PhysicalWindowExec {
+                        input,
+                        window_functions: window.window_functions,
+                    }));
                 Ok(physical)
             }
         }
@@ -2000,6 +2181,7 @@ impl<'a> Planner<'a> {
             LogicalOperator::Update(_) => 0,
             LogicalOperator::Delete(_) => 0,
             LogicalOperator::Subquery(subq) => self.estimate_cardinality(subq.plan),
+            LogicalOperator::Window(window) => self.estimate_cardinality(window.input),
         }
     }
 
