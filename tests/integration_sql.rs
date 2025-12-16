@@ -1205,3 +1205,435 @@ mod edge_case_tests {
         }
     }
 }
+
+mod subquery_tests {
+    use super::*;
+
+    #[test]
+    fn select_from_subquery_returns_subquery_results() {
+        let dir = tempdir().unwrap();
+        let db = Database::create(dir.path().join("test_db")).unwrap();
+        db.execute("CREATE TABLE users (id INT, name TEXT, age INT)")
+            .unwrap();
+        db.execute("INSERT INTO users VALUES (1, 'Alice', 30)")
+            .unwrap();
+        db.execute("INSERT INTO users VALUES (2, 'Bob', 25)").unwrap();
+        db.execute("INSERT INTO users VALUES (3, 'Carol', 35)")
+            .unwrap();
+
+        let rows = db
+            .query("SELECT * FROM (SELECT id, name FROM users WHERE age > 26) AS older_users")
+            .unwrap();
+
+        assert_eq!(
+            rows.len(),
+            2,
+            "Subquery SHOULD return 2 rows (Alice and Carol, age > 26)"
+        );
+    }
+
+    #[test]
+    fn subquery_can_be_filtered_by_outer_query() {
+        let dir = tempdir().unwrap();
+        let db = Database::create(dir.path().join("test_db")).unwrap();
+        db.execute("CREATE TABLE nums (n INT)").unwrap();
+        for i in 1..=10 {
+            db.execute(&format!("INSERT INTO nums VALUES ({})", i))
+                .unwrap();
+        }
+
+        let rows = db
+            .query("SELECT * FROM (SELECT n FROM nums WHERE n <= 5) AS small WHERE n > 2")
+            .unwrap();
+
+        assert_eq!(
+            rows.len(),
+            3,
+            "Outer WHERE SHOULD filter subquery results: 3, 4, 5"
+        );
+    }
+
+    #[test]
+    fn subquery_with_aggregation_works() {
+        let dir = tempdir().unwrap();
+        let db = Database::create(dir.path().join("test_db")).unwrap();
+        db.execute("CREATE TABLE sales (region TEXT, amount INT)")
+            .unwrap();
+        db.execute("INSERT INTO sales VALUES ('North', 100)")
+            .unwrap();
+        db.execute("INSERT INTO sales VALUES ('North', 200)")
+            .unwrap();
+        db.execute("INSERT INTO sales VALUES ('South', 150)")
+            .unwrap();
+
+        let rows = db
+            .query(
+                "SELECT region, total FROM (SELECT region, SUM(amount) AS total FROM sales GROUP BY region) AS region_totals WHERE total > 200",
+            )
+            .unwrap();
+
+        assert_eq!(
+            rows.len(),
+            1,
+            "Only North (300) SHOULD have total > 200"
+        );
+        match &rows[0].values[1] {
+            OwnedValue::Int(total) => {
+                assert_eq!(*total, 300, "North total SHOULD be 300")
+            }
+            other => panic!("Expected Int for total, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn nested_subqueries_work() {
+        let dir = tempdir().unwrap();
+        let db = Database::create(dir.path().join("test_db")).unwrap();
+        db.execute("CREATE TABLE data (x INT)").unwrap();
+        for i in 1..=20 {
+            db.execute(&format!("INSERT INTO data VALUES ({})", i))
+                .unwrap();
+        }
+
+        let rows = db
+            .query(
+                "SELECT * FROM (SELECT * FROM (SELECT x FROM data WHERE x <= 10) AS inner_sq WHERE x > 5) AS outer_sq",
+            )
+            .unwrap();
+
+        assert_eq!(
+            rows.len(),
+            5,
+            "Nested subqueries SHOULD return 6, 7, 8, 9, 10"
+        );
+    }
+
+    #[test]
+    fn subquery_with_limit_and_offset_works() {
+        let dir = tempdir().unwrap();
+        let db = Database::create(dir.path().join("test_db")).unwrap();
+        db.execute("CREATE TABLE items (id INT)").unwrap();
+        for i in 1..=10 {
+            db.execute(&format!("INSERT INTO items VALUES ({})", i))
+                .unwrap();
+        }
+
+        let rows = db
+            .query("SELECT * FROM (SELECT id FROM items LIMIT 5 OFFSET 2) AS paged")
+            .unwrap();
+
+        assert_eq!(
+            rows.len(),
+            5,
+            "Subquery with LIMIT 5 OFFSET 2 SHOULD return 5 rows"
+        );
+    }
+
+    #[test]
+    fn join_with_subquery_works() {
+        let dir = tempdir().unwrap();
+        let db = Database::create(dir.path().join("test_db")).unwrap();
+        db.execute("CREATE TABLE orders (id INT, user_id INT)")
+            .unwrap();
+        db.execute("CREATE TABLE users (id INT, name TEXT)")
+            .unwrap();
+        db.execute("INSERT INTO users VALUES (1, 'Alice')").unwrap();
+        db.execute("INSERT INTO users VALUES (2, 'Bob')").unwrap();
+        db.execute("INSERT INTO orders VALUES (100, 1)").unwrap();
+        db.execute("INSERT INTO orders VALUES (101, 1)").unwrap();
+
+        let rows = db
+            .query(
+                "SELECT o.id, u.name FROM orders AS o
+                 JOIN (SELECT id, name FROM users) AS u ON o.user_id = u.id",
+            )
+            .unwrap();
+
+        assert_eq!(rows.len(), 2, "Join with subquery SHOULD return 2 rows");
+    }
+}
+
+mod cte_tests {
+    use super::*;
+
+    #[test]
+    fn simple_cte_returns_results() {
+        let dir = tempdir().unwrap();
+        let db = Database::create(dir.path().join("test_db")).unwrap();
+        db.execute("CREATE TABLE users (id INT, name TEXT)")
+            .unwrap();
+        db.execute("INSERT INTO users VALUES (1, 'Alice')").unwrap();
+        db.execute("INSERT INTO users VALUES (2, 'Bob')").unwrap();
+
+        let rows = db
+            .query("WITH user_names AS (SELECT name FROM users) SELECT * FROM user_names")
+            .unwrap();
+
+        assert_eq!(rows.len(), 2, "CTE SHOULD return 2 user names");
+    }
+
+    #[test]
+    fn cte_can_reference_another_cte() {
+        let dir = tempdir().unwrap();
+        let db = Database::create(dir.path().join("test_db")).unwrap();
+        db.execute("CREATE TABLE nums (n INT)").unwrap();
+        for i in 1..=10 {
+            db.execute(&format!("INSERT INTO nums VALUES ({})", i))
+                .unwrap();
+        }
+
+        let rows = db
+            .query(
+                "WITH
+                 small AS (SELECT n FROM nums WHERE n <= 5),
+                 tiny AS (SELECT n FROM small WHERE n <= 3)
+                 SELECT * FROM tiny",
+            )
+            .unwrap();
+
+        assert_eq!(
+            rows.len(),
+            3,
+            "Chained CTEs SHOULD return 3 rows (1, 2, 3)"
+        );
+    }
+
+    #[test]
+    fn cte_with_column_aliases() {
+        let dir = tempdir().unwrap();
+        let db = Database::create(dir.path().join("test_db")).unwrap();
+        db.execute("CREATE TABLE sales (amount INT)").unwrap();
+        db.execute("INSERT INTO sales VALUES (100)").unwrap();
+        db.execute("INSERT INTO sales VALUES (200)").unwrap();
+
+        let rows = db
+            .query(
+                "WITH totals (total_amount) AS (SELECT SUM(amount) FROM sales)
+                 SELECT total_amount FROM totals",
+            )
+            .unwrap();
+
+        assert_eq!(rows.len(), 1);
+        match &rows[0].values[0] {
+            OwnedValue::Int(total) => {
+                assert_eq!(*total, 300, "CTE column alias SHOULD work, total=300")
+            }
+            other => panic!("Expected Int, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn cte_used_multiple_times_in_query() {
+        let dir = tempdir().unwrap();
+        let db = Database::create(dir.path().join("test_db")).unwrap();
+        db.execute("CREATE TABLE items (id INT, value INT)")
+            .unwrap();
+        db.execute("INSERT INTO items VALUES (1, 10)").unwrap();
+        db.execute("INSERT INTO items VALUES (2, 20)").unwrap();
+
+        let rows = db
+            .query(
+                "WITH item_values AS (SELECT id, value FROM items)
+                 SELECT a.id, b.value
+                 FROM item_values a
+                 JOIN item_values b ON a.id = b.id",
+            )
+            .unwrap();
+
+        assert_eq!(
+            rows.len(),
+            2,
+            "CTE used twice in same query SHOULD work"
+        );
+    }
+
+    #[test]
+    fn cte_with_aggregation() {
+        let dir = tempdir().unwrap();
+        let db = Database::create(dir.path().join("test_db")).unwrap();
+        db.execute("CREATE TABLE orders (customer_id INT, amount INT)")
+            .unwrap();
+        db.execute("INSERT INTO orders VALUES (1, 100)").unwrap();
+        db.execute("INSERT INTO orders VALUES (1, 50)").unwrap();
+        db.execute("INSERT INTO orders VALUES (2, 200)").unwrap();
+
+        let rows = db
+            .query(
+                "WITH customer_totals AS (
+                    SELECT customer_id, SUM(amount) AS total
+                    FROM orders
+                    GROUP BY customer_id
+                 )
+                 SELECT * FROM customer_totals WHERE total >= 150",
+            )
+            .unwrap();
+
+        assert_eq!(
+            rows.len(),
+            2,
+            "Both customers SHOULD have total >= 150"
+        );
+    }
+}
+
+mod set_operation_tests {
+    use super::*;
+
+    #[test]
+    fn union_combines_results_without_duplicates() {
+        let dir = tempdir().unwrap();
+        let db = Database::create(dir.path().join("test_db")).unwrap();
+        db.execute("CREATE TABLE t1 (n INT)").unwrap();
+        db.execute("CREATE TABLE t2 (n INT)").unwrap();
+        db.execute("INSERT INTO t1 VALUES (1)").unwrap();
+        db.execute("INSERT INTO t1 VALUES (2)").unwrap();
+        db.execute("INSERT INTO t2 VALUES (2)").unwrap();
+        db.execute("INSERT INTO t2 VALUES (3)").unwrap();
+
+        let rows = db
+            .query("SELECT n FROM t1 UNION SELECT n FROM t2")
+            .unwrap();
+
+        assert_eq!(
+            rows.len(),
+            3,
+            "UNION SHOULD return 3 unique values (1, 2, 3)"
+        );
+    }
+
+    #[test]
+    fn union_all_preserves_duplicates() {
+        let dir = tempdir().unwrap();
+        let db = Database::create(dir.path().join("test_db")).unwrap();
+        db.execute("CREATE TABLE t1 (n INT)").unwrap();
+        db.execute("CREATE TABLE t2 (n INT)").unwrap();
+        db.execute("INSERT INTO t1 VALUES (1)").unwrap();
+        db.execute("INSERT INTO t1 VALUES (2)").unwrap();
+        db.execute("INSERT INTO t2 VALUES (2)").unwrap();
+        db.execute("INSERT INTO t2 VALUES (3)").unwrap();
+
+        let rows = db
+            .query("SELECT n FROM t1 UNION ALL SELECT n FROM t2")
+            .unwrap();
+
+        assert_eq!(
+            rows.len(),
+            4,
+            "UNION ALL SHOULD return 4 values including duplicate 2"
+        );
+    }
+
+    #[test]
+    fn intersect_returns_common_rows() {
+        let dir = tempdir().unwrap();
+        let db = Database::create(dir.path().join("test_db")).unwrap();
+        db.execute("CREATE TABLE t1 (n INT)").unwrap();
+        db.execute("CREATE TABLE t2 (n INT)").unwrap();
+        db.execute("INSERT INTO t1 VALUES (1)").unwrap();
+        db.execute("INSERT INTO t1 VALUES (2)").unwrap();
+        db.execute("INSERT INTO t1 VALUES (3)").unwrap();
+        db.execute("INSERT INTO t2 VALUES (2)").unwrap();
+        db.execute("INSERT INTO t2 VALUES (3)").unwrap();
+        db.execute("INSERT INTO t2 VALUES (4)").unwrap();
+
+        let rows = db
+            .query("SELECT n FROM t1 INTERSECT SELECT n FROM t2")
+            .unwrap();
+
+        assert_eq!(
+            rows.len(),
+            2,
+            "INTERSECT SHOULD return 2 common values (2, 3)"
+        );
+    }
+
+    #[test]
+    fn except_returns_difference() {
+        let dir = tempdir().unwrap();
+        let db = Database::create(dir.path().join("test_db")).unwrap();
+        db.execute("CREATE TABLE t1 (n INT)").unwrap();
+        db.execute("CREATE TABLE t2 (n INT)").unwrap();
+        db.execute("INSERT INTO t1 VALUES (1)").unwrap();
+        db.execute("INSERT INTO t1 VALUES (2)").unwrap();
+        db.execute("INSERT INTO t1 VALUES (3)").unwrap();
+        db.execute("INSERT INTO t2 VALUES (2)").unwrap();
+
+        let rows = db
+            .query("SELECT n FROM t1 EXCEPT SELECT n FROM t2")
+            .unwrap();
+
+        assert_eq!(
+            rows.len(),
+            2,
+            "EXCEPT SHOULD return 2 values (1, 3) not in t2"
+        );
+    }
+
+    #[test]
+    fn union_with_order_by() {
+        let dir = tempdir().unwrap();
+        let db = Database::create(dir.path().join("test_db")).unwrap();
+        db.execute("CREATE TABLE t1 (n INT)").unwrap();
+        db.execute("CREATE TABLE t2 (n INT)").unwrap();
+        db.execute("INSERT INTO t1 VALUES (3)").unwrap();
+        db.execute("INSERT INTO t1 VALUES (1)").unwrap();
+        db.execute("INSERT INTO t2 VALUES (2)").unwrap();
+
+        let rows = db
+            .query("SELECT n FROM t1 UNION SELECT n FROM t2 ORDER BY n")
+            .unwrap();
+
+        assert_eq!(rows.len(), 3);
+        match &rows[0].values[0] {
+            OwnedValue::Int(n) => assert_eq!(*n, 1, "First row SHOULD be 1 after ORDER BY"),
+            other => panic!("Expected Int, got {:?}", other),
+        }
+        match &rows[2].values[0] {
+            OwnedValue::Int(n) => assert_eq!(*n, 3, "Last row SHOULD be 3 after ORDER BY"),
+            other => panic!("Expected Int, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn chained_set_operations() {
+        let dir = tempdir().unwrap();
+        let db = Database::create(dir.path().join("test_db")).unwrap();
+        db.execute("CREATE TABLE t1 (n INT)").unwrap();
+        db.execute("CREATE TABLE t2 (n INT)").unwrap();
+        db.execute("CREATE TABLE t3 (n INT)").unwrap();
+        db.execute("INSERT INTO t1 VALUES (1)").unwrap();
+        db.execute("INSERT INTO t1 VALUES (2)").unwrap();
+        db.execute("INSERT INTO t2 VALUES (2)").unwrap();
+        db.execute("INSERT INTO t2 VALUES (3)").unwrap();
+        db.execute("INSERT INTO t3 VALUES (3)").unwrap();
+        db.execute("INSERT INTO t3 VALUES (4)").unwrap();
+
+        let rows = db
+            .query("SELECT n FROM t1 UNION SELECT n FROM t2 UNION SELECT n FROM t3")
+            .unwrap();
+
+        assert_eq!(
+            rows.len(),
+            4,
+            "Chained UNION SHOULD return 4 unique values (1, 2, 3, 4)"
+        );
+    }
+
+    #[test]
+    fn set_operation_with_different_column_names() {
+        let dir = tempdir().unwrap();
+        let db = Database::create(dir.path().join("test_db")).unwrap();
+        db.execute("CREATE TABLE t1 (x INT)").unwrap();
+        db.execute("CREATE TABLE t2 (y INT)").unwrap();
+        db.execute("INSERT INTO t1 VALUES (1)").unwrap();
+        db.execute("INSERT INTO t2 VALUES (2)").unwrap();
+
+        let rows = db.query("SELECT x FROM t1 UNION SELECT y FROM t2").unwrap();
+
+        assert_eq!(
+            rows.len(),
+            2,
+            "UNION SHOULD work with different column names"
+        );
+    }
+}

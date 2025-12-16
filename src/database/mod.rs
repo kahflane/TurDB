@@ -754,10 +754,11 @@ mod tests {
              WHERE a.id = r.all_types_id",
         );
         assert!(
-            result.is_err(),
-            "JOIN queries should fail until executor supports joins"
+            result.is_ok(),
+            "JOIN queries should succeed now that executor supports joins"
         );
-        println!("JOIN query correctly rejected (executor doesn't support joins yet)");
+        let rows = result.unwrap();
+        println!("JOIN query returned {} rows", rows.len());
 
         let result = db.query(
             "SELECT a.id, a.bigint_col, r.category
@@ -765,10 +766,11 @@ mod tests {
              WHERE a.id = r.id AND r.active = TRUE",
         );
         assert!(
-            result.is_err(),
-            "Filtered JOIN queries should fail until executor supports joins"
+            result.is_ok(),
+            "Filtered JOIN queries should succeed now that executor supports joins"
         );
-        println!("Filtered JOIN correctly rejected");
+        let rows = result.unwrap();
+        println!("Filtered JOIN returned {} rows", rows.len());
 
         let rows = db
             .query("SELECT * FROM all_types WHERE bigint_col > 50000000")
@@ -857,10 +859,11 @@ mod tests {
              LIMIT 10",
         );
         assert!(
-            result.is_err(),
-            "Complex JOIN query should fail until executor supports joins"
+            result.is_ok(),
+            "Complex JOIN query should succeed now that executor supports joins"
         );
-        println!("Complex JOIN with filter and LIMIT correctly rejected");
+        let rows = result.unwrap();
+        println!("Complex JOIN with filter and LIMIT returned {} rows", rows.len());
 
         db.close().unwrap();
 
