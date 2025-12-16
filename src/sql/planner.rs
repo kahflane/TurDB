@@ -1793,56 +1793,16 @@ impl<'a> Planner<'a> {
 
     fn try_optimize_filter_to_index_scan(
         &self,
-        filter: &LogicalFilter<'a>,
+        _filter: &LogicalFilter<'a>,
     ) -> Option<&'a PhysicalOperator<'a>> {
-        let scan = match filter.input {
-            LogicalOperator::Scan(s) => s,
-            _ => return None,
-        };
-
-        let table_name = if let Some(schema) = scan.schema {
-            let full_name = self.arena.alloc_str(&format!("{}.{}", schema, scan.table));
-            full_name
-        } else {
-            scan.table
-        };
-
-        let table_def = self.catalog.resolve_table(table_name).ok()?;
-
-        let filter_columns = self.extract_filter_columns(filter.predicate);
-        let best_index = self.select_best_index(table_def, filter_columns)?;
-
-        let index_columns = best_index.columns();
-        let first_index_col = index_columns.first()?;
-        let bounds = self.extract_scan_bounds_for_column(filter.predicate, first_index_col);
-        let scan_type = self.bounds_to_scan_type(&bounds);
-
-        if scan_type == ScanBoundType::Full {
-            return None;
-        }
-
-        let key_range = self.encode_scan_bounds(&bounds);
-
-        if matches!(key_range, ScanRange::FullScan) {
-            return None;
-        }
-
-        let residual = self.compute_residual_filter(filter.predicate, &index_columns);
-
-        let index_scan = self
-            .arena
-            .alloc(PhysicalOperator::IndexScan(PhysicalIndexScan {
-                schema: scan.schema,
-                table: scan.table,
-                index_name: best_index.name(),
-                key_range,
-                residual_filter: residual,
-                is_covering: false,
-            }));
-
-        Some(index_scan)
+        None
+        // TODO: Re-enable IndexScan optimization once executor supports it
+        // The executor doesn't currently support IndexScan properly - it needs
+        // explicit BTreeCursorAdapter setup via build_index_scan method.
+        // For now, fall back to TableScan + FilterExec which works correctly.
     }
 
+    #[allow(dead_code)]
     fn compute_residual_filter(
         &self,
         predicate: &'a Expr<'a>,
@@ -1891,6 +1851,7 @@ impl<'a> Planner<'a> {
         }
     }
 
+    #[allow(dead_code)]
     fn predicate_uses_index_column(&self, expr: &Expr<'a>, index_columns: &[String]) -> bool {
         match expr {
             Expr::Column(col_ref) => index_columns
@@ -2365,6 +2326,7 @@ impl<'a> Planner<'a> {
         }
     }
 
+    #[allow(dead_code)]
     fn encode_literal_to_bytes(&self, expr: &Expr<'a>) -> Option<&'a [u8]> {
         match expr {
             Expr::Literal(lit) => {
@@ -2412,6 +2374,7 @@ impl<'a> Planner<'a> {
         }
     }
 
+    #[allow(dead_code)]
     fn encode_int_to_arena(&self, n: i64, buf: &mut bumpalo::collections::Vec<'a, u8>) {
         use crate::encoding::key::type_prefix;
         if n < 0 {
@@ -2425,6 +2388,7 @@ impl<'a> Planner<'a> {
         }
     }
 
+    #[allow(dead_code)]
     fn encode_float_to_arena(&self, f: f64, buf: &mut bumpalo::collections::Vec<'a, u8>) {
         use crate::encoding::key::type_prefix;
         if f.is_nan() {
@@ -2444,6 +2408,7 @@ impl<'a> Planner<'a> {
         }
     }
 
+    #[allow(dead_code)]
     fn encode_text_to_arena(&self, s: &str, buf: &mut bumpalo::collections::Vec<'a, u8>) {
         use crate::encoding::key::type_prefix;
         buf.push(type_prefix::TEXT);
@@ -2464,6 +2429,7 @@ impl<'a> Planner<'a> {
         buf.push(0x00);
     }
 
+    #[allow(dead_code)]
     fn encode_scan_bounds(&self, bounds: &ColumnScanBounds<'a>) -> ScanRange<'a> {
         if let Some(point) = bounds.point_value {
             if let Some(encoded) = self.encode_literal_to_bytes(point.value) {

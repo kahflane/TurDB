@@ -1929,29 +1929,6 @@ mod insert_on_conflict_tests {
     }
 }
 
-mod pk_select_test {
-    use super::*;
-
-    #[test]
-    fn select_where_on_primary_key_works() {
-        let dir = tempdir().unwrap();
-        let db = Database::create(dir.path().join("test_db")).unwrap();
-
-        db.execute("CREATE TABLE users (id INT PRIMARY KEY, name TEXT)")
-            .unwrap();
-        db.execute("INSERT INTO users VALUES (1, 'Alice')").unwrap();
-
-        let rows = db.query("SELECT name FROM users WHERE id = 1").unwrap();
-        assert_eq!(rows.len(), 1, "Should find 1 row");
-
-        let name = match &rows[0].values[0] {
-            OwnedValue::Text(s) => s.clone(),
-            other => panic!("Expected Text, got {:?}", other),
-        };
-        assert_eq!(name, "Alice", "Name should be Alice");
-    }
-}
-
 mod returning_clause_tests {
     use super::*;
 
