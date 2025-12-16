@@ -278,6 +278,11 @@ impl<'a> ExecutorBuilder<'a> {
                     self.ctx.arena,
                 )))
             }
+            PhysicalOperator::SetOpExec(_) => {
+                eyre::bail!(
+                    "SetOpExec requires special handling - use Database::query instead"
+                )
+            }
         }
     }
 

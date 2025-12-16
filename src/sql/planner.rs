@@ -177,6 +177,22 @@ pub enum LogicalOperator<'a> {
     Update(LogicalUpdate<'a>),
     Delete(LogicalDelete<'a>),
     Subquery(LogicalSubquery<'a>),
+    SetOp(LogicalSetOp<'a>),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SetOpKind {
+    Union,
+    Intersect,
+    Except,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct LogicalSetOp<'a> {
+    pub left: &'a LogicalOperator<'a>,
+    pub right: &'a LogicalOperator<'a>,
+    pub kind: SetOpKind,
+    pub all: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -300,6 +316,15 @@ pub enum PhysicalOperator<'a> {
     SortExec(PhysicalSortExec<'a>),
     LimitExec(PhysicalLimitExec<'a>),
     SubqueryExec(PhysicalSubqueryExec<'a>),
+    SetOpExec(PhysicalSetOpExec<'a>),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct PhysicalSetOpExec<'a> {
+    pub left: &'a PhysicalOperator<'a>,
+    pub right: &'a PhysicalOperator<'a>,
+    pub kind: SetOpKind,
+    pub all: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -449,6 +474,41 @@ impl<'a> PlanNode<'a> {
     }
 }
 
+pub struct CteContext<'a> {
+    pub ctes: hashbrown::HashMap<&'a str, PlannedCte<'a>>,
+}
+
+pub struct PlannedCte<'a> {
+    pub plan: &'a LogicalOperator<'a>,
+    pub output_schema: OutputSchema<'a>,
+    pub columns: Option<&'a [&'a str]>,
+}
+
+impl<'a> CteContext<'a> {
+    pub fn new() -> Self {
+        Self {
+            ctes: hashbrown::HashMap::new(),
+        }
+    }
+
+    pub fn get(&self, name: &str) -> Option<&PlannedCte<'a>> {
+        self.ctes
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v)
+    }
+
+    pub fn insert(&mut self, name: &'a str, cte: PlannedCte<'a>) {
+        self.ctes.insert(name, cte);
+    }
+}
+
+impl<'a> Default for CteContext<'a> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 pub struct Planner<'a> {
     catalog: &'a Catalog,
     arena: &'a Bump,
@@ -483,8 +543,64 @@ impl<'a> Planner<'a> {
     }
 
     fn plan_select(&self, select: &crate::sql::ast::SelectStmt<'a>) -> Result<LogicalPlan<'a>> {
+        let cte_context = self.build_cte_context(select.with)?;
+        self.plan_select_with_ctes(select, &cte_context)
+    }
+
+    fn build_cte_context(
+        &self,
+        with_clause: Option<&crate::sql::ast::WithClause<'a>>,
+    ) -> Result<CteContext<'a>> {
+        let mut ctx = CteContext::new();
+
+        if let Some(with) = with_clause {
+            for cte in with.ctes {
+                let cte_plan = self.plan_select_with_ctes(cte.query, &ctx)?;
+                let mut output_schema = self.compute_logical_output_schema(cte_plan.root)?;
+
+                if let Some(col_names) = cte.columns {
+                    if col_names.len() != output_schema.columns.len() {
+                        bail!(
+                            "CTE '{}' has {} column names but query returns {} columns",
+                            cte.name,
+                            col_names.len(),
+                            output_schema.columns.len()
+                        );
+                    }
+                    let mut new_cols = bumpalo::collections::Vec::new_in(self.arena);
+                    for (i, col) in output_schema.columns.iter().enumerate() {
+                        new_cols.push(OutputColumn {
+                            name: col_names[i],
+                            data_type: col.data_type,
+                            nullable: col.nullable,
+                        });
+                    }
+                    output_schema = OutputSchema {
+                        columns: new_cols.into_bump_slice(),
+                    };
+                }
+
+                ctx.insert(
+                    cte.name,
+                    PlannedCte {
+                        plan: cte_plan.root,
+                        output_schema,
+                        columns: cte.columns,
+                    },
+                );
+            }
+        }
+
+        Ok(ctx)
+    }
+
+    fn plan_select_with_ctes(
+        &self,
+        select: &crate::sql::ast::SelectStmt<'a>,
+        cte_context: &CteContext<'a>,
+    ) -> Result<LogicalPlan<'a>> {
         let mut current: &'a LogicalOperator<'a> = match select.from {
-            Some(from) => self.plan_from_clause(from)?,
+            Some(from) => self.plan_from_clause_with_ctes(from, cte_context)?,
             None => bail!("SELECT without FROM clause not yet supported"),
         };
 
@@ -540,41 +656,172 @@ impl<'a> Planner<'a> {
         }));
         current = project;
 
-        if !select.order_by.is_empty() {
-            for order_item in select.order_by.iter() {
-                self.validate_expr_columns(order_item.expr, &tables_in_scope)?;
+        if let Some(set_op) = select.set_op {
+            let right_select = set_op.right;
+            let right_order_by = right_select.order_by;
+            let right_limit = right_select.limit;
+            let right_offset = right_select.offset;
+
+            let right_plan = self.plan_select_core(right_select, cte_context)?;
+            let kind = match set_op.op {
+                crate::sql::ast::SetOperator::Union => SetOpKind::Union,
+                crate::sql::ast::SetOperator::Intersect => SetOpKind::Intersect,
+                crate::sql::ast::SetOperator::Except => SetOpKind::Except,
+            };
+            let set_op_node = self.arena.alloc(LogicalOperator::SetOp(LogicalSetOp {
+                left: current,
+                right: right_plan.root,
+                kind,
+                all: set_op.all,
+            }));
+            current = set_op_node;
+
+            if !right_order_by.is_empty() {
+                let sort_keys = self.convert_order_by(right_order_by);
+                let sort = self.arena.alloc(LogicalOperator::Sort(LogicalSort {
+                    input: current,
+                    order_by: sort_keys,
+                }));
+                current = sort;
             }
-            let sort_keys = self.convert_order_by(select.order_by);
-            let sort = self.arena.alloc(LogicalOperator::Sort(LogicalSort {
-                input: current,
-                order_by: sort_keys,
-            }));
-            current = sort;
-        }
 
-        if select.limit.is_some() || select.offset.is_some() {
-            let limit_val = select.limit.and_then(|e| self.eval_const_u64(e));
-            let offset_val = select.offset.and_then(|e| self.eval_const_u64(e));
+            if right_limit.is_some() || right_offset.is_some() {
+                let limit_val = right_limit.and_then(|e| self.eval_const_u64(e));
+                let offset_val = right_offset.and_then(|e| self.eval_const_u64(e));
+                let limit_op = self.arena.alloc(LogicalOperator::Limit(LogicalLimit {
+                    input: current,
+                    limit: limit_val,
+                    offset: offset_val,
+                }));
+                current = limit_op;
+            }
+        } else {
+            if !select.order_by.is_empty() {
+                for order_item in select.order_by.iter() {
+                    self.validate_expr_columns(order_item.expr, &tables_in_scope)?;
+                }
+                let sort_keys = self.convert_order_by(select.order_by);
+                let sort = self.arena.alloc(LogicalOperator::Sort(LogicalSort {
+                    input: current,
+                    order_by: sort_keys,
+                }));
+                current = sort;
+            }
 
-            let limit_op = self.arena.alloc(LogicalOperator::Limit(LogicalLimit {
-                input: current,
-                limit: limit_val,
-                offset: offset_val,
-            }));
-            current = limit_op;
+            if select.limit.is_some() || select.offset.is_some() {
+                let limit_val = select.limit.and_then(|e| self.eval_const_u64(e));
+                let offset_val = select.offset.and_then(|e| self.eval_const_u64(e));
+
+                let limit_op = self.arena.alloc(LogicalOperator::Limit(LogicalLimit {
+                    input: current,
+                    limit: limit_val,
+                    offset: offset_val,
+                }));
+                current = limit_op;
+            }
         }
 
         Ok(LogicalPlan { root: current })
     }
 
-    fn plan_from_clause(
+    fn plan_select_core(
+        &self,
+        select: &crate::sql::ast::SelectStmt<'a>,
+        cte_context: &CteContext<'a>,
+    ) -> Result<LogicalPlan<'a>> {
+        let mut current: &'a LogicalOperator<'a> = match select.from {
+            Some(from) => self.plan_from_clause_with_ctes(from, cte_context)?,
+            None => bail!("SELECT without FROM clause not yet supported"),
+        };
+
+        let tables_in_scope = self.collect_tables_in_scope(current);
+        self.validate_select_columns(select.columns, &tables_in_scope)?;
+
+        if let Some(predicate) = select.where_clause {
+            self.validate_expr_columns(predicate, &tables_in_scope)?;
+            let filter = self.arena.alloc(LogicalOperator::Filter(LogicalFilter {
+                input: current,
+                predicate,
+            }));
+            current = filter;
+        }
+
+        let has_aggregates = self.select_has_aggregates(select.columns);
+        if !select.group_by.is_empty() || has_aggregates {
+            for group_expr in select.group_by.iter() {
+                self.validate_expr_columns(group_expr, &tables_in_scope)?;
+            }
+
+            let aggregates = self.extract_aggregates(select.columns);
+            let agg = self
+                .arena
+                .alloc(LogicalOperator::Aggregate(LogicalAggregate {
+                    input: current,
+                    group_by: select.group_by,
+                    aggregates,
+                }));
+            current = agg;
+
+            if let Some(having) = select.having {
+                self.validate_expr_columns(having, &tables_in_scope)?;
+                let having_filter = self.arena.alloc(LogicalOperator::Filter(LogicalFilter {
+                    input: current,
+                    predicate: having,
+                }));
+                current = having_filter;
+            }
+        }
+
+        let (exprs, aliases) = self.extract_select_expressions(select.columns);
+        let project = self.arena.alloc(LogicalOperator::Project(LogicalProject {
+            input: current,
+            expressions: exprs,
+            aliases,
+        }));
+        current = project;
+
+        if let Some(set_op) = select.set_op {
+            let right_plan = self.plan_select_core(set_op.right, cte_context)?;
+            let kind = match set_op.op {
+                crate::sql::ast::SetOperator::Union => SetOpKind::Union,
+                crate::sql::ast::SetOperator::Intersect => SetOpKind::Intersect,
+                crate::sql::ast::SetOperator::Except => SetOpKind::Except,
+            };
+            let set_op_node = self.arena.alloc(LogicalOperator::SetOp(LogicalSetOp {
+                left: current,
+                right: right_plan.root,
+                kind,
+                all: set_op.all,
+            }));
+            current = set_op_node;
+        }
+
+        Ok(LogicalPlan { root: current })
+    }
+
+    fn plan_from_clause_with_ctes(
         &self,
         from: &'a crate::sql::ast::FromClause<'a>,
+        cte_context: &CteContext<'a>,
     ) -> Result<&'a LogicalOperator<'a>> {
         use crate::sql::ast::FromClause;
 
         match from {
             FromClause::Table(table_ref) => {
+                if table_ref.schema.is_none() {
+                    if let Some(cte) = cte_context.get(table_ref.name) {
+                        let alias = table_ref.alias.unwrap_or(table_ref.name);
+                        let subquery_op =
+                            self.arena
+                                .alloc(LogicalOperator::Subquery(LogicalSubquery {
+                                    plan: cte.plan,
+                                    alias,
+                                    output_schema: cte.output_schema.clone(),
+                                }));
+                        return Ok(subquery_op);
+                    }
+                }
+
                 self.validate_table_exists(table_ref.schema, table_ref.name)?;
 
                 let scan = self.arena.alloc(LogicalOperator::Scan(LogicalScan {
@@ -584,9 +831,9 @@ impl<'a> Planner<'a> {
                 }));
                 Ok(scan)
             }
-            FromClause::Join(join) => self.plan_join(join),
+            FromClause::Join(join) => self.plan_join_with_ctes(join, cte_context),
             FromClause::Subquery { query, alias } => {
-                let subquery_plan = self.plan_select(query)?;
+                let subquery_plan = self.plan_select_with_ctes(query, cte_context)?;
                 let output_schema = self.compute_logical_output_schema(subquery_plan.root)?;
                 let subquery_op = self.arena.alloc(LogicalOperator::Subquery(LogicalSubquery {
                     plan: subquery_plan.root,
@@ -604,12 +851,13 @@ impl<'a> Planner<'a> {
         }
     }
 
-    fn plan_join(
+    fn plan_join_with_ctes(
         &self,
         join: &'a crate::sql::ast::JoinClause<'a>,
+        cte_context: &CteContext<'a>,
     ) -> Result<&'a LogicalOperator<'a>> {
-        let left = self.plan_from_clause(join.left)?;
-        let right = self.plan_from_clause(join.right)?;
+        let left = self.plan_from_clause_with_ctes(join.left, cte_context)?;
+        let right = self.plan_from_clause_with_ctes(join.right, cte_context)?;
 
         let condition = match join.condition {
             crate::sql::ast::JoinCondition::On(expr) => Some(expr),
@@ -1227,6 +1475,7 @@ impl<'a> Planner<'a> {
                 })
             }
             PhysicalOperator::SubqueryExec(subq) => Ok(subq.output_schema.clone()),
+            PhysicalOperator::SetOpExec(set_op) => self.compute_output_schema(set_op.left),
         }
     }
 
@@ -1349,6 +1598,7 @@ impl<'a> Planner<'a> {
                 })
             }
             LogicalOperator::Subquery(subq) => Ok(subq.output_schema.clone()),
+            LogicalOperator::SetOp(set_op) => self.compute_logical_output_schema(set_op.left),
             LogicalOperator::Values(_) | LogicalOperator::Insert(_) | LogicalOperator::Update(_) | LogicalOperator::Delete(_) => {
                 Ok(OutputSchema::empty())
             }
@@ -1556,6 +1806,17 @@ impl<'a> Planner<'a> {
                             alias: subq.alias,
                             output_schema: subq.output_schema.clone(),
                         }));
+                Ok(physical)
+            }
+            LogicalOperator::SetOp(set_op) => {
+                let left = self.logical_to_physical(set_op.left)?;
+                let right = self.logical_to_physical(set_op.right)?;
+                let physical = self.arena.alloc(PhysicalOperator::SetOpExec(PhysicalSetOpExec {
+                    left,
+                    right,
+                    kind: set_op.kind,
+                    all: set_op.all,
+                }));
                 Ok(physical)
             }
         }
@@ -2000,6 +2261,21 @@ impl<'a> Planner<'a> {
             LogicalOperator::Update(_) => 0,
             LogicalOperator::Delete(_) => 0,
             LogicalOperator::Subquery(subq) => self.estimate_cardinality(subq.plan),
+            LogicalOperator::SetOp(set_op) => {
+                let left_card = self.estimate_cardinality(set_op.left);
+                let right_card = self.estimate_cardinality(set_op.right);
+                match set_op.kind {
+                    SetOpKind::Union => {
+                        if set_op.all {
+                            left_card + right_card
+                        } else {
+                            left_card + right_card / 2
+                        }
+                    }
+                    SetOpKind::Intersect => left_card.min(right_card) / 2,
+                    SetOpKind::Except => left_card / 2,
+                }
+            }
         }
     }
 

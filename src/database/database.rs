@@ -6,7 +6,7 @@ use crate::schema::{Catalog, ColumnDef as SchemaColumnDef};
 use crate::sql::ast::IsolationLevel;
 use crate::sql::builder::ExecutorBuilder;
 use crate::sql::context::ExecutionContext;
-use crate::sql::executor::{Executor, MaterializedRowSource, StreamingBTreeSource};
+use crate::sql::executor::{Executor, ExecutorRow, MaterializedRowSource, RowSource, StreamingBTreeSource};
 use crate::sql::planner::Planner;
 use crate::sql::predicate::CompiledPredicate;
 use crate::sql::Parser;
@@ -476,15 +476,34 @@ impl Database {
         enum PlanSource<'a> {
             TableScan(&'a crate::sql::planner::PhysicalTableScan<'a>),
             Subquery(&'a crate::sql::planner::PhysicalSubqueryExec<'a>),
+            NestedLoopJoin(&'a crate::sql::planner::PhysicalNestedLoopJoin<'a>),
+            GraceHashJoin(&'a crate::sql::planner::PhysicalGraceHashJoin<'a>),
+            SetOp(&'a crate::sql::planner::PhysicalSetOpExec<'a>),
         }
 
         fn find_plan_source<'a>(
             op: &'a crate::sql::planner::PhysicalOperator<'a>,
         ) -> Option<PlanSource<'a>> {
             use crate::sql::planner::PhysicalOperator;
+            #[cfg(test)]
+            {
+                let op_name = match op {
+                    PhysicalOperator::TableScan(_) => "TableScan",
+                    PhysicalOperator::SubqueryExec(_) => "SubqueryExec",
+                    PhysicalOperator::SetOpExec(_) => "SetOpExec",
+                    PhysicalOperator::SortExec(_) => "SortExec",
+                    PhysicalOperator::ProjectExec(_) => "ProjectExec",
+                    PhysicalOperator::FilterExec(_) => "FilterExec",
+                    _ => "Other",
+                };
+                eprintln!("DEBUG find_plan_source: op={}", op_name);
+            }
             match op {
                 PhysicalOperator::TableScan(scan) => Some(PlanSource::TableScan(scan)),
                 PhysicalOperator::SubqueryExec(subq) => Some(PlanSource::Subquery(subq)),
+                PhysicalOperator::NestedLoopJoin(join) => Some(PlanSource::NestedLoopJoin(join)),
+                PhysicalOperator::GraceHashJoin(join) => Some(PlanSource::GraceHashJoin(join)),
+                PhysicalOperator::SetOpExec(set_op) => Some(PlanSource::SetOp(set_op)),
                 PhysicalOperator::FilterExec(filter) => find_plan_source(filter.input),
                 PhysicalOperator::ProjectExec(project) => find_plan_source(project.input),
                 PhysicalOperator::LimitExec(limit) => find_plan_source(limit.input),
@@ -507,6 +526,23 @@ impl Database {
                 PhysicalOperator::SortExec(sort) => find_table_scan(sort.input),
                 PhysicalOperator::HashAggregate(agg) => find_table_scan(agg.input),
                 PhysicalOperator::SortedAggregate(agg) => find_table_scan(agg.input),
+                PhysicalOperator::SubqueryExec(subq) => find_table_scan(subq.child_plan),
+                _ => None,
+            }
+        }
+
+        fn find_nested_subquery<'a>(
+            op: &'a crate::sql::planner::PhysicalOperator<'a>,
+        ) -> Option<&'a crate::sql::planner::PhysicalSubqueryExec<'a>> {
+            use crate::sql::planner::PhysicalOperator;
+            match op {
+                PhysicalOperator::SubqueryExec(subq) => Some(subq),
+                PhysicalOperator::FilterExec(filter) => find_nested_subquery(filter.input),
+                PhysicalOperator::ProjectExec(project) => find_nested_subquery(project.input),
+                PhysicalOperator::LimitExec(limit) => find_nested_subquery(limit.input),
+                PhysicalOperator::SortExec(sort) => find_nested_subquery(sort.input),
+                PhysicalOperator::HashAggregate(agg) => find_nested_subquery(agg.input),
+                PhysicalOperator::SortedAggregate(agg) => find_nested_subquery(agg.input),
                 _ => None,
             }
         }
@@ -564,6 +600,111 @@ impl Database {
                 PhysicalOperator::LimitExec(limit) => find_projections(limit.input, table_def),
                 PhysicalOperator::SortExec(sort) => find_projections(sort.input, table_def),
                 _ => None,
+            }
+        }
+
+        fn execute_subquery_recursive<'a>(
+            subq: &'a crate::sql::planner::PhysicalSubqueryExec<'a>,
+            catalog: &crate::schema::catalog::Catalog,
+            file_manager: &mut FileManager,
+        ) -> Result<Vec<Vec<OwnedValue>>> {
+            if let Some(nested_subq) = find_nested_subquery(subq.child_plan) {
+                let nested_rows = execute_subquery_recursive(nested_subq, catalog, file_manager)?;
+
+                let nested_source = MaterializedRowSource::new(nested_rows);
+                let nested_arena = Bump::new();
+
+                let nested_column_map: Vec<(String, usize)> = nested_subq
+                    .output_schema
+                    .columns
+                    .iter()
+                    .enumerate()
+                    .map(|(idx, col)| (col.name.to_lowercase(), idx))
+                    .collect();
+
+                let inner_plan = crate::sql::planner::PhysicalPlan {
+                    root: subq.child_plan,
+                    output_schema: subq.output_schema.clone(),
+                };
+
+                let inner_ctx = ExecutionContext::new(&nested_arena);
+                let inner_builder = ExecutorBuilder::new(&inner_ctx);
+                let mut inner_executor = inner_builder
+                    .build_with_source_and_column_map(&inner_plan, nested_source, &nested_column_map)
+                    .wrap_err("failed to build executor for nested subquery")?;
+
+                let mut materialized_rows: Vec<Vec<OwnedValue>> = Vec::new();
+                inner_executor.open()?;
+                while let Some(row) = inner_executor.next()? {
+                    let owned_values: Vec<OwnedValue> =
+                        row.values.iter().map(OwnedValue::from).collect();
+                    materialized_rows.push(owned_values);
+                }
+                inner_executor.close()?;
+                return Ok(materialized_rows);
+            }
+
+            let inner_table_scan = find_table_scan(subq.child_plan);
+
+            if let Some(inner_scan) = inner_table_scan {
+                let schema_name = inner_scan.schema.unwrap_or("root");
+                let table_name = inner_scan.table;
+
+                let inner_table_def = catalog
+                    .resolve_table(table_name)
+                    .wrap_err_with(|| format!("table '{}' not found", table_name))?;
+
+                let column_types: Vec<_> =
+                    inner_table_def.columns().iter().map(|c| c.data_type()).collect();
+
+                let storage = file_manager
+                    .table_data(schema_name, table_name)
+                    .wrap_err_with(|| {
+                        format!(
+                            "failed to open table storage for {}.{}",
+                            schema_name, table_name
+                        )
+                    })?;
+
+                let root_page = 1u32;
+                let inner_source = StreamingBTreeSource::from_btree_scan_with_projections(
+                    storage,
+                    root_page,
+                    column_types,
+                    None,
+                )
+                .wrap_err("failed to create inner table scan")?;
+
+                let inner_arena = Bump::new();
+                let inner_plan = crate::sql::planner::PhysicalPlan {
+                    root: subq.child_plan,
+                    output_schema: subq.output_schema.clone(),
+                };
+
+                let inner_table_column_map: Vec<(String, usize)> = inner_table_def
+                    .columns()
+                    .iter()
+                    .enumerate()
+                    .map(|(idx, col)| (col.name().to_lowercase(), idx))
+                    .collect();
+
+                let inner_ctx = ExecutionContext::new(&inner_arena);
+                let inner_builder = ExecutorBuilder::new(&inner_ctx);
+                let mut inner_executor = inner_builder
+                    .build_with_source_and_column_map(&inner_plan, inner_source, &inner_table_column_map)
+                    .wrap_err("failed to build inner executor")?;
+
+                let mut materialized_rows: Vec<Vec<OwnedValue>> = Vec::new();
+                inner_executor.open()?;
+                while let Some(row) = inner_executor.next()? {
+                    let owned_values: Vec<OwnedValue> =
+                        row.values.iter().map(OwnedValue::from).collect();
+                    materialized_rows.push(owned_values);
+                }
+                inner_executor.close()?;
+                Ok(materialized_rows)
+            } else {
+                bail!("subquery inner plan must have a table scan")
             }
         }
 
@@ -651,61 +792,7 @@ impl Database {
                 rows
             }
             Some(PlanSource::Subquery(subq)) => {
-                let inner_table_scan = find_table_scan(subq.child_plan);
-
-                let inner_rows = if let Some(inner_scan) = inner_table_scan {
-                    let schema_name = inner_scan.schema.unwrap_or("root");
-                    let table_name = inner_scan.table;
-
-                    let inner_table_def = catalog
-                        .resolve_table(table_name)
-                        .wrap_err_with(|| format!("table '{}' not found", table_name))?;
-
-                    let column_types: Vec<_> =
-                        inner_table_def.columns().iter().map(|c| c.data_type()).collect();
-
-                    let storage = file_manager
-                        .table_data(schema_name, table_name)
-                        .wrap_err_with(|| {
-                            format!(
-                                "failed to open table storage for {}.{}",
-                                schema_name, table_name
-                            )
-                        })?;
-
-                    let root_page = 1u32;
-                    let inner_source = StreamingBTreeSource::from_btree_scan_with_projections(
-                        storage,
-                        root_page,
-                        column_types,
-                        None,
-                    )
-                    .wrap_err("failed to create inner table scan")?;
-
-                    let inner_arena = Bump::new();
-                    let inner_plan = crate::sql::planner::PhysicalPlan {
-                        root: subq.child_plan,
-                        output_schema: subq.output_schema.clone(),
-                    };
-
-                    let inner_ctx = ExecutionContext::new(&inner_arena);
-                    let inner_builder = ExecutorBuilder::new(&inner_ctx);
-                    let mut inner_executor = inner_builder
-                        .build_with_source(&inner_plan, inner_source)
-                        .wrap_err("failed to build inner executor")?;
-
-                    let mut materialized_rows: Vec<Vec<OwnedValue>> = Vec::new();
-                    inner_executor.open()?;
-                    while let Some(row) = inner_executor.next()? {
-                        let owned_values: Vec<OwnedValue> =
-                            row.values.iter().map(OwnedValue::from).collect();
-                        materialized_rows.push(owned_values);
-                    }
-                    inner_executor.close()?;
-                    materialized_rows
-                } else {
-                    bail!("subquery inner plan must have a table scan")
-                };
+                let inner_rows = execute_subquery_recursive(subq, catalog, file_manager)?;
 
                 let materialized_source = MaterializedRowSource::new(inner_rows);
 
@@ -737,6 +824,204 @@ impl Database {
                 executor.close()?;
                 rows
             }
+            Some(PlanSource::NestedLoopJoin(_)) | Some(PlanSource::GraceHashJoin(_)) => {
+                fn find_subquery_in_join<'a>(
+                    op: &'a crate::sql::planner::PhysicalOperator<'a>,
+                ) -> Option<&'a crate::sql::planner::PhysicalSubqueryExec<'a>> {
+                    use crate::sql::planner::PhysicalOperator;
+                    match op {
+                        PhysicalOperator::SubqueryExec(subq) => Some(subq),
+                        PhysicalOperator::FilterExec(f) => find_subquery_in_join(f.input),
+                        PhysicalOperator::ProjectExec(p) => find_subquery_in_join(p.input),
+                        _ => None,
+                    }
+                }
+
+                fn find_table_in_join<'a>(
+                    op: &'a crate::sql::planner::PhysicalOperator<'a>,
+                ) -> Option<&'a crate::sql::planner::PhysicalTableScan<'a>> {
+                    use crate::sql::planner::PhysicalOperator;
+                    match op {
+                        PhysicalOperator::TableScan(scan) => Some(scan),
+                        PhysicalOperator::FilterExec(f) => find_table_in_join(f.input),
+                        PhysicalOperator::ProjectExec(p) => find_table_in_join(p.input),
+                        _ => None,
+                    }
+                }
+
+                let (left_op, right_op, join_type, condition, join_keys) = match plan_source {
+                    Some(PlanSource::NestedLoopJoin(j)) => (j.left, j.right, j.join_type, j.condition, &[][..]),
+                    Some(PlanSource::GraceHashJoin(j)) => (j.left, j.right, j.join_type, None, j.join_keys),
+                    _ => unreachable!(),
+                };
+
+                let left_subq = find_subquery_in_join(left_op);
+                let right_subq = find_subquery_in_join(right_op);
+                let left_table = find_table_in_join(left_op);
+                let right_table = find_table_in_join(right_op);
+
+                let mut left_rows: Vec<Vec<OwnedValue>> = Vec::new();
+                let mut right_rows: Vec<Vec<OwnedValue>> = Vec::new();
+                let mut right_col_count = 0usize;
+
+                if let Some(subq) = left_subq {
+                    left_rows = execute_subquery_recursive(subq, catalog, file_manager)?;
+                } else if let Some(scan) = left_table {
+                    let schema_name = scan.schema.unwrap_or("root");
+                    let table_name = scan.table;
+                    let table_def = catalog.resolve_table(table_name)?;
+                    let column_types: Vec<_> = table_def.columns().iter().map(|c| c.data_type()).collect();
+                    let storage = file_manager.table_data(schema_name, table_name)?;
+                    let source = StreamingBTreeSource::from_btree_scan_with_projections(
+                        storage, 1, column_types.clone(), None,
+                    )?;
+                    let mut cursor = source;
+                    while let Some(row) = cursor.next_row()? {
+                        left_rows.push(row.iter().map(OwnedValue::from).collect());
+                    }
+                }
+
+                if let Some(subq) = right_subq {
+                    right_rows = execute_subquery_recursive(subq, catalog, file_manager)?;
+                    right_col_count = subq.output_schema.columns.len();
+                } else if let Some(scan) = right_table {
+                    let schema_name = scan.schema.unwrap_or("root");
+                    let table_name = scan.table;
+                    let table_def = catalog.resolve_table(table_name)?;
+                    let column_types: Vec<_> = table_def.columns().iter().map(|c| c.data_type()).collect();
+                    let storage = file_manager.table_data(schema_name, table_name)?;
+                    let source = StreamingBTreeSource::from_btree_scan_with_projections(
+                        storage, 1, column_types.clone(), None,
+                    )?;
+                    let mut cursor = source;
+                    while let Some(row) = cursor.next_row()? {
+                        right_rows.push(row.iter().map(OwnedValue::from).collect());
+                    }
+                    right_col_count = column_types.len();
+                }
+
+                let mut join_column_map: Vec<(String, usize)> = Vec::new();
+                let mut idx = 0usize;
+
+                if let Some(subq) = left_subq {
+                    for col in subq.output_schema.columns {
+                        join_column_map.push((col.name.to_lowercase(), idx));
+                        join_column_map.push((format!("{}.{}", subq.alias, col.name).to_lowercase(), idx));
+                        idx += 1;
+                    }
+                } else if let Some(scan) = left_table {
+                    let table_def = catalog.resolve_table(scan.table)?;
+                    for col in table_def.columns() {
+                        join_column_map.push((col.name().to_lowercase(), idx));
+                        join_column_map.push((format!("{}.{}", scan.table, col.name()).to_lowercase(), idx));
+                        if let Some(alias) = scan.alias {
+                            join_column_map.push((format!("{}.{}", alias, col.name()).to_lowercase(), idx));
+                        }
+                        idx += 1;
+                    }
+                }
+
+                if let Some(subq) = right_subq {
+                    for col in subq.output_schema.columns {
+                        join_column_map.push((col.name.to_lowercase(), idx));
+                        join_column_map.push((format!("{}.{}", subq.alias, col.name).to_lowercase(), idx));
+                        idx += 1;
+                    }
+                } else if let Some(scan) = right_table {
+                    let table_def = catalog.resolve_table(scan.table)?;
+                    for col in table_def.columns() {
+                        join_column_map.push((col.name().to_lowercase(), idx));
+                        join_column_map.push((format!("{}.{}", scan.table, col.name()).to_lowercase(), idx));
+                        if let Some(alias) = scan.alias {
+                            join_column_map.push((format!("{}.{}", alias, col.name()).to_lowercase(), idx));
+                        }
+                        idx += 1;
+                    }
+                }
+
+                let condition_predicate = condition.map(|c| {
+                    crate::sql::predicate::CompiledPredicate::new(c, join_column_map.clone())
+                });
+
+                let key_indices: Vec<(usize, usize)> = join_keys.iter().filter_map(|(left_expr, right_expr)| {
+                    use crate::sql::ast::Expr;
+
+                    let left_idx = if let Expr::Column(col) = left_expr {
+                        let qualified = col.table.map(|t| format!("{}.{}", t, col.column).to_lowercase());
+                        qualified.as_ref()
+                            .and_then(|q| join_column_map.iter().find(|(name, _)| name == q).map(|(_, idx)| *idx))
+                            .or_else(|| join_column_map.iter().find(|(name, _)| name.eq_ignore_ascii_case(col.column)).map(|(_, idx)| *idx))
+                    } else { None };
+
+                    let right_idx = if let Expr::Column(col) = right_expr {
+                        let qualified = col.table.map(|t| format!("{}.{}", t, col.column).to_lowercase());
+                        qualified.as_ref()
+                            .and_then(|q| join_column_map.iter().find(|(name, _)| name == q).map(|(_, idx)| *idx))
+                            .or_else(|| join_column_map.iter().find(|(name, _)| name.eq_ignore_ascii_case(col.column)).map(|(_, idx)| *idx))
+                    } else { None };
+
+                    match (left_idx, right_idx) {
+                        (Some(l), Some(r)) => Some((l, r)),
+                        _ => None,
+                    }
+                }).collect();
+
+                let mut result_rows: Vec<Row> = Vec::new();
+                for left_row in &left_rows {
+                    let mut matched = false;
+                    for right_row in &right_rows {
+                        let mut combined: Vec<OwnedValue> = left_row.clone();
+                        combined.extend(right_row.clone());
+
+                        let should_include = if let Some(ref pred) = condition_predicate {
+                            let values: Vec<Value<'_>> = combined.iter().map(|v| v.to_value()).collect();
+                            let row_ref = ExecutorRow::new(&values);
+                            pred.evaluate(&row_ref)
+                        } else if !key_indices.is_empty() {
+                            key_indices.iter().all(|(left_idx, right_idx)| {
+                                combined.get(*left_idx) == combined.get(*right_idx)
+                            })
+                        } else {
+                            true
+                        };
+
+                        if should_include {
+                            matched = true;
+                            let output_columns = physical_plan.output_schema.columns;
+                            let owned: Vec<OwnedValue> = output_columns.iter().map(|col| {
+                                let col_name = col.name.to_lowercase();
+                                let source_idx = join_column_map.iter()
+                                    .find(|(name, _)| name == &col_name)
+                                    .map(|(_, idx)| *idx)
+                                    .unwrap_or(0);
+                                let val = combined.get(source_idx).cloned().unwrap_or(OwnedValue::Null);
+                                convert_value_with_type(&val.to_value(), col.data_type)
+                            }).collect();
+                            result_rows.push(Row::new(owned));
+                        }
+                    }
+                    if !matched && matches!(join_type, crate::sql::ast::JoinType::Left | crate::sql::ast::JoinType::Full) {
+                        let mut combined: Vec<OwnedValue> = left_row.clone();
+                        combined.extend(std::iter::repeat_n(OwnedValue::Null, right_col_count));
+                        let output_columns = physical_plan.output_schema.columns;
+                        let owned: Vec<OwnedValue> = output_columns.iter().map(|col| {
+                            let col_name = col.name.to_lowercase();
+                            let source_idx = join_column_map.iter()
+                                .find(|(name, _)| name == &col_name)
+                                .map(|(_, idx)| *idx)
+                                .unwrap_or(0);
+                            let val = combined.get(source_idx).cloned().unwrap_or(OwnedValue::Null);
+                            convert_value_with_type(&val.to_value(), col.data_type)
+                        }).collect();
+                        result_rows.push(Row::new(owned));
+                    }
+                }
+                result_rows
+            }
+            Some(PlanSource::SetOp(_set_op)) => {
+                drop(file_manager_guard);
+                return self.execute_physical_plan_recursive(physical_plan.root, &arena);
+            }
             None => {
                 bail!("unsupported query plan type - no table scan or subquery found")
             }
@@ -764,6 +1049,225 @@ impl Database {
         };
 
         Ok(rows)
+    }
+
+    fn execute_physical_plan_recursive<'a>(
+        &self,
+        op: &'a crate::sql::planner::PhysicalOperator<'a>,
+        _arena: &'a Bump,
+    ) -> Result<Vec<Row>> {
+        use crate::sql::planner::{PhysicalOperator, SetOpKind};
+
+        let catalog_guard = self.catalog.read();
+        let catalog = catalog_guard.as_ref().unwrap();
+
+        let mut file_manager_guard = self.file_manager.write();
+        let file_manager = file_manager_guard.as_mut().unwrap();
+
+        fn execute_branch_for_set_op<'a>(
+            _db_path: &std::path::Path,
+            op: &'a PhysicalOperator<'a>,
+            catalog: &crate::schema::catalog::Catalog,
+            file_manager: &mut crate::storage::FileManager,
+        ) -> Result<Vec<Row>> {
+            fn find_table_scan_for_set<'a>(
+                op: &'a PhysicalOperator<'a>,
+            ) -> Option<&'a crate::sql::planner::PhysicalTableScan<'a>> {
+                match op {
+                    PhysicalOperator::TableScan(scan) => Some(scan),
+                    PhysicalOperator::FilterExec(f) => find_table_scan_for_set(f.input),
+                    PhysicalOperator::ProjectExec(p) => find_table_scan_for_set(p.input),
+                    PhysicalOperator::LimitExec(l) => find_table_scan_for_set(l.input),
+                    PhysicalOperator::SortExec(s) => find_table_scan_for_set(s.input),
+                    PhysicalOperator::SubqueryExec(sub) => find_table_scan_for_set(sub.child_plan),
+                    PhysicalOperator::SetOpExec(set) => find_table_scan_for_set(set.left),
+                    _ => None,
+                }
+            }
+
+            match op {
+                PhysicalOperator::SortExec(sort) => {
+                    let mut rows = execute_branch_for_set_op(_db_path, sort.input, catalog, file_manager)?;
+                    if !sort.order_by.is_empty() {
+                        let first_key = &sort.order_by[0];
+                        let ascending = first_key.ascending;
+                        rows.sort_by(|a, b| {
+                            let a_val = a.values.first();
+                            let b_val = b.values.first();
+                            let cmp = match (a_val, b_val) {
+                                (Some(OwnedValue::Int(a_i)), Some(OwnedValue::Int(b_i))) => a_i.cmp(b_i),
+                                (Some(OwnedValue::Text(a_t)), Some(OwnedValue::Text(b_t))) => a_t.cmp(b_t),
+                                (Some(OwnedValue::Float(a_f)), Some(OwnedValue::Float(b_f))) => {
+                                    a_f.partial_cmp(b_f).unwrap_or(std::cmp::Ordering::Equal)
+                                }
+                                _ => std::cmp::Ordering::Equal,
+                            };
+                            if ascending { cmp } else { cmp.reverse() }
+                        });
+                    }
+                    Ok(rows)
+                }
+                PhysicalOperator::LimitExec(limit) => {
+                    let rows = execute_branch_for_set_op(_db_path, limit.input, catalog, file_manager)?;
+                    let offset = limit.offset.unwrap_or(0) as usize;
+                    let count = limit.limit.unwrap_or(usize::MAX as u64) as usize;
+                    Ok(rows.into_iter().skip(offset).take(count).collect())
+                }
+                PhysicalOperator::SetOpExec(set_op) => {
+                    let left_rows = execute_branch_for_set_op(_db_path, set_op.left, catalog, file_manager)?;
+                    let right_rows = execute_branch_for_set_op(_db_path, set_op.right, catalog, file_manager)?;
+
+                    fn row_to_key(row: &Row) -> Vec<u64> {
+                        use std::hash::{Hash, Hasher};
+                        row.values
+                            .iter()
+                            .map(|v| {
+                                let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                                format!("{:?}", v).hash(&mut hasher);
+                                hasher.finish()
+                            })
+                            .collect()
+                    }
+
+                    let result = match set_op.kind {
+                        SetOpKind::Union => {
+                            if set_op.all {
+                                let mut all = left_rows;
+                                all.extend(right_rows);
+                                all
+                            } else {
+                                let mut seen: std::collections::HashSet<Vec<u64>> =
+                                    std::collections::HashSet::new();
+                                let mut result = Vec::new();
+                                for row in left_rows.into_iter().chain(right_rows.into_iter()) {
+                                    let key = row_to_key(&row);
+                                    if seen.insert(key) {
+                                        result.push(row);
+                                    }
+                                }
+                                result
+                            }
+                        }
+                        SetOpKind::Intersect => {
+                            let right_keys: std::collections::HashSet<Vec<u64>> =
+                                right_rows.iter().map(row_to_key).collect();
+                            if set_op.all {
+                                left_rows
+                                    .into_iter()
+                                    .filter(|row| right_keys.contains(&row_to_key(row)))
+                                    .collect()
+                            } else {
+                                let mut seen: std::collections::HashSet<Vec<u64>> =
+                                    std::collections::HashSet::new();
+                                left_rows
+                                    .into_iter()
+                                    .filter(|row| {
+                                        let key = row_to_key(row);
+                                        right_keys.contains(&key) && seen.insert(key)
+                                    })
+                                    .collect()
+                            }
+                        }
+                        SetOpKind::Except => {
+                            let right_keys: std::collections::HashSet<Vec<u64>> =
+                                right_rows.iter().map(row_to_key).collect();
+                            if set_op.all {
+                                left_rows
+                                    .into_iter()
+                                    .filter(|row| !right_keys.contains(&row_to_key(row)))
+                                    .collect()
+                            } else {
+                                let mut seen: std::collections::HashSet<Vec<u64>> =
+                                    std::collections::HashSet::new();
+                                left_rows
+                                    .into_iter()
+                                    .filter(|row| {
+                                        let key = row_to_key(row);
+                                        !right_keys.contains(&key) && seen.insert(key)
+                                    })
+                                    .collect()
+                            }
+                        }
+                    };
+                    Ok(result)
+                }
+                _ => {
+                    let scan = find_table_scan_for_set(op)
+                        .ok_or_else(|| eyre::eyre!("set operation branch must have a table scan"))?;
+
+                    let schema_name = scan.schema.unwrap_or("root");
+                    let table_name = scan.table;
+
+                    let table_def = catalog
+                        .resolve_table(table_name)
+                        .wrap_err_with(|| format!("table '{}' not found", table_name))?;
+
+                    let column_types: Vec<_> =
+                        table_def.columns().iter().map(|c| c.data_type()).collect();
+
+                    let storage = file_manager
+                        .table_data(schema_name, table_name)
+                        .wrap_err_with(|| {
+                            format!(
+                                "failed to open table storage for {}.{}",
+                                schema_name, table_name
+                            )
+                        })?;
+
+                    let root_page = 1u32;
+                    let source = StreamingBTreeSource::from_btree_scan_with_projections(
+                        storage,
+                        root_page,
+                        column_types.clone(),
+                        None,
+                    )
+                    .wrap_err("failed to create table scan")?;
+
+                    let branch_arena = Bump::new();
+                    let output_schema = crate::sql::planner::OutputSchema {
+                        columns: branch_arena.alloc_slice_fill_iter(
+                            table_def.columns().iter().map(|col| {
+                                crate::sql::planner::OutputColumn {
+                                    name: branch_arena.alloc_str(col.name()),
+                                    data_type: col.data_type(),
+                                    nullable: col.is_nullable(),
+                                }
+                            })
+                        ),
+                    };
+
+                    let branch_plan = crate::sql::planner::PhysicalPlan {
+                        root: op,
+                        output_schema,
+                    };
+
+                    let column_map: Vec<(String, usize)> = table_def
+                        .columns()
+                        .iter()
+                        .enumerate()
+                        .map(|(idx, col)| (col.name().to_lowercase(), idx))
+                        .collect();
+
+                    let ctx = ExecutionContext::new(&branch_arena);
+                    let builder = ExecutorBuilder::new(&ctx);
+                    let mut executor = builder
+                        .build_with_source_and_column_map(&branch_plan, source, &column_map)
+                        .wrap_err("failed to build executor")?;
+
+                    let mut rows = Vec::new();
+                    executor.open()?;
+                    while let Some(row) = executor.next()? {
+                        let owned: Vec<OwnedValue> =
+                            row.values.iter().map(OwnedValue::from).collect();
+                        rows.push(Row::new(owned));
+                    }
+                    executor.close()?;
+                    Ok(rows)
+                }
+            }
+        }
+
+        execute_branch_for_set_op(&self.path, op, catalog, file_manager)
     }
 
     pub fn execute(&self, sql: &str) -> Result<ExecuteResult> {
