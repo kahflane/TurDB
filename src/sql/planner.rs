@@ -450,7 +450,8 @@ impl<'a> Planner<'a> {
             current = filter;
         }
 
-        if !select.group_by.is_empty() {
+        let has_aggregates = self.select_has_aggregates(select.columns);
+        if !select.group_by.is_empty() || has_aggregates {
             for group_expr in select.group_by.iter() {
                 self.validate_expr_columns(group_expr, &tables_in_scope)?;
             }
@@ -605,6 +606,19 @@ impl<'a> Planner<'a> {
         } else {
             false
         }
+    }
+
+    fn select_has_aggregates(&self, columns: &'a [crate::sql::ast::SelectColumn<'a>]) -> bool {
+        use crate::sql::ast::SelectColumn;
+
+        for col in columns {
+            if let SelectColumn::Expr { expr, .. } = col {
+                if self.is_aggregate_function(expr) {
+                    return true;
+                }
+            }
+        }
+        false
     }
 
     fn extract_select_expressions(
