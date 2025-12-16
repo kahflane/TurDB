@@ -1104,7 +1104,7 @@ impl Database {
         let file_manager = file_manager_guard.as_mut().unwrap();
 
         let mut count = 0;
-        let mut key_buf = Vec::with_capacity(64);
+        let mut key_buf: SmallVec<[u8; 64]> = SmallVec::new();
 
         for row_exprs in rows.iter() {
             let mut values: Vec<OwnedValue> = row_exprs
@@ -1238,7 +1238,7 @@ impl Database {
                     }
 
                     if index_btree.search(&key_buf)?.is_some() {
-                        let col_names: Vec<&str> = col_indices
+                        let col_names: SmallVec<[&str; 8]> = col_indices
                             .iter()
                             .filter_map(|&idx| columns.get(idx).map(|c| c.name()))
                             .collect();
@@ -1335,7 +1335,7 @@ impl Database {
         })
     }
 
-    fn encode_value_as_key(value: &OwnedValue, buf: &mut Vec<u8>) {
+    fn encode_value_as_key<B: crate::encoding::key::KeyBuffer>(value: &OwnedValue, buf: &mut B) {
         use crate::encoding::key;
 
         match value {

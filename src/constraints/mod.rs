@@ -99,6 +99,7 @@
 use crate::schema::table::{Constraint, TableDef};
 use crate::types::OwnedValue;
 use eyre::{bail, Result};
+use smallvec::SmallVec;
 
 pub struct ConstraintValidator<'a> {
     table: &'a TableDef,
@@ -214,7 +215,7 @@ impl<'a> ConstraintValidator<'a> {
     }
 
     fn parse_date_default(s: &str) -> OwnedValue {
-        let parts: Vec<&str> = s.split('-').collect();
+        let parts: SmallVec<[&str; 4]> = s.split('-').collect();
         if parts.len() != 3 {
             return OwnedValue::Null;
         }
@@ -243,7 +244,7 @@ impl<'a> ConstraintValidator<'a> {
     }
 
     fn parse_time_default(s: &str) -> OwnedValue {
-        let parts: Vec<&str> = s.split(':').collect();
+        let parts: SmallVec<[&str; 4]> = s.split(':').collect();
         if parts.len() < 2 {
             return OwnedValue::Null;
         }
@@ -256,7 +257,7 @@ impl<'a> ConstraintValidator<'a> {
             Err(_) => return OwnedValue::Null,
         };
         let (second, micros_frac) = if parts.len() > 2 {
-            let sec_parts: Vec<&str> = parts[2].split('.').collect();
+            let sec_parts: SmallVec<[&str; 2]> = parts[2].split('.').collect();
             let sec: i64 = sec_parts[0].parse().unwrap_or(0);
             let frac = if sec_parts.len() > 1 {
                 let frac_str = sec_parts[1];
@@ -274,7 +275,7 @@ impl<'a> ConstraintValidator<'a> {
     }
 
     fn parse_timestamp_default(s: &str) -> OwnedValue {
-        let datetime_parts: Vec<&str> = s.split(&[' ', 'T'][..]).collect();
+        let datetime_parts: SmallVec<[&str; 2]> = s.split(&[' ', 'T'][..]).collect();
         if datetime_parts.is_empty() {
             return OwnedValue::Null;
         }
@@ -340,7 +341,7 @@ impl<'a> ConstraintValidator<'a> {
 
     fn parse_point_default(s: &str) -> OwnedValue {
         let stripped = s.trim().trim_matches(|c| c == '(' || c == ')');
-        let parts: Vec<&str> = stripped.split(',').collect();
+        let parts: SmallVec<[&str; 2]> = stripped.split(',').collect();
         if parts.len() != 2 {
             return OwnedValue::Null;
         }
@@ -437,7 +438,7 @@ impl<'a> ConstraintValidator<'a> {
     }
 
     fn parse_inet4_default(s: &str) -> OwnedValue {
-        let parts: Vec<&str> = s.split('/').next().unwrap_or(s).split('.').collect();
+        let parts: SmallVec<[&str; 4]> = s.split('/').next().unwrap_or(s).split('.').collect();
         if parts.len() != 4 {
             return OwnedValue::Null;
         }
@@ -461,15 +462,15 @@ impl<'a> ConstraintValidator<'a> {
         if addr_str == "::" {
             return OwnedValue::Inet6([0u8; 16]);
         }
-        let parts: Vec<&str> = addr_str.split("::").collect();
+        let parts: SmallVec<[&str; 2]> = addr_str.split("::").collect();
         let mut bytes = [0u8; 16];
         if parts.len() == 2 {
-            let left_groups: Vec<u16> = parts[0]
+            let left_groups: SmallVec<[u16; 8]> = parts[0]
                 .split(':')
                 .filter(|p| !p.is_empty())
                 .filter_map(|p| u16::from_str_radix(p, 16).ok())
                 .collect();
-            let right_groups: Vec<u16> = parts[1]
+            let right_groups: SmallVec<[u16; 8]> = parts[1]
                 .split(':')
                 .filter(|p| !p.is_empty())
                 .filter_map(|p| u16::from_str_radix(p, 16).ok())
@@ -486,7 +487,7 @@ impl<'a> ConstraintValidator<'a> {
                 bytes[idx + 1] = group as u8;
             }
         } else {
-            let groups: Vec<u16> = addr_str
+            let groups: SmallVec<[u16; 8]> = addr_str
                 .split(':')
                 .filter_map(|p| u16::from_str_radix(p, 16).ok())
                 .collect();
@@ -504,7 +505,7 @@ impl<'a> ConstraintValidator<'a> {
 
     fn parse_decimal_default(s: &str) -> OwnedValue {
         let trimmed = s.trim();
-        let parts: Vec<&str> = trimmed.split('.').collect();
+        let parts: SmallVec<[&str; 2]> = trimmed.split('.').collect();
         let (int_part, frac_part, scale) = if parts.len() == 2 {
             (parts[0], parts[1], parts[1].len() as i16)
         } else {
