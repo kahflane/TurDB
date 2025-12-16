@@ -90,9 +90,11 @@
 
 #[allow(clippy::module_inception)]
 mod database;
+pub mod prepared;
 pub mod row;
 
 pub use database::Database;
+pub use prepared::{BoundStatement, PreparedStatement};
 pub use row::Row;
 
 #[derive(Debug)]
@@ -2145,7 +2147,8 @@ mod tests {
 
         let db = Database::create(&db_path).unwrap();
 
-        db.execute("CREATE TABLE users (id INT, name TEXT)").unwrap();
+        db.execute("CREATE TABLE users (id INT, name TEXT)")
+            .unwrap();
         db.execute("INSERT INTO users VALUES (1, 'Alice')").unwrap();
         db.execute("INSERT INTO users VALUES (2, 'Bob')").unwrap();
 

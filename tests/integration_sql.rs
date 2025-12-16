@@ -48,7 +48,9 @@ mod ddl_tests {
         let dir = tempdir().unwrap();
         let db = Database::create(dir.path().join("test_db")).unwrap();
 
-        let result = db.execute("CREATE TABLE users (id INT, name TEXT)").unwrap();
+        let result = db
+            .execute("CREATE TABLE users (id INT, name TEXT)")
+            .unwrap();
 
         assert!(
             matches!(result, ExecuteResult::CreateTable { created: true }),
@@ -195,9 +197,7 @@ mod dml_tests {
         db.execute("CREATE TABLE users (id INT, name TEXT)")
             .unwrap();
 
-        let result = db
-            .execute("INSERT INTO users VALUES (1, 'Alice')")
-            .unwrap();
+        let result = db.execute("INSERT INTO users VALUES (1, 'Alice')").unwrap();
 
         assert!(
             matches!(result, ExecuteResult::Insert { rows_affected: 1 }),
@@ -216,11 +216,7 @@ mod dml_tests {
         let rows = db.query("SELECT id, name FROM users").unwrap();
 
         assert_eq!(rows.len(), 1, "SHOULD return exactly 1 row");
-        assert_eq!(
-            rows[0].values.len(),
-            2,
-            "Row SHOULD have exactly 2 columns"
-        );
+        assert_eq!(rows[0].values.len(), 2, "Row SHOULD have exactly 2 columns");
 
         match &rows[0].values[0] {
             OwnedValue::Int(id) => assert_eq!(*id, 42, "id SHOULD be 42"),
@@ -544,7 +540,8 @@ mod transaction_tests {
         let db = Database::create(dir.path().join("test_db")).unwrap();
         db.execute("CREATE TABLE users (id INT, name TEXT)")
             .unwrap();
-        db.execute("INSERT INTO users VALUES (1, 'Original')").unwrap();
+        db.execute("INSERT INTO users VALUES (1, 'Original')")
+            .unwrap();
 
         db.execute("BEGIN").unwrap();
         db.execute("UPDATE users SET name = 'Modified' WHERE id = 1")
@@ -689,10 +686,7 @@ mod constraint_tests {
 
         let result = db.execute("INSERT INTO users VALUES (1, 'Bob')");
 
-        assert!(
-            result.is_err(),
-            "PRIMARY KEY SHOULD reject duplicate id=1"
-        );
+        assert!(result.is_err(), "PRIMARY KEY SHOULD reject duplicate id=1");
     }
 
     #[test]
@@ -744,10 +738,7 @@ mod constraint_tests {
 
         let result = db.execute("INSERT INTO users VALUES (1, 25)");
 
-        assert!(
-            result.is_ok(),
-            "CHECK(age >= 0) SHOULD accept age=25"
-        );
+        assert!(result.is_ok(), "CHECK(age >= 0) SHOULD accept age=25");
     }
 
     #[test]
@@ -877,7 +868,8 @@ mod data_type_tests {
         let dir = tempdir().unwrap();
         let db = Database::create(dir.path().join("test_db")).unwrap();
         db.execute("CREATE TABLE docs (content TEXT)").unwrap();
-        db.execute("INSERT INTO docs VALUES ('Hello, World!')").unwrap();
+        db.execute("INSERT INTO docs VALUES ('Hello, World!')")
+            .unwrap();
 
         let rows = db.query("SELECT content FROM docs").unwrap();
 
@@ -1153,7 +1145,8 @@ mod edge_case_tests {
         let dir = tempdir().unwrap();
         let db = Database::create(dir.path().join("test_db")).unwrap();
         db.execute("CREATE TABLE data (text_col TEXT)").unwrap();
-        db.execute("INSERT INTO data VALUES ('Hello''World')").unwrap();
+        db.execute("INSERT INTO data VALUES ('Hello''World')")
+            .unwrap();
 
         let rows = db.query("SELECT text_col FROM data").unwrap();
 
@@ -1203,5 +1196,191 @@ mod edge_case_tests {
             OwnedValue::Int(v) => assert_eq!(*v, 10, "10th column SHOULD be 10"),
             other => panic!("Expected Int, got {:?}", other),
         }
+    }
+}
+
+mod prepared_statement_tests {
+    use super::*;
+
+    #[test]
+    fn prepare_returns_prepared_statement() {
+        let dir = tempdir().unwrap();
+        let db = Database::create(dir.path().join("test_db")).unwrap();
+        db.execute("CREATE TABLE users (id INT, name TEXT)")
+            .unwrap();
+
+        let stmt = db.prepare("SELECT * FROM users WHERE id = ?");
+
+        assert!(
+            stmt.is_ok(),
+            "prepare() SHOULD return Ok for valid SQL with parameter"
+        );
+    }
+
+    #[test]
+    fn prepared_statement_query_returns_matching_rows() {
+        let dir = tempdir().unwrap();
+        let db = Database::create(dir.path().join("test_db")).unwrap();
+        db.execute("CREATE TABLE users (id INT, name TEXT)")
+            .unwrap();
+        db.execute("INSERT INTO users VALUES (1, 'Alice')").unwrap();
+        db.execute("INSERT INTO users VALUES (2, 'Bob')").unwrap();
+        db.execute("INSERT INTO users VALUES (3, 'Carol')").unwrap();
+
+        let stmt = db
+            .prepare("SELECT id, name FROM users WHERE id = ?")
+            .unwrap();
+        let rows = stmt.bind(2i64).query(&db).unwrap();
+
+        assert_eq!(rows.len(), 1, "SHOULD return exactly 1 row for id=2");
+        match &rows[0].values[0] {
+            OwnedValue::Int(id) => assert_eq!(id, &2, "SHOULD return row with id=2"),
+            other => panic!("Expected Int for id, got {:?}", other),
+        }
+        match &rows[0].values[1] {
+            OwnedValue::Text(name) => assert_eq!(name, "Bob", "SHOULD return Bob for id=2"),
+            other => panic!("Expected Text for name, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn prepared_statement_with_multiple_params() {
+        let dir = tempdir().unwrap();
+        let db = Database::create(dir.path().join("test_db")).unwrap();
+        db.execute("CREATE TABLE products (id INT, name TEXT, price INT)")
+            .unwrap();
+        db.execute("INSERT INTO products VALUES (1, 'Apple', 100)")
+            .unwrap();
+        db.execute("INSERT INTO products VALUES (2, 'Banana', 50)")
+            .unwrap();
+        db.execute("INSERT INTO products VALUES (3, 'Cherry', 200)")
+            .unwrap();
+
+        let stmt = db
+            .prepare("SELECT name FROM products WHERE price > ? AND price < ?")
+            .unwrap();
+        let rows = stmt.bind(50i64).bind(200i64).query(&db).unwrap();
+
+        assert_eq!(
+            rows.len(),
+            1,
+            "SHOULD return exactly 1 product in price range"
+        );
+        match &rows[0].values[0] {
+            OwnedValue::Text(name) => {
+                assert_eq!(name, "Apple", "SHOULD return Apple (price=100)")
+            }
+            other => panic!("Expected Text for name, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn prepared_statement_can_be_reused_with_different_params() {
+        let dir = tempdir().unwrap();
+        let db = Database::create(dir.path().join("test_db")).unwrap();
+        db.execute("CREATE TABLE users (id INT, name TEXT)")
+            .unwrap();
+        db.execute("INSERT INTO users VALUES (1, 'Alice')").unwrap();
+        db.execute("INSERT INTO users VALUES (2, 'Bob')").unwrap();
+        db.execute("INSERT INTO users VALUES (3, 'Carol')").unwrap();
+
+        let stmt = db.prepare("SELECT name FROM users WHERE id = ?").unwrap();
+
+        let rows1 = stmt.bind(1i64).query(&db).unwrap();
+        assert_eq!(rows1.len(), 1, "First query SHOULD return 1 row");
+        match &rows1[0].values[0] {
+            OwnedValue::Text(name) => assert_eq!(name, "Alice"),
+            other => panic!("Expected Text, got {:?}", other),
+        }
+
+        let rows2 = stmt.bind(2i64).query(&db).unwrap();
+        assert_eq!(rows2.len(), 1, "Second query SHOULD return 1 row");
+        match &rows2[0].values[0] {
+            OwnedValue::Text(name) => assert_eq!(name, "Bob"),
+            other => panic!("Expected Text, got {:?}", other),
+        }
+
+        let rows3 = stmt.bind(3i64).query(&db).unwrap();
+        assert_eq!(rows3.len(), 1, "Third query SHOULD return 1 row");
+        match &rows3[0].values[0] {
+            OwnedValue::Text(name) => assert_eq!(name, "Carol"),
+            other => panic!("Expected Text, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn prepared_insert_executes_correctly() {
+        let dir = tempdir().unwrap();
+        let db = Database::create(dir.path().join("test_db")).unwrap();
+        db.execute("CREATE TABLE items (id INT, name TEXT)")
+            .unwrap();
+
+        let insert_stmt = db.prepare("INSERT INTO items VALUES (?, ?)").unwrap();
+        insert_stmt.bind(1i64).bind("Widget").execute(&db).unwrap();
+        insert_stmt.bind(2i64).bind("Gadget").execute(&db).unwrap();
+
+        let rows = db.query("SELECT id, name FROM items ORDER BY id").unwrap();
+        assert_eq!(rows.len(), 2, "SHOULD have 2 inserted rows");
+        match (&rows[0].values[0], &rows[0].values[1]) {
+            (OwnedValue::Int(id), OwnedValue::Text(name)) => {
+                assert_eq!(id, &1);
+                assert_eq!(name, "Widget");
+            }
+            other => panic!("Unexpected types: {:?}", other),
+        }
+        match (&rows[1].values[0], &rows[1].values[1]) {
+            (OwnedValue::Int(id), OwnedValue::Text(name)) => {
+                assert_eq!(id, &2);
+                assert_eq!(name, "Gadget");
+            }
+            other => panic!("Unexpected types: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn prepared_statement_escapes_single_quotes_in_strings() {
+        let dir = tempdir().unwrap();
+        let db = Database::create(dir.path().join("test_db")).unwrap();
+        db.execute("CREATE TABLE notes (id INT, content TEXT)")
+            .unwrap();
+
+        let stmt = db.prepare("INSERT INTO notes VALUES (?, ?)").unwrap();
+        stmt.bind(1i64).bind("It's a test").execute(&db).unwrap();
+        stmt.bind(2i64).bind("Say \"Hello\"").execute(&db).unwrap();
+
+        let rows = db.query("SELECT content FROM notes ORDER BY id").unwrap();
+        assert_eq!(rows.len(), 2);
+        match &rows[0].values[0] {
+            OwnedValue::Text(s) => assert_eq!(s, "It's a test"),
+            other => panic!("Expected Text, got {:?}", other),
+        }
+        match &rows[1].values[0] {
+            OwnedValue::Text(s) => assert_eq!(s, "Say \"Hello\""),
+            other => panic!("Expected Text, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn prepared_statement_error_on_param_count_mismatch() {
+        let dir = tempdir().unwrap();
+        let db = Database::create(dir.path().join("test_db")).unwrap();
+        db.execute("CREATE TABLE users (id INT, name TEXT)")
+            .unwrap();
+
+        let stmt = db
+            .prepare("SELECT * FROM users WHERE id = ? AND name = ?")
+            .unwrap();
+        let result = stmt.bind(1i64).query(&db);
+
+        assert!(
+            result.is_err(),
+            "SHOULD error when fewer params than expected"
+        );
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("parameter count mismatch"),
+            "Error should mention parameter count mismatch: {}",
+            err_msg
+        );
     }
 }
