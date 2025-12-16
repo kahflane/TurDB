@@ -123,12 +123,14 @@ impl<'a> TableSource<'a> {
 
     pub fn has_column(&self, col_name: &str) -> bool {
         match self {
-            TableSource::Table { def, .. } => {
-                def.columns().iter().any(|c| c.name().eq_ignore_ascii_case(col_name))
-            }
-            TableSource::Subquery { output_schema, .. } => {
-                output_schema.columns.iter().any(|c| c.name.eq_ignore_ascii_case(col_name))
-            }
+            TableSource::Table { def, .. } => def
+                .columns()
+                .iter()
+                .any(|c| c.name().eq_ignore_ascii_case(col_name)),
+            TableSource::Subquery { output_schema, .. } => output_schema
+                .columns
+                .iter()
+                .any(|c| c.name.eq_ignore_ascii_case(col_name)),
         }
     }
 }
@@ -837,11 +839,7 @@ impl<'a> Planner<'a> {
         }
     }
 
-    fn validate_expr_columns(
-        &self,
-        expr: &Expr<'a>,
-        tables: &[TableSource<'a>],
-    ) -> Result<()> {
+    fn validate_expr_columns(&self, expr: &Expr<'a>, tables: &[TableSource<'a>]) -> Result<()> {
         match expr {
             Expr::Column(col_ref) => self.validate_column_in_scope(col_ref, tables),
             Expr::BinaryOp { left, right, .. } => {
@@ -1325,7 +1323,8 @@ impl<'a> Planner<'a> {
                             "sum" | "min" | "max" => {
                                 if let crate::sql::ast::FunctionArgs::Args(args) = func.args {
                                     if let Some(first_arg) = args.first() {
-                                        let (_, dt, _) = self.infer_expr_type(first_arg.value, &input_schema)?;
+                                        let (_, dt, _) =
+                                            self.infer_expr_type(first_arg.value, &input_schema)?;
                                         dt
                                     } else {
                                         DataType::Int8
@@ -1349,9 +1348,10 @@ impl<'a> Planner<'a> {
                 })
             }
             LogicalOperator::Subquery(subq) => Ok(subq.output_schema.clone()),
-            LogicalOperator::Values(_) | LogicalOperator::Insert(_) | LogicalOperator::Update(_) | LogicalOperator::Delete(_) => {
-                Ok(OutputSchema::empty())
-            }
+            LogicalOperator::Values(_)
+            | LogicalOperator::Insert(_)
+            | LogicalOperator::Update(_)
+            | LogicalOperator::Delete(_) => Ok(OutputSchema::empty()),
         }
     }
 
