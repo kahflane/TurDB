@@ -86,6 +86,7 @@ use crate::sql::util::{
 use crate::types::Value;
 use bumpalo::Bump;
 use eyre::Result;
+use smallvec::SmallVec;
 use std::borrow::Cow;
 
 pub struct ExecutorRow<'a> {
@@ -683,18 +684,18 @@ where
 {
     left: L,
     right: R,
-    left_key_indices: Vec<usize>,
-    right_key_indices: Vec<usize>,
+    left_key_indices: SmallVec<[usize; 4]>,
+    right_key_indices: SmallVec<[usize; 4]>,
     arena: &'a Bump,
     num_partitions: usize,
-    left_partitions: Vec<Vec<Vec<Value<'static>>>>,
-    right_partitions: Vec<Vec<Vec<Value<'static>>>>,
+    left_partitions: Vec<Vec<SmallVec<[Value<'static>; 16]>>>,
+    right_partitions: Vec<Vec<SmallVec<[Value<'static>; 16]>>>,
     current_partition: usize,
-    partition_hash_table: hashbrown::HashMap<u64, Vec<usize>>,
-    partition_build_rows: Vec<Vec<Value<'static>>>,
+    partition_hash_table: hashbrown::HashMap<u64, SmallVec<[usize; 8]>>,
+    partition_build_rows: Vec<SmallVec<[Value<'static>; 16]>>,
     current_probe_idx: usize,
     current_match_idx: usize,
-    current_matches: Vec<usize>,
+    current_matches: SmallVec<[usize; 16]>,
     partitioned: bool,
 }
 
@@ -706,8 +707,8 @@ where
     pub fn new(
         left: L,
         right: R,
-        left_key_indices: Vec<usize>,
-        right_key_indices: Vec<usize>,
+        left_key_indices: SmallVec<[usize; 4]>,
+        right_key_indices: SmallVec<[usize; 4]>,
         arena: &'a Bump,
         num_partitions: usize,
     ) -> Self {
@@ -725,7 +726,7 @@ where
             partition_build_rows: Vec::new(),
             current_probe_idx: 0,
             current_match_idx: 0,
-            current_matches: Vec::new(),
+            current_matches: SmallVec::new(),
             partitioned: false,
         }
     }
@@ -778,7 +779,7 @@ where
             let hash = Self::hash_keys(row, &self.right_key_indices);
             self.partition_hash_table
                 .entry(hash)
-                .or_insert_with(Vec::new)
+                .or_insert_with(SmallVec::new)
                 .push(idx);
         }
     }
@@ -821,14 +822,16 @@ where
     fn next(&mut self) -> Result<Option<ExecutorRow<'a>>> {
         if !self.partitioned {
             while let Some(row) = self.left.next()? {
-                let owned: Vec<Value<'static>> = row.values.iter().map(clone_value_owned).collect();
+                let owned: SmallVec<[Value<'static>; 16]> =
+                    row.values.iter().map(clone_value_owned).collect();
                 let hash = Self::hash_keys(&owned, &self.left_key_indices);
                 let partition = (hash as usize) % self.num_partitions;
                 self.left_partitions[partition].push(owned);
             }
 
             while let Some(row) = self.right.next()? {
-                let owned: Vec<Value<'static>> = row.values.iter().map(clone_value_owned).collect();
+                let owned: SmallVec<[Value<'static>; 16]> =
+                    row.values.iter().map(clone_value_owned).collect();
                 let hash = Self::hash_keys(&owned, &self.right_key_indices);
                 let partition = (hash as usize) % self.num_partitions;
                 self.right_partitions[partition].push(owned);
@@ -915,16 +918,20 @@ pub enum AggregateFunction {
     Max { column: usize },
 }
 
+type GroupValue = SmallVec<[Value<'static>; 8]>;
+type GroupAggStates = SmallVec<[AggregateState; 4]>;
+
+#[allow(clippy::type_complexity)]
 pub struct HashAggregateExecutor<'a, E>
 where
     E: Executor<'a>,
 {
     child: E,
-    group_by: Vec<usize>,
-    aggregates: Vec<AggregateFunction>,
+    group_by: SmallVec<[usize; 4]>,
+    aggregates: SmallVec<[AggregateFunction; 4]>,
     arena: &'a Bump,
-    groups: hashbrown::HashMap<Vec<u8>, (Vec<Value<'static>>, Vec<AggregateState>)>,
-    result_iter: Option<std::vec::IntoIter<(Vec<Value<'static>>, Vec<AggregateState>)>>,
+    groups: hashbrown::HashMap<Vec<u8>, (GroupValue, GroupAggStates)>,
+    result_iter: Option<std::vec::IntoIter<(GroupValue, GroupAggStates)>>,
     computed: bool,
 }
 
@@ -934,8 +941,8 @@ where
 {
     pub fn new(
         child: E,
-        group_by: Vec<usize>,
-        aggregates: Vec<AggregateFunction>,
+        group_by: SmallVec<[usize; 4]>,
+        aggregates: SmallVec<[AggregateFunction; 4]>,
         arena: &'a Bump,
     ) -> Self {
         Self {
@@ -959,7 +966,7 @@ where
         key
     }
 
-    fn extract_group_values(&self, row: &ExecutorRow) -> Vec<Value<'static>> {
+    fn extract_group_values(&self, row: &ExecutorRow) -> SmallVec<[Value<'static>; 8]> {
         self.group_by
             .iter()
             .map(|&col| row.get(col).map(clone_value_owned).unwrap_or(Value::Null))
@@ -999,12 +1006,12 @@ where
             }
 
             if self.groups.is_empty() && self.group_by.is_empty() {
-                let states: Vec<AggregateState> = self
+                let states: SmallVec<[AggregateState; 4]> = self
                     .aggregates
                     .iter()
                     .map(|_| AggregateState::new())
                     .collect();
-                self.groups.insert(Vec::new(), (Vec::new(), states));
+                self.groups.insert(Vec::new(), (SmallVec::new(), states));
             }
 
             let results: Vec<_> = self.groups.drain().map(|(_, v)| v).collect();
