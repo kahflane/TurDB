@@ -97,22 +97,52 @@ pub use row::Row;
 
 #[derive(Debug)]
 pub enum ExecuteResult {
-    CreateTable { created: bool },
-    CreateSchema { created: bool },
-    CreateIndex { created: bool },
-    DropTable { dropped: bool },
-    DropIndex { dropped: bool },
-    DropSchema { dropped: bool },
-    Insert { rows_affected: usize },
-    Update { rows_affected: usize },
-    Delete { rows_affected: usize },
-    Select { rows: Vec<Row> },
-    Pragma { name: String, value: Option<String> },
+    CreateTable {
+        created: bool,
+    },
+    CreateSchema {
+        created: bool,
+    },
+    CreateIndex {
+        created: bool,
+    },
+    DropTable {
+        dropped: bool,
+    },
+    DropIndex {
+        dropped: bool,
+    },
+    DropSchema {
+        dropped: bool,
+    },
+    Insert {
+        rows_affected: usize,
+        returned: Option<Vec<Row>>,
+    },
+    Update {
+        rows_affected: usize,
+        returned: Option<Vec<Row>>,
+    },
+    Delete {
+        rows_affected: usize,
+        returned: Option<Vec<Row>>,
+    },
+    Select {
+        rows: Vec<Row>,
+    },
+    Pragma {
+        name: String,
+        value: Option<String>,
+    },
     Begin,
     Commit,
     Rollback,
-    Savepoint { name: String },
-    Release { name: String },
+    Savepoint {
+        name: String,
+    },
+    Release {
+        name: String,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -377,7 +407,13 @@ mod tests {
             .unwrap();
 
         assert!(
-            matches!(result, ExecuteResult::Update { rows_affected: 1 }),
+            matches!(
+                result,
+                ExecuteResult::Update {
+                    rows_affected: 1,
+                    ..
+                }
+            ),
             "expected Update with 1 row affected"
         );
 
@@ -405,7 +441,13 @@ mod tests {
         let result = db.execute("UPDATE users SET name = 'Updated'").unwrap();
 
         assert!(
-            matches!(result, ExecuteResult::Update { rows_affected: 3 }),
+            matches!(
+                result,
+                ExecuteResult::Update {
+                    rows_affected: 3,
+                    ..
+                }
+            ),
             "expected Update with 3 rows affected"
         );
 
@@ -434,7 +476,13 @@ mod tests {
             .unwrap();
 
         assert!(
-            matches!(result, ExecuteResult::Update { rows_affected: 0 }),
+            matches!(
+                result,
+                ExecuteResult::Update {
+                    rows_affected: 0,
+                    ..
+                }
+            ),
             "expected Update with 0 rows affected"
         );
 
@@ -465,7 +513,13 @@ mod tests {
             .unwrap();
 
         assert!(
-            matches!(result, ExecuteResult::Update { rows_affected: 1 }),
+            matches!(
+                result,
+                ExecuteResult::Update {
+                    rows_affected: 1,
+                    ..
+                }
+            ),
             "expected Update with 1 row affected"
         );
 
@@ -493,7 +547,13 @@ mod tests {
         let result = db.execute("DELETE FROM users WHERE id = 2").unwrap();
 
         assert!(
-            matches!(result, ExecuteResult::Delete { rows_affected: 1 }),
+            matches!(
+                result,
+                ExecuteResult::Delete {
+                    rows_affected: 1,
+                    ..
+                }
+            ),
             "expected Delete with 1 row affected"
         );
 
@@ -517,7 +577,13 @@ mod tests {
         let result = db.execute("DELETE FROM users").unwrap();
 
         assert!(
-            matches!(result, ExecuteResult::Delete { rows_affected: 3 }),
+            matches!(
+                result,
+                ExecuteResult::Delete {
+                    rows_affected: 3,
+                    ..
+                }
+            ),
             "expected Delete with 3 rows affected"
         );
 
@@ -540,7 +606,13 @@ mod tests {
         let result = db.execute("DELETE FROM users WHERE id = 999").unwrap();
 
         assert!(
-            matches!(result, ExecuteResult::Delete { rows_affected: 0 }),
+            matches!(
+                result,
+                ExecuteResult::Delete {
+                    rows_affected: 0,
+                    ..
+                }
+            ),
             "expected Delete with 0 rows affected"
         );
 
@@ -569,7 +641,13 @@ mod tests {
         let result = db.execute("DELETE FROM users WHERE active = 0").unwrap();
 
         assert!(
-            matches!(result, ExecuteResult::Delete { rows_affected: 2 }),
+            matches!(
+                result,
+                ExecuteResult::Delete {
+                    rows_affected: 2,
+                    ..
+                }
+            ),
             "expected Delete with 2 rows affected"
         );
 
@@ -823,7 +901,7 @@ mod tests {
         let result = db
             .execute("UPDATE all_types SET text_col = 'Updated text content' WHERE id < 10")
             .unwrap();
-        if let ExecuteResult::Update { rows_affected } = result {
+        if let ExecuteResult::Update { rows_affected, .. } = result {
             println!("Updated {} rows", rows_affected);
             assert!(rows_affected > 0, "should update some rows");
         }
@@ -831,14 +909,14 @@ mod tests {
         let result = db
             .execute("UPDATE related_data SET score = 999.99, active = FALSE WHERE id >= 90")
             .unwrap();
-        if let ExecuteResult::Update { rows_affected } = result {
+        if let ExecuteResult::Update { rows_affected, .. } = result {
             println!("Updated related_data: {} rows", rows_affected);
         }
 
         let result = db
             .execute("DELETE FROM related_data WHERE id >= 95")
             .unwrap();
-        if let ExecuteResult::Delete { rows_affected } = result {
+        if let ExecuteResult::Delete { rows_affected, .. } = result {
             println!("Deleted {} rows from related_data", rows_affected);
             assert_eq!(rows_affected, 5, "should delete 5 rows");
         }
@@ -2145,7 +2223,8 @@ mod tests {
 
         let db = Database::create(&db_path).unwrap();
 
-        db.execute("CREATE TABLE users (id INT, name TEXT)").unwrap();
+        db.execute("CREATE TABLE users (id INT, name TEXT)")
+            .unwrap();
         db.execute("INSERT INTO users VALUES (1, 'Alice')").unwrap();
         db.execute("INSERT INTO users VALUES (2, 'Bob')").unwrap();
 
