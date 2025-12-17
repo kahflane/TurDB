@@ -69,6 +69,8 @@ impl<'a> ExecutorBuilder<'a> {
                 let base_col_count =
                     self.count_base_columns_before_window(project.input, column_map.len());
 
+                let agg_info = self.get_aggregate_info(project.input);
+
                 let child = self.build_operator(project.input, source, column_map)?;
 
                 let has_complex_expressions = project.expressions.iter().any(|expr| {
@@ -76,8 +78,13 @@ impl<'a> ExecutorBuilder<'a> {
                 });
 
                 if has_complex_expressions && !project.expressions.is_empty() {
+                    let effective_column_map = if let Some((group_by, aggregates)) = &agg_info {
+                        self.build_aggregate_column_map(group_by, aggregates, column_map)
+                    } else {
+                        column_map.to_vec()
+                    };
                     let expressions: Vec<&'a Expr<'a>> = project.expressions.to_vec();
-                    let projection = CompiledProjection::new(expressions, column_map.to_vec());
+                    let projection = CompiledProjection::new(expressions, effective_column_map);
                     Ok(DynamicExecutor::ProjectExpr(
                         Box::new(child),
                         projection,
@@ -85,14 +92,68 @@ impl<'a> ExecutorBuilder<'a> {
                     ))
                 } else {
                     let projections: Vec<usize> = if project.expressions.is_empty() {
-                        (0..column_map.len()).collect()
+                        let output_len = if let Some((group_by, aggregates)) = &agg_info {
+                            group_by.len() + aggregates.len()
+                        } else {
+                            column_map.len()
+                        };
+                        (0..output_len).collect()
                     } else {
                         project
                             .expressions
                             .iter()
                             .enumerate()
                             .map(|(default_idx, expr)| {
-                                if let Expr::Column(col_ref) = expr {
+                                if let Some((group_by, aggregates)) = &agg_info {
+                                    if let Expr::Column(col_ref) = expr {
+                                        for (idx, group_expr) in group_by.iter().enumerate() {
+                                            if let Expr::Column(group_col) = group_expr {
+                                                if group_col.column.eq_ignore_ascii_case(col_ref.column) {
+                                                    return idx;
+                                                }
+                                            }
+                                        }
+                                    }
+                                    if let Expr::Function(FunctionCall { name, args, .. }) = expr {
+                                        for (idx, agg) in aggregates.iter().enumerate() {
+                                            let matches_func = match agg.function {
+                                                crate::sql::planner::AggregateFunction::Count => {
+                                                    name.name.eq_ignore_ascii_case("count")
+                                                }
+                                                crate::sql::planner::AggregateFunction::Sum => {
+                                                    name.name.eq_ignore_ascii_case("sum")
+                                                }
+                                                crate::sql::planner::AggregateFunction::Avg => {
+                                                    name.name.eq_ignore_ascii_case("avg")
+                                                }
+                                                crate::sql::planner::AggregateFunction::Min => {
+                                                    name.name.eq_ignore_ascii_case("min")
+                                                }
+                                                crate::sql::planner::AggregateFunction::Max => {
+                                                    name.name.eq_ignore_ascii_case("max")
+                                                }
+                                            };
+                                            if matches_func {
+                                                use crate::sql::ast::FunctionArgs;
+                                                let first_arg = match args {
+                                                    FunctionArgs::Args(arg_list) => arg_list.first().map(|a| a.value),
+                                                    _ => None,
+                                                };
+                                                let args_match = match (agg.argument, first_arg) {
+                                                    (Some(Expr::Column(agg_col)), Some(Expr::Column(arg_col))) => {
+                                                        agg_col.column.eq_ignore_ascii_case(arg_col.column)
+                                                    }
+                                                    (None, _) | (Some(Expr::Literal(_)), _) => true,
+                                                    _ => false,
+                                                };
+                                                if args_match {
+                                                    return group_by.len() + idx;
+                                                }
+                                            }
+                                        }
+                                    }
+                                    default_idx
+                                } else if let Expr::Column(col_ref) = expr {
                                     column_map
                                         .iter()
                                         .find(|(name, _)| name.eq_ignore_ascii_case(col_ref.column))
@@ -480,5 +541,68 @@ impl<'a> ExecutorBuilder<'a> {
             }
         }
         None
+    }
+
+    fn get_aggregate_info(
+        &self,
+        op: &'a crate::sql::planner::PhysicalOperator<'a>,
+    ) -> Option<(
+        &'a [&'a crate::sql::ast::Expr<'a>],
+        &'a [crate::sql::planner::AggregateExpr<'a>],
+    )> {
+        use crate::sql::planner::PhysicalOperator;
+
+        match op {
+            PhysicalOperator::HashAggregate(agg) => Some((agg.group_by, agg.aggregates)),
+            PhysicalOperator::SortedAggregate(agg) => Some((agg.group_by, agg.aggregates)),
+            PhysicalOperator::FilterExec(filter) => self.get_aggregate_info(filter.input),
+            PhysicalOperator::SortExec(sort) => self.get_aggregate_info(sort.input),
+            PhysicalOperator::LimitExec(limit) => self.get_aggregate_info(limit.input),
+            _ => None,
+        }
+    }
+
+    fn build_aggregate_column_map(
+        &self,
+        group_by: &[&'a crate::sql::ast::Expr<'a>],
+        aggregates: &[crate::sql::planner::AggregateExpr<'a>],
+        original_column_map: &[(String, usize)],
+    ) -> Vec<(String, usize)> {
+        use crate::sql::ast::Expr;
+
+        let mut result = Vec::new();
+
+        for (idx, expr) in group_by.iter().enumerate() {
+            if let Expr::Column(col) = expr {
+                result.push((col.column.to_lowercase(), idx));
+            }
+        }
+
+        let group_count = group_by.len();
+        for (idx, agg) in aggregates.iter().enumerate() {
+            if let Some(Expr::Column(col)) = agg.argument {
+                let agg_name = match agg.function {
+                    crate::sql::planner::AggregateFunction::Count => format!("count_{}", col.column),
+                    crate::sql::planner::AggregateFunction::Sum => format!("sum_{}", col.column),
+                    crate::sql::planner::AggregateFunction::Avg => format!("avg_{}", col.column),
+                    crate::sql::planner::AggregateFunction::Min => format!("min_{}", col.column),
+                    crate::sql::planner::AggregateFunction::Max => format!("max_{}", col.column),
+                };
+                result.push((agg_name.to_lowercase(), group_count + idx));
+            } else {
+                let agg_name = match agg.function {
+                    crate::sql::planner::AggregateFunction::Count => "count".to_string(),
+                    crate::sql::planner::AggregateFunction::Sum => "sum".to_string(),
+                    crate::sql::planner::AggregateFunction::Avg => "avg".to_string(),
+                    crate::sql::planner::AggregateFunction::Min => "min".to_string(),
+                    crate::sql::planner::AggregateFunction::Max => "max".to_string(),
+                };
+                result.push((agg_name.to_lowercase(), group_count + idx));
+            }
+        }
+
+        let _ = original_column_map;
+
+        result
     }
 }

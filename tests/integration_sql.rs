@@ -2165,4 +2165,287 @@ mod returning_clause_tests {
             "The remaining row SHOULD be id=2"
         );
     }
+
+    #[test]
+    fn subquery_in_from_returns_subquery_results() {
+        let dir = tempdir().unwrap();
+        let db = Database::create(dir.path().join("test_db")).unwrap();
+
+        db.execute("CREATE TABLE users (id INT, name TEXT)")
+            .unwrap();
+        db.execute("INSERT INTO users VALUES (1, 'Alice')").unwrap();
+        db.execute("INSERT INTO users VALUES (2, 'Bob')").unwrap();
+        db.execute("INSERT INTO users VALUES (3, 'Carol')").unwrap();
+
+        let rows = db
+            .query("SELECT * FROM (SELECT id, name FROM users) AS sub")
+            .unwrap();
+
+        assert_eq!(
+            rows.len(),
+            3,
+            "Subquery SHOULD return all 3 rows from users table"
+        );
+
+        assert_eq!(
+            rows[0].values[0],
+            OwnedValue::Int(1),
+            "First row id SHOULD be 1"
+        );
+        match &rows[0].values[1] {
+            OwnedValue::Text(s) => assert_eq!(s, "Alice", "First row name SHOULD be 'Alice'"),
+            other => panic!("Expected Text, got {:?}", other),
+        }
+
+        assert_eq!(
+            rows[1].values[0],
+            OwnedValue::Int(2),
+            "Second row id SHOULD be 2"
+        );
+    }
+
+    #[test]
+    fn subquery_with_where_clause_filters_correctly() {
+        let dir = tempdir().unwrap();
+        let db = Database::create(dir.path().join("test_db")).unwrap();
+
+        db.execute("CREATE TABLE products (id INT, price INT)")
+            .unwrap();
+        db.execute("INSERT INTO products VALUES (1, 10)").unwrap();
+        db.execute("INSERT INTO products VALUES (2, 50)").unwrap();
+        db.execute("INSERT INTO products VALUES (3, 100)").unwrap();
+
+        let rows = db
+            .query("SELECT * FROM (SELECT id, price FROM products WHERE price > 20) AS expensive")
+            .unwrap();
+
+        assert_eq!(
+            rows.len(),
+            2,
+            "Subquery with WHERE SHOULD return only 2 rows with price > 20"
+        );
+
+        let prices: Vec<i64> = rows
+            .iter()
+            .filter_map(|r| match &r.values[1] {
+                OwnedValue::Int(p) => Some(*p),
+                _ => None,
+            })
+            .collect();
+
+        assert!(
+            prices.iter().all(|&p| p > 20),
+            "All prices SHOULD be > 20, got {:?}",
+            prices
+        );
+    }
+
+    #[test]
+    fn subquery_columns_accessible_via_alias() {
+        let dir = tempdir().unwrap();
+        let db = Database::create(dir.path().join("test_db")).unwrap();
+
+        db.execute("CREATE TABLE items (id INT, name TEXT, qty INT)")
+            .unwrap();
+        db.execute("INSERT INTO items VALUES (1, 'Widget', 10)")
+            .unwrap();
+        db.execute("INSERT INTO items VALUES (2, 'Gadget', 20)")
+            .unwrap();
+
+        let rows = db
+            .query("SELECT sub.name, sub.qty FROM (SELECT id, name, qty FROM items) AS sub")
+            .unwrap();
+
+        assert_eq!(
+            rows.len(),
+            2,
+            "SHOULD return 2 rows when selecting specific columns from subquery"
+        );
+
+        match &rows[0].values[0] {
+            OwnedValue::Text(s) => {
+                assert_eq!(s, "Widget", "First row name SHOULD be 'Widget'")
+            }
+            other => panic!("Expected Text for name, got {:?}", other),
+        }
+        assert_eq!(
+            rows[0].values[1],
+            OwnedValue::Int(10),
+            "First row qty SHOULD be 10"
+        );
+    }
+
+    #[test]
+    fn subquery_with_aggregation_returns_single_row() {
+        let dir = tempdir().unwrap();
+        let db = Database::create(dir.path().join("test_db")).unwrap();
+
+        db.execute("CREATE TABLE scores (player TEXT, score INT)")
+            .unwrap();
+        db.execute("INSERT INTO scores VALUES ('A', 100)").unwrap();
+        db.execute("INSERT INTO scores VALUES ('B', 200)").unwrap();
+        db.execute("INSERT INTO scores VALUES ('C', 300)").unwrap();
+
+        let rows = db
+            .query("SELECT * FROM (SELECT SUM(score) AS total FROM scores) AS stats")
+            .unwrap();
+
+        assert_eq!(
+            rows.len(),
+            1,
+            "Aggregation subquery SHOULD return exactly 1 row"
+        );
+
+        assert_eq!(
+            rows[0].values[0],
+            OwnedValue::Int(600),
+            "SUM(score) SHOULD be 100 + 200 + 300 = 600"
+        );
+    }
+
+    #[test]
+    fn nested_subqueries_execute_correctly() {
+        let dir = tempdir().unwrap();
+        let db = Database::create(dir.path().join("test_db")).unwrap();
+
+        db.execute("CREATE TABLE data (val INT)").unwrap();
+        db.execute("INSERT INTO data VALUES (1)").unwrap();
+        db.execute("INSERT INTO data VALUES (2)").unwrap();
+        db.execute("INSERT INTO data VALUES (3)").unwrap();
+
+        let rows = db
+            .query(
+                "SELECT * FROM (SELECT * FROM (SELECT val FROM data WHERE val > 1) AS inner) AS outer",
+            )
+            .unwrap();
+
+        assert_eq!(
+            rows.len(),
+            2,
+            "Nested subquery SHOULD return 2 rows where val > 1"
+        );
+
+        let vals: Vec<i64> = rows
+            .iter()
+            .filter_map(|r| match &r.values[0] {
+                OwnedValue::Int(v) => Some(*v),
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(vals, vec![2, 3], "Nested subquery SHOULD return vals [2, 3]");
+    }
+
+    #[test]
+    fn subquery_with_order_by_preserves_order() {
+        let dir = tempdir().unwrap();
+        let db = Database::create(dir.path().join("test_db")).unwrap();
+
+        db.execute("CREATE TABLE nums (n INT)").unwrap();
+        db.execute("INSERT INTO nums VALUES (3)").unwrap();
+        db.execute("INSERT INTO nums VALUES (1)").unwrap();
+        db.execute("INSERT INTO nums VALUES (2)").unwrap();
+
+        let rows = db
+            .query("SELECT * FROM (SELECT n FROM nums ORDER BY n DESC) AS sorted")
+            .unwrap();
+
+        assert_eq!(
+            rows.len(),
+            3,
+            "SHOULD return all 3 rows from ordered subquery"
+        );
+
+        let vals: Vec<i64> = rows
+            .iter()
+            .filter_map(|r| match &r.values[0] {
+                OwnedValue::Int(v) => Some(*v),
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(
+            vals,
+            vec![3, 2, 1],
+            "Subquery ORDER BY DESC SHOULD preserve order [3, 2, 1]"
+        );
+    }
+
+    #[test]
+    fn subquery_with_limit_respects_limit() {
+        let dir = tempdir().unwrap();
+        let db = Database::create(dir.path().join("test_db")).unwrap();
+
+        db.execute("CREATE TABLE items (id INT)").unwrap();
+        for i in 1..=10 {
+            db.execute(&format!("INSERT INTO items VALUES ({})", i))
+                .unwrap();
+        }
+
+        let rows = db
+            .query("SELECT * FROM (SELECT id FROM items LIMIT 3) AS limited")
+            .unwrap();
+
+        assert_eq!(
+            rows.len(),
+            3,
+            "Subquery with LIMIT 3 SHOULD return exactly 3 rows"
+        );
+    }
+
+    #[test]
+    fn subquery_join_with_table_works() {
+        let dir = tempdir().unwrap();
+        let db = Database::create(dir.path().join("test_db")).unwrap();
+
+        db.execute("CREATE TABLE orders (id INT, user_id INT, amount INT)")
+            .unwrap();
+        db.execute("CREATE TABLE users (id INT, name TEXT)")
+            .unwrap();
+
+        db.execute("INSERT INTO users VALUES (1, 'Alice')").unwrap();
+        db.execute("INSERT INTO users VALUES (2, 'Bob')").unwrap();
+        db.execute("INSERT INTO orders VALUES (100, 1, 50)")
+            .unwrap();
+        db.execute("INSERT INTO orders VALUES (101, 1, 75)")
+            .unwrap();
+        db.execute("INSERT INTO orders VALUES (102, 2, 30)")
+            .unwrap();
+
+        let rows = db
+            .query(
+                "SELECT u.name, totals.total_amount
+                 FROM users AS u
+                 JOIN (SELECT user_id, SUM(amount) AS total_amount FROM orders GROUP BY user_id) AS totals
+                 ON u.id = totals.user_id
+                 ORDER BY u.name",
+            )
+            .unwrap();
+
+        assert_eq!(
+            rows.len(),
+            2,
+            "Join with subquery SHOULD return 2 rows (one per user with orders)"
+        );
+
+        match &rows[0].values[0] {
+            OwnedValue::Text(s) => assert_eq!(s, "Alice", "First user SHOULD be 'Alice'"),
+            other => panic!("Expected Text, got {:?}", other),
+        }
+        assert_eq!(
+            rows[0].values[1],
+            OwnedValue::Int(125),
+            "Alice's total SHOULD be 50 + 75 = 125"
+        );
+
+        match &rows[1].values[0] {
+            OwnedValue::Text(s) => assert_eq!(s, "Bob", "Second user SHOULD be 'Bob'"),
+            other => panic!("Expected Text, got {:?}", other),
+        }
+        assert_eq!(
+            rows[1].values[1],
+            OwnedValue::Int(30),
+            "Bob's total SHOULD be 30"
+        );
+    }
 }
