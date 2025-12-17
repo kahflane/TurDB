@@ -228,7 +228,8 @@
       "files": ["src/sql/planner.rs", "src/sql/executor.rs"],
       "effort": "~500 lines, 1-2 weeks",
       "impact": "Analytics queries not supported",
-      "status": "pending"
+      "status": "completed",
+      "notes": "Implemented ROW_NUMBER, RANK, DENSE_RANK, SUM, AVG, COUNT, MIN, MAX with OVER (PARTITION BY ... ORDER BY ...). WindowExec operator added to planner and executor."
     },
     {
       "id": 9,
@@ -238,7 +239,8 @@
       "files": ["src/database/database.rs", "src/sql/planner.rs"],
       "effort": "~150 lines, 2-3 days",
       "impact": "Common data migration pattern not supported",
-      "status": "pending"
+      "status": "completed",
+      "notes": "Implemented INSERT INTO ... SELECT from another table/query. Supports column expressions and WHERE filtering in source query."
     },
     {
       "id": 10,
@@ -248,7 +250,8 @@
       "files": ["src/database/database.rs", "src/sql/planner.rs"],
       "effort": "~200 lines, 3-4 days",
       "impact": "Upsert pattern not supported",
-      "status": "pending"
+      "status": "completed",
+      "notes": "Implemented ON CONFLICT DO NOTHING and ON CONFLICT DO UPDATE SET. Works with PRIMARY KEY and UNIQUE constraints."
     },
     {
       "id": 11,
@@ -268,7 +271,8 @@
       "files": ["src/database/database.rs", "src/sql/planner.rs"],
       "effort": "~150 lines, 2-3 days",
       "impact": "Can't get inserted/updated values back",
-      "status": "pending"
+      "status": "completed",
+      "notes": "Implemented RETURNING * and RETURNING column_list for INSERT, UPDATE, and DELETE statements. Returns affected rows with specified columns."
     },
     {
       "id": 13,

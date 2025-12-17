@@ -506,19 +506,6 @@ impl Database {
             op: &'a crate::sql::planner::PhysicalOperator<'a>,
         ) -> Option<PlanSource<'a>> {
             use crate::sql::planner::PhysicalOperator;
-            #[cfg(test)]
-            {
-                let op_name = match op {
-                    PhysicalOperator::TableScan(_) => "TableScan",
-                    PhysicalOperator::SubqueryExec(_) => "SubqueryExec",
-                    PhysicalOperator::SetOpExec(_) => "SetOpExec",
-                    PhysicalOperator::SortExec(_) => "SortExec",
-                    PhysicalOperator::ProjectExec(_) => "ProjectExec",
-                    PhysicalOperator::FilterExec(_) => "FilterExec",
-                    _ => "Other",
-                };
-                eprintln!("DEBUG find_plan_source: op={}", op_name);
-            }
             match op {
                 PhysicalOperator::TableScan(scan) => Some(PlanSource::TableScan(scan)),
                 PhysicalOperator::IndexScan(scan) => Some(PlanSource::IndexScan(scan)),
@@ -900,10 +887,18 @@ impl Database {
 
                 let materialized_source = MaterializedRowSource::new(inner_rows);
 
+                let subq_column_map: Vec<(String, usize)> = subq
+                    .output_schema
+                    .columns
+                    .iter()
+                    .enumerate()
+                    .map(|(idx, col)| (col.name.to_lowercase(), idx))
+                    .collect();
+
                 let ctx = ExecutionContext::new(&arena);
                 let builder = ExecutorBuilder::new(&ctx);
                 let mut executor = builder
-                    .build_with_source(&physical_plan, materialized_source)
+                    .build_with_source_and_column_map(&physical_plan, materialized_source, &subq_column_map)
                     .wrap_err("failed to build executor with subquery source")?;
 
                 let output_columns = physical_plan.output_schema.columns;
@@ -937,6 +932,10 @@ impl Database {
                         PhysicalOperator::SubqueryExec(subq) => Some(subq),
                         PhysicalOperator::FilterExec(f) => find_subquery_in_join(f.input),
                         PhysicalOperator::ProjectExec(p) => find_subquery_in_join(p.input),
+                        PhysicalOperator::HashAggregate(agg) => find_subquery_in_join(agg.input),
+                        PhysicalOperator::SortedAggregate(agg) => find_subquery_in_join(agg.input),
+                        PhysicalOperator::SortExec(s) => find_subquery_in_join(s.input),
+                        PhysicalOperator::LimitExec(l) => find_subquery_in_join(l.input),
                         _ => None,
                     }
                 }
@@ -949,6 +948,10 @@ impl Database {
                         PhysicalOperator::TableScan(scan) => Some(scan),
                         PhysicalOperator::FilterExec(f) => find_table_in_join(f.input),
                         PhysicalOperator::ProjectExec(p) => find_table_in_join(p.input),
+                        PhysicalOperator::HashAggregate(agg) => find_table_in_join(agg.input),
+                        PhysicalOperator::SortedAggregate(agg) => find_table_in_join(agg.input),
+                        PhysicalOperator::SortExec(s) => find_table_in_join(s.input),
+                        PhysicalOperator::LimitExec(l) => find_table_in_join(l.input),
                         _ => None,
                     }
                 }
