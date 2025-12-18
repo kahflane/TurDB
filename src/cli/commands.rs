@@ -149,6 +149,17 @@ fn format_create_table(table: &TableDef) -> String {
             if col.has_constraint(&Constraint::PrimaryKey) {
                 col_def.push_str(" PRIMARY KEY");
             }
+            if col.has_constraint(&Constraint::AutoIncrement) {
+                col_def.push_str(" AUTO_INCREMENT");
+            }
+            if col.has_constraint(&Constraint::Unique)
+                && !col.has_constraint(&Constraint::PrimaryKey)
+            {
+                col_def.push_str(" UNIQUE");
+            }
+            if let Some(default) = col.default_value() {
+                col_def.push_str(&format!(" DEFAULT {}", default));
+            }
             col_def
         })
         .collect();
