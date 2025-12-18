@@ -341,6 +341,9 @@ pub enum DataType<'a> {
     BigInt,
     SmallInt,
     TinyInt,
+    Serial,
+    BigSerial,
+    SmallSerial,
     Real,
     DoublePrecision,
     Decimal(Option<u32>, Option<u32>),
@@ -378,6 +381,7 @@ pub enum ColumnConstraint<'a> {
     Null,
     Unique,
     PrimaryKey,
+    AutoIncrement,
     Default(&'a Expr<'a>),
     Check(&'a Expr<'a>),
     References {

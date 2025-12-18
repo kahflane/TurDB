@@ -515,6 +515,33 @@ mod truncate_tests {
             other => panic!("id SHOULD be Int, got {:?}", other),
         }
     }
+
+    #[test]
+    fn truncate_restart_identity_resets_auto_increment() {
+        let dir = tempdir().unwrap();
+        let db = Database::create(dir.path().join("test_db")).unwrap();
+        db.execute("CREATE TABLE items (id SERIAL PRIMARY KEY, name TEXT)")
+            .unwrap();
+        db.execute("INSERT INTO items (name) VALUES ('a')").unwrap();
+        db.execute("INSERT INTO items (name) VALUES ('b')").unwrap();
+
+        let before = db.query("SELECT id FROM items").unwrap();
+        assert_eq!(before.len(), 2);
+        match &before[1].values[0] {
+            OwnedValue::Int(id) => assert_eq!(*id, 2, "Second row id SHOULD be 2"),
+            other => panic!("id SHOULD be Int, got {:?}", other),
+        }
+
+        db.execute("TRUNCATE items RESTART IDENTITY").unwrap();
+        db.execute("INSERT INTO items (name) VALUES ('c')").unwrap();
+
+        let after = db.query("SELECT id FROM items").unwrap();
+        assert_eq!(after.len(), 1);
+        match &after[0].values[0] {
+            OwnedValue::Int(id) => assert_eq!(*id, 1, "First row after RESTART IDENTITY SHOULD have id 1"),
+            other => panic!("id SHOULD be Int, got {:?}", other),
+        }
+    }
 }
 
 mod transaction_tests {

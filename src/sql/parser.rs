@@ -1784,6 +1784,8 @@ impl<'a> Parser<'a> {
                 constraints.push(ColumnConstraint::PrimaryKey);
             } else if self.consume_keyword(Keyword::Unique) {
                 constraints.push(ColumnConstraint::Unique);
+            } else if self.consume_keyword(Keyword::AutoIncrement) {
+                constraints.push(ColumnConstraint::AutoIncrement);
             } else if self.consume_keyword(Keyword::Default) {
                 let expr = self.parse_expr(0)?;
                 constraints.push(ColumnConstraint::Default(self.arena.alloc(expr)));
@@ -2602,6 +2604,18 @@ impl<'a> Parser<'a> {
             Token::Keyword(Keyword::Tinyint) => {
                 self.advance();
                 Ok(DataType::TinyInt)
+            }
+            Token::Keyword(Keyword::Serial) => {
+                self.advance();
+                Ok(DataType::Serial)
+            }
+            Token::Keyword(Keyword::BigSerial) => {
+                self.advance();
+                Ok(DataType::BigSerial)
+            }
+            Token::Keyword(Keyword::SmallSerial) => {
+                self.advance();
+                Ok(DataType::SmallSerial)
             }
             Token::Keyword(Keyword::Real) | Token::Keyword(Keyword::Float) => {
                 self.advance();
