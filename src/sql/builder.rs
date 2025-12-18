@@ -81,7 +81,7 @@ impl<'a> ExecutorBuilder<'a> {
                     let effective_column_map = if let Some((group_by, aggregates)) = &agg_info {
                         self.build_aggregate_column_map(group_by, aggregates, column_map)
                     } else {
-                        column_map.to_vec()
+                        self.compute_input_column_map(project.input)
                     };
                     let expressions: Vec<&'a Expr<'a>> = project.expressions.to_vec();
                     let projection = CompiledProjection::new(expressions, effective_column_map);
@@ -604,5 +604,67 @@ impl<'a> ExecutorBuilder<'a> {
         let _ = original_column_map;
 
         result
+    }
+
+    fn compute_input_column_map(
+        &self,
+        op: &'a crate::sql::planner::PhysicalOperator<'a>,
+    ) -> Vec<(String, usize)> {
+        use crate::sql::planner::PhysicalOperator;
+
+        match op {
+            PhysicalOperator::TableScan(scan) => {
+                if let Some(table_def) = scan.table_def {
+                    table_def
+                        .columns()
+                        .iter()
+                        .enumerate()
+                        .map(|(idx, col)| (col.name().to_string(), idx))
+                        .collect()
+                } else {
+                    Vec::new()
+                }
+            }
+            PhysicalOperator::IndexScan(_) => {
+                Vec::new()
+            }
+            PhysicalOperator::FilterExec(filter) => self.compute_input_column_map(filter.input),
+            PhysicalOperator::SortExec(sort) => self.compute_input_column_map(sort.input),
+            PhysicalOperator::LimitExec(limit) => self.compute_input_column_map(limit.input),
+            PhysicalOperator::ProjectExec(project) => self.compute_input_column_map(project.input),
+            PhysicalOperator::WindowExec(window) => self.compute_input_column_map(window.input),
+            PhysicalOperator::HashAggregate(agg) => {
+                self.build_aggregate_column_map(agg.group_by, agg.aggregates, &[])
+            }
+            PhysicalOperator::SortedAggregate(agg) => {
+                self.build_aggregate_column_map(agg.group_by, agg.aggregates, &[])
+            }
+            PhysicalOperator::SubqueryExec(subq) => subq
+                .output_schema
+                .columns
+                .iter()
+                .enumerate()
+                .map(|(idx, col)| (col.name.to_string(), idx))
+                .collect(),
+            PhysicalOperator::NestedLoopJoin(join) => {
+                let mut result = self.compute_input_column_map(join.left);
+                let right_cols = self.compute_input_column_map(join.right);
+                let offset = result.len();
+                for (name, idx) in right_cols {
+                    result.push((name, idx + offset));
+                }
+                result
+            }
+            PhysicalOperator::GraceHashJoin(join) => {
+                let mut result = self.compute_input_column_map(join.left);
+                let right_cols = self.compute_input_column_map(join.right);
+                let offset = result.len();
+                for (name, idx) in right_cols {
+                    result.push((name, idx + offset));
+                }
+                result
+            }
+            PhysicalOperator::SetOpExec(_) => Vec::new(),
+        }
     }
 }
