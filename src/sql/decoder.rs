@@ -589,4 +589,37 @@ mod tests {
             _ => panic!("Expected Text value, got {:?}", result[0]),
         }
     }
+
+    #[test]
+    fn test_schema_evolution_returns_null_for_missing_column() {
+        use crate::records::types::ColumnDef;
+        use crate::records::{RecordBuilder, Schema};
+
+        let old_schema = Schema::new(vec![
+            ColumnDef::new("id", DataType::Int4),
+            ColumnDef::new("name", DataType::Text),
+        ]);
+
+        let mut builder = RecordBuilder::new(&old_schema);
+        builder.set_int4(0, 1).unwrap();
+        builder.set_text(1, "John").unwrap();
+        let old_record = builder.build().unwrap();
+
+        let new_decoder = SimpleDecoder::new(vec![
+            DataType::Int4,
+            DataType::Text,
+            DataType::Int4,
+        ]);
+
+        let result = new_decoder.decode(&[], &old_record).unwrap();
+
+        assert_eq!(result.len(), 3);
+        assert!(matches!(result[0], Value::Int(1)));
+        assert!(matches!(&result[1], Value::Text(s) if s == "John"));
+        assert!(
+            matches!(result[2], Value::Null),
+            "Expected Null for missing column, got {:?}",
+            result[2]
+        );
+    }
 }
