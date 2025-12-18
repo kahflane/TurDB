@@ -2422,28 +2422,16 @@ impl Database {
         let table_id = table_def.id();
         let columns = table_def.columns().to_vec();
 
-        let from_table_data: Option<(
+        #[allow(clippy::type_complexity)]
+        let from_tables_data: Option<Vec<(
             String,
             String,
             Option<&str>,
             Vec<crate::schema::table::ColumnDef>,
-        )> = if let Some(from_clause) = update.from {
-            match from_clause {
-                crate::sql::ast::FromClause::Table(table_ref) => {
-                    let from_schema = table_ref.schema.unwrap_or("root");
-                    let from_table = table_ref.name;
-                    let from_alias = table_ref.alias;
-                    let from_table_def = catalog.resolve_table(from_table)?;
-                    let from_columns = from_table_def.columns().to_vec();
-                    Some((
-                        from_schema.to_string(),
-                        from_table.to_string(),
-                        from_alias,
-                        from_columns,
-                    ))
-                }
-                _ => bail!("UPDATE...FROM currently only supports simple table references"),
-            }
+        )>> = if let Some(from_clause) = update.from {
+            let mut tables = Vec::new();
+            Self::extract_tables_from_clause(*from_clause, catalog, &mut tables)?;
+            Some(tables)
         } else {
             None
         };
@@ -2452,8 +2440,7 @@ impl Database {
 
         let schema = create_record_schema(&columns);
 
-        if let Some((from_schema_name, from_table_name, from_alias, from_columns)) = from_table_data
-        {
+        if let Some(from_tables) = from_tables_data {
             return self.execute_update_with_from(
                 update,
                 arena,
@@ -2464,10 +2451,7 @@ impl Database {
                 table_id as usize,
                 &columns,
                 &schema,
-                &from_schema_name,
-                &from_table_name,
-                from_alias,
-                &from_columns,
+                from_tables,
             );
         }
 
@@ -2680,10 +2664,12 @@ impl Database {
         table_id: usize,
         columns: &[crate::schema::table::ColumnDef],
         schema: &crate::records::Schema,
-        from_schema_name: &str,
-        from_table_name: &str,
-        from_alias: Option<&str>,
-        from_columns: &[crate::schema::table::ColumnDef],
+        from_tables: Vec<(
+            String,
+            String,
+            Option<&str>,
+            Vec<crate::schema::table::ColumnDef>,
+        )>,
     ) -> Result<ExecuteResult> {
         use crate::btree::BTree;
         use crate::records::RecordView;
@@ -2705,22 +2691,25 @@ impl Database {
             }
         }
 
-        let target_col_count = columns.len();
-        for (idx, col) in from_columns.iter().enumerate() {
-            combined_column_map.push((col.name().to_string(), target_col_count + idx));
-            combined_column_map.push((
-                format!("{}.{}", from_table_name, col.name()),
-                target_col_count + idx,
-            ));
-            if let Some(alias) = from_alias {
+        let mut current_col_offset = columns.len();
+        let mut from_schemas: Vec<crate::records::Schema> = Vec::new();
+        for (_, from_table_name, from_alias, from_columns) in &from_tables {
+            for (idx, col) in from_columns.iter().enumerate() {
+                combined_column_map.push((col.name().to_string(), current_col_offset + idx));
                 combined_column_map.push((
-                    format!("{}.{}", alias, col.name()),
-                    target_col_count + idx,
+                    format!("{}.{}", from_table_name, col.name()),
+                    current_col_offset + idx,
                 ));
+                if let Some(alias) = from_alias {
+                    combined_column_map.push((
+                        format!("{}.{}", alias, col.name()),
+                        current_col_offset + idx,
+                    ));
+                }
             }
+            current_col_offset += from_columns.len();
+            from_schemas.push(create_record_schema(from_columns));
         }
-
-        let from_schema = create_record_schema(from_columns);
 
         let predicate = update
             .where_clause
@@ -2740,18 +2729,24 @@ impl Database {
         let mut file_manager_guard = self.file_manager.write();
         let file_manager = file_manager_guard.as_mut().unwrap();
 
-        let from_storage = file_manager.table_data_mut(from_schema_name, from_table_name)?;
-        let from_btree = BTree::new(from_storage, 1u32)?;
-        let mut from_cursor = from_btree.cursor_first()?;
+        let mut all_from_rows: Vec<Vec<Vec<OwnedValue>>> = Vec::new();
+        for (i, (from_schema_name, from_table_name, _, from_columns)) in from_tables.iter().enumerate() {
+            let from_storage = file_manager.table_data_mut(from_schema_name, from_table_name)?;
+            let from_btree = BTree::new(from_storage, 1u32)?;
+            let mut from_cursor = from_btree.cursor_first()?;
 
-        let mut from_rows: Vec<Vec<OwnedValue>> = Vec::new();
-        while from_cursor.valid() {
-            let value = from_cursor.value()?;
-            let record = RecordView::new(value, &from_schema)?;
-            let row_values = OwnedValue::extract_row_from_record(&record, from_columns)?;
-            from_rows.push(row_values);
-            from_cursor.advance()?;
+            let mut table_rows: Vec<Vec<OwnedValue>> = Vec::new();
+            while from_cursor.valid() {
+                let value = from_cursor.value()?;
+                let record = RecordView::new(value, &from_schemas[i])?;
+                let row_values = OwnedValue::extract_row_from_record(&record, from_columns)?;
+                table_rows.push(row_values);
+                from_cursor.advance()?;
+            }
+            all_from_rows.push(table_rows);
         }
+
+        let combined_from_rows = Self::cartesian_product(&all_from_rows);
 
         let storage = file_manager.table_data_mut(schema_name, table_name)?;
         let root_page = 1u32;
@@ -2768,7 +2763,7 @@ impl Database {
             let record = RecordView::new(value, schema)?;
             let target_row_values = OwnedValue::extract_row_from_record(&record, columns)?;
 
-            for from_row in &from_rows {
+            for from_row in &combined_from_rows {
                 let mut combined_values: Vec<Value<'_>> = Vec::with_capacity(
                     target_row_values.len() + from_row.len(),
                 );
@@ -2969,6 +2964,28 @@ impl Database {
         })
     }
 
+    fn cartesian_product(tables: &[Vec<Vec<OwnedValue>>]) -> Vec<Vec<OwnedValue>> {
+        if tables.is_empty() {
+            return vec![vec![]];
+        }
+
+        let mut result: Vec<Vec<OwnedValue>> = vec![vec![]];
+
+        for table_rows in tables {
+            let mut new_result: Vec<Vec<OwnedValue>> = Vec::new();
+            for existing in &result {
+                for row in table_rows {
+                    let mut combined = existing.clone();
+                    combined.extend(row.clone());
+                    new_result.push(combined);
+                }
+            }
+            result = new_result;
+        }
+
+        result
+    }
+
     fn eval_expr_with_row(
         &self,
         expr: &crate::sql::ast::Expr<'_>,
@@ -3090,6 +3107,41 @@ impl Database {
             }
             _ => Self::eval_literal(expr),
         }
+    }
+
+    fn extract_tables_from_clause<'a>(
+        from_clause: crate::sql::ast::FromClause<'a>,
+        catalog: &Catalog,
+        tables: &mut Vec<(
+            String,
+            String,
+            Option<&'a str>,
+            Vec<crate::schema::table::ColumnDef>,
+        )>,
+    ) -> Result<()> {
+        use crate::sql::ast::FromClause;
+
+        match from_clause {
+            FromClause::Table(table_ref) => {
+                let schema = table_ref.schema.unwrap_or("root");
+                let table_name = table_ref.name;
+                let alias = table_ref.alias;
+                let table_def = catalog.resolve_table(table_name)?;
+                let columns = table_def.columns().to_vec();
+                tables.push((schema.to_string(), table_name.to_string(), alias, columns));
+            }
+            FromClause::Join(join_clause) => {
+                Self::extract_tables_from_clause(*join_clause.left, catalog, tables)?;
+                Self::extract_tables_from_clause(*join_clause.right, catalog, tables)?;
+            }
+            FromClause::Subquery { .. } => {
+                bail!("UPDATE...FROM does not support subqueries in FROM clause")
+            }
+            FromClause::Lateral { .. } => {
+                bail!("UPDATE...FROM does not support LATERAL in FROM clause")
+            }
+        }
+        Ok(())
     }
 
     fn execute_delete(
