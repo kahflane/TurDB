@@ -80,6 +80,8 @@
 //! - `transaction`: MVCC and WAL
 
 pub mod btree;
+#[cfg(feature = "cli")]
+pub mod cli;
 pub mod constraints;
 pub mod database;
 pub mod encoding;
