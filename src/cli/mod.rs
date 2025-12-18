@@ -11,17 +11,17 @@
 //!
 //! ```text
 //! ┌─────────────────────────────────────────────────────────────┐
-//! │                      CLI Entry Point                         │
-//! │                      (bin/turdb.rs)                          │
+//! │                      CLI Entry Point                        │
+//! │                      (bin/turdb.rs)                         │
 //! ├─────────────────────────────────────────────────────────────┤
-//! │                         REPL Loop                            │
-//! │  - Reads input via rustyline                                 │
-//! │  - Dispatches to command handler or SQL executor             │
-//! │  - Formats and displays results                              │
+//! │                         REPL Loop                           │
+//! │  - Reads input via rustyline                                │
+//! │  - Dispatches to command handler or SQL executor            │
+//! │  - Formats and displays results                             │
 //! ├─────────────────────────────────────────────────────────────┤
-//! │     Commands          │    Table Formatter    │   History    │
-//! │  (.quit, .tables,     │  ASCII box drawing    │  Persistent  │
-//! │   .schema, .help)     │  for query results    │  ~/.turdb_*  │
+//! │     Commands          │    Table Formatter    │   History   │
+//! │  (.quit, .tables,     │  ASCII box drawing    │  Persistent │
+//! │   .schema, .help)     │  for query results    │  ~/.turdb_* │
 //! └─────────────────────────────────────────────────────────────┘
 //! ```
 //!

@@ -21,3 +21,6 @@ rust-project.json
 # Git worktrees
 .worktrees/
 CODE_REVIEW.md
+AGENTS.md
+.crush/
+book/*

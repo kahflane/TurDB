@@ -130,6 +130,7 @@ pub enum ExecuteResult {
         returned: Option<Vec<Row>>,
     },
     Select {
+        columns: Vec<String>,
         rows: Vec<Row>,
     },
     Pragma {
@@ -2248,5 +2249,38 @@ mod tests {
         let name1 = get_text_value(&rows[1].values[1]);
         assert_eq!(id1, 2);
         assert_eq!(name1, "Bob");
+    }
+
+    #[test]
+    fn test_query_with_columns_returns_proper_column_names() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("test_db");
+
+        let db = Database::create(&db_path).unwrap();
+        db.execute("CREATE TABLE users (id INT, name TEXT)").unwrap();
+        db.execute("INSERT INTO users VALUES (1, 'Alice')").unwrap();
+
+        let (columns, rows) = db.query_with_columns("SELECT * FROM users").unwrap();
+        assert_eq!(columns, vec!["id", "name"]);
+        assert_eq!(rows.len(), 1);
+    }
+
+    #[test]
+    fn test_execute_select_returns_proper_column_names() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("test_db");
+
+        let db = Database::create(&db_path).unwrap();
+        db.execute("CREATE TABLE users (id INT, name TEXT)").unwrap();
+        db.execute("INSERT INTO users VALUES (1, 'Alice')").unwrap();
+
+        let result = db.execute("SELECT * FROM users").unwrap();
+        match result {
+            ExecuteResult::Select { columns, rows } => {
+                assert_eq!(columns, vec!["id", "name"]);
+                assert_eq!(rows.len(), 1);
+            }
+            _ => panic!("Expected Select result"),
+        }
     }
 }
