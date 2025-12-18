@@ -505,6 +505,11 @@ fn parse_object(tokenizer: &mut JsonTokenizer) -> Result<JsonValue> {
 
 pub fn parse_json_path(path: &str) -> Option<Vec<String>> {
     let path = path.trim();
+    
+    if path.starts_with('$') {
+        return parse_dollar_path(path);
+    }
+    
     if !path.starts_with('{') || !path.ends_with('}') {
         return None;
     }
@@ -515,6 +520,57 @@ pub fn parse_json_path(path: &str) -> Option<Vec<String>> {
     }
 
     Some(inner.split(',').map(|s| s.trim().to_string()).collect())
+}
+
+fn parse_dollar_path(path: &str) -> Option<Vec<String>> {
+    let path = path.trim();
+    if !path.starts_with('$') {
+        return None;
+    }
+    
+    let rest = &path[1..];
+    if rest.is_empty() {
+        return Some(vec![]);
+    }
+    
+    let mut elements = Vec::new();
+    let mut current = String::new();
+    let mut in_bracket = false;
+    
+    for ch in rest.chars() {
+        match ch {
+            '.' if !in_bracket => {
+                if !current.is_empty() {
+                    elements.push(current);
+                    current = String::new();
+                }
+            }
+            '[' => {
+                if !current.is_empty() {
+                    elements.push(current);
+                    current = String::new();
+                }
+                in_bracket = true;
+            }
+            ']' => {
+                in_bracket = false;
+                if !current.is_empty() {
+                    elements.push(current);
+                    current = String::new();
+                }
+            }
+            '\'' | '"' => {}
+            _ => {
+                current.push(ch);
+            }
+        }
+    }
+    
+    if !current.is_empty() {
+        elements.push(current);
+    }
+    
+    Some(elements)
 }
 
 pub struct JsonNavigator<'a> {

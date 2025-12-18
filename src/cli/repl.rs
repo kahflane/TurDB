@@ -176,7 +176,7 @@ impl Repl {
                 self.print_result(result, elapsed);
             }
             Err(err) => {
-                eprintln!("Error: {}", err);
+                eprintln!("Error: {:#}", err);
             }
         }
     }
