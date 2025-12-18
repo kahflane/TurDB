@@ -408,8 +408,116 @@ impl<'a> CompiledPredicate<'a> {
                 Value::Null => Some(Value::Null),
                 _ => None,
             },
+            DataType::Date => match val {
+                Value::Text(s) => self.parse_date(s),
+                Value::Int(d) => Some(Value::Int(*d)),
+                Value::Null => Some(Value::Null),
+                _ => None,
+            },
+            DataType::Time => match val {
+                Value::Text(s) => self.parse_time(s),
+                Value::Int(t) => Some(Value::Int(*t)),
+                Value::Null => Some(Value::Null),
+                _ => None,
+            },
+            DataType::Timestamp | DataType::TimestampTz => match val {
+                Value::Text(s) => self.parse_timestamp(s),
+                Value::TimestampTz { micros, offset_secs } => {
+                    Some(Value::TimestampTz { micros: *micros, offset_secs: *offset_secs })
+                }
+                Value::Int(t) => Some(Value::TimestampTz { micros: *t, offset_secs: 0 }),
+                Value::Null => Some(Value::Null),
+                _ => None,
+            },
             _ => Some(val.clone()),
         }
+    }
+
+    fn parse_date(&self, s: &str) -> Option<Value<'a>> {
+        let s = s.trim();
+        let parts: Vec<&str> = s.split('-').collect();
+        if parts.len() != 3 {
+            return None;
+        }
+        let year: i32 = parts[0].parse().ok()?;
+        let month: u32 = parts[1].parse().ok()?;
+        let day: u32 = parts[2].parse().ok()?;
+        if !(1..=12).contains(&month) {
+            return None;
+        }
+        let days_in_month = match month {
+            1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+            4 | 6 | 9 | 11 => 30,
+            2 => {
+                let is_leap = (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0);
+                if is_leap { 29 } else { 28 }
+            }
+            _ => return None,
+        };
+        if !(1..=days_in_month).contains(&day) {
+            return None;
+        }
+        let a = (14 - month as i32) / 12;
+        let y = year + 4800 - a;
+        let m = month as i32 + 12 * a - 3;
+        let jdn = day as i32 + (153 * m + 2) / 5 + 365 * y + y / 4 - y / 100 + y / 400 - 32045;
+        let days = jdn - 2440588;
+        Some(Value::Int(days as i64))
+    }
+
+    fn parse_time(&self, s: &str) -> Option<Value<'a>> {
+        let s = s.trim();
+        let parts: Vec<&str> = s.split(':').collect();
+        if parts.len() < 2 || parts.len() > 3 {
+            return None;
+        }
+        let hour: u32 = parts[0].parse().ok()?;
+        let minute: u32 = parts[1].parse().ok()?;
+        if hour > 23 || minute > 59 {
+            return None;
+        }
+        let (second, micros_frac) = if parts.len() == 3 {
+            let sec_parts: Vec<&str> = parts[2].split('.').collect();
+            let sec: u32 = sec_parts[0].parse().ok()?;
+            if sec > 59 {
+                return None;
+            }
+            let frac: i64 = if sec_parts.len() > 1 {
+                let frac_str = sec_parts[1];
+                let padded = format!("{:0<6}", &frac_str[..frac_str.len().min(6)]);
+                padded.parse().unwrap_or(0)
+            } else {
+                0
+            };
+            (sec, frac)
+        } else {
+            (0, 0)
+        };
+        let micros = (hour as i64 * 3600 + minute as i64 * 60 + second as i64) * 1_000_000 + micros_frac;
+        Some(Value::Int(micros))
+    }
+
+    fn parse_timestamp(&self, s: &str) -> Option<Value<'a>> {
+        let s = s.trim();
+        let parts: Vec<&str> = s.splitn(2, [' ', 'T']).collect();
+        if parts.is_empty() {
+            return None;
+        }
+        let date_val = self.parse_date(parts[0])?;
+        let days = match date_val {
+            Value::Int(d) => d,
+            _ => return None,
+        };
+        let time_micros = if parts.len() > 1 {
+            match self.parse_time(parts[1]) {
+                Some(Value::Int(t)) => t,
+                _ => return None,
+            }
+        } else {
+            0
+        };
+        let micros = days * 86400 * 1_000_000 + time_micros;
+        Some(Value::TimestampTz { micros, offset_secs: 0 })
     }
 
     fn parse_and_build_jsonb(&self, s: &str) -> Option<Value<'a>> {
