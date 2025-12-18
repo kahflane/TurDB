@@ -38,6 +38,12 @@ impl<'a> CompiledPredicate<'a> {
                 _ => true,
             },
             Expr::Literal(Literal::Boolean(b)) => *b,
+            Expr::Like { .. } | Expr::Between { .. } | Expr::InList { .. } => {
+                match self.eval_value(expr, row) {
+                    Some(Value::Int(n)) => n != 0,
+                    _ => false,
+                }
+            }
             _ => true,
         }
     }
@@ -396,8 +402,218 @@ impl<'a> CompiledPredicate<'a> {
                 Value::Null => Some(Value::Null),
                 _ => None,
             },
+            DataType::Json | DataType::Jsonb => match val {
+                Value::Text(s) => self.parse_and_build_jsonb(s),
+                Value::Jsonb(_) => Some(val.clone()),
+                Value::Null => Some(Value::Null),
+                _ => None,
+            },
             _ => Some(val.clone()),
         }
+    }
+
+    fn parse_and_build_jsonb(&self, s: &str) -> Option<Value<'a>> {
+        use crate::records::jsonb::JsonbBuilder;
+
+        let s = s.trim();
+        if s == "null" {
+            return Some(Value::Jsonb(Cow::Owned(JsonbBuilder::new_null().build())));
+        }
+        if s == "true" {
+            return Some(Value::Jsonb(Cow::Owned(JsonbBuilder::new_bool(true).build())));
+        }
+        if s == "false" {
+            return Some(Value::Jsonb(Cow::Owned(JsonbBuilder::new_bool(false).build())));
+        }
+        if s.starts_with('"') && s.ends_with('"') && s.len() >= 2 {
+            let inner = &s[1..s.len() - 1];
+            return Some(Value::Jsonb(Cow::Owned(JsonbBuilder::new_string(inner).build())));
+        }
+        if s.starts_with('{') || s.starts_with('[') {
+            if let Some(jsonb_bytes) = self.parse_json_to_jsonb(s) {
+                return Some(Value::Jsonb(Cow::Owned(jsonb_bytes)));
+            }
+            return None;
+        }
+        if let Ok(n) = s.parse::<f64>() {
+            if s.chars().all(|c| c.is_ascii_digit() || c == '.' || c == '-' || c == '+' || c == 'e' || c == 'E') {
+                return Some(Value::Jsonb(Cow::Owned(JsonbBuilder::new_number(n).build())));
+            }
+        }
+        None
+    }
+
+    fn parse_json_to_jsonb(&self, s: &str) -> Option<Vec<u8>> {
+        use crate::records::jsonb::{JsonbBuilder, JsonbBuilderValue};
+
+        fn parse_value(s: &str) -> Option<JsonbBuilderValue> {
+            let s = s.trim();
+            if s == "null" {
+                return Some(JsonbBuilderValue::Null);
+            }
+            if s == "true" {
+                return Some(JsonbBuilderValue::Bool(true));
+            }
+            if s == "false" {
+                return Some(JsonbBuilderValue::Bool(false));
+            }
+            if s.starts_with('"') && s.ends_with('"') && s.len() >= 2 {
+                let inner = &s[1..s.len() - 1];
+                return Some(JsonbBuilderValue::String(inner.to_string()));
+            }
+            if s.starts_with('{') && s.ends_with('}') {
+                return parse_object(&s[1..s.len() - 1]);
+            }
+            if s.starts_with('[') && s.ends_with(']') {
+                return parse_array(&s[1..s.len() - 1]);
+            }
+            if let Ok(n) = s.parse::<f64>() {
+                if s.chars().all(|c| c.is_ascii_digit() || c == '.' || c == '-' || c == '+' || c == 'e' || c == 'E') {
+                    return Some(JsonbBuilderValue::Number(n));
+                }
+            }
+            None
+        }
+
+        fn parse_object(s: &str) -> Option<JsonbBuilderValue> {
+            let s = s.trim();
+            if s.is_empty() {
+                return Some(JsonbBuilderValue::Object(Vec::new()));
+            }
+            let mut entries = Vec::new();
+            let mut depth = 0;
+            let mut in_string = false;
+            let mut escape = false;
+            let mut start = 0;
+
+            let chars: Vec<char> = s.chars().collect();
+            for (i, &c) in chars.iter().enumerate() {
+                if escape {
+                    escape = false;
+                    continue;
+                }
+                if c == '\\' && in_string {
+                    escape = true;
+                    continue;
+                }
+                if c == '"' {
+                    in_string = !in_string;
+                } else if !in_string {
+                    if c == '{' || c == '[' {
+                        depth += 1;
+                    } else if c == '}' || c == ']' {
+                        depth -= 1;
+                    } else if c == ',' && depth == 0 {
+                        let part: String = chars[start..i].iter().collect();
+                        if let Some((k, v)) = parse_key_value(&part) {
+                            entries.push((k, v));
+                        } else {
+                            return None;
+                        }
+                        start = i + 1;
+                    }
+                }
+            }
+            if start < chars.len() {
+                let part: String = chars[start..].iter().collect();
+                if let Some((k, v)) = parse_key_value(&part) {
+                    entries.push((k, v));
+                } else {
+                    return None;
+                }
+            }
+            Some(JsonbBuilderValue::Object(entries))
+        }
+
+        fn parse_key_value(s: &str) -> Option<(String, JsonbBuilderValue)> {
+            let s = s.trim();
+            let colon_pos = s.find(':')?;
+            let key_part = s[..colon_pos].trim();
+            let val_part = s[colon_pos + 1..].trim();
+            if key_part.starts_with('"') && key_part.ends_with('"') && key_part.len() >= 2 {
+                let key = key_part[1..key_part.len() - 1].to_string();
+                let value = parse_value(val_part)?;
+                Some((key, value))
+            } else {
+                None
+            }
+        }
+
+        fn parse_array(s: &str) -> Option<JsonbBuilderValue> {
+            let s = s.trim();
+            if s.is_empty() {
+                return Some(JsonbBuilderValue::Array(Vec::new()));
+            }
+            let mut elements = Vec::new();
+            let mut depth = 0;
+            let mut in_string = false;
+            let mut escape = false;
+            let mut start = 0;
+
+            let chars: Vec<char> = s.chars().collect();
+            for (i, &c) in chars.iter().enumerate() {
+                if escape {
+                    escape = false;
+                    continue;
+                }
+                if c == '\\' && in_string {
+                    escape = true;
+                    continue;
+                }
+                if c == '"' {
+                    in_string = !in_string;
+                } else if !in_string {
+                    if c == '{' || c == '[' {
+                        depth += 1;
+                    } else if c == '}' || c == ']' {
+                        depth -= 1;
+                    } else if c == ',' && depth == 0 {
+                        let part: String = chars[start..i].iter().collect();
+                        if let Some(v) = parse_value(&part) {
+                            elements.push(v);
+                        } else {
+                            return None;
+                        }
+                        start = i + 1;
+                    }
+                }
+            }
+            if start < chars.len() {
+                let part: String = chars[start..].iter().collect();
+                if let Some(v) = parse_value(&part) {
+                    elements.push(v);
+                } else {
+                    return None;
+                }
+            }
+            Some(JsonbBuilderValue::Array(elements))
+        }
+
+        fn build_jsonb(value: &JsonbBuilderValue) -> Vec<u8> {
+            match value {
+                JsonbBuilderValue::Null => JsonbBuilder::new_null().build(),
+                JsonbBuilderValue::Bool(b) => JsonbBuilder::new_bool(*b).build(),
+                JsonbBuilderValue::Number(n) => JsonbBuilder::new_number(*n).build(),
+                JsonbBuilderValue::String(s) => JsonbBuilder::new_string(s.clone()).build(),
+                JsonbBuilderValue::Array(elements) => {
+                    let mut builder = JsonbBuilder::new_array();
+                    for elem in elements {
+                        builder.push(elem.clone());
+                    }
+                    builder.build()
+                }
+                JsonbBuilderValue::Object(entries) => {
+                    let mut builder = JsonbBuilder::new_object();
+                    for (key, val) in entries {
+                        builder.set(key.clone(), val.clone());
+                    }
+                    builder.build()
+                }
+            }
+        }
+
+        let value = parse_value(s)?;
+        Some(build_jsonb(&value))
     }
 
     fn eval_function(
