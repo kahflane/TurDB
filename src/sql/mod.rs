@@ -52,6 +52,7 @@ pub mod context;
 pub mod decoder;
 pub mod executor;
 pub mod expr;
+pub mod functions;
 pub mod lexer;
 pub mod parser;
 pub mod planner;
