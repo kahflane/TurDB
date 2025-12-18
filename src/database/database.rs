@@ -1,7 +1,10 @@
 use crate::database::row::Row;
 use crate::database::{CheckpointInfo, ExecuteResult, RecoveryInfo};
 use crate::mvcc::{TransactionManager, TxnId, TxnState, WriteEntry};
-use crate::parsing::{parse_binary_blob, parse_hex_blob, parse_interval, parse_uuid, parse_vector};
+use crate::parsing::{
+    parse_binary_blob, parse_date, parse_hex_blob, parse_interval, parse_time, parse_timestamp,
+    parse_uuid, parse_vector,
+};
 use crate::schema::{Catalog, ColumnDef as SchemaColumnDef};
 use crate::sql::ast::IsolationLevel;
 use crate::sql::builder::ExecutorBuilder;
@@ -4355,6 +4358,10 @@ impl Database {
                     Some(DataType::Jsonb) => Self::parse_json_string(s),
                     Some(DataType::Vector) => parse_vector(s),
                     Some(DataType::Interval) => parse_interval(s),
+                    Some(DataType::Timestamp) => parse_timestamp(s),
+                    Some(DataType::TimestampTz) => parse_timestamp(s),
+                    Some(DataType::Date) => parse_date(s),
+                    Some(DataType::Time) => parse_time(s),
                     _ => Ok(OwnedValue::Text(s.to_string())),
                 },
                 Literal::Boolean(b) => Ok(OwnedValue::Bool(*b)),
