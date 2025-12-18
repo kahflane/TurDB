@@ -279,6 +279,152 @@ impl<'a> JsonbView<'a> {
         }
         Ok(self.entry_count() / 2)
     }
+
+    pub fn iter_object(&self) -> Result<ObjectIter<'a>> {
+        if self.root_type() != JSONB_TYPE_OBJECT {
+            bail!("cannot iterate over non-object jsonb");
+        }
+        Ok(ObjectIter {
+            view: *self,
+            pair_idx: 0,
+            pair_count: self.entry_count() / 2,
+        })
+    }
+
+    pub fn iter_array(&self) -> Result<ArrayIter<'a>> {
+        if self.root_type() != JSONB_TYPE_ARRAY {
+            bail!("cannot iterate over non-array jsonb");
+        }
+        Ok(ArrayIter {
+            view: *self,
+            idx: 0,
+            len: self.entry_count(),
+        })
+    }
+
+    pub fn to_json_string(&self) -> Result<String> {
+        match self.root_type() {
+            JSONB_TYPE_OBJECT => {
+                let mut result = String::from("{");
+                let mut first = true;
+                for item in self.iter_object()? {
+                    let (key, value) = item?;
+                    if !first {
+                        result.push(',');
+                    }
+                    first = false;
+                    result.push_str(&escape_json_string(key));
+                    result.push(':');
+                    result.push_str(&value.to_json_string()?);
+                }
+                result.push('}');
+                Ok(result)
+            }
+            JSONB_TYPE_ARRAY => {
+                let mut result = String::from("[");
+                let mut first = true;
+                for item in self.iter_array()? {
+                    let value = item?;
+                    if !first {
+                        result.push(',');
+                    }
+                    first = false;
+                    result.push_str(&value.to_json_string()?);
+                }
+                result.push(']');
+                Ok(result)
+            }
+            _ => self.as_value()?.to_json_string(),
+        }
+    }
+}
+
+pub struct ObjectIter<'a> {
+    view: JsonbView<'a>,
+    pair_idx: usize,
+    pair_count: usize,
+}
+
+impl<'a> Iterator for ObjectIter<'a> {
+    type Item = Result<(&'a str, JsonbValue<'a>)>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.pair_idx >= self.pair_count {
+            return None;
+        }
+        let key = match self.view.read_key_at(self.pair_idx) {
+            Ok(k) => k,
+            Err(e) => return Some(Err(e)),
+        };
+        let value = match self.view.read_value_at(self.pair_idx) {
+            Ok(v) => v,
+            Err(e) => return Some(Err(e)),
+        };
+        self.pair_idx += 1;
+        Some(Ok((key, value)))
+    }
+}
+
+pub struct ArrayIter<'a> {
+    view: JsonbView<'a>,
+    idx: usize,
+    len: usize,
+}
+
+impl<'a> Iterator for ArrayIter<'a> {
+    type Item = Result<JsonbValue<'a>>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.idx >= self.len {
+            return None;
+        }
+        let entry = self.view.read_entry(self.idx);
+        self.idx += 1;
+        Some(self.view.decode_entry(entry))
+    }
+}
+
+impl<'a> JsonbValue<'a> {
+    pub fn to_json_string(&self) -> Result<String> {
+        match self {
+            JsonbValue::Null => Ok("null".to_string()),
+            JsonbValue::Bool(b) => Ok(if *b { "true" } else { "false" }.to_string()),
+            JsonbValue::Number(n) => Ok(format_json_number(*n)),
+            JsonbValue::String(s) => Ok(escape_json_string(s)),
+            JsonbValue::Array(view) => view.to_json_string(),
+            JsonbValue::Object(view) => view.to_json_string(),
+        }
+    }
+}
+
+fn escape_json_string(s: &str) -> String {
+    let mut result = String::with_capacity(s.len() + 2);
+    result.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => result.push_str("\\\""),
+            '\\' => result.push_str("\\\\"),
+            '\n' => result.push_str("\\n"),
+            '\r' => result.push_str("\\r"),
+            '\t' => result.push_str("\\t"),
+            c if c.is_control() => {
+                result.push_str(&format!("\\u{:04x}", c as u32));
+            }
+            c => result.push(c),
+        }
+    }
+    result.push('"');
+    result
+}
+
+fn format_json_number(n: f64) -> String {
+    if n.is_nan() || n.is_infinite() {
+        "null".to_string()
+    } else if n.fract() == 0.0 && n.abs() < (i64::MAX as f64) {
+        format!("{}", n as i64)
+    } else {
+        format!("{}", n)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
