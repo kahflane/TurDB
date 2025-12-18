@@ -33,7 +33,8 @@
       "Bash(cloc:*)",
       "Bash(cargo clean:*)",
       "Bash(ls:*)",
-      "Bash(tee:*)"
+      "Bash(tee:*)",
+      "Bash(./target/release/turdb:*)"
     ]
   }
 }

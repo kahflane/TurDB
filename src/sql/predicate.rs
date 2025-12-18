@@ -957,12 +957,14 @@ impl<'a> CompiledPredicate<'a> {
                 JsonbValue::Bool(b) => Some(Value::Text(Cow::Owned(b.to_string()))),
                 JsonbValue::Number(n) => Some(Value::Text(Cow::Owned(n.to_string()))),
                 JsonbValue::String(s) => Some(Value::Text(Cow::Owned(s.to_string()))),
-                JsonbValue::Array(view) => {
-                    Some(Value::Text(Cow::Owned(format!("<jsonb array: {} bytes>", view.data().len()))))
-                }
-                JsonbValue::Object(view) => {
-                    Some(Value::Text(Cow::Owned(format!("<jsonb object: {} bytes>", view.data().len()))))
-                }
+                JsonbValue::Array(view) => match view.to_json_string() {
+                    Ok(s) => Some(Value::Text(Cow::Owned(s))),
+                    Err(_) => Some(Value::Null),
+                },
+                JsonbValue::Object(view) => match view.to_json_string() {
+                    Ok(s) => Some(Value::Text(Cow::Owned(s))),
+                    Err(_) => Some(Value::Null),
+                },
             }
         } else {
             match val {
