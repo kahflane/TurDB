@@ -79,6 +79,7 @@ pub enum Constraint {
     NotNull,
     PrimaryKey,
     Unique,
+    AutoIncrement,
     ForeignKey { table: String, column: String },
     Check(String),
 }
@@ -137,6 +138,7 @@ impl ColumnDef {
                     (Constraint::NotNull, Constraint::NotNull) => true,
                     (Constraint::PrimaryKey, Constraint::PrimaryKey) => true,
                     (Constraint::Unique, Constraint::Unique) => true,
+                    (Constraint::AutoIncrement, Constraint::AutoIncrement) => true,
                     (
                         Constraint::ForeignKey {
                             table: t1,

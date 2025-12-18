@@ -1637,6 +1637,10 @@ impl Database {
             .columns
             .iter()
             .map(|col| {
+                use crate::schema::table::Constraint as SchemaConstraint;
+                use crate::sql::ast::ColumnConstraint;
+                use crate::sql::ast::DataType as SqlDataType;
+
                 let data_type = Self::convert_data_type(&col.data_type);
                 let mut column = SchemaColumnDef::new(col.name.to_string(), data_type);
 
@@ -1645,9 +1649,6 @@ impl Database {
                 }
 
                 for constraint in col.constraints {
-                    use crate::schema::table::Constraint as SchemaConstraint;
-                    use crate::sql::ast::ColumnConstraint;
-
                     match constraint {
                         ColumnConstraint::NotNull => {
                             column = column.with_constraint(SchemaConstraint::NotNull);
@@ -1682,9 +1683,18 @@ impl Database {
                                 column: fk_column.to_string(),
                             });
                         }
+                        ColumnConstraint::AutoIncrement => {
+                            column = column.with_constraint(SchemaConstraint::AutoIncrement);
+                        }
                         ColumnConstraint::Null | ColumnConstraint::Generated { .. } => {}
                     }
                 }
+
+                if matches!(col.data_type, SqlDataType::Serial | SqlDataType::BigSerial | SqlDataType::SmallSerial) {
+                    column = column.with_constraint(SchemaConstraint::AutoIncrement);
+                    column = column.with_constraint(SchemaConstraint::NotNull);
+                }
+
                 column
             })
             .collect();
@@ -2004,17 +2014,40 @@ impl Database {
         let column_types: Vec<crate::records::types::DataType> =
             columns.iter().map(|c| c.data_type()).collect();
 
+        let insert_col_indices: Option<Vec<usize>> = insert.columns.map(|cols| {
+            cols.iter()
+                .filter_map(|col_name| {
+                    columns.iter().position(|c| c.name().eq_ignore_ascii_case(col_name))
+                })
+                .collect()
+        });
+
+        let auto_increment_col_idx: Option<usize> = columns
+            .iter()
+            .position(|c| c.has_constraint(&Constraint::AutoIncrement));
+
         let rows_to_insert: Vec<Vec<OwnedValue>> = match &insert.source {
             crate::sql::ast::InsertSource::Values(values) => {
                 let mut result = Vec::with_capacity(values.len());
                 for row_exprs in values.iter() {
-                    let row: Vec<OwnedValue> = row_exprs
-                        .iter()
-                        .zip(column_types.iter())
-                        .map(|(expr, data_type)| {
-                            Database::eval_literal_with_type(expr, Some(data_type))
-                        })
-                        .collect::<Result<Vec<_>>>()?;
+                    let mut row = vec![OwnedValue::Null; columns.len()];
+
+                    if let Some(ref col_indices) = insert_col_indices {
+                        for (val_idx, &col_idx) in col_indices.iter().enumerate() {
+                            if let Some(expr) = row_exprs.get(val_idx) {
+                                let data_type = column_types.get(col_idx);
+                                row[col_idx] = Database::eval_literal_with_type(expr, data_type)?;
+                            }
+                        }
+                    } else {
+                        for (idx, expr) in row_exprs.iter().enumerate() {
+                            if idx < columns.len() {
+                                let data_type = column_types.get(idx);
+                                row[idx] = Database::eval_literal_with_type(expr, data_type)?;
+                            }
+                        }
+                    }
+
                     result.push(row);
                 }
                 result
@@ -2044,6 +2077,16 @@ impl Database {
 
         for row_values in rows_to_insert.iter() {
             let mut values: Vec<OwnedValue> = row_values.clone();
+
+            if let Some(auto_col_idx) = auto_increment_col_idx {
+                if values.get(auto_col_idx).is_none_or(|v| v.is_null()) {
+                    let storage = file_manager.table_data_mut(schema_name, table_name)?;
+                    let page = storage.page_mut(0)?;
+                    let header = TableFileHeader::from_bytes_mut(page)?;
+                    let next_val = header.next_auto_increment() + 1;
+                    values[auto_col_idx] = OwnedValue::Int(next_val as i64);
+                }
+            }
 
             validator.validate_insert(&mut values)?;
 
@@ -3481,6 +3524,33 @@ impl Database {
             }
 
             storage.sync()?;
+
+            let catalog_guard = self.catalog.read();
+            let catalog = catalog_guard.as_ref().unwrap();
+            let table_def = catalog.resolve_table(table_name)?;
+            let indexes: Vec<String> = table_def.indexes().iter().map(|i| i.name().to_string()).collect();
+            drop(catalog_guard);
+
+            for index_name in indexes {
+                if file_manager.index_exists(schema_name, table_name, &index_name) {
+                    let index_storage = file_manager.index_data_mut(schema_name, table_name, &index_name)?;
+                    let index_btree = BTree::new(index_storage, root_page)?;
+                    let mut index_cursor = index_btree.cursor_first()?;
+
+                    let mut index_keys_to_delete: Vec<Vec<u8>> = Vec::new();
+                    while index_cursor.valid() {
+                        index_keys_to_delete.push(index_cursor.key()?.to_vec());
+                        index_cursor.advance()?;
+                    }
+
+                    let mut index_btree_mut = BTree::new(index_storage, root_page)?;
+                    for key in &index_keys_to_delete {
+                        index_btree_mut.delete(key)?;
+                    }
+
+                    index_storage.sync()?;
+                }
+            }
         }
 
         Ok(ExecuteResult::Truncate {
@@ -3863,6 +3933,9 @@ impl Database {
             SqlType::BigInt => DataType::Int8,
             SqlType::SmallInt => DataType::Int2,
             SqlType::TinyInt => DataType::Int2,
+            SqlType::Serial => DataType::Int4,
+            SqlType::BigSerial => DataType::Int8,
+            SqlType::SmallSerial => DataType::Int2,
             SqlType::Real | SqlType::DoublePrecision => DataType::Float8,
             SqlType::Decimal(_, _) | SqlType::Numeric(_, _) => DataType::Float8,
             SqlType::Varchar(_) => DataType::Varchar,

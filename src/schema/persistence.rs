@@ -248,6 +248,9 @@ impl CatalogPersistence {
                 buf.extend((expr_bytes.len() as u16).to_le_bytes());
                 buf.extend(expr_bytes);
             }
+            Constraint::AutoIncrement => {
+                buf.push(5);
+            }
         }
         Ok(())
     }
@@ -646,6 +649,7 @@ impl CatalogPersistence {
 
                 Ok((Constraint::Check(expr), pos))
             }
+            5 => Ok((Constraint::AutoIncrement, pos)),
             _ => bail!("unknown constraint type: {}", constraint_type),
         }
     }
