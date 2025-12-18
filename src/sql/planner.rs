@@ -1246,6 +1246,10 @@ impl<'a> Planner<'a> {
                 Ok(())
             }
             Expr::IsNull { expr, .. } => self.validate_expr_columns(expr, tables),
+            Expr::Like { expr, pattern, .. } => {
+                self.validate_expr_columns(expr, tables)?;
+                self.validate_expr_columns(pattern, tables)
+            }
             _ => Ok(()),
         }
     }
