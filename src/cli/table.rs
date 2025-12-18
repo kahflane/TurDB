@@ -200,10 +200,8 @@ fn format_vector(floats: &[f32]) -> String {
 }
 
 fn format_date(days_since_epoch: i32) -> String {
-    let epoch = 719528;
-    let total_days = epoch + days_since_epoch;
-
-    let (year, month, day) = days_to_ymd(total_days);
+    let jdn = 2440588 + days_since_epoch;
+    let (year, month, day) = jdn_to_ymd(jdn);
     format!("{:04}-{:02}-{:02}", year, month, day)
 }
 
@@ -225,12 +223,11 @@ fn format_timestamp(micros: i64) -> String {
     let seconds = micros / 1_000_000;
     let micros_part = (micros % 1_000_000).abs();
 
-    let days = (seconds / 86400) as i32;
+    let days = seconds / 86400;
     let time_of_day = (seconds % 86400).abs();
 
-    let epoch = 719528;
-    let total_days = epoch + days;
-    let (year, month, day) = days_to_ymd(total_days);
+    let jdn = 2440588 + days as i32;
+    let (year, month, day) = jdn_to_ymd(jdn);
 
     let hours = time_of_day / 3600;
     let minutes = (time_of_day % 3600) / 60;
@@ -276,8 +273,8 @@ fn format_interval(micros: i64, days: i32, months: i32) -> String {
     }
 }
 
-fn days_to_ymd(total_days: i32) -> (i32, u32, u32) {
-    let a = total_days + 32044;
+fn jdn_to_ymd(jdn: i32) -> (i32, u32, u32) {
+    let a = jdn + 32044;
     let b = (4 * a + 3) / 146097;
     let c = a - (146097 * b) / 4;
     let d = (4 * c + 3) / 1461;

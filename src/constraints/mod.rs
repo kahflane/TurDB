@@ -215,6 +215,17 @@ impl<'a> ConstraintValidator<'a> {
     }
 
     fn parse_date_default(s: &str) -> OwnedValue {
+        let upper = s.to_uppercase();
+        if upper == "CURRENT_DATE" {
+            use std::time::SystemTime;
+            let now = SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0);
+            let days = (now / 86400) as i32;
+            return OwnedValue::Date(days);
+        }
+        
         let parts: SmallVec<[&str; 4]> = s.split('-').collect();
         if parts.len() != 3 {
             return OwnedValue::Null;
@@ -244,6 +255,18 @@ impl<'a> ConstraintValidator<'a> {
     }
 
     fn parse_time_default(s: &str) -> OwnedValue {
+        let upper = s.to_uppercase();
+        if upper == "CURRENT_TIME" {
+            use std::time::SystemTime;
+            let now = SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0);
+            let day_secs = now % 86400;
+            let micros = day_secs * 1_000_000;
+            return OwnedValue::Time(micros);
+        }
+        
         let parts: SmallVec<[&str; 4]> = s.split(':').collect();
         if parts.len() < 2 {
             return OwnedValue::Null;
@@ -275,6 +298,20 @@ impl<'a> ConstraintValidator<'a> {
     }
 
     fn parse_timestamp_default(s: &str) -> OwnedValue {
+        let upper = s.to_uppercase();
+        if upper == "CURRENT_TIMESTAMP" || upper == "NOW" || upper == "LOCALTIME" || upper == "LOCALTIMESTAMP" {
+            use std::time::SystemTime;
+            let now = SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .map(|d| {
+                    let secs = d.as_secs() as i64;
+                    let micros = d.subsec_micros() as i64;
+                    secs * 1_000_000 + micros
+                })
+                .unwrap_or(0);
+            return OwnedValue::Timestamp(now);
+        }
+        
         let datetime_parts: SmallVec<[&str; 2]> = s.split(&[' ', 'T'][..]).collect();
         if datetime_parts.is_empty() {
             return OwnedValue::Null;

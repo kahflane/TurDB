@@ -2649,6 +2649,10 @@ impl<'a> Parser<'a> {
                 self.advance();
                 Ok(DataType::Date)
             }
+            Token::Keyword(Keyword::Datetime) => {
+                self.advance();
+                Ok(DataType::Timestamp)
+            }
             Token::Keyword(Keyword::Time) => {
                 self.advance();
                 Ok(DataType::Time)
