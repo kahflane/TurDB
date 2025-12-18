@@ -282,7 +282,8 @@
       "files": ["src/database/database.rs", "src/sql/planner.rs"],
       "effort": "~200 lines, 2-3 days",
       "impact": "Complex updates not supported",
-      "status": "pending"
+      "status": "completed",
+      "notes": "Implemented UPDATE...FROM for single table FROM clause with aliases and RETURNING support. Multi-table FROM (comma-separated joins) returns error as expected."
     },
     {
       "id": 14,

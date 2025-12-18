@@ -2449,3 +2449,243 @@ mod returning_clause_tests {
         );
     }
 }
+
+mod update_from_tests {
+    use super::*;
+
+    #[test]
+    fn update_from_simple_table_join() {
+        let dir = tempdir().unwrap();
+        let db = Database::create(dir.path().join("test_db")).unwrap();
+
+        db.execute("CREATE TABLE products (id INT, name TEXT, price INT)")
+            .unwrap();
+        db.execute("CREATE TABLE price_updates (product_id INT, new_price INT)")
+            .unwrap();
+
+        db.execute("INSERT INTO products VALUES (1, 'Apple', 100)")
+            .unwrap();
+        db.execute("INSERT INTO products VALUES (2, 'Banana', 50)")
+            .unwrap();
+        db.execute("INSERT INTO products VALUES (3, 'Cherry', 75)")
+            .unwrap();
+
+        db.execute("INSERT INTO price_updates VALUES (1, 120)")
+            .unwrap();
+        db.execute("INSERT INTO price_updates VALUES (3, 90)")
+            .unwrap();
+
+        let result = db
+            .execute(
+                "UPDATE products SET price = price_updates.new_price
+                 FROM price_updates
+                 WHERE products.id = price_updates.product_id",
+            )
+            .unwrap();
+
+        assert!(
+            matches!(result, ExecuteResult::Update { rows_affected: 2, .. }),
+            "UPDATE...FROM SHOULD update 2 rows that match the join condition"
+        );
+
+        let rows = db.query("SELECT id, price FROM products ORDER BY id").unwrap();
+        assert_eq!(rows.len(), 3, "All 3 products should still exist");
+
+        assert_eq!(
+            rows[0].values[1],
+            OwnedValue::Int(120),
+            "Product 1 price SHOULD be updated to 120"
+        );
+        assert_eq!(
+            rows[1].values[1],
+            OwnedValue::Int(50),
+            "Product 2 price SHOULD remain 50 (not in price_updates)"
+        );
+        assert_eq!(
+            rows[2].values[1],
+            OwnedValue::Int(90),
+            "Product 3 price SHOULD be updated to 90"
+        );
+    }
+
+    #[test]
+    fn update_from_with_alias() {
+        let dir = tempdir().unwrap();
+        let db = Database::create(dir.path().join("test_db")).unwrap();
+
+        db.execute("CREATE TABLE employees (id INT, name TEXT, dept_id INT, salary INT)")
+            .unwrap();
+        db.execute("CREATE TABLE departments (id INT, name TEXT, budget INT)")
+            .unwrap();
+
+        db.execute("INSERT INTO employees VALUES (1, 'Alice', 10, 50000)")
+            .unwrap();
+        db.execute("INSERT INTO employees VALUES (2, 'Bob', 20, 60000)")
+            .unwrap();
+
+        db.execute("INSERT INTO departments VALUES (10, 'Engineering', 100000)")
+            .unwrap();
+        db.execute("INSERT INTO departments VALUES (20, 'Sales', 80000)")
+            .unwrap();
+
+        let result = db
+            .execute(
+                "UPDATE employees AS e SET salary = salary + 10000
+                 FROM departments AS d
+                 WHERE e.dept_id = d.id AND d.name = 'Engineering'",
+            )
+            .unwrap();
+
+        assert!(
+            matches!(result, ExecuteResult::Update { rows_affected: 1, .. }),
+            "UPDATE...FROM with alias SHOULD update 1 row in Engineering dept"
+        );
+
+        let rows = db.query("SELECT id, salary FROM employees ORDER BY id").unwrap();
+
+        assert_eq!(
+            rows[0].values[1],
+            OwnedValue::Int(60000),
+            "Alice's salary SHOULD be 50000 + 10000 = 60000"
+        );
+        assert_eq!(
+            rows[1].values[1],
+            OwnedValue::Int(60000),
+            "Bob's salary SHOULD remain 60000 (not in Engineering)"
+        );
+    }
+
+    #[test]
+    fn update_from_multiple_tables_comma_join() {
+        let dir = tempdir().unwrap();
+        let db = Database::create(dir.path().join("test_db")).unwrap();
+
+        db.execute("CREATE TABLE orders (id INT, customer_id INT, status TEXT)")
+            .unwrap();
+        db.execute("CREATE TABLE customers (id INT, tier TEXT)")
+            .unwrap();
+        db.execute("CREATE TABLE promotions (tier TEXT, new_status TEXT)")
+            .unwrap();
+
+        db.execute("INSERT INTO orders VALUES (1, 100, 'pending')")
+            .unwrap();
+        db.execute("INSERT INTO orders VALUES (2, 200, 'pending')")
+            .unwrap();
+        db.execute("INSERT INTO orders VALUES (3, 100, 'shipped')")
+            .unwrap();
+
+        db.execute("INSERT INTO customers VALUES (100, 'gold')").unwrap();
+        db.execute("INSERT INTO customers VALUES (200, 'silver')").unwrap();
+
+        db.execute("INSERT INTO promotions VALUES ('gold', 'priority')")
+            .unwrap();
+        db.execute("INSERT INTO promotions VALUES ('silver', 'standard')")
+            .unwrap();
+
+        let result = db
+            .execute(
+                "UPDATE orders SET status = promotions.new_status
+                 FROM customers, promotions
+                 WHERE orders.customer_id = customers.id
+                   AND customers.tier = promotions.tier",
+            )
+            .unwrap();
+
+        assert!(
+            matches!(result, ExecuteResult::Update { rows_affected: 3, .. }),
+            "UPDATE...FROM with multiple tables SHOULD update 3 rows"
+        );
+
+        let rows = db.query("SELECT id, status FROM orders ORDER BY id").unwrap();
+        assert_eq!(
+            rows[0].values[1],
+            OwnedValue::Text("priority".to_string()),
+            "Order 1 (gold customer) status SHOULD be 'priority'"
+        );
+        assert_eq!(
+            rows[1].values[1],
+            OwnedValue::Text("standard".to_string()),
+            "Order 2 (silver customer) status SHOULD be 'standard'"
+        );
+        assert_eq!(
+            rows[2].values[1],
+            OwnedValue::Text("priority".to_string()),
+            "Order 3 (gold customer) status SHOULD be 'priority'"
+        );
+    }
+
+    #[test]
+    fn update_from_no_matching_rows() {
+        let dir = tempdir().unwrap();
+        let db = Database::create(dir.path().join("test_db")).unwrap();
+
+        db.execute("CREATE TABLE target (id INT, value INT)")
+            .unwrap();
+        db.execute("CREATE TABLE source (id INT, value INT)")
+            .unwrap();
+
+        db.execute("INSERT INTO target VALUES (1, 100)").unwrap();
+        db.execute("INSERT INTO source VALUES (999, 200)").unwrap();
+
+        let result = db
+            .execute(
+                "UPDATE target SET value = source.value
+                 FROM source
+                 WHERE target.id = source.id",
+            )
+            .unwrap();
+
+        assert!(
+            matches!(result, ExecuteResult::Update { rows_affected: 0, .. }),
+            "UPDATE...FROM with no matching rows SHOULD update 0 rows"
+        );
+
+        let rows = db.query("SELECT id, value FROM target").unwrap();
+        assert_eq!(
+            rows[0].values[1],
+            OwnedValue::Int(100),
+            "Target value SHOULD remain unchanged"
+        );
+    }
+
+    #[test]
+    fn update_from_with_returning() {
+        let dir = tempdir().unwrap();
+        let db = Database::create(dir.path().join("test_db")).unwrap();
+
+        db.execute("CREATE TABLE inventory (id INT, name TEXT, quantity INT)")
+            .unwrap();
+        db.execute("CREATE TABLE restocks (product_id INT, add_quantity INT)")
+            .unwrap();
+
+        db.execute("INSERT INTO inventory VALUES (1, 'Widget', 10)")
+            .unwrap();
+        db.execute("INSERT INTO inventory VALUES (2, 'Gadget', 5)")
+            .unwrap();
+
+        db.execute("INSERT INTO restocks VALUES (1, 15)").unwrap();
+
+        let result = db
+            .execute(
+                "UPDATE inventory SET quantity = quantity + restocks.add_quantity
+                 FROM restocks
+                 WHERE inventory.id = restocks.product_id
+                 RETURNING id, name, quantity",
+            )
+            .unwrap();
+
+        match result {
+            ExecuteResult::Update { rows_affected, returned } => {
+                assert_eq!(rows_affected, 1, "SHOULD update 1 row");
+                let returned_rows = returned.expect("RETURNING SHOULD produce rows");
+                assert_eq!(returned_rows.len(), 1, "SHOULD return 1 row");
+                assert_eq!(
+                    returned_rows[0].values[2],
+                    OwnedValue::Int(25),
+                    "Returned quantity SHOULD be 10 + 15 = 25"
+                );
+            }
+            other => panic!("Expected Update result, got {:?}", other),
+        }
+    }
+}
