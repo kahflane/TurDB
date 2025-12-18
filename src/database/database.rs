@@ -1599,6 +1599,7 @@ impl Database {
             Statement::Savepoint(savepoint) => self.execute_savepoint(savepoint),
             Statement::Release(release) => self.execute_release(release),
             Statement::Truncate(truncate) => self.execute_truncate(truncate),
+            Statement::AlterTable(alter) => self.execute_alter_table(alter),
             _ => bail!("unsupported statement type"),
         }
     }
@@ -3562,6 +3563,119 @@ impl Database {
         Ok(ExecuteResult::Truncate {
             rows_affected: total_rows_affected,
         })
+    }
+
+    fn execute_alter_table(
+        &self,
+        alter: &crate::sql::ast::AlterTableStmt<'_>,
+    ) -> Result<ExecuteResult> {
+        use crate::sql::ast::AlterTableAction;
+
+        self.ensure_catalog()?;
+        self.ensure_file_manager()?;
+
+        let schema_name = alter.table.schema.unwrap_or("root");
+        let table_name = alter.table.name;
+
+        let action_desc = match &alter.action {
+            AlterTableAction::RenameTable(new_name) => {
+                {
+                    let mut file_manager_guard = self.file_manager.write();
+                    let file_manager = file_manager_guard.as_mut().unwrap();
+                    file_manager.rename_table(schema_name, table_name, new_name)?;
+                }
+
+                {
+                    let mut catalog_guard = self.catalog.write();
+                    let catalog = catalog_guard.as_mut().unwrap();
+                    let schema = catalog
+                        .get_schema_mut(schema_name)
+                        .ok_or_else(|| eyre::eyre!("schema '{}' not found", schema_name))?;
+                    if !schema.table_exists(table_name) {
+                        bail!("table '{}' not found in schema '{}'", table_name, schema_name);
+                    }
+                    schema.rename_table(table_name, new_name);
+                }
+
+                format!("renamed table to '{}'", new_name)
+            }
+            _ => {
+                let mut catalog_guard = self.catalog.write();
+                let catalog = catalog_guard.as_mut().unwrap();
+
+                let schema = catalog
+                    .get_schema_mut(schema_name)
+                    .ok_or_else(|| eyre::eyre!("schema '{}' not found", schema_name))?;
+
+                if !schema.table_exists(table_name) {
+                    bail!("table '{}' not found in schema '{}'", table_name, schema_name);
+                }
+
+                match &alter.action {
+                    AlterTableAction::DropColumn { name, if_exists, .. } => {
+                        let table = schema.get_table_mut(table_name).unwrap();
+                        if table.drop_column(name).is_none() && !if_exists {
+                            bail!("column '{}' not found in table '{}'", name, table_name);
+                        }
+                        format!("dropped column '{}'", name)
+                    }
+                    AlterTableAction::RenameColumn { old_name, new_name } => {
+                        let table = schema.get_table_mut(table_name).unwrap();
+                        if !table.rename_column(old_name, new_name) {
+                            bail!("column '{}' not found in table '{}'", old_name, table_name);
+                        }
+                        format!("renamed column '{}' to '{}'", old_name, new_name)
+                    }
+                    AlterTableAction::AddColumn(col_def) => {
+                        let table = schema.get_table_mut(table_name).unwrap();
+                        let column = Self::ast_column_to_schema_column(col_def)?;
+                        let col_name = column.name().to_string();
+                        table.add_column(column);
+                        format!("added column '{}'", col_name)
+                    }
+                    _ => bail!("ALTER TABLE action not yet supported"),
+                }
+            }
+        };
+
+        self.save_catalog()?;
+
+        Ok(ExecuteResult::AlterTable { action: action_desc })
+    }
+
+    fn ast_column_to_schema_column(
+        col_def: &crate::sql::ast::ColumnDef<'_>,
+    ) -> Result<crate::schema::table::ColumnDef> {
+        use crate::schema::table::{ColumnDef as SchemaColumnDef, Constraint as SchemaConstraint};
+
+        let data_type = Self::convert_data_type(&col_def.data_type);
+        let mut column = SchemaColumnDef::new(col_def.name, data_type);
+
+        for constraint in col_def.constraints.iter() {
+            match constraint {
+                crate::sql::ast::ColumnConstraint::NotNull => {
+                    column = column.with_constraint(SchemaConstraint::NotNull);
+                }
+                crate::sql::ast::ColumnConstraint::PrimaryKey => {
+                    column = column.with_constraint(SchemaConstraint::PrimaryKey);
+                    column = column.with_constraint(SchemaConstraint::NotNull);
+                }
+                crate::sql::ast::ColumnConstraint::Unique => {
+                    column = column.with_constraint(SchemaConstraint::Unique);
+                }
+                crate::sql::ast::ColumnConstraint::AutoIncrement => {
+                    column = column.with_constraint(SchemaConstraint::AutoIncrement);
+                }
+                crate::sql::ast::ColumnConstraint::Default(expr) => {
+                    if let Some(default_str) = Self::expr_to_default_string(expr) {
+                        column = column.with_default(default_str);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        Ok(column)
     }
 
     fn execute_drop_table(

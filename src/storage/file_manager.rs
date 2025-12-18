@@ -457,6 +457,49 @@ impl FileManager {
         Ok(())
     }
 
+    pub fn rename_table(&mut self, schema: &str, old_name: &str, new_name: &str) -> Result<()> {
+        ensure!(
+            self.table_exists(schema, old_name),
+            "table '{}.{}' does not exist",
+            schema,
+            old_name
+        );
+
+        ensure!(
+            !self.table_exists(schema, new_name),
+            "table '{}.{}' already exists",
+            schema,
+            new_name
+        );
+
+        let old_table_path = self.table_file_path(schema, old_name);
+        let new_table_path = self.table_file_path(schema, new_name);
+
+        fs::rename(&old_table_path, &new_table_path).wrap_err_with(|| {
+            format!(
+                "failed to rename table file from '{}' to '{}'",
+                old_table_path.display(),
+                new_table_path.display()
+            )
+        })?;
+
+        for index_name in self.list_indexes(schema, old_name).unwrap_or_default() {
+            let old_index_path = self.index_file_path(schema, old_name, &index_name);
+            let new_index_path = self.index_file_path(schema, new_name, &index_name);
+            if old_index_path.exists() {
+                fs::rename(&old_index_path, &new_index_path).wrap_err_with(|| {
+                    format!(
+                        "failed to rename index file from '{}' to '{}'",
+                        old_index_path.display(),
+                        new_index_path.display()
+                    )
+                })?;
+            }
+        }
+
+        Ok(())
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn create_index(
         &mut self,

@@ -158,4 +158,14 @@ impl Schema {
     pub fn tables_mut(&mut self) -> &mut HashMap<String, TableDef> {
         &mut self.tables
     }
+
+    pub fn rename_table(&mut self, old_name: &str, new_name: &str) -> bool {
+        if let Some(mut table) = self.tables.remove(old_name) {
+            table.rename(new_name);
+            self.tables.insert(new_name.to_string(), table);
+            true
+        } else {
+            false
+        }
+    }
 }

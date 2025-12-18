@@ -314,6 +314,9 @@ impl Repl {
             ExecuteResult::Release { name } => {
                 println!("Savepoint '{}' released ({:.3} sec)", name, elapsed.as_secs_f64());
             }
+            ExecuteResult::AlterTable { action } => {
+                println!("Table altered: {} ({:.3} sec)", action, elapsed.as_secs_f64());
+            }
         }
     }
 
