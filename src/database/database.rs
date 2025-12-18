@@ -3792,7 +3792,8 @@ impl Database {
         use crate::sql::ast::DataType as SqlType;
 
         match sql_type {
-            SqlType::Integer | SqlType::BigInt => DataType::Int8,
+            SqlType::Integer => DataType::Int4,
+            SqlType::BigInt => DataType::Int8,
             SqlType::SmallInt => DataType::Int2,
             SqlType::TinyInt => DataType::Int2,
             SqlType::Real | SqlType::DoublePrecision => DataType::Float8,
@@ -3846,6 +3847,22 @@ impl Database {
                 crate::sql::ast::Literal::Null => None,
                 _ => None,
             },
+            Expr::Function(func) => {
+                let name = func.name.name.to_uppercase();
+                match name.as_str() {
+                    "CURRENT_TIMESTAMP" | "NOW" | "CURRENT_DATE" | "CURRENT_TIME" 
+                    | "LOCALTIME" | "LOCALTIMESTAMP" => Some(name),
+                    _ => None,
+                }
+            }
+            Expr::Column(col) => {
+                let name = col.column.to_uppercase();
+                match name.as_str() {
+                    "CURRENT_TIMESTAMP" | "NOW" | "CURRENT_DATE" | "CURRENT_TIME"
+                    | "LOCALTIME" | "LOCALTIMESTAMP" => Some(name),
+                    _ => None,
+                }
+            }
             _ => None,
         }
     }

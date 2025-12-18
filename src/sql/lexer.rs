@@ -168,6 +168,7 @@ static KEYWORDS: phf::Map<&'static str, Keyword> = phf_map! {
     "BOOLEAN" => Keyword::Boolean,
     "BOOL" => Keyword::Bool,
     "DATE" => Keyword::Date,
+    "DATETIME" => Keyword::Datetime,
     "TIME" => Keyword::Time,
     "TIMESTAMP" => Keyword::Timestamp,
     "TIMESTAMPTZ" => Keyword::Timestamptz,
