@@ -77,7 +77,17 @@ impl<'a> ExecutorBuilder<'a> {
                 let child = self.build_operator(project.input, source, column_map)?;
 
                 let has_complex_expressions = project.expressions.iter().any(|expr| {
-                    !matches!(expr, Expr::Column(_)) && !matches!(expr, Expr::Function(_))
+                    match expr {
+                        Expr::Column(_) => false,
+                        Expr::Function(func) => {
+                            let name = func.name.name.to_uppercase();
+                            !matches!(
+                                name.as_str(),
+                                "COUNT" | "SUM" | "AVG" | "MIN" | "MAX"
+                            )
+                        }
+                        _ => true,
+                    }
                 });
 
                 if has_complex_expressions && !project.expressions.is_empty() {

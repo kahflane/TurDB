@@ -606,6 +606,33 @@ impl<'a> CompiledPredicate<'a> {
                     _ => None,
                 }
             }
+            "NOW" | "CURRENT_TIMESTAMP" => {
+                use std::time::SystemTime;
+                let now = SystemTime::now()
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .ok()?;
+                let secs = now.as_secs();
+                let datetime = format_unix_timestamp(secs as i64);
+                Some(Value::Text(Cow::Owned(datetime)))
+            }
+            "CURRENT_DATE" => {
+                use std::time::SystemTime;
+                let now = SystemTime::now()
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .ok()?;
+                let secs = now.as_secs();
+                let date = format_unix_date(secs as i64);
+                Some(Value::Text(Cow::Owned(date)))
+            }
+            "CURRENT_TIME" => {
+                use std::time::SystemTime;
+                let now = SystemTime::now()
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .ok()?;
+                let secs = now.as_secs();
+                let time = format_unix_time(secs as i64);
+                Some(Value::Text(Cow::Owned(time)))
+            }
             _ => None,
         }
     }
@@ -1292,4 +1319,53 @@ impl<'a> CompiledProjection<'a> {
     pub fn expression_count(&self) -> usize {
         self.expressions.len()
     }
+}
+
+fn format_unix_timestamp(secs: i64) -> String {
+    const SECONDS_PER_DAY: i64 = 86400;
+    const DAYS_PER_YEAR: i64 = 365;
+    const DAYS_PER_4_YEARS: i64 = 1461;
+    const DAYS_PER_100_YEARS: i64 = 36524;
+    const DAYS_PER_400_YEARS: i64 = 146097;
+
+    let mut days = secs / SECONDS_PER_DAY;
+    let day_secs = secs % SECONDS_PER_DAY;
+
+    let hours = day_secs / 3600;
+    let minutes = (day_secs % 3600) / 60;
+    let seconds = day_secs % 60;
+
+    days += 719468;
+
+    let era = if days >= 0 {
+        days / DAYS_PER_400_YEARS
+    } else {
+        (days - DAYS_PER_400_YEARS + 1) / DAYS_PER_400_YEARS
+    };
+    let doe = (days - era * DAYS_PER_400_YEARS) as u32;
+    let yoe = (doe - doe / DAYS_PER_4_YEARS as u32 + doe / DAYS_PER_100_YEARS as u32
+        - doe / DAYS_PER_400_YEARS as u32)
+        / DAYS_PER_YEAR as u32;
+    let y = yoe as i64 + era * 400;
+    let doy = doe
+        - (DAYS_PER_YEAR as u32 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+
+    format!(
+        "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+        y, m, d, hours, minutes, seconds
+    )
+}
+
+fn format_unix_date(secs: i64) -> String {
+    let ts = format_unix_timestamp(secs);
+    ts.split(' ').next().unwrap_or("").to_string()
+}
+
+fn format_unix_time(secs: i64) -> String {
+    let ts = format_unix_timestamp(secs);
+    ts.split(' ').nth(1).unwrap_or("").to_string()
 }
