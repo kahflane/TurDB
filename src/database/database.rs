@@ -468,6 +468,11 @@ impl Database {
     }
 
     pub fn query(&self, sql: &str) -> Result<Vec<Row>> {
+        let (_columns, rows) = self.query_with_columns(sql)?;
+        Ok(rows)
+    }
+
+    pub fn query_with_columns(&self, sql: &str) -> Result<(Vec<String>, Vec<Row>)> {
         use crate::sql::ast::{Distinct, Statement};
 
         self.ensure_catalog()?;
@@ -489,6 +494,13 @@ impl Database {
         let physical_plan = planner
             .create_physical_plan(&stmt)
             .wrap_err("failed to create query plan")?;
+
+        let column_names: Vec<String> = physical_plan
+            .output_schema
+            .columns
+            .iter()
+            .map(|c| c.name.to_string())
+            .collect();
 
         let mut file_manager_guard = self.file_manager.write();
         let file_manager = file_manager_guard.as_mut().unwrap();
@@ -1127,7 +1139,8 @@ impl Database {
             }
             Some(PlanSource::SetOp(_set_op)) => {
                 drop(file_manager_guard);
-                return self.execute_physical_plan_recursive(physical_plan.root, &arena);
+                let rows = self.execute_physical_plan_recursive(physical_plan.root, &arena)?;
+                return Ok((column_names, rows));
             }
             None => {
                 bail!("unsupported query plan type - no table scan or subquery found")
@@ -1155,7 +1168,7 @@ impl Database {
             rows
         };
 
-        Ok(rows)
+        Ok((column_names, rows))
     }
 
     fn execute_physical_plan_recursive<'a>(
@@ -1534,8 +1547,8 @@ impl Database {
             Statement::Update(update) => self.execute_update(update, &arena),
             Statement::Delete(delete) => self.execute_delete(delete, &arena),
             Statement::Select(_) => {
-                let rows = self.query(sql)?;
-                Ok(ExecuteResult::Select { rows })
+                let (columns, rows) = self.query_with_columns(sql)?;
+                Ok(ExecuteResult::Select { columns, rows })
             }
             Statement::Drop(drop) => {
                 use crate::sql::ast::ObjectType;

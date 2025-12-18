@@ -183,12 +183,11 @@ impl Repl {
 
     fn print_result(&self, result: ExecuteResult, elapsed: std::time::Duration) {
         match result {
-            ExecuteResult::Select { rows } => {
+            ExecuteResult::Select { columns, rows } => {
                 if rows.is_empty() {
                     println!("Empty set ({:.3} sec)", elapsed.as_secs_f64());
                 } else {
-                    let headers = self.generate_headers(&rows);
-                    let formatter = TableFormatter::new(headers, &rows);
+                    let formatter = TableFormatter::new(columns, &rows);
                     println!("{}", formatter.render());
                     println!(
                         "{} row{} in set ({:.3} sec)",
