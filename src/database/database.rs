@@ -2507,7 +2507,7 @@ impl Database {
         arena: &Bump,
     ) -> Result<ExecuteResult> {
         use crate::btree::BTree;
-        use crate::records::RecordView;
+        use crate::sql::decoder::RecordDecoder;
 
         self.ensure_catalog()?;
         self.ensure_file_manager()?;
@@ -2577,6 +2577,10 @@ impl Database {
         let file_manager = file_manager_guard.as_mut().unwrap();
         let storage = file_manager.table_data_mut(schema_name, table_name)?;
 
+        let column_types: Vec<crate::records::types::DataType> =
+            columns.iter().map(|c| c.data_type()).collect();
+        let decoder = crate::sql::decoder::SimpleDecoder::new(column_types);
+
         let root_page = 1u32;
         let btree = BTree::new(storage, root_page)?;
         let mut cursor = btree.cursor_first()?;
@@ -2587,8 +2591,9 @@ impl Database {
             let key = cursor.key()?;
             let value = cursor.value()?;
 
-            let record = RecordView::new(value, &schema)?;
-            let mut row_values = OwnedValue::extract_row_from_record(&record, &columns)?;
+            let values = decoder.decode(key, value)?;
+            let mut row_values: Vec<OwnedValue> =
+                values.into_iter().map(OwnedValue::from).collect();
 
             let should_update = if let Some(ref pred) = predicate {
                 use crate::sql::executor::ExecutorRow;
@@ -2657,9 +2662,9 @@ impl Database {
 
                     if existing_key != update_key.as_slice() {
                         let existing_value = check_cursor.value()?;
-                        let existing_record = RecordView::new(existing_value, &schema)?;
-                        let existing_values =
-                            OwnedValue::extract_row_from_record(&existing_record, &columns)?;
+                        let existing_values_raw = decoder.decode(existing_key, existing_value)?;
+                        let existing_values: Vec<OwnedValue> =
+                            existing_values_raw.into_iter().map(OwnedValue::from).collect();
 
                         for &col_idx in &unique_col_indices {
                             let new_val = updated_values.get(col_idx);
@@ -2774,6 +2779,7 @@ impl Database {
     ) -> Result<ExecuteResult> {
         use crate::btree::BTree;
         use crate::records::RecordView;
+        use crate::sql::decoder::RecordDecoder;
         use crate::sql::executor::ExecutorRow;
         use std::borrow::Cow;
 
@@ -2854,6 +2860,10 @@ impl Database {
         let btree = BTree::new(storage, root_page)?;
         let mut cursor = btree.cursor_first()?;
 
+        let column_types: Vec<crate::records::types::DataType> =
+            columns.iter().map(|c| c.data_type()).collect();
+        let decoder = crate::sql::decoder::SimpleDecoder::new(column_types);
+
         let mut rows_to_update: Vec<(Vec<u8>, Vec<u8>, Vec<OwnedValue>)> = Vec::new();
         let mut updated_keys: HashSet<Vec<u8>> = HashSet::new();
 
@@ -2861,8 +2871,9 @@ impl Database {
             let key = cursor.key()?;
             let value = cursor.value()?;
 
-            let record = RecordView::new(value, schema)?;
-            let target_row_values = OwnedValue::extract_row_from_record(&record, columns)?;
+            let values = decoder.decode(key, value)?;
+            let target_row_values: Vec<OwnedValue> =
+                values.into_iter().map(OwnedValue::from).collect();
 
             for from_row in &combined_from_rows {
                 let mut combined_values: Vec<Value<'_>> = Vec::with_capacity(
@@ -3599,48 +3610,197 @@ impl Database {
 
                 format!("renamed table to '{}'", new_name)
             }
-            _ => {
+            AlterTableAction::RenameColumn { old_name, new_name } => {
                 let mut catalog_guard = self.catalog.write();
                 let catalog = catalog_guard.as_mut().unwrap();
-
                 let schema = catalog
                     .get_schema_mut(schema_name)
                     .ok_or_else(|| eyre::eyre!("schema '{}' not found", schema_name))?;
-
                 if !schema.table_exists(table_name) {
                     bail!("table '{}' not found in schema '{}'", table_name, schema_name);
                 }
-
-                match &alter.action {
-                    AlterTableAction::DropColumn { name, if_exists, .. } => {
-                        let table = schema.get_table_mut(table_name).unwrap();
-                        if table.drop_column(name).is_none() && !if_exists {
-                            bail!("column '{}' not found in table '{}'", name, table_name);
-                        }
-                        format!("dropped column '{}'", name)
-                    }
-                    AlterTableAction::RenameColumn { old_name, new_name } => {
-                        let table = schema.get_table_mut(table_name).unwrap();
-                        if !table.rename_column(old_name, new_name) {
-                            bail!("column '{}' not found in table '{}'", old_name, table_name);
-                        }
-                        format!("renamed column '{}' to '{}'", old_name, new_name)
-                    }
-                    AlterTableAction::AddColumn(col_def) => {
-                        let table = schema.get_table_mut(table_name).unwrap();
-                        let column = Self::ast_column_to_schema_column(col_def)?;
-                        let col_name = column.name().to_string();
-                        table.add_column(column);
-                        format!("added column '{}'", col_name)
-                    }
-                    _ => bail!("ALTER TABLE action not yet supported"),
+                let table = schema.get_table_mut(table_name).unwrap();
+                if !table.rename_column(old_name, new_name) {
+                    bail!("column '{}' not found in table '{}'", old_name, table_name);
                 }
+                format!("renamed column '{}' to '{}'", old_name, new_name)
             }
+            AlterTableAction::AddColumn(col_def) => {
+                let mut catalog_guard = self.catalog.write();
+                let catalog = catalog_guard.as_mut().unwrap();
+                let schema = catalog
+                    .get_schema_mut(schema_name)
+                    .ok_or_else(|| eyre::eyre!("schema '{}' not found", schema_name))?;
+                if !schema.table_exists(table_name) {
+                    bail!("table '{}' not found in schema '{}'", table_name, schema_name);
+                }
+                let table = schema.get_table_mut(table_name).unwrap();
+                let column = Self::ast_column_to_schema_column(col_def)?;
+                let col_name = column.name().to_string();
+                table.add_column(column);
+                format!("added column '{}'", col_name)
+            }
+            AlterTableAction::DropColumn { name, if_exists, .. } => {
+                self.migrate_table_drop_column(schema_name, table_name, name, *if_exists)?
+            }
+            _ => bail!("ALTER TABLE action not yet supported"),
         };
 
         self.save_catalog()?;
 
         Ok(ExecuteResult::AlterTable { action: action_desc })
+    }
+
+    fn migrate_table_drop_column(
+        &self,
+        schema_name: &str,
+        table_name: &str,
+        column_name: &str,
+        if_exists: bool,
+    ) -> Result<String> {
+        use crate::btree::BTree;
+        use crate::sql::decoder::{RecordDecoder, SimpleDecoder};
+        use crate::types::{create_record_schema, OwnedValue};
+
+        const BATCH_SIZE: usize = 10_000;
+
+        let (old_columns, drop_idx, indexes_to_drop) = {
+            let catalog_guard = self.catalog.read();
+            let catalog = catalog_guard.as_ref().unwrap();
+            let schema = catalog
+                .get_schema(schema_name)
+                .ok_or_else(|| eyre::eyre!("schema '{}' not found", schema_name))?;
+            let table = schema
+                .get_table(table_name)
+                .ok_or_else(|| eyre::eyre!("table '{}' not found", table_name))?;
+
+            let old_columns: Vec<crate::schema::ColumnDef> = table.columns().to_vec();
+            let drop_idx = old_columns
+                .iter()
+                .position(|c| c.name().eq_ignore_ascii_case(column_name));
+
+            if drop_idx.is_none() && !if_exists {
+                bail!(
+                    "column '{}' not found in table '{}'",
+                    column_name,
+                    table_name
+                );
+            }
+
+            let indexes_to_drop: Vec<String> = table
+                .indexes()
+                .iter()
+                .filter(|idx| {
+                    idx.columns()
+                        .iter()
+                        .any(|c| c.eq_ignore_ascii_case(column_name))
+                })
+                .map(|idx| idx.name().to_string())
+                .collect();
+
+            (old_columns, drop_idx, indexes_to_drop)
+        };
+
+        let Some(drop_idx) = drop_idx else {
+            return Ok(format!("column '{}' does not exist (skipped)", column_name));
+        };
+
+        for index_name in &indexes_to_drop {
+            let mut file_manager_guard = self.file_manager.write();
+            let file_manager = file_manager_guard.as_mut().unwrap();
+
+            if file_manager.index_exists(schema_name, table_name, index_name) {
+                let index_storage =
+                    file_manager.index_data_mut(schema_name, table_name, index_name)?;
+                let root_page = 1u32;
+                let index_btree = BTree::new(index_storage, root_page)?;
+                let mut index_cursor = index_btree.cursor_first()?;
+
+                let mut keys_to_delete: Vec<Vec<u8>> = Vec::new();
+                while index_cursor.valid() {
+                    keys_to_delete.push(index_cursor.key()?.to_vec());
+                    index_cursor.advance()?;
+                }
+
+                let mut index_btree_mut = BTree::new(index_storage, root_page)?;
+                for key in &keys_to_delete {
+                    index_btree_mut.delete(key)?;
+                }
+                index_storage.sync()?;
+            }
+        }
+
+        let old_column_types: Vec<crate::records::types::DataType> =
+            old_columns.iter().map(|c| c.data_type()).collect();
+        let decoder = SimpleDecoder::new(old_column_types);
+
+        let mut new_columns = old_columns.clone();
+        new_columns.remove(drop_idx);
+        let new_schema = create_record_schema(&new_columns);
+
+        {
+            let mut file_manager_guard = self.file_manager.write();
+            let file_manager = file_manager_guard.as_mut().unwrap();
+            let storage = file_manager.table_data_mut(schema_name, table_name)?;
+            let root_page = 1u32;
+
+            let all_keys: Vec<Vec<u8>> = {
+                let btree = BTree::new(storage, root_page)?;
+                let mut cursor = btree.cursor_first()?;
+                let mut keys = Vec::new();
+                while cursor.valid() {
+                    keys.push(cursor.key()?.to_vec());
+                    cursor.advance()?;
+                }
+                keys
+            };
+
+            for chunk in all_keys.chunks(BATCH_SIZE) {
+                let mut batch: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(chunk.len());
+
+                {
+                    let btree = BTree::new(storage, root_page)?;
+                    for key in chunk {
+                        if let Some(handle) = btree.search(key)? {
+                            let value = btree.get_value(&handle)?;
+                            let values = decoder.decode(key, value)?;
+                            let mut owned_values: Vec<OwnedValue> =
+                                values.into_iter().map(OwnedValue::from).collect();
+                            owned_values.remove(drop_idx);
+
+                            let new_record =
+                                OwnedValue::build_record_from_values(&owned_values, &new_schema)?;
+                            batch.push((key.clone(), new_record));
+                        }
+                    }
+                }
+
+                let mut btree_mut = BTree::new(storage, root_page)?;
+                for (key, _) in &batch {
+                    btree_mut.delete(key)?;
+                }
+                for (key, new_value) in &batch {
+                    btree_mut.insert(key, new_value)?;
+                }
+            }
+
+            storage.sync()?;
+        }
+
+        {
+            let mut catalog_guard = self.catalog.write();
+            let catalog = catalog_guard.as_mut().unwrap();
+            let schema = catalog.get_schema_mut(schema_name).unwrap();
+            let table = schema.get_table_mut(table_name).unwrap();
+
+            for index_name in &indexes_to_drop {
+                table.remove_index(index_name);
+            }
+
+            table.drop_column(column_name);
+        }
+
+        Ok(format!("dropped column '{}'", column_name))
     }
 
     fn ast_column_to_schema_column(

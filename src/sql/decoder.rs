@@ -8,23 +8,20 @@ pub trait RecordDecoder {
 pub struct SimpleDecoder {
     column_types: Vec<crate::records::types::DataType>,
     decode_columns: Vec<usize>,
-    cached_schema: crate::records::Schema,
+    current_schema: crate::records::Schema,
+    older_schemas: Vec<(u16, usize, usize, crate::records::Schema)>,
 }
 
 impl SimpleDecoder {
     pub fn new(column_types: Vec<crate::records::types::DataType>) -> Self {
-        use crate::records::types::ColumnDef;
-        let column_defs: Vec<ColumnDef> = column_types
-            .iter()
-            .enumerate()
-            .map(|(i, dt)| ColumnDef::new(format!("col{}", i), *dt))
-            .collect();
-        let cached_schema = crate::records::Schema::new(column_defs);
+        let (current_schema, _current_header_len, older_schemas) =
+            Self::build_schemas(&column_types);
         let decode_columns: Vec<usize> = (0..column_types.len()).collect();
         Self {
             column_types,
             decode_columns,
-            cached_schema,
+            current_schema,
+            older_schemas,
         }
     }
 
@@ -32,18 +29,92 @@ impl SimpleDecoder {
         column_types: Vec<crate::records::types::DataType>,
         projections: Vec<usize>,
     ) -> Self {
+        let (current_schema, _current_header_len, older_schemas) =
+            Self::build_schemas(&column_types);
+        Self {
+            column_types,
+            decode_columns: projections,
+            current_schema,
+            older_schemas,
+        }
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn build_schemas(
+        column_types: &[crate::records::types::DataType],
+    ) -> (crate::records::Schema, u16, Vec<(u16, usize, usize, crate::records::Schema)>) {
         use crate::records::types::ColumnDef;
+        use crate::records::Schema;
+
         let column_defs: Vec<ColumnDef> = column_types
             .iter()
             .enumerate()
             .map(|(i, dt)| ColumnDef::new(format!("col{}", i), *dt))
             .collect();
-        let cached_schema = crate::records::Schema::new(column_defs);
-        Self {
-            column_types,
-            decode_columns: projections,
-            cached_schema,
+        let current_schema = Schema::new(column_defs);
+        let current_header_len = Self::compute_header_len(&current_schema);
+
+        let mut older_schemas = Vec::new();
+        for n in 1..column_types.len() {
+            let column_defs: Vec<ColumnDef> = column_types[..n]
+                .iter()
+                .enumerate()
+                .map(|(i, dt)| ColumnDef::new(format!("col{}", i), *dt))
+                .collect();
+            let schema = Schema::new(column_defs);
+            let header_len = Self::compute_header_len(&schema);
+            let min_record_size = header_len as usize + schema.total_fixed_size();
+            older_schemas.push((header_len, n, min_record_size, schema));
         }
+
+        older_schemas.sort_by(|a, b| b.1.cmp(&a.1));
+
+        (current_schema, current_header_len, older_schemas)
+    }
+
+    fn compute_header_len(schema: &crate::records::Schema) -> u16 {
+        let bitmap_size = crate::records::Schema::null_bitmap_size(schema.column_count());
+        let offset_table_size = schema.var_column_count() * 2;
+        (2 + bitmap_size + offset_table_size) as u16
+    }
+
+    fn schema_fits_record(schema: &crate::records::Schema, value: &[u8]) -> bool {
+        let header_len = u16::from_le_bytes([value[0], value[1]]) as usize;
+        let expected_header = Self::compute_header_len(schema) as usize;
+
+        if header_len != expected_header {
+            return false;
+        }
+
+        let fixed_size = schema.total_fixed_size();
+        let var_count = schema.var_column_count();
+
+        if var_count == 0 {
+            return value.len() == header_len + fixed_size;
+        }
+
+        let bitmap_size = crate::records::Schema::null_bitmap_size(schema.column_count());
+        let offset_table_start = 2 + bitmap_size;
+        let last_offset_pos = offset_table_start + (var_count - 1) * 2;
+
+        if last_offset_pos + 2 > value.len() {
+            return false;
+        }
+
+        let last_var_offset =
+            u16::from_le_bytes([value[last_offset_pos], value[last_offset_pos + 1]]) as usize;
+
+        let expected_len = header_len + fixed_size + last_var_offset;
+        value.len() == expected_len
+    }
+
+    fn find_older_schema(&self, value: &[u8]) -> Option<(usize, &crate::records::Schema)> {
+        for (_h, col_count, _min_size, schema) in &self.older_schemas {
+            if Self::schema_fits_record(schema, value) {
+                return Some((*col_count, schema));
+            }
+        }
+        None
     }
 }
 
@@ -80,10 +151,23 @@ impl SimpleDecoder {
             return Ok(());
         }
 
-        let view = RecordView::new(value, &self.cached_schema)?;
+        let (record_col_count, view) = if Self::schema_fits_record(&self.current_schema, value) {
+            let view = RecordView::new(value, &self.current_schema)?;
+            (self.column_types.len(), view)
+        } else if let Some((col_count, schema)) = self.find_older_schema(value) {
+            let view = RecordView::new(value, schema)?;
+            (col_count, view)
+        } else {
+            let header_len = u16::from_le_bytes([value[0], value[1]]);
+            eyre::bail!(
+                "unknown record format: header_len={}, record_len={}",
+                header_len,
+                value.len()
+            );
+        };
 
         for &idx in columns {
-            if idx >= self.column_types.len() {
+            if idx >= self.column_types.len() || idx >= record_col_count {
                 output.push(Value::Null);
                 continue;
             }
