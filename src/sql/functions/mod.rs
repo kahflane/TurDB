@@ -26,6 +26,7 @@
 //! `Option<Value<'a>>` to handle NULL propagation and error cases.
 
 pub mod datetime;
+pub mod system;
 
 use crate::types::Value;
 use std::borrow::Cow;
@@ -40,6 +41,9 @@ pub fn eval_function<'a>(name: &str, args: &[Option<Value<'a>>]) -> Option<Value
         | "DATE_FORMAT" | "STRFTIME" | "DATE_ADD" | "DATE_SUB" 
         | "DATEDIFF" | "FROM_DAYS" | "TO_DAYS" | "LAST_DAY" => {
             datetime::eval_datetime_function(&upper_name, args)
+        }
+        "VERSION" | "DATABASE" | "CURRENT_DATABASE" | "TYPEOF" => {
+            system::eval_system_function(&upper_name, args)
         }
         "FORMAT" => eval_format(args),
         "COALESCE" => eval_coalesce(args),

@@ -537,7 +537,35 @@ impl<'a> CompiledPredicate<'a> {
                     0
                 },
             )),
-            _ => None,
+            BinaryOperator::Eq
+            | BinaryOperator::NotEq
+            | BinaryOperator::Lt
+            | BinaryOperator::LtEq
+            | BinaryOperator::Gt
+            | BinaryOperator::GtEq => {
+                let result = self.compare_values(&Some(left.clone()), &Some(right.clone()), op);
+                Some(Value::Int(if result { 1 } else { 0 }))
+            }
+            BinaryOperator::And => {
+                let l = self.value_to_bool(left);
+                let r = self.value_to_bool(right);
+                Some(Value::Int(if l && r { 1 } else { 0 }))
+            }
+            BinaryOperator::Or => {
+                let l = self.value_to_bool(left);
+                let r = self.value_to_bool(right);
+                Some(Value::Int(if l || r { 1 } else { 0 }))
+            }
+        }
+    }
+
+    fn value_to_bool(&self, val: &Value<'a>) -> bool {
+        match val {
+            Value::Int(n) => *n != 0,
+            Value::Float(f) => *f != 0.0,
+            Value::Null => false,
+            Value::Text(s) => !s.is_empty(),
+            _ => false,
         }
     }
 
