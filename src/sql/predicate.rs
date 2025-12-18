@@ -50,10 +50,20 @@ impl<'a> CompiledPredicate<'a> {
 
         match expr {
             Expr::Column(col_ref) => {
+                let lookup_name = if let Some(table) = col_ref.table {
+                    format!("{}.{}", table, col_ref.column)
+                } else {
+                    col_ref.column.to_string()
+                };
                 let col_idx = self
                     .column_map
                     .iter()
-                    .find(|(name, _)| name.eq_ignore_ascii_case(col_ref.column))
+                    .find(|(name, _)| name.eq_ignore_ascii_case(&lookup_name))
+                    .or_else(|| {
+                        self.column_map
+                            .iter()
+                            .find(|(name, _)| name.eq_ignore_ascii_case(col_ref.column))
+                    })
                     .map(|(_, idx)| *idx)?;
                 row.get(col_idx).cloned()
             }
