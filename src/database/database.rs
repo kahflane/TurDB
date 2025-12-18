@@ -1639,6 +1639,10 @@ impl Database {
                 let data_type = Self::convert_data_type(&col.data_type);
                 let mut column = SchemaColumnDef::new(col.name.to_string(), data_type);
 
+                if let Some(max_len) = Self::extract_type_length(&col.data_type) {
+                    column = column.with_max_length(max_len);
+                }
+
                 for constraint in col.constraints {
                     use crate::schema::table::Constraint as SchemaConstraint;
                     use crate::sql::ast::ColumnConstraint;
@@ -3793,8 +3797,9 @@ impl Database {
             SqlType::TinyInt => DataType::Int2,
             SqlType::Real | SqlType::DoublePrecision => DataType::Float8,
             SqlType::Decimal(_, _) | SqlType::Numeric(_, _) => DataType::Float8,
-            SqlType::Varchar(_) | SqlType::Text => DataType::Text,
-            SqlType::Char(_) => DataType::Text,
+            SqlType::Varchar(_) => DataType::Varchar,
+            SqlType::Text => DataType::Text,
+            SqlType::Char(_) => DataType::Char,
             SqlType::Blob => DataType::Blob,
             SqlType::Boolean => DataType::Bool,
             SqlType::Date => DataType::Date,
@@ -3816,6 +3821,16 @@ impl Database {
             SqlType::DateRange => DataType::DateRange,
             SqlType::TsRange => DataType::TimestampRange,
             _ => DataType::Text,
+        }
+    }
+
+    fn extract_type_length(sql_type: &crate::sql::ast::DataType) -> Option<u32> {
+        use crate::sql::ast::DataType as SqlType;
+
+        match sql_type {
+            SqlType::Varchar(len) => *len,
+            SqlType::Char(len) => *len,
+            _ => None,
         }
     }
 
