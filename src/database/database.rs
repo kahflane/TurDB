@@ -2079,12 +2079,18 @@ impl Database {
             let mut values: Vec<OwnedValue> = row_values.clone();
 
             if let Some(auto_col_idx) = auto_increment_col_idx {
+                let storage = file_manager.table_data_mut(schema_name, table_name)?;
+                let page = storage.page_mut(0)?;
+                let header = TableFileHeader::from_bytes_mut(page)?;
+
                 if values.get(auto_col_idx).is_none_or(|v| v.is_null()) {
-                    let storage = file_manager.table_data_mut(schema_name, table_name)?;
-                    let page = storage.page_mut(0)?;
-                    let header = TableFileHeader::from_bytes_mut(page)?;
                     let next_val = header.next_auto_increment() + 1;
                     values[auto_col_idx] = OwnedValue::Int(next_val as i64);
+                } else if let Some(OwnedValue::Int(provided_val)) = values.get(auto_col_idx) {
+                    let current = header.auto_increment();
+                    if *provided_val as u64 > current {
+                        header.set_auto_increment(*provided_val as u64);
+                    }
                 }
             }
 
