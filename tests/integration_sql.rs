@@ -2556,7 +2556,7 @@ mod update_from_tests {
     }
 
     #[test]
-    fn update_from_multiple_tables_returns_error() {
+    fn update_from_multiple_tables_comma_join() {
         let dir = tempdir().unwrap();
         let db = Database::create(dir.path().join("test_db")).unwrap();
 
@@ -2564,27 +2564,53 @@ mod update_from_tests {
             .unwrap();
         db.execute("CREATE TABLE customers (id INT, tier TEXT)")
             .unwrap();
-        db.execute("CREATE TABLE promotions (tier TEXT, discount TEXT)")
+        db.execute("CREATE TABLE promotions (tier TEXT, new_status TEXT)")
             .unwrap();
 
         db.execute("INSERT INTO orders VALUES (1, 100, 'pending')")
             .unwrap();
+        db.execute("INSERT INTO orders VALUES (2, 200, 'pending')")
+            .unwrap();
+        db.execute("INSERT INTO orders VALUES (3, 100, 'shipped')")
+            .unwrap();
 
         db.execute("INSERT INTO customers VALUES (100, 'gold')").unwrap();
+        db.execute("INSERT INTO customers VALUES (200, 'silver')").unwrap();
 
         db.execute("INSERT INTO promotions VALUES ('gold', 'priority')")
             .unwrap();
+        db.execute("INSERT INTO promotions VALUES ('silver', 'standard')")
+            .unwrap();
 
-        let result = db.execute(
-            "UPDATE orders SET status = 'priority'
-             FROM customers, promotions
-             WHERE orders.customer_id = customers.id
-               AND customers.tier = promotions.tier",
-        );
+        let result = db
+            .execute(
+                "UPDATE orders SET status = promotions.new_status
+                 FROM customers, promotions
+                 WHERE orders.customer_id = customers.id
+                   AND customers.tier = promotions.tier",
+            )
+            .unwrap();
 
         assert!(
-            result.is_err(),
-            "UPDATE...FROM with multiple tables (comma-separated joins) SHOULD return an error until feature is implemented"
+            matches!(result, ExecuteResult::Update { rows_affected: 3, .. }),
+            "UPDATE...FROM with multiple tables SHOULD update 3 rows"
+        );
+
+        let rows = db.query("SELECT id, status FROM orders ORDER BY id").unwrap();
+        assert_eq!(
+            rows[0].values[1],
+            OwnedValue::Text("priority".to_string()),
+            "Order 1 (gold customer) status SHOULD be 'priority'"
+        );
+        assert_eq!(
+            rows[1].values[1],
+            OwnedValue::Text("standard".to_string()),
+            "Order 2 (silver customer) status SHOULD be 'standard'"
+        );
+        assert_eq!(
+            rows[2].values[1],
+            OwnedValue::Text("priority".to_string()),
+            "Order 3 (gold customer) status SHOULD be 'priority'"
         );
     }
 
