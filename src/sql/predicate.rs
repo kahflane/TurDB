@@ -1,4 +1,5 @@
 use crate::parsing::{parse_json_path, JsonNavigator};
+use crate::records::jsonb::{JsonbValue, JsonbView};
 use crate::sql::executor::ExecutorRow;
 use crate::types::Value;
 use std::borrow::Cow;
@@ -575,18 +576,79 @@ impl<'a> CompiledPredicate<'a> {
         key: &Value<'a>,
         as_text: bool,
     ) -> Option<Value<'a>> {
-        let json_bytes = match json_val {
-            Value::Jsonb(bytes) => bytes.as_ref(),
-            Value::Text(s) => s.as_bytes(),
+        match json_val {
+            Value::Jsonb(bytes) => {
+                self.extract_from_jsonb_binary(bytes.as_ref(), key, as_text)
+            }
+            Value::Text(s) => {
+                match key {
+                    Value::Text(key_str) => {
+                        if key_str.starts_with('$') {
+                            let path_elements = self.parse_json_path_elements(key_str)?;
+                            self.traverse_json_path(s, &path_elements, as_text)
+                        } else {
+                            self.extract_json_key(s, key_str, as_text)
+                        }
+                    }
+                    Value::Int(index) => self.extract_json_array_index(s, *index, as_text),
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    }
+
+    fn extract_from_jsonb_binary(
+        &self,
+        bytes: &[u8],
+        key: &Value<'a>,
+        as_text: bool,
+    ) -> Option<Value<'a>> {
+        let view = JsonbView::new(bytes).ok()?;
+
+        let result = match key {
+            Value::Text(key_str) => {
+                if key_str.starts_with('$') {
+                    let path_elements = self.parse_json_path_elements(key_str)?;
+                    let path_refs: Vec<&str> = path_elements.iter().map(|s| s.as_str()).collect();
+                    view.get_path(&path_refs).ok()?
+                } else {
+                    view.get(key_str).ok()?
+                }
+            }
+            Value::Int(index) => view.array_get(*index as usize).ok()?,
             _ => return None,
         };
 
-        let json_str = std::str::from_utf8(json_bytes).ok()?;
+        match result {
+            Some(jsonb_val) => self.jsonb_value_to_value(jsonb_val, as_text),
+            None => Some(Value::Null),
+        }
+    }
 
-        match key {
-            Value::Text(key_str) => self.extract_json_key(json_str, key_str, as_text),
-            Value::Int(index) => self.extract_json_array_index(json_str, *index, as_text),
-            _ => None,
+    fn jsonb_value_to_value<'b>(&self, val: JsonbValue<'b>, as_text: bool) -> Option<Value<'a>> {
+        if as_text {
+            match val {
+                JsonbValue::Null => Some(Value::Null),
+                JsonbValue::Bool(b) => Some(Value::Text(Cow::Owned(b.to_string()))),
+                JsonbValue::Number(n) => Some(Value::Text(Cow::Owned(n.to_string()))),
+                JsonbValue::String(s) => Some(Value::Text(Cow::Owned(s.to_string()))),
+                JsonbValue::Array(view) => {
+                    Some(Value::Text(Cow::Owned(format!("<jsonb array: {} bytes>", view.data().len()))))
+                }
+                JsonbValue::Object(view) => {
+                    Some(Value::Text(Cow::Owned(format!("<jsonb object: {} bytes>", view.data().len()))))
+                }
+            }
+        } else {
+            match val {
+                JsonbValue::Null => Some(Value::Null),
+                JsonbValue::Bool(b) => Some(Value::Int(if b { 1 } else { 0 })),
+                JsonbValue::Number(n) => Some(Value::Float(n)),
+                JsonbValue::String(s) => Some(Value::Text(Cow::Owned(s.to_string()))),
+                JsonbValue::Array(view) => Some(Value::Jsonb(Cow::Owned(view.data().to_vec()))),
+                JsonbValue::Object(view) => Some(Value::Jsonb(Cow::Owned(view.data().to_vec()))),
+            }
         }
     }
 
@@ -732,21 +794,43 @@ impl<'a> CompiledPredicate<'a> {
         path: &Value<'a>,
         as_text: bool,
     ) -> Option<Value<'a>> {
-        let json_bytes = match json_val {
-            Value::Jsonb(bytes) => bytes.as_ref(),
-            Value::Text(s) => s.as_bytes(),
-            _ => return None,
-        };
-
         let path_str = match path {
             Value::Text(s) => s.as_ref(),
             _ => return None,
         };
 
         let path_elements = self.parse_json_path_elements(path_str)?;
-        let json_str = std::str::from_utf8(json_bytes).ok()?;
 
-        self.traverse_json_path(json_str, &path_elements, as_text)
+        match json_val {
+            Value::Jsonb(bytes) => {
+                self.traverse_jsonb_path(bytes.as_ref(), &path_elements, as_text)
+            }
+            Value::Text(s) => {
+                self.traverse_json_path(s, &path_elements, as_text)
+            }
+            _ => None,
+        }
+    }
+
+    fn traverse_jsonb_path(
+        &self,
+        bytes: &[u8],
+        path: &[String],
+        as_text: bool,
+    ) -> Option<Value<'a>> {
+        let view = JsonbView::new(bytes).ok()?;
+
+        if path.is_empty() {
+            return self.jsonb_value_to_value(view.as_value().ok()?, as_text);
+        }
+
+        let path_refs: Vec<&str> = path.iter().map(|s| s.as_str()).collect();
+        let result = view.get_path(&path_refs).ok()?;
+
+        match result {
+            Some(jsonb_val) => self.jsonb_value_to_value(jsonb_val, as_text),
+            None => Some(Value::Null),
+        }
     }
 
     fn parse_json_path_elements(&self, path: &str) -> Option<Vec<String>> {
