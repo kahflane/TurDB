@@ -256,6 +256,31 @@ impl RowSource for MaterializedRowSource {
     }
 }
 
+pub struct DualSource {
+    exhausted: bool,
+}
+
+impl Default for DualSource {
+    fn default() -> Self {
+        Self { exhausted: false }
+    }
+}
+
+impl RowSource for DualSource {
+    fn reset(&mut self) -> Result<()> {
+        self.exhausted = false;
+        Ok(())
+    }
+
+    fn next_row(&mut self) -> Result<Option<Vec<Value<'static>>>> {
+        if self.exhausted {
+            return Ok(None);
+        }
+        self.exhausted = true;
+        Ok(Some(Vec::new()))
+    }
+}
+
 impl RowSource for BTreeCursorAdapter {
     fn reset(&mut self) -> Result<()> {
         self.current = 0;

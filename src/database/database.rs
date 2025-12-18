@@ -512,6 +512,7 @@ impl Database {
             NestedLoopJoin(&'a crate::sql::planner::PhysicalNestedLoopJoin<'a>),
             GraceHashJoin(&'a crate::sql::planner::PhysicalGraceHashJoin<'a>),
             SetOp(&'a crate::sql::planner::PhysicalSetOpExec<'a>),
+            DualScan,
         }
 
         fn find_plan_source<'a>(
@@ -520,6 +521,7 @@ impl Database {
             use crate::sql::planner::PhysicalOperator;
             match op {
                 PhysicalOperator::TableScan(scan) => Some(PlanSource::TableScan(scan)),
+                PhysicalOperator::DualScan => Some(PlanSource::DualScan),
                 PhysicalOperator::IndexScan(scan) => Some(PlanSource::IndexScan(scan)),
                 PhysicalOperator::SubqueryExec(subq) => Some(PlanSource::Subquery(subq)),
                 PhysicalOperator::NestedLoopJoin(join) => Some(PlanSource::NestedLoopJoin(join)),
@@ -1141,6 +1143,37 @@ impl Database {
                 drop(file_manager_guard);
                 let rows = self.execute_physical_plan_recursive(physical_plan.root, &arena)?;
                 return Ok((column_names, rows));
+            }
+            Some(PlanSource::DualScan) => {
+                let ctx = ExecutionContext::new(&arena);
+                let builder = ExecutorBuilder::new(&ctx);
+
+                let source = crate::sql::executor::DualSource::default();
+                let mut executor = builder
+                    .build_with_source(&physical_plan, source)
+                    .wrap_err("failed to build executor for dual scan")?;
+
+                let output_columns = physical_plan.output_schema.columns;
+
+                let mut rows = Vec::new();
+                executor.open()?;
+                while let Some(row) = executor.next()? {
+                    let owned: Vec<OwnedValue> = row
+                        .values
+                        .iter()
+                        .enumerate()
+                        .map(|(idx, val)| {
+                            let col_type = output_columns
+                                .get(idx)
+                                .map(|c| c.data_type)
+                                .unwrap_or(DataType::Int8);
+                            convert_value_with_type(val, col_type)
+                        })
+                        .collect();
+                    rows.push(Row::new(owned));
+                }
+                executor.close()?;
+                rows
             }
             None => {
                 bail!("unsupported query plan type - no table scan or subquery found")

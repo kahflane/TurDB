@@ -168,6 +168,7 @@ impl<'a> OutputSchema<'a> {
 #[derive(Debug, Clone, PartialEq)]
 pub enum LogicalOperator<'a> {
     Scan(LogicalScan<'a>),
+    DualScan,
     Project(LogicalProject<'a>),
     Filter(LogicalFilter<'a>),
     Aggregate(LogicalAggregate<'a>),
@@ -324,6 +325,7 @@ pub struct LogicalPlan<'a> {
 #[derive(Debug, Clone, PartialEq)]
 pub enum PhysicalOperator<'a> {
     TableScan(PhysicalTableScan<'a>),
+    DualScan,
     IndexScan(PhysicalIndexScan<'a>),
     FilterExec(PhysicalFilterExec<'a>),
     ProjectExec(PhysicalProjectExec<'a>),
@@ -626,11 +628,13 @@ impl<'a> Planner<'a> {
     ) -> Result<LogicalPlan<'a>> {
         let mut current: &'a LogicalOperator<'a> = match select.from {
             Some(from) => self.plan_from_clause_with_ctes(from, cte_context)?,
-            None => bail!("SELECT without FROM clause not yet supported"),
+            None => self.arena.alloc(LogicalOperator::DualScan),
         };
 
         let tables_in_scope = self.collect_tables_in_scope(current);
-        self.validate_select_columns(select.columns, &tables_in_scope)?;
+        if select.from.is_some() {
+            self.validate_select_columns(select.columns, &tables_in_scope)?;
+        }
 
         if let Some(predicate) = select.where_clause {
             self.validate_expr_columns(predicate, &tables_in_scope)?;
@@ -761,11 +765,13 @@ impl<'a> Planner<'a> {
     ) -> Result<LogicalPlan<'a>> {
         let mut current: &'a LogicalOperator<'a> = match select.from {
             Some(from) => self.plan_from_clause_with_ctes(from, cte_context)?,
-            None => bail!("SELECT without FROM clause not yet supported"),
+            None => self.arena.alloc(LogicalOperator::DualScan),
         };
 
         let tables_in_scope = self.collect_tables_in_scope(current);
-        self.validate_select_columns(select.columns, &tables_in_scope)?;
+        if select.from.is_some() {
+            self.validate_select_columns(select.columns, &tables_in_scope)?;
+        }
 
         if let Some(predicate) = select.where_clause {
             self.validate_expr_columns(predicate, &tables_in_scope)?;
@@ -1437,6 +1443,7 @@ impl<'a> Planner<'a> {
                     columns: columns.into_bump_slice(),
                 })
             }
+            PhysicalOperator::DualScan => Ok(OutputSchema { columns: &[] }),
             PhysicalOperator::IndexScan(scan) => {
                 let table_name = if let Some(schema) = scan.schema {
                     self.arena.alloc_str(&format!("{}.{}", schema, scan.table))
@@ -1627,6 +1634,7 @@ impl<'a> Planner<'a> {
                     columns: columns.into_bump_slice(),
                 })
             }
+            LogicalOperator::DualScan => Ok(OutputSchema { columns: &[] }),
             LogicalOperator::Project(project) => {
                 let input_schema = self.compute_logical_output_schema(project.input)?;
 
@@ -1863,6 +1871,7 @@ impl<'a> Planner<'a> {
                     }));
                 Ok(physical)
             }
+            LogicalOperator::DualScan => Ok(self.arena.alloc(PhysicalOperator::DualScan)),
             LogicalOperator::Filter(filter) => {
                 if let Some(index_scan) = self.try_optimize_filter_to_index_scan(filter) {
                     return Ok(index_scan);
@@ -2366,6 +2375,7 @@ impl<'a> Planner<'a> {
 
         match op {
             LogicalOperator::Scan(_) => DEFAULT_TABLE_CARDINALITY,
+            LogicalOperator::DualScan => 1,
             LogicalOperator::Filter(filter) => {
                 let input_card = self.estimate_cardinality(filter.input);
                 ((input_card as f64) * FILTER_SELECTIVITY).max(1.0) as u64

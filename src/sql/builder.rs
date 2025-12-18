@@ -56,6 +56,9 @@ impl<'a> ExecutorBuilder<'a> {
             PhysicalOperator::TableScan(_) => Ok(DynamicExecutor::TableScan(
                 TableScanExecutor::new(source, self.ctx.arena),
             )),
+            PhysicalOperator::DualScan => Ok(DynamicExecutor::TableScan(
+                TableScanExecutor::new(source, self.ctx.arena),
+            )),
             PhysicalOperator::FilterExec(filter) => {
                 let child = self.build_operator(filter.input, source, column_map)?;
                 let predicate = CompiledPredicate::new(filter.predicate, column_map.to_vec());
@@ -625,6 +628,7 @@ impl<'a> ExecutorBuilder<'a> {
                     Vec::new()
                 }
             }
+            PhysicalOperator::DualScan => Vec::new(),
             PhysicalOperator::IndexScan(_) => {
                 Vec::new()
             }
