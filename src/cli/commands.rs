@@ -27,6 +27,7 @@
 //!
 //! Commands that need database access receive a reference to the Database.
 
+use crate::records::types::DataType;
 use crate::schema::{Constraint, IndexDef, TableDef};
 use crate::Database;
 
@@ -140,7 +141,8 @@ fn format_create_table(table: &TableDef) -> String {
         .columns()
         .iter()
         .map(|col| {
-            let mut col_def = format!("  {} {:?}", col.name(), col.data_type());
+            let type_str = format_data_type(col.data_type(), col.max_length());
+            let mut col_def = format!("  {} {}", col.name(), type_str);
             if !col.is_nullable() {
                 col_def.push_str(" NOT NULL");
             }
@@ -154,6 +156,49 @@ fn format_create_table(table: &TableDef) -> String {
     sql.push_str(&columns.join(",\n"));
     sql.push_str("\n);");
     sql
+}
+
+fn format_data_type(data_type: DataType, max_length: Option<u32>) -> String {
+    use DataType::*;
+    match data_type {
+        Varchar => match max_length {
+            Some(len) => format!("VARCHAR({})", len),
+            None => "VARCHAR".to_string(),
+        },
+        Char => match max_length {
+            Some(len) => format!("CHAR({})", len),
+            None => "CHAR".to_string(),
+        },
+        Bool => "BOOLEAN".to_string(),
+        Int2 => "SMALLINT".to_string(),
+        Int4 => "INT".to_string(),
+        Int8 => "BIGINT".to_string(),
+        Float4 => "REAL".to_string(),
+        Float8 => "DOUBLE PRECISION".to_string(),
+        Text => "TEXT".to_string(),
+        Blob => "BLOB".to_string(),
+        Date => "DATE".to_string(),
+        Time => "TIME".to_string(),
+        Timestamp => "TIMESTAMP".to_string(),
+        TimestampTz => "TIMESTAMPTZ".to_string(),
+        Uuid => "UUID".to_string(),
+        Jsonb => "JSONB".to_string(),
+        Vector => "VECTOR".to_string(),
+        Array => "ARRAY".to_string(),
+        Interval => "INTERVAL".to_string(),
+        Point => "POINT".to_string(),
+        Box => "BOX".to_string(),
+        Circle => "CIRCLE".to_string(),
+        MacAddr => "MACADDR".to_string(),
+        Inet4 | Inet6 => "INET".to_string(),
+        Decimal => "DECIMAL".to_string(),
+        Int4Range => "INT4RANGE".to_string(),
+        Int8Range => "INT8RANGE".to_string(),
+        DateRange => "DATERANGE".to_string(),
+        TimestampRange => "TSRANGE".to_string(),
+        Enum => "ENUM".to_string(),
+        Composite => "COMPOSITE".to_string(),
+    }
 }
 
 fn list_indexes(db: &Database, args: &[&str]) -> CommandResult {

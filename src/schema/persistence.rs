@@ -212,6 +212,13 @@ impl CatalogPersistence {
             buf.push(0);
         }
 
+        if let Some(max_len) = column.max_length() {
+            buf.push(1);
+            buf.extend(max_len.to_le_bytes());
+        } else {
+            buf.push(0);
+        }
+
         Ok(())
     }
 
@@ -512,6 +519,26 @@ impl CatalogPersistence {
             column = column.with_default(default_val);
         }
 
+        if pos < bytes.len() {
+            let has_max_length = bytes[pos] != 0;
+            pos += 1;
+
+            if has_max_length {
+                ensure!(
+                    pos + 4 <= bytes.len(),
+                    "unexpected end of data reading max_length"
+                );
+                let max_len = u32::from_le_bytes([
+                    bytes[pos],
+                    bytes[pos + 1],
+                    bytes[pos + 2],
+                    bytes[pos + 3],
+                ]);
+                pos += 4;
+                column = column.with_max_length(max_len);
+            }
+        }
+
         Ok((column, pos))
     }
 
@@ -535,6 +562,8 @@ impl CatalogPersistence {
             21 => Ok(DataType::Blob),
             22 => Ok(DataType::Vector),
             23 => Ok(DataType::Jsonb),
+            24 => Ok(DataType::Varchar),
+            25 => Ok(DataType::Char),
             30 => Ok(DataType::Decimal),
             31 => Ok(DataType::Interval),
             40 => Ok(DataType::Int4Range),
