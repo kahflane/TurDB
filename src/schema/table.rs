@@ -166,6 +166,10 @@ impl ColumnDef {
     pub fn max_length(&self) -> Option<u32> {
         self.max_length
     }
+
+    pub fn set_name(&mut self, name: impl Into<String>) {
+        self.name = name.into();
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -354,5 +358,30 @@ impl TableDef {
 
     pub fn add_index(&mut self, index: IndexDef) {
         self.indexes.push(index);
+    }
+
+    pub fn drop_column(&mut self, name: &str) -> Option<ColumnDef> {
+        if let Some(pos) = self.columns.iter().position(|c| c.name() == name) {
+            Some(self.columns.remove(pos))
+        } else {
+            None
+        }
+    }
+
+    pub fn rename(&mut self, new_name: impl Into<String>) {
+        self.name = new_name.into();
+    }
+
+    pub fn add_column(&mut self, column: ColumnDef) {
+        self.columns.push(column);
+    }
+
+    pub fn rename_column(&mut self, old_name: &str, new_name: &str) -> bool {
+        if let Some(col) = self.columns.iter_mut().find(|c| c.name() == old_name) {
+            col.set_name(new_name);
+            true
+        } else {
+            false
+        }
     }
 }

@@ -149,6 +149,9 @@ pub enum ExecuteResult {
     Release {
         name: String,
     },
+    AlterTable {
+        action: String,
+    },
 }
 
 #[derive(Debug, Clone)]
