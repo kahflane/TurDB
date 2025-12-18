@@ -633,6 +633,40 @@ impl<'a> CompiledPredicate<'a> {
                 let time = format_unix_time_local(secs as i64);
                 Some(Value::Text(Cow::Owned(time)))
             }
+            "DATE_FORMAT" | "STRFTIME" => {
+                if args.len() < 2 {
+                    return None;
+                }
+                let format_str = match args.first()?.as_ref()? {
+                    Value::Text(s) => s.to_string(),
+                    _ => return None,
+                };
+                let datetime_str = match args.get(1)?.as_ref()? {
+                    Value::Text(s) => s.to_string(),
+                    Value::Null => return Some(Value::Null),
+                    _ => return None,
+                };
+                let formatted = format_datetime_with_pattern(&datetime_str, &format_str);
+                Some(Value::Text(Cow::Owned(formatted)))
+            }
+            "FORMAT" => {
+                if args.len() < 2 {
+                    return None;
+                }
+                let number = match args.first()?.as_ref()? {
+                    Value::Float(f) => *f,
+                    Value::Int(n) => *n as f64,
+                    Value::Null => return Some(Value::Null),
+                    _ => return None,
+                };
+                let decimals = match args.get(1)?.as_ref()? {
+                    Value::Int(n) => *n as usize,
+                    Value::Float(f) => *f as usize,
+                    _ => return None,
+                };
+                let formatted = format_number_with_decimals(number, decimals);
+                Some(Value::Text(Cow::Owned(formatted)))
+            }
             _ => None,
         }
     }
@@ -1403,4 +1437,100 @@ fn format_unix_date_local(secs: i64) -> String {
 fn format_unix_time_local(secs: i64) -> String {
     let ts = format_unix_timestamp_local(secs);
     ts.split(' ').nth(1).unwrap_or("").to_string()
+}
+
+fn format_datetime_with_pattern(datetime_str: &str, pattern: &str) -> String {
+    let parts: Vec<&str> = datetime_str.split(' ').collect();
+    let date_part = parts.first().unwrap_or(&"");
+    let time_part = parts.get(1).unwrap_or(&"00:00:00");
+
+    let date_parts: Vec<&str> = date_part.split('-').collect();
+    let year = date_parts.first().unwrap_or(&"0000");
+    let month = date_parts.get(1).unwrap_or(&"01");
+    let day = date_parts.get(2).unwrap_or(&"01");
+
+    let time_parts: Vec<&str> = time_part.split(':').collect();
+    let hour = time_parts.first().unwrap_or(&"00");
+    let minute = time_parts.get(1).unwrap_or(&"00");
+    let second = time_parts.get(2).unwrap_or(&"00");
+
+    let hour_num: u32 = hour.parse().unwrap_or(0);
+    let hour_12 = if hour_num == 0 {
+        12
+    } else if hour_num > 12 {
+        hour_num - 12
+    } else {
+        hour_num
+    };
+    let am_pm = if hour_num < 12 { "AM" } else { "PM" };
+
+    let month_num: u32 = month.parse().unwrap_or(1);
+    let month_names = [
+        "January", "February", "March", "April", "May", "June",
+        "July", "August", "September", "October", "November", "December",
+    ];
+    let month_abbrs = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun",
+        "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    let month_name = month_names.get((month_num as usize).saturating_sub(1)).unwrap_or(&"");
+    let month_abbr = month_abbrs.get((month_num as usize).saturating_sub(1)).unwrap_or(&"");
+
+    pattern
+        .replace("%Y", year)
+        .replace("%y", &year[year.len().saturating_sub(2)..])
+        .replace("%m", month)
+        .replace("%d", day)
+        .replace("%H", hour)
+        .replace("%i", minute)
+        .replace("%s", second)
+        .replace("%M", month_name)
+        .replace("%b", month_abbr)
+        .replace("%h", &format!("{:02}", hour_12))
+        .replace("%p", am_pm)
+        .replace("%T", &format!("{}:{}:{}", hour, minute, second))
+        .replace("%D", &format!("{}{}", day, ordinal_suffix(day.parse().unwrap_or(1))))
+}
+
+fn ordinal_suffix(n: u32) -> &'static str {
+    match n % 100 {
+        11 | 12 | 13 => "th",
+        _ => match n % 10 {
+            1 => "st",
+            2 => "nd",
+            3 => "rd",
+            _ => "th",
+        },
+    }
+}
+
+fn format_number_with_decimals(number: f64, decimals: usize) -> String {
+    let formatted = format!("{:.prec$}", number, prec = decimals);
+    
+    let parts: Vec<&str> = formatted.split('.').collect();
+    let integer_part = parts.first().unwrap_or(&"0");
+    let decimal_part = parts.get(1);
+
+    let is_negative = integer_part.starts_with('-');
+    let abs_integer: String = integer_part.chars().filter(|c| c.is_ascii_digit()).collect();
+    
+    let mut with_commas = String::new();
+    for (i, c) in abs_integer.chars().rev().enumerate() {
+        if i > 0 && i % 3 == 0 {
+            with_commas.push(',');
+        }
+        with_commas.push(c);
+    }
+    let with_commas: String = with_commas.chars().rev().collect();
+
+    let result = match decimal_part {
+        Some(dec) => format!("{}.{}", with_commas, dec),
+        None => with_commas,
+    };
+
+    if is_negative {
+        format!("-{}", result)
+    } else {
+        result
+    }
 }
