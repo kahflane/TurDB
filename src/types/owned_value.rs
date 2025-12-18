@@ -453,7 +453,7 @@ impl OwnedValue {
         match self {
             OwnedValue::Null => builder.set_null(idx),
             OwnedValue::Bool(b) => builder.set_bool(idx, *b)?,
-            OwnedValue::Int(i) => builder.set_int8(idx, *i)?,
+            OwnedValue::Int(i) => builder.set_int_auto(idx, *i)?,
             OwnedValue::Float(f) => builder.set_float8(idx, *f)?,
             OwnedValue::Text(s) => builder.set_text(idx, s)?,
             OwnedValue::Blob(b) => builder.set_blob(idx, b)?,

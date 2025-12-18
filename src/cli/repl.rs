@@ -242,6 +242,14 @@ impl Repl {
                     elapsed.as_secs_f64()
                 );
             }
+            ExecuteResult::Truncate { rows_affected } => {
+                println!(
+                    "Query OK, {} row{} affected ({:.3} sec)",
+                    rows_affected,
+                    if rows_affected == 1 { "" } else { "s" },
+                    elapsed.as_secs_f64()
+                );
+            }
             ExecuteResult::CreateTable { created } => {
                 if created {
                     println!("Table created ({:.3} sec)", elapsed.as_secs_f64());
