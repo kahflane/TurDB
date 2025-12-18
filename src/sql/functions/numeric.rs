@@ -163,7 +163,7 @@ fn eval_floor<'a>(args: &[Option<Value<'a>>]) -> Option<Value<'a>> {
 
 fn eval_round<'a>(args: &[Option<Value<'a>>]) -> Option<Value<'a>> {
     let val = get_float(args.first()?)?;
-    let decimals = args.get(1).and_then(|v| get_int(v)).unwrap_or(0);
+    let decimals = args.get(1).and_then(get_int).unwrap_or(0);
     
     let multiplier = 10_f64.powi(decimals as i32);
     let rounded = (val * multiplier).round() / multiplier;
@@ -177,7 +177,7 @@ fn eval_round<'a>(args: &[Option<Value<'a>>]) -> Option<Value<'a>> {
 
 fn eval_truncate<'a>(args: &[Option<Value<'a>>]) -> Option<Value<'a>> {
     let val = get_float(args.first()?)?;
-    let decimals = args.get(1).and_then(|v| get_int(v)).unwrap_or(0);
+    let decimals = args.get(1).and_then(get_int).unwrap_or(0);
     
     let multiplier = 10_f64.powi(decimals as i32);
     let truncated = (val * multiplier).trunc() / multiplier;
@@ -268,7 +268,7 @@ fn eval_tan<'a>(args: &[Option<Value<'a>>]) -> Option<Value<'a>> {
 
 fn eval_asin<'a>(args: &[Option<Value<'a>>]) -> Option<Value<'a>> {
     let val = get_float(args.first()?)?;
-    if val < -1.0 || val > 1.0 {
+    if !(-1.0..=1.0).contains(&val) {
         return Some(Value::Null);
     }
     Some(Value::Float(val.asin()))
@@ -276,7 +276,7 @@ fn eval_asin<'a>(args: &[Option<Value<'a>>]) -> Option<Value<'a>> {
 
 fn eval_acos<'a>(args: &[Option<Value<'a>>]) -> Option<Value<'a>> {
     let val = get_float(args.first()?)?;
-    if val < -1.0 || val > 1.0 {
+    if !(-1.0..=1.0).contains(&val) {
         return Some(Value::Null);
     }
     Some(Value::Float(val.acos()))
@@ -313,7 +313,7 @@ fn eval_radians<'a>(args: &[Option<Value<'a>>]) -> Option<Value<'a>> {
 }
 
 fn eval_rand<'a>(args: &[Option<Value<'a>>]) -> Option<Value<'a>> {
-    let seed = args.first().and_then(|v| get_int(v));
+    let seed = args.first().and_then(get_int);
     
     let random = match seed {
         Some(s) => {
@@ -441,6 +441,7 @@ fn eval_least<'a>(args: &[Option<Value<'a>>]) -> Option<Value<'a>> {
 }
 
 #[cfg(test)]
+#[allow(clippy::useless_vec)]
 mod tests {
     use super::*;
 
@@ -449,9 +450,9 @@ mod tests {
         let args = vec![Some(Value::Int(-5))];
         assert_eq!(eval_abs(&args), Some(Value::Int(5)));
         
-        let args = vec![Some(Value::Float(-3.14))];
+        let args = vec![Some(Value::Float(-3.125))];
         if let Some(Value::Float(f)) = eval_abs(&args) {
-            assert!((f - 3.14).abs() < 0.001);
+            assert!((f - 3.125).abs() < 0.001);
         } else {
             panic!("Expected float");
         }

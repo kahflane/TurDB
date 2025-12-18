@@ -129,6 +129,9 @@ pub enum ExecuteResult {
         rows_affected: usize,
         returned: Option<Vec<Row>>,
     },
+    Truncate {
+        rows_affected: usize,
+    },
     Select {
         columns: Vec<String>,
         rows: Vec<Row>,

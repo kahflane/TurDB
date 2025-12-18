@@ -245,7 +245,7 @@ fn eval_week<'a>(args: &[Option<Value<'a>>]) -> Option<Value<'a>> {
     let datetime = get_text(args.first()?)?;
     let (year, month, day) = parse_date(&datetime)?;
     let doy = day_of_year(year, month, day);
-    let week = (doy + 6) / 7;
+    let week = doy.div_ceil(7);
     Some(Value::Int(week as i64))
 }
 
@@ -253,7 +253,7 @@ fn eval_yearweek<'a>(args: &[Option<Value<'a>>]) -> Option<Value<'a>> {
     let datetime = get_text(args.first()?)?;
     let (year, month, day) = parse_date(&datetime)?;
     let doy = day_of_year(year, month, day);
-    let week = (doy + 6) / 7;
+    let week = doy.div_ceil(7);
     Some(Value::Int(year * 100 + week as i64))
 }
 
@@ -452,7 +452,7 @@ fn eval_maketime<'a>(args: &[Option<Value<'a>>]) -> Option<Value<'a>> {
 
 fn eval_timestamp<'a>(args: &[Option<Value<'a>>]) -> Option<Value<'a>> {
     let date = get_text(args.first()?)?;
-    let time = args.get(1).and_then(|v| get_text(v)).unwrap_or_else(|| "00:00:00".to_string());
+    let time = args.get(1).and_then(get_text).unwrap_or_else(|| "00:00:00".to_string());
     
     let date_part = date.split(' ').next().unwrap_or(&date);
     Some(Value::Text(Cow::Owned(format!("{} {}", date_part, time))))
@@ -584,8 +584,7 @@ fn day_of_week(year: i64, month: u32, day: u32) -> u32 {
     let k = y % 100;
     let j = y / 100;
     let h = (q + (13 * (m as i64 + 1)) / 5 + k + k / 4 + j / 4 - 2 * j) % 7;
-    let dow = ((h + 6) % 7) as u32;
-    dow
+    ((h + 6) % 7) as u32
 }
 
 fn day_of_year(year: i64, month: u32, day: u32) -> u32 {
@@ -612,7 +611,7 @@ fn get_local_timezone_offset() -> i64 {
                 return 0;
             }
             let tm = tm.assume_init();
-            tm.tm_gmtoff as i64
+            tm.tm_gmtoff
         }
     }
     #[cfg(not(unix))]
@@ -716,13 +715,13 @@ fn format_datetime_with_pattern(datetime_str: &str, pattern: &str) -> String {
         .replace("%t", &last_day.to_string())
         .replace("%j", &format!("{:03}", doy))
         .replace("%w", &dow.to_string())
-        .replace("%U", &format!("{:02}", (doy + 6) / 7))
+        .replace("%U", &format!("{:02}", doy.div_ceil(7)))
         .replace("%%", "%")
 }
 
 fn ordinal_suffix(n: u32) -> &'static str {
     match n % 100 {
-        11 | 12 | 13 => "th",
+        11..=13 => "th",
         _ => match n % 10 {
             1 => "st",
             2 => "nd",

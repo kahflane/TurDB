@@ -118,6 +118,23 @@ impl<'a> RecordBuilder<'a> {
         Ok(())
     }
 
+    pub fn set_int_auto(&mut self, col_idx: usize, value: i64) -> Result<()> {
+        use crate::types::DataType;
+
+        let col_type = self
+            .schema
+            .column(col_idx)
+            .map(|c| c.data_type)
+            .unwrap_or(DataType::Int8);
+
+        match col_type {
+            DataType::Int2 => self.set_int2(col_idx, value as i16),
+            DataType::Int4 => self.set_int4(col_idx, value as i32),
+            DataType::Bool => self.set_bool(col_idx, value != 0),
+            _ => self.set_int8(col_idx, value),
+        }
+    }
+
     pub fn set_float4(&mut self, col_idx: usize, value: f32) -> Result<()> {
         self.set_fixed_bytes(col_idx, &value.to_le_bytes());
         Ok(())

@@ -425,6 +425,98 @@ mod dml_tests {
     }
 }
 
+mod truncate_tests {
+    use super::*;
+
+    #[test]
+    fn truncate_removes_all_rows() {
+        let dir = tempdir().unwrap();
+        let db = Database::create(dir.path().join("test_db")).unwrap();
+        db.execute("CREATE TABLE items (id INT, name TEXT)")
+            .unwrap();
+        db.execute("INSERT INTO items VALUES (1, 'a')").unwrap();
+        db.execute("INSERT INTO items VALUES (2, 'b')").unwrap();
+        db.execute("INSERT INTO items VALUES (3, 'c')").unwrap();
+
+        let before = db.query("SELECT * FROM items").unwrap();
+        assert_eq!(before.len(), 3, "SHOULD have 3 rows before truncate");
+
+        let result = db.execute("TRUNCATE items").unwrap();
+        assert!(
+            matches!(
+                result,
+                ExecuteResult::Truncate {
+                    rows_affected: 3,
+                    ..
+                }
+            ),
+            "TRUNCATE SHOULD return rows_affected: 3"
+        );
+
+        let after = db.query("SELECT * FROM items").unwrap();
+        assert_eq!(after.len(), 0, "SHOULD have 0 rows after truncate");
+    }
+
+    #[test]
+    fn truncate_table_keyword_optional() {
+        let dir = tempdir().unwrap();
+        let db = Database::create(dir.path().join("test_db")).unwrap();
+        db.execute("CREATE TABLE items (id INT)").unwrap();
+        db.execute("INSERT INTO items VALUES (1)").unwrap();
+
+        let result = db.execute("TRUNCATE TABLE items").unwrap();
+        assert!(
+            matches!(
+                result,
+                ExecuteResult::Truncate {
+                    rows_affected: 1,
+                    ..
+                }
+            ),
+            "TRUNCATE TABLE SHOULD work"
+        );
+
+        let after = db.query("SELECT * FROM items").unwrap();
+        assert_eq!(after.len(), 0, "SHOULD have 0 rows after truncate");
+    }
+
+    #[test]
+    fn truncate_empty_table_returns_zero_rows() {
+        let dir = tempdir().unwrap();
+        let db = Database::create(dir.path().join("test_db")).unwrap();
+        db.execute("CREATE TABLE empty_table (id INT)").unwrap();
+
+        let result = db.execute("TRUNCATE empty_table").unwrap();
+
+        assert!(
+            matches!(
+                result,
+                ExecuteResult::Truncate { rows_affected: 0 }
+            ),
+            "TRUNCATE on empty table SHOULD return rows_affected: 0"
+        );
+    }
+
+    #[test]
+    fn truncate_allows_reinsert_after() {
+        let dir = tempdir().unwrap();
+        let db = Database::create(dir.path().join("test_db")).unwrap();
+        db.execute("CREATE TABLE items (id INT, val TEXT)")
+            .unwrap();
+        db.execute("INSERT INTO items VALUES (1, 'old')").unwrap();
+
+        db.execute("TRUNCATE items").unwrap();
+        db.execute("INSERT INTO items VALUES (2, 'new')").unwrap();
+
+        let rows = db.query("SELECT id, val FROM items").unwrap();
+        assert_eq!(rows.len(), 1, "SHOULD have 1 row after reinsert");
+        match &rows[0].values[0] {
+            OwnedValue::Int(id) => assert_eq!(*id, 2, "id SHOULD be 2"),
+            other => panic!("id SHOULD be Int, got {:?}", other),
+        }
+    }
+}
+
 mod transaction_tests {
     use super::*;
 

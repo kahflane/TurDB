@@ -168,7 +168,7 @@ fn eval_conv<'a>(args: &[Option<Value<'a>>]) -> Option<Value<'a>> {
         _ => return None,
     };
     
-    if from_base < 2 || from_base > 36 || to_base < 2 || to_base > 36 {
+    if !(2..=36).contains(&from_base) || !(2..=36).contains(&to_base) {
         return Some(Value::Null);
     }
     
@@ -177,7 +177,7 @@ fn eval_conv<'a>(args: &[Option<Value<'a>>]) -> Option<Value<'a>> {
     let result = if to_base == 10 {
         num.to_string()
     } else {
-        let mut n = num.abs() as u64;
+        let mut n = num.unsigned_abs();
         let mut digits = Vec::new();
         if n == 0 {
             digits.push('0');

@@ -150,7 +150,7 @@ fn eval_right<'a>(args: &[Option<Value<'a>>]) -> Option<Value<'a>> {
 fn eval_substr<'a>(args: &[Option<Value<'a>>]) -> Option<Value<'a>> {
     let text = get_text(args.first()?)?;
     let pos = get_int(args.get(1)?)?;
-    let len = args.get(2).and_then(|v| get_int(v));
+    let len = args.get(2).and_then(get_int);
     
     let chars: Vec<char> = text.chars().collect();
     let start = if pos > 0 {
@@ -204,7 +204,7 @@ fn eval_instr<'a>(args: &[Option<Value<'a>>]) -> Option<Value<'a>> {
 fn eval_locate<'a>(args: &[Option<Value<'a>>]) -> Option<Value<'a>> {
     let needle = get_text(args.first()?)?;
     let haystack = get_text(args.get(1)?)?;
-    let start = args.get(2).and_then(|v| get_int(v)).unwrap_or(1);
+    let start = args.get(2).and_then(get_int).unwrap_or(1);
     
     if start < 1 {
         return Some(Value::Int(0));

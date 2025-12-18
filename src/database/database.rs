@@ -1598,6 +1598,7 @@ impl Database {
             Statement::Rollback(rollback) => self.execute_rollback(rollback),
             Statement::Savepoint(savepoint) => self.execute_savepoint(savepoint),
             Statement::Release(release) => self.execute_release(release),
+            Statement::Truncate(truncate) => self.execute_truncate(truncate),
             _ => bail!("unsupported statement type"),
         }
     }
@@ -3418,6 +3419,72 @@ impl Database {
         Ok(ExecuteResult::Delete {
             rows_affected,
             returned: returned_rows,
+        })
+    }
+
+    fn execute_truncate(
+        &self,
+        truncate: &crate::sql::ast::TruncateStmt<'_>,
+    ) -> Result<ExecuteResult> {
+        use crate::btree::BTree;
+
+        self.ensure_catalog()?;
+        self.ensure_file_manager()?;
+
+        let tables_info: Vec<(String, String)> = {
+            let catalog_guard = self.catalog.read();
+            let catalog = catalog_guard.as_ref().unwrap();
+
+            let mut info = Vec::new();
+            for table_ref in truncate.tables {
+                let schema_name = table_ref.schema.unwrap_or("root");
+                let table_name = table_ref.name;
+
+                catalog.resolve_table(table_name)?;
+                info.push((schema_name.to_string(), table_name.to_string()));
+            }
+            info
+        };
+
+        let mut total_rows_affected: usize = 0;
+
+        for (schema_name, table_name) in &tables_info {
+            let mut file_manager_guard = self.file_manager.write();
+            let file_manager = file_manager_guard.as_mut().unwrap();
+            let storage = file_manager.table_data_mut(schema_name, table_name)?;
+
+            let root_page = 1u32;
+            let btree = BTree::new(storage, root_page)?;
+            let mut cursor = btree.cursor_first()?;
+
+            let mut keys_to_delete: Vec<Vec<u8>> = Vec::new();
+            while cursor.valid() {
+                keys_to_delete.push(cursor.key()?.to_vec());
+                cursor.advance()?;
+            }
+
+            let rows_affected = keys_to_delete.len();
+            total_rows_affected += rows_affected;
+
+            let mut btree_mut = BTree::new(storage, root_page)?;
+            for key in &keys_to_delete {
+                btree_mut.delete(key)?;
+            }
+
+            let page = storage.page_mut(0)?;
+            let header = TableFileHeader::from_bytes_mut(page)?;
+
+            header.set_row_count(0);
+
+            if truncate.restart_identity {
+                header.set_auto_increment(0);
+            }
+
+            storage.sync()?;
+        }
+
+        Ok(ExecuteResult::Truncate {
+            rows_affected: total_rows_affected,
         })
     }
 

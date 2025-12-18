@@ -256,14 +256,9 @@ impl RowSource for MaterializedRowSource {
     }
 }
 
+#[derive(Default)]
 pub struct DualSource {
     exhausted: bool,
-}
-
-impl Default for DualSource {
-    fn default() -> Self {
-        Self { exhausted: false }
-    }
 }
 
 impl RowSource for DualSource {
