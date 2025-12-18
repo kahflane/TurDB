@@ -612,7 +612,7 @@ impl<'a> CompiledPredicate<'a> {
                     .duration_since(SystemTime::UNIX_EPOCH)
                     .ok()?;
                 let secs = now.as_secs();
-                let datetime = format_unix_timestamp(secs as i64);
+                let datetime = format_unix_timestamp_local(secs as i64);
                 Some(Value::Text(Cow::Owned(datetime)))
             }
             "CURRENT_DATE" => {
@@ -621,7 +621,7 @@ impl<'a> CompiledPredicate<'a> {
                     .duration_since(SystemTime::UNIX_EPOCH)
                     .ok()?;
                 let secs = now.as_secs();
-                let date = format_unix_date(secs as i64);
+                let date = format_unix_date_local(secs as i64);
                 Some(Value::Text(Cow::Owned(date)))
             }
             "CURRENT_TIME" => {
@@ -630,7 +630,7 @@ impl<'a> CompiledPredicate<'a> {
                     .duration_since(SystemTime::UNIX_EPOCH)
                     .ok()?;
                 let secs = now.as_secs();
-                let time = format_unix_time(secs as i64);
+                let time = format_unix_time_local(secs as i64);
                 Some(Value::Text(Cow::Owned(time)))
             }
             _ => None,
@@ -1321,6 +1321,41 @@ impl<'a> CompiledProjection<'a> {
     }
 }
 
+fn get_local_timezone_offset() -> i64 {
+    use std::time::SystemTime;
+
+    let now = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+
+    #[cfg(unix)]
+    {
+        use std::mem::MaybeUninit;
+        
+        let mut tm = MaybeUninit::<libc::tm>::uninit();
+        let time_t = now as libc::time_t;
+        
+        unsafe {
+            if libc::localtime_r(&time_t, tm.as_mut_ptr()).is_null() {
+                return 0;
+            }
+            let tm = tm.assume_init();
+            tm.tm_gmtoff as i64
+        }
+    }
+    
+    #[cfg(not(unix))]
+    {
+        0
+    }
+}
+
+fn format_unix_timestamp_local(secs: i64) -> String {
+    let offset = get_local_timezone_offset();
+    format_unix_timestamp(secs + offset)
+}
+
 fn format_unix_timestamp(secs: i64) -> String {
     const SECONDS_PER_DAY: i64 = 86400;
     const DAYS_PER_YEAR: i64 = 365;
@@ -1360,12 +1395,12 @@ fn format_unix_timestamp(secs: i64) -> String {
     )
 }
 
-fn format_unix_date(secs: i64) -> String {
-    let ts = format_unix_timestamp(secs);
+fn format_unix_date_local(secs: i64) -> String {
+    let ts = format_unix_timestamp_local(secs);
     ts.split(' ').next().unwrap_or("").to_string()
 }
 
-fn format_unix_time(secs: i64) -> String {
-    let ts = format_unix_timestamp(secs);
+fn format_unix_time_local(secs: i64) -> String {
+    let ts = format_unix_timestamp_local(secs);
     ts.split(' ').nth(1).unwrap_or("").to_string()
 }
