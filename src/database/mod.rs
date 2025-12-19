@@ -140,6 +140,10 @@ pub enum ExecuteResult {
         name: String,
         value: Option<String>,
     },
+    Set {
+        name: String,
+        value: String,
+    },
     Begin,
     Commit,
     Rollback,

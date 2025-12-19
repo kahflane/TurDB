@@ -140,6 +140,10 @@ pub struct BTree<'a, S: Storage> {
     storage: &'a mut S,
     root_page: u32,
     freelist: Option<&'a mut Freelist>,
+    /// Hint for the rightmost leaf page (PostgreSQL-style fastpath optimization).
+    /// When set, insert() will first try this page for sequential inserts,
+    /// avoiding tree traversal for monotonically increasing keys.
+    rightmost_hint: Option<u32>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -227,6 +231,24 @@ impl<'a, S: Storage> BTree<'a, S> {
             storage,
             root_page,
             freelist: None,
+            rightmost_hint: None,
+        })
+    }
+
+    /// Creates a BTree with a hint for the rightmost leaf page.
+    /// This enables fastpath optimization for bulk sequential inserts.
+    pub fn with_rightmost_hint(storage: &'a mut S, root_page: u32, hint: Option<u32>) -> Result<Self> {
+        ensure!(
+            root_page < storage.page_count(),
+            "root page {} out of bounds (page_count={})",
+            root_page,
+            storage.page_count()
+        );
+        Ok(Self {
+            storage,
+            root_page,
+            freelist: None,
+            rightmost_hint: hint,
         })
     }
 
@@ -245,6 +267,7 @@ impl<'a, S: Storage> BTree<'a, S> {
             storage,
             root_page,
             freelist: Some(freelist),
+            rightmost_hint: None,
         })
     }
 
@@ -263,6 +286,7 @@ impl<'a, S: Storage> BTree<'a, S> {
             storage,
             root_page,
             freelist: None,
+            rightmost_hint: None,
         })
     }
 
@@ -326,6 +350,15 @@ impl<'a, S: Storage> BTree<'a, S> {
     }
 
     pub fn insert(&mut self, key: &[u8], value: &[u8]) -> Result<()> {
+        // PostgreSQL-style fastpath optimization: try the cached rightmost leaf first.
+        // This avoids tree traversal for monotonically increasing keys.
+        if let Some(hint_page) = self.rightmost_hint {
+            if let Ok(true) = self.try_fastpath_insert(hint_page, key, value) {
+                return Ok(());
+            }
+            // Fastpath failed, fall back to normal insert
+        }
+
         let mut path: PathStack = SmallVec::new();
         let mut current_page = self.root_page;
 
@@ -351,15 +384,84 @@ impl<'a, S: Storage> BTree<'a, S> {
 
         let result = self.insert_into_leaf(current_page, key, value)?;
 
+        // Update rightmost hint after successful insert
+        self.update_rightmost_hint(current_page);
+
         if let InsertResult::Split {
             separator,
             new_page,
         } = result
         {
             self.propagate_split(path, &separator, current_page, new_page)?;
+            // After split, the new page becomes the rightmost
+            self.update_rightmost_hint(new_page);
         }
 
         Ok(())
+    }
+
+    /// Attempts a fastpath insert into the hinted rightmost leaf page.
+    /// Returns Ok(true) if successful, Ok(false) if fastpath conditions not met.
+    fn try_fastpath_insert(&mut self, hint_page: u32, key: &[u8], value: &[u8]) -> Result<bool> {
+        // Verify hint page is valid and is a leaf
+        if hint_page >= self.storage.page_count() {
+            return Ok(false);
+        }
+
+        let page_data = self.storage.page(hint_page)?;
+        let header = PageHeader::from_bytes(page_data)?;
+
+        if header.page_type() != PageType::BTreeLeaf {
+            return Ok(false);
+        }
+
+        let leaf = LeafNode::from_page(page_data)?;
+
+        // Check if this is still the rightmost leaf (next_leaf == 0)
+        if leaf.next_leaf() != 0 {
+            return Ok(false);
+        }
+
+        // Check if key is greater than all existing keys (should go at the end)
+        let cell_count = leaf.cell_count() as usize;
+        if cell_count > 0 {
+            let last_key = leaf.key_at(cell_count - 1)?;
+            if key <= last_key {
+                return Ok(false); // Key doesn't belong at the end
+            }
+        }
+
+        // Check if there's enough space
+        let value_len_size = varint_len(value.len() as u64);
+        let cell_size = key.len() + value_len_size + value.len();
+        let space_needed = cell_size + SLOT_SIZE;
+
+        if (leaf.free_space() as usize) < space_needed {
+            return Ok(false); // Not enough space, need split
+        }
+
+        // Fastpath conditions met! Insert directly.
+        let page_data = self.storage.page_mut(hint_page)?;
+        let mut leaf = LeafNodeMut::from_page(page_data)?;
+        leaf.insert_cell(key, value)?;
+
+        Ok(true)
+    }
+
+    /// Updates the rightmost hint if the given page is the rightmost leaf.
+    fn update_rightmost_hint(&mut self, page_no: u32) {
+        if let Ok(page_data) = self.storage.page(page_no) {
+            if let Ok(leaf) = LeafNode::from_page(page_data) {
+                if leaf.next_leaf() == 0 {
+                    self.rightmost_hint = Some(page_no);
+                }
+            }
+        }
+    }
+
+    /// Returns the current rightmost hint for use in subsequent BTree instances.
+    pub fn rightmost_hint(&self) -> Option<u32> {
+        self.rightmost_hint
     }
 
     fn insert_into_leaf(&mut self, page_no: u32, key: &[u8], value: &[u8]) -> Result<InsertResult> {
@@ -403,14 +505,26 @@ impl<'a, S: Storage> BTree<'a, S> {
         all_keys.insert(insert_pos, arena.alloc_slice_copy(key));
         all_values.insert(insert_pos, arena.alloc_slice_copy(value));
 
-        let mid = all_keys.len() / 2;
-
         let old_next_leaf;
         {
             let page_data = self.storage.page(page_no)?;
             let leaf = LeafNode::from_page(page_data)?;
             old_next_leaf = leaf.next_leaf();
         }
+
+        // PostgreSQL-style optimization: use 90/10 split for rightmost leaf.
+        // This optimizes for monotonically increasing keys (e.g., auto-increment, timestamps)
+        // by leaving more space in the new rightmost page for future inserts.
+        let is_rightmost = old_next_leaf == 0;
+        let mid = if is_rightmost {
+            // 90/10 split: keep only ~10% in old page, move ~90% to new page
+            // This leaves room for more sequential inserts in the new rightmost page
+            // Minimum of 1 to ensure at least one key stays in old page
+            (all_keys.len() / 10).max(1)
+        } else {
+            // Normal 50/50 split for non-rightmost pages
+            all_keys.len() / 2
+        };
 
         {
             let page_data = self.storage.page_mut(page_no)?;
