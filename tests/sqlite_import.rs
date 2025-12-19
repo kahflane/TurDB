@@ -53,7 +53,7 @@ const TABLES: &[TableSchema] = &[
     TableSchema {
         name: "Competitions",
         turdb_ddl: "CREATE TABLE competitions (
-            id BIGINT, slug TEXT, title TEXT, subtitle TEXT, host_segment_title TEXT,
+            id BIGINT primary key auto_increment, slug TEXT, title TEXT, subtitle TEXT, host_segment_title TEXT,
             forum_id BIGINT, organization_id FLOAT, enabled_date TEXT, deadline_date TEXT,
             prohibit_new_entrants_deadline_date TEXT, team_merger_deadline_date TEXT,
             team_model_deadline_date TEXT, model_submission_deadline_date TEXT,
@@ -74,13 +74,13 @@ const TABLES: &[TableSchema] = &[
     },
     TableSchema {
         name: "CompetitionTags",
-        turdb_ddl: "CREATE TABLE competition_tags (id BIGINT, competition_id BIGINT, tag_id BIGINT)",
+        turdb_ddl: "CREATE TABLE competition_tags (id BIGINT primary key auto_increment, competition_id BIGINT, tag_id BIGINT)",
         columns: "Id, CompetitionId, TagId",
     },
     TableSchema {
         name: "Datasets",
         turdb_ddl: "CREATE TABLE datasets (
-            id BIGINT, creator_user_id BIGINT, owner_user_id FLOAT, owner_organization_id FLOAT,
+            id BIGINT primary key auto_increment, creator_user_id BIGINT, owner_user_id FLOAT, owner_organization_id FLOAT,
             current_dataset_version_id FLOAT, current_datasource_version_id FLOAT,
             forum_id BIGINT, type BIGINT, creation_date TEXT, last_activity_date TEXT,
             total_views BIGINT, total_downloads BIGINT, total_votes BIGINT, total_kernels INT
@@ -89,13 +89,13 @@ const TABLES: &[TableSchema] = &[
     },
     TableSchema {
         name: "DatasetTags",
-        turdb_ddl: "CREATE TABLE dataset_tags (id BIGINT, dataset_id BIGINT, tag_id BIGINT)",
+        turdb_ddl: "CREATE TABLE dataset_tags (id BIGINT primary key auto_increment, dataset_id BIGINT, tag_id BIGINT)",
         columns: "Id, DatasetId, TagId",
     },
     TableSchema {
         name: "DatasetTasks",
         turdb_ddl: "CREATE TABLE dataset_tasks (
-            id BIGINT, dataset_id BIGINT, owner_user_id BIGINT, creation_date TEXT,
+            id BIGINT primary key auto_increment, dataset_id BIGINT, owner_user_id BIGINT, creation_date TEXT,
             description TEXT, forum_id FLOAT, title TEXT, subtitle TEXT,
             deadline TEXT, total_votes INT
         )",
@@ -104,7 +104,7 @@ const TABLES: &[TableSchema] = &[
     TableSchema {
         name: "DatasetTaskSubmissions",
         turdb_ddl: "CREATE TABLE dataset_task_submissions (
-            id BIGINT, dataset_task_id BIGINT, submitted_user_id FLOAT, creation_date TEXT,
+            id BIGINT primary key auto_increment, dataset_task_id BIGINT, submitted_user_id FLOAT, creation_date TEXT,
             kernel_id FLOAT, dataset_id FLOAT, accepted_date TEXT
         )",
         columns: "Id, DatasetTaskId, SubmittedUserId, CreationDate, KernelId, DatasetId, AcceptedDate",
@@ -112,7 +112,7 @@ const TABLES: &[TableSchema] = &[
     TableSchema {
         name: "DatasetVersions",
         turdb_ddl: "CREATE TABLE dataset_versions (
-            id BIGINT, dataset_id BIGINT, datasource_version_id BIGINT, creator_user_id BIGINT,
+            id BIGINT primary key auto_increment, dataset_id BIGINT, datasource_version_id BIGINT, creator_user_id BIGINT,
             license_name TEXT, creation_date TEXT, version_number FLOAT, title TEXT,
             slug TEXT, subtitle TEXT, description TEXT, version_notes TEXT,
             total_compressed_bytes FLOAT, total_uncompressed_bytes REAL
@@ -121,34 +121,26 @@ const TABLES: &[TableSchema] = &[
     },
     TableSchema {
         name: "DatasetVotes",
-        turdb_ddl: "CREATE TABLE dataset_votes (id BIGINT, user_id BIGINT, dataset_version_id BIGINT, vote_date TEXT)",
+        turdb_ddl: "CREATE TABLE dataset_votes (id BIGINT primary key auto_increment, user_id BIGINT, dataset_version_id BIGINT, vote_date TEXT)",
         columns: "Id, UserId, DatasetVersionId, VoteDate",
     },
     TableSchema {
         name: "Datasources",
         turdb_ddl: "CREATE TABLE datasources (
-            id BIGINT, creator_user_id BIGINT, creation_date TEXT, type BIGINT,
+            id BIGINT primary key auto_increment, creator_user_id BIGINT, creation_date TEXT, type BIGINT,
             current_datasource_version_id INT
         )",
         columns: "Id, CreatorUserId, CreationDate, Type, CurrentDatasourceVersionId",
     },
     TableSchema {
-        name: "EpisodeAgents",
-        turdb_ddl: "CREATE TABLE episode_agents (
-            id BIGINT, episode_id BIGINT, idx BIGINT, reward FLOAT, state BIGINT, submission_id BIGINT,
-            initial_confidence FLOAT, initial_score FLOAT, updated_confidence FLOAT, updated_score REAL
-        )",
-        columns: "Id, EpisodeId, \"Index\", Reward, State, SubmissionId, InitialConfidence, InitialScore, UpdatedConfidence, UpdatedScore",
-    },
-    TableSchema {
         name: "Episodes",
-        turdb_ddl: "CREATE TABLE episodes (id BIGINT, type BIGINT, competition_id BIGINT, create_time TEXT, end_time TEXT)",
+        turdb_ddl: "CREATE TABLE episodes (id BIGINT primary key auto_increment, type BIGINT, competition_id BIGINT, create_time TEXT, end_time TEXT)",
         columns: "Id, Type, CompetitionId, CreateTime, EndTime",
     },
     TableSchema {
         name: "ForumMessages",
         turdb_ddl: "CREATE TABLE forum_messages (
-            id BIGINT, forum_topic_id BIGINT, post_user_id BIGINT, post_date TEXT,
+            id BIGINT primary key auto_increment, forum_topic_id BIGINT, post_user_id BIGINT, post_date TEXT,
             reply_to_forum_message_id FLOAT, message TEXT, medal FLOAT, medal_award_date TEXT
         )",
         columns: "Id, ForumTopicId, PostUserId, PostDate, ReplyToForumMessageId, Message, Medal, MedalAwardDate",
@@ -156,19 +148,19 @@ const TABLES: &[TableSchema] = &[
     TableSchema {
         name: "ForumMessageVotes",
         turdb_ddl: "CREATE TABLE forum_message_votes (
-            id BIGINT, forum_message_id BIGINT, from_user_id BIGINT, to_user_id BIGINT, vote_date TEXT
+            id BIGINT primary key auto_increment, forum_message_id BIGINT, from_user_id BIGINT, to_user_id BIGINT, vote_date TEXT
         )",
         columns: "Id, ForumMessageId, FromUserId, ToUserId, VoteDate",
     },
     TableSchema {
         name: "Forums",
-        turdb_ddl: "CREATE TABLE forums (id BIGINT, parent_forum_id FLOAT, title TEXT)",
+        turdb_ddl: "CREATE TABLE forums (id BIGINT primary key auto_increment, parent_forum_id FLOAT, title TEXT)",
         columns: "Id, ParentForumId, Title",
     },
     TableSchema {
         name: "ForumTopics",
         turdb_ddl: "CREATE TABLE forum_topics (
-            id BIGINT, forum_id BIGINT, kernel_id FLOAT, last_forum_message_id FLOAT,
+            id BIGINT primary key auto_increment, forum_id BIGINT, kernel_id FLOAT, last_forum_message_id FLOAT,
             first_forum_message_id FLOAT, creation_date TEXT, last_comment_date TEXT,
             title TEXT, is_sticky BIGINT, total_views BIGINT, score BIGINT,
             total_messages BIGINT, total_replies INT
@@ -177,13 +169,13 @@ const TABLES: &[TableSchema] = &[
     },
     TableSchema {
         name: "KernelLanguages",
-        turdb_ddl: "CREATE TABLE kernel_languages (id BIGINT, name TEXT, display_name TEXT, is_notebook BIGINT)",
+        turdb_ddl: "CREATE TABLE kernel_languages (id BIGINT primary key auto_increment, name TEXT, display_name TEXT, is_notebook BIGINT)",
         columns: "Id, Name, DisplayName, IsNotebook",
     },
     TableSchema {
         name: "Kernels",
         turdb_ddl: "CREATE TABLE kernels (
-            id BIGINT, author_user_id BIGINT, current_kernel_version_id FLOAT,
+            id BIGINT primary key auto_increment, author_user_id BIGINT, current_kernel_version_id FLOAT,
             fork_parent_kernel_version_id FLOAT, forum_topic_id FLOAT,
             first_kernel_version_id FLOAT, creation_date TEXT, evaluation_date TEXT,
             made_public_date TEXT, is_project_language_template BIGINT, current_url_slug TEXT,
@@ -193,28 +185,28 @@ const TABLES: &[TableSchema] = &[
     },
     TableSchema {
         name: "KernelTags",
-        turdb_ddl: "CREATE TABLE kernel_tags (id BIGINT, kernel_id BIGINT, tag_id BIGINT)",
+        turdb_ddl: "CREATE TABLE kernel_tags (id BIGINT primary key auto_increment, kernel_id BIGINT, tag_id BIGINT)",
         columns: "Id, KernelId, TagId",
     },
     TableSchema {
         name: "KernelVersionCompetitionSources",
-        turdb_ddl: "CREATE TABLE kernel_version_competition_sources (id BIGINT, kernel_version_id BIGINT, source_competition_id BIGINT)",
+        turdb_ddl: "CREATE TABLE kernel_version_competition_sources (id BIGINT primary key auto_increment, kernel_version_id BIGINT, source_competition_id BIGINT)",
         columns: "Id, KernelVersionId, SourceCompetitionId",
     },
     TableSchema {
         name: "KernelVersionDatasetSources",
-        turdb_ddl: "CREATE TABLE kernel_version_dataset_sources (id BIGINT, kernel_version_id BIGINT, source_dataset_version_id BIGINT)",
+        turdb_ddl: "CREATE TABLE kernel_version_dataset_sources (id BIGINT primary key auto_increment, kernel_version_id BIGINT, source_dataset_version_id BIGINT)",
         columns: "Id, KernelVersionId, SourceDatasetVersionId",
     },
     TableSchema {
         name: "KernelVersionKernelSources",
-        turdb_ddl: "CREATE TABLE kernel_version_kernel_sources (id BIGINT, kernel_version_id BIGINT, source_kernel_version_id BIGINT)",
+        turdb_ddl: "CREATE TABLE kernel_version_kernel_sources (id BIGINT primary key auto_increment, kernel_version_id BIGINT, source_kernel_version_id BIGINT)",
         columns: "Id, KernelVersionId, SourceKernelVersionId",
     },
     TableSchema {
         name: "KernelVersions",
         turdb_ddl: "CREATE TABLE kernel_versions (
-            id BIGINT, script_id BIGINT, parent_script_version_id FLOAT, script_language_id BIGINT,
+            id BIGINT primary key auto_increment, script_id BIGINT, parent_script_version_id FLOAT, script_language_id BIGINT,
             author_user_id BIGINT, creation_date TEXT, version_number FLOAT, title TEXT,
             evaluation_date TEXT, is_change BIGINT, total_lines FLOAT,
             lines_inserted_from_previous FLOAT, lines_changed_from_previous FLOAT,
@@ -226,18 +218,18 @@ const TABLES: &[TableSchema] = &[
     },
     TableSchema {
         name: "KernelVotes",
-        turdb_ddl: "CREATE TABLE kernel_votes (id BIGINT, user_id BIGINT, kernel_version_id BIGINT, vote_date TEXT)",
+        turdb_ddl: "CREATE TABLE kernel_votes (id BIGINT primary key auto_increment, user_id BIGINT, kernel_version_id BIGINT, vote_date TEXT)",
         columns: "Id, UserId, KernelVersionId, VoteDate",
     },
     TableSchema {
         name: "Organizations",
-        turdb_ddl: "CREATE TABLE organizations (id BIGINT, name TEXT, slug TEXT, creation_date TEXT, description TEXT)",
+        turdb_ddl: "CREATE TABLE organizations (id BIGINT primary key auto_increment, name TEXT, slug TEXT, creation_date TEXT, description TEXT)",
         columns: "Id, Name, Slug, CreationDate, Description",
     },
     TableSchema {
         name: "Submissions",
         turdb_ddl: "CREATE TABLE submissions (
-            id BIGINT, submitted_user_id BIGINT, team_id BIGINT, source_kernel_version_id BIGINT,
+            id BIGINT primary key auto_increment, submitted_user_id BIGINT, team_id BIGINT, source_kernel_version_id BIGINT,
             submission_date TEXT, score_date TEXT, is_after_deadline BIGINT,
             public_score_leaderboard_display TEXT, public_score_full_precision FLOAT,
             private_score_leaderboard_display TEXT, private_score_full_precision REAL
@@ -247,20 +239,20 @@ const TABLES: &[TableSchema] = &[
     TableSchema {
         name: "Tags",
         turdb_ddl: "CREATE TABLE tags (
-            id BIGINT, parent_tag_id FLOAT, name TEXT, slug TEXT, full_path TEXT,
+            id BIGINT primary key auto_increment, parent_tag_id FLOAT, name TEXT, slug TEXT, full_path TEXT,
             description TEXT, dataset_count BIGINT, competition_count BIGINT, kernel_count INT
         )",
         columns: "Id, ParentTagId, Name, Slug, FullPath, Description, DatasetCount, CompetitionCount, KernelCount",
     },
     TableSchema {
         name: "TeamMemberships",
-        turdb_ddl: "CREATE TABLE team_memberships (id BIGINT, team_id BIGINT, user_id BIGINT, request_date TEXT)",
+        turdb_ddl: "CREATE TABLE team_memberships (id BIGINT primary key auto_increment, team_id BIGINT, user_id BIGINT, request_date TEXT)",
         columns: "Id, TeamId, UserId, RequestDate",
     },
     TableSchema {
         name: "Teams",
         turdb_ddl: "CREATE TABLE teams (
-            id BIGINT, competition_id BIGINT, team_leader_id FLOAT, team_name TEXT,
+            id BIGINT primary key auto_increment, competition_id BIGINT, team_leader_id FLOAT, team_name TEXT,
             score_first_submitted_date FLOAT, last_submission_date TEXT,
             public_leaderboard_submission_id FLOAT, private_leaderboard_submission_id FLOAT,
             is_benchmark BIGINT, medal FLOAT, medal_award_date TEXT,
@@ -272,7 +264,7 @@ const TABLES: &[TableSchema] = &[
     TableSchema {
         name: "UserAchievements",
         turdb_ddl: "CREATE TABLE user_achievements (
-            id BIGINT, user_id BIGINT, achievement_type TEXT, tier BIGINT,
+            id BIGINT primary key auto_increment, user_id BIGINT, achievement_type TEXT, tier BIGINT,
             tier_achievement_date TEXT, points BIGINT, current_ranking FLOAT,
             highest_ranking FLOAT, total_gold BIGINT, total_silver BIGINT, total_bronze INT
         )",
@@ -280,18 +272,26 @@ const TABLES: &[TableSchema] = &[
     },
     TableSchema {
         name: "UserFollowers",
-        turdb_ddl: "CREATE TABLE user_followers (id BIGINT, user_id BIGINT, following_user_id BIGINT, creation_date TEXT)",
+        turdb_ddl: "CREATE TABLE user_followers (id BIGINT primary key auto_increment, user_id BIGINT, following_user_id BIGINT, creation_date TEXT)",
         columns: "Id, UserId, FollowingUserId, CreationDate",
     },
     TableSchema {
         name: "UserOrganizations",
-        turdb_ddl: "CREATE TABLE user_organizations (id BIGINT, user_id BIGINT, organization_id BIGINT, join_date TEXT)",
+        turdb_ddl: "CREATE TABLE user_organizations (id BIGINT primary key auto_increment, user_id BIGINT, organization_id BIGINT, join_date TEXT)",
         columns: "Id, UserId, OrganizationId, JoinDate",
     },
     TableSchema {
         name: "Users",
-        turdb_ddl: "CREATE TABLE users (id BIGINT, user_name TEXT, display_name TEXT, register_date TEXT, performance_tier BIGINT)",
+        turdb_ddl: "CREATE TABLE users (id BIGINT primary key auto_increment, user_name TEXT, display_name TEXT, register_date TEXT, performance_tier BIGINT)",
         columns: "Id, UserName, DisplayName, RegisterDate, PerformanceTier",
+    },
+    TableSchema {
+        name: "EpisodeAgents",
+        turdb_ddl: "CREATE TABLE episode_agents (
+            id BIGINT primary key auto_increment, episode_id BIGINT, idx BIGINT, reward FLOAT, state BIGINT, submission_id BIGINT,
+            initial_confidence FLOAT, initial_score FLOAT, updated_confidence FLOAT, updated_score REAL
+        )",
+        columns: "Id, EpisodeId, \"Index\", Reward, State, SubmissionId, InitialConfidence, InitialScore, UpdatedConfidence, UpdatedScore",
     },
 ];
 
@@ -414,7 +414,10 @@ fn import_all_tables_from_sqlite() {
 
     let sqlite_conn = Connection::open(SQLITE_DB_PATH).expect("Failed to open SQLite DB");
     let db = Database::create(TURDB_PATH).unwrap();
-
+    db.execute("PRAGMA WAL=ON").expect("Failed to execute PRAGMA");
+    db.execute("SET foreign_keys = OFF").expect("Failed to set foreign keys");
+    db.execute("SET cache_size = 1024").expect("Failed to set cache size");
+    
     println!("\n=== Starting SQLite to TurDB Import ===\n");
 
     let overall_start = Instant::now();
@@ -432,7 +435,8 @@ fn import_all_tables_from_sqlite() {
             }
         }
     }
-
+    db.execute("SET foreign_keys = ON").expect("Failed to set foreign keys");
+    
     let overall_elapsed = overall_start.elapsed();
     let overall_rate = total_rows as f64 / overall_elapsed.as_secs_f64();
 
@@ -457,6 +461,7 @@ fn import_small_tables_only() {
 
     let sqlite_conn = Connection::open(SQLITE_DB_PATH).expect("Failed to open SQLite DB");
     let db = Database::create(TURDB_PATH).unwrap();
+    db.execute("PRAGMA WAL=ON").expect("Failed to enable WAL");
 
     println!("\n=== Importing Small Tables Only ===\n");
 
