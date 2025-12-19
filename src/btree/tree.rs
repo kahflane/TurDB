@@ -802,6 +802,16 @@ impl<'a, S: Storage + ?Sized> Cursor<'a, S> {
             return Ok(false);
         }
 
+        let page_count = self.storage.page_count();
+        if next_page >= page_count {
+            bail!(
+                "corrupt next_leaf pointer: page {} has next_leaf={} but page_count={}",
+                self.current_page,
+                next_page,
+                page_count
+            );
+        }
+
         self.storage.prefetch_pages(next_page + 1, 2);
 
         self.current_page = next_page;
