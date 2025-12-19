@@ -317,6 +317,9 @@ impl Repl {
             ExecuteResult::AlterTable { action } => {
                 println!("Table altered: {} ({:.3} sec)", action, elapsed.as_secs_f64());
             }
+            ExecuteResult::Set { name, value } => {
+                println!("{} = {} ({:.3} sec)", name, value, elapsed.as_secs_f64());
+            }
         }
     }
 

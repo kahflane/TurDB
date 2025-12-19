@@ -80,6 +80,10 @@ impl<'a> ExecutorBuilder<'a> {
                     match expr {
                         Expr::Column(_) => false,
                         Expr::Function(func) => {
+                            // Window functions (with OVER clause) are not complex - they use precomputed results
+                            if func.over.is_some() {
+                                return false;
+                            }
                             let name = func.name.name.to_uppercase();
                             !matches!(
                                 name.as_str(),

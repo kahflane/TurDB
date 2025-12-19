@@ -2971,8 +2971,27 @@ impl<'a> Parser<'a> {
 
         let name = self.expect_ident()?;
 
+        // Support multiple formats like SQLite:
+        // PRAGMA name = value
+        // PRAGMA name(value)
+        // PRAGMA name value (space-separated)
         let value = if self.consume_token(&Token::Eq) {
+            // PRAGMA name = value
             Some(self.expect_ident()?)
+        } else if self.consume_token(&Token::LParen) {
+            // PRAGMA name(value)
+            let val = self.expect_ident()?;
+            self.expect_token(&Token::RParen)?;
+            Some(val)
+        } else if matches!(self.current, Token::Ident(_) | Token::Keyword(_)) {
+            // PRAGMA name value (space-separated) - like PRAGMA wal ON
+            Some(self.expect_ident()?)
+        } else if matches!(self.current, Token::Integer(_)) {
+            // PRAGMA name 1 (numeric value)
+            match self.advance() {
+                Token::Integer(s) => Some(s),
+                _ => None,
+            }
         } else {
             None
         };

@@ -325,6 +325,59 @@ impl<'a, S: RowSource> WindowState<'a, S> {
                             }
                         }
                     }
+                    "sum" => {
+                        // Compute SUM over the partition
+                        let sum: i64 = partition_indices
+                            .iter()
+                            .map(|&row_idx| self.get_arg_value(row_idx, window_func))
+                            .sum();
+                        for &row_idx in &partition_indices {
+                            self.window_results[row_idx][func_idx] = sum;
+                        }
+                    }
+                    "count" => {
+                        // COUNT over the partition
+                        let count = partition_indices.len() as i64;
+                        for &row_idx in &partition_indices {
+                            self.window_results[row_idx][func_idx] = count;
+                        }
+                    }
+                    "avg" => {
+                        // AVG over the partition
+                        if partition_indices.is_empty() {
+                            continue;
+                        }
+                        let sum: i64 = partition_indices
+                            .iter()
+                            .map(|&row_idx| self.get_arg_value(row_idx, window_func))
+                            .sum();
+                        let avg = sum / partition_indices.len() as i64;
+                        for &row_idx in &partition_indices {
+                            self.window_results[row_idx][func_idx] = avg;
+                        }
+                    }
+                    "min" => {
+                        // MIN over the partition
+                        let min = partition_indices
+                            .iter()
+                            .map(|&row_idx| self.get_arg_value(row_idx, window_func))
+                            .min()
+                            .unwrap_or(0);
+                        for &row_idx in &partition_indices {
+                            self.window_results[row_idx][func_idx] = min;
+                        }
+                    }
+                    "max" => {
+                        // MAX over the partition
+                        let max = partition_indices
+                            .iter()
+                            .map(|&row_idx| self.get_arg_value(row_idx, window_func))
+                            .max()
+                            .unwrap_or(0);
+                        for &row_idx in &partition_indices {
+                            self.window_results[row_idx][func_idx] = max;
+                        }
+                    }
                     _ => {
                         for &row_idx in &partition_indices {
                             self.window_results[row_idx][func_idx] = 0;
@@ -333,6 +386,24 @@ impl<'a, S: RowSource> WindowState<'a, S> {
                 }
             }
         }
+    }
+
+    fn get_arg_value(&self, row_idx: usize, window_func: &WindowFunctionDef<'a>) -> i64 {
+        // Get the first argument's value for aggregate window functions
+        if let Some(first_arg) = window_func.args.first() {
+            if let crate::sql::ast::Expr::Column(col_ref) = first_arg {
+                if let Some(col_idx) = self.find_column_index(col_ref.column) {
+                    if let Some(val) = self.rows.get(row_idx).and_then(|r| r.get(col_idx)) {
+                        return match val {
+                            Value::Int(i) => *i,
+                            Value::Float(f) => *f as i64,
+                            _ => 0,
+                        };
+                    }
+                }
+            }
+        }
+        0
     }
 
     fn get_partitions(&self, window_func: &WindowFunctionDef<'a>) -> Vec<Vec<usize>> {

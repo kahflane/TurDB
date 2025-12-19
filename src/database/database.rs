@@ -2505,6 +2505,18 @@ impl Database {
             }
         }
 
+        // Flush dirty pages to WAL if WAL is enabled and not in explicit transaction (autocommit mode)
+        // In explicit transaction, WAL will be flushed on commit
+        let in_transaction = self.active_txn.lock().is_some();
+        if wal_enabled && !in_transaction && !self.dirty_pages.lock().is_empty() {
+            let table_storage = file_manager.table_data(schema_name, table_name)?;
+            let mut wal_guard = self.wal.lock();
+            if let Some(ref mut wal) = *wal_guard {
+                WalStorage::flush_wal(&self.dirty_pages, table_storage, wal)
+                    .wrap_err("failed to flush WAL after insert")?;
+            }
+        }
+
         Ok(ExecuteResult::Insert {
             rows_affected: count,
             returned: returned_rows,
@@ -2786,13 +2798,42 @@ impl Database {
                 .collect()
         });
 
-        let storage = file_manager.table_data_mut(schema_name, table_name)?;
-        let mut btree_mut = BTree::new(storage, root_page)?;
+        // Check if WAL is enabled
+        let wal_enabled = self.wal_enabled.load(std::sync::atomic::Ordering::Acquire);
+        if wal_enabled {
+            self.ensure_wal()?;
+        }
 
-        for (key, _old_value, updated_values) in &rows_to_update {
-            btree_mut.delete(key)?;
-            let record_data = OwnedValue::build_record_from_values(updated_values, &schema)?;
-            btree_mut.insert(key, &record_data)?;
+        let storage = file_manager.table_data_mut(schema_name, table_name)?;
+
+        if wal_enabled {
+            let mut wal_storage = WalStorage::new(storage, &self.dirty_pages);
+            let mut btree_mut = BTree::new(&mut wal_storage, root_page)?;
+
+            for (key, _old_value, updated_values) in &rows_to_update {
+                btree_mut.delete(key)?;
+                let record_data = OwnedValue::build_record_from_values(updated_values, &schema)?;
+                btree_mut.insert(key, &record_data)?;
+            }
+        } else {
+            let mut btree_mut = BTree::new(storage, root_page)?;
+
+            for (key, _old_value, updated_values) in &rows_to_update {
+                btree_mut.delete(key)?;
+                let record_data = OwnedValue::build_record_from_values(updated_values, &schema)?;
+                btree_mut.insert(key, &record_data)?;
+            }
+        }
+
+        // Flush dirty pages to WAL if WAL is enabled and not in explicit transaction
+        let in_transaction = self.active_txn.lock().is_some();
+        if wal_enabled && !in_transaction && !self.dirty_pages.lock().is_empty() {
+            let table_storage = file_manager.table_data(schema_name, table_name)?;
+            let mut wal_guard = self.wal.lock();
+            if let Some(ref mut wal) = *wal_guard {
+                WalStorage::flush_wal(&self.dirty_pages, table_storage, wal)
+                    .wrap_err("failed to flush WAL after update")?;
+            }
         }
 
         drop(file_manager_guard);
@@ -3104,13 +3145,42 @@ impl Database {
                 .collect()
         });
 
-        let storage = file_manager.table_data_mut(schema_name, table_name)?;
-        let mut btree_mut = BTree::new(storage, root_page)?;
+        // Check if WAL is enabled
+        let wal_enabled = self.wal_enabled.load(std::sync::atomic::Ordering::Acquire);
+        if wal_enabled {
+            self.ensure_wal()?;
+        }
 
-        for (key, _old_value, updated_values) in &rows_to_update {
-            btree_mut.delete(key)?;
-            let record_data = OwnedValue::build_record_from_values(updated_values, schema)?;
-            btree_mut.insert(key, &record_data)?;
+        let storage = file_manager.table_data_mut(schema_name, table_name)?;
+
+        if wal_enabled {
+            let mut wal_storage = WalStorage::new(storage, &self.dirty_pages);
+            let mut btree_mut = BTree::new(&mut wal_storage, root_page)?;
+
+            for (key, _old_value, updated_values) in &rows_to_update {
+                btree_mut.delete(key)?;
+                let record_data = OwnedValue::build_record_from_values(updated_values, schema)?;
+                btree_mut.insert(key, &record_data)?;
+            }
+        } else {
+            let mut btree_mut = BTree::new(storage, root_page)?;
+
+            for (key, _old_value, updated_values) in &rows_to_update {
+                btree_mut.delete(key)?;
+                let record_data = OwnedValue::build_record_from_values(updated_values, schema)?;
+                btree_mut.insert(key, &record_data)?;
+            }
+        }
+
+        // Flush dirty pages to WAL if WAL is enabled and not in explicit transaction
+        let in_transaction = self.active_txn.lock().is_some();
+        if wal_enabled && !in_transaction && !self.dirty_pages.lock().is_empty() {
+            let table_storage = file_manager.table_data(schema_name, table_name)?;
+            let mut wal_guard = self.wal.lock();
+            if let Some(ref mut wal) = *wal_guard {
+                WalStorage::flush_wal(&self.dirty_pages, table_storage, wal)
+                    .wrap_err("failed to flush WAL after update with from")?;
+            }
         }
 
         drop(file_manager_guard);
@@ -3513,11 +3583,38 @@ impl Database {
             None
         };
 
-        let storage = file_manager.table_data_mut(schema_name, table_name)?;
-        let mut btree_mut = BTree::new(storage, root_page)?;
+        // Check if WAL is enabled
+        let wal_enabled = self.wal_enabled.load(std::sync::atomic::Ordering::Acquire);
+        if wal_enabled {
+            self.ensure_wal()?;
+        }
 
-        for (key, _old_value, _row_values) in &rows_to_delete {
-            btree_mut.delete(key)?;
+        let storage = file_manager.table_data_mut(schema_name, table_name)?;
+
+        if wal_enabled {
+            let mut wal_storage = WalStorage::new(storage, &self.dirty_pages);
+            let mut btree_mut = BTree::new(&mut wal_storage, root_page)?;
+
+            for (key, _old_value, _row_values) in &rows_to_delete {
+                btree_mut.delete(key)?;
+            }
+        } else {
+            let mut btree_mut = BTree::new(storage, root_page)?;
+
+            for (key, _old_value, _row_values) in &rows_to_delete {
+                btree_mut.delete(key)?;
+            }
+        }
+
+        // Flush dirty pages to WAL if WAL is enabled and not in explicit transaction
+        let in_transaction = self.active_txn.lock().is_some();
+        if wal_enabled && !in_transaction && !self.dirty_pages.lock().is_empty() {
+            let table_storage = file_manager.table_data(schema_name, table_name)?;
+            let mut wal_guard = self.wal.lock();
+            if let Some(ref mut wal) = *wal_guard {
+                WalStorage::flush_wal(&self.dirty_pages, table_storage, wal)
+                    .wrap_err("failed to flush WAL after delete")?;
+            }
         }
 
         drop(file_manager_guard);
@@ -4067,6 +4164,16 @@ impl Database {
             .ok_or_else(|| eyre::eyre!("no transaction in progress"))?;
 
         self.finalize_transaction_commit(txn)?;
+
+        // Flush WAL on transaction commit if enabled and there are dirty pages
+        let wal_enabled = self
+            .wal_enabled
+            .load(std::sync::atomic::Ordering::Acquire);
+        if wal_enabled && !self.dirty_pages.lock().is_empty() {
+            // Try to flush for all tables - use checkpoint_table for a default table
+            // In a more complete implementation, we'd track which tables were modified
+            let _ = self.checkpoint_table("root", "");
+        }
 
         Ok(ExecuteResult::Commit)
     }
