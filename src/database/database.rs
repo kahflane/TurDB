@@ -119,6 +119,9 @@ impl ActiveTransaction {
     }
 }
 
+/// Default page cache size (number of 16KB pages)
+const DEFAULT_CACHE_SIZE: u32 = 256;
+
 pub struct Database {
     path: PathBuf,
     file_manager: RwLock<Option<FileManager>>,
@@ -133,6 +136,10 @@ pub struct Database {
     dirty_pages: Mutex<HashSet<u32>>,
     txn_manager: TransactionManager,
     active_txn: Mutex<Option<ActiveTransaction>>,
+    /// Session setting: whether foreign key constraints are checked (default: true)
+    foreign_keys_enabled: std::sync::atomic::AtomicBool,
+    /// Session setting: page cache size in number of pages (default: 256 = 4MB)
+    cache_size: std::sync::atomic::AtomicU32,
 }
 
 impl Database {
@@ -194,6 +201,8 @@ impl Database {
             dirty_pages: Mutex::new(HashSet::new()),
             txn_manager: TransactionManager::new(),
             active_txn: Mutex::new(None),
+            foreign_keys_enabled: AtomicBool::new(true),
+            cache_size: std::sync::atomic::AtomicU32::new(DEFAULT_CACHE_SIZE),
         };
 
         let recovery_info = RecoveryInfo {
@@ -247,6 +256,8 @@ impl Database {
             dirty_pages: Mutex::new(HashSet::new()),
             txn_manager: TransactionManager::new(),
             active_txn: Mutex::new(None),
+            foreign_keys_enabled: AtomicBool::new(true),
+            cache_size: std::sync::atomic::AtomicU32::new(DEFAULT_CACHE_SIZE),
         })
     }
 
@@ -1603,7 +1614,56 @@ impl Database {
             Statement::Release(release) => self.execute_release(release),
             Statement::Truncate(truncate) => self.execute_truncate(truncate),
             Statement::AlterTable(alter) => self.execute_alter_table(alter),
+            Statement::Set(set) => self.execute_set(set),
             _ => bail!("unsupported statement type"),
+        }
+    }
+
+    fn execute_set(&self, set: &crate::sql::ast::SetStmt<'_>) -> Result<ExecuteResult> {
+        use std::sync::atomic::Ordering;
+
+        let name = set.name.to_lowercase();
+        let value = set.value.first().ok_or_else(|| eyre::eyre!("SET requires a value"))?;
+
+        match name.as_str() {
+            "foreign_keys" => {
+                let enabled = match value {
+                    crate::sql::ast::Expr::Literal(crate::sql::ast::Literal::Boolean(b)) => *b,
+                    crate::sql::ast::Expr::Literal(crate::sql::ast::Literal::Integer(i)) => {
+                        i.parse::<i64>().unwrap_or(0) != 0
+                    }
+                    crate::sql::ast::Expr::Literal(crate::sql::ast::Literal::String(s)) => {
+                        matches!(s.to_lowercase().as_str(), "on" | "true" | "1" | "yes")
+                    }
+                    crate::sql::ast::Expr::Column(col) => {
+                        matches!(col.column.to_lowercase().as_str(), "on" | "true" | "yes")
+                    }
+                    _ => bail!("invalid value for foreign_keys: expected ON/OFF, TRUE/FALSE, or 1/0"),
+                };
+                self.foreign_keys_enabled.store(enabled, Ordering::Release);
+                Ok(ExecuteResult::Set {
+                    name: "foreign_keys".to_string(),
+                    value: if enabled { "ON".to_string() } else { "OFF".to_string() },
+                })
+            }
+            "cache_size" => {
+                let size = match value {
+                    crate::sql::ast::Expr::Literal(crate::sql::ast::Literal::Integer(i)) => {
+                        let parsed: i64 = i.parse().wrap_err("cache_size must be a valid integer")?;
+                        if parsed <= 0 {
+                            bail!("cache_size must be a positive integer");
+                        }
+                        parsed as u32
+                    }
+                    _ => bail!("invalid value for cache_size: expected a positive integer"),
+                };
+                self.cache_size.store(size, Ordering::Release);
+                Ok(ExecuteResult::Set {
+                    name: "cache_size".to_string(),
+                    value: size.to_string(),
+                })
+            }
+            _ => bail!("unknown setting: {}", set.name),
         }
     }
 
@@ -2116,7 +2176,9 @@ impl Database {
                 }
             }
 
-            if !fk_constraints.is_empty() {
+            // Only check FK constraints if foreign_keys_enabled is true
+            let fk_enabled = self.foreign_keys_enabled.load(Ordering::Acquire);
+            if fk_enabled && !fk_constraints.is_empty() {
                 let catalog_guard = self.catalog.read();
                 let catalog = catalog_guard.as_ref().unwrap();
 
