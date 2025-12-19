@@ -26,6 +26,30 @@ use parking_lot::{Mutex, RwLock};
 use smallvec::SmallVec;
 use std::path::{Path, PathBuf};
 
+/// Macro to execute BTree operations with or without WAL tracking.
+/// This eliminates code duplication across UPDATE and DELETE operations where we need
+/// to branch between WalStorage (when WAL is enabled) and direct storage access.
+///
+/// # Arguments
+/// * `$wal_enabled` - boolean indicating if WAL mode is active
+/// * `$storage` - mutable reference to the underlying storage
+/// * `$dirty_pages` - reference to the dirty pages tracking set
+/// * `$root_page` - the root page of the BTree
+/// * `$btree_ops` - block of code that operates on `btree_mut: BTree`
+macro_rules! with_btree_storage {
+    ($wal_enabled:expr, $storage:expr, $dirty_pages:expr, $root_page:expr, $btree_ops:expr) => {{
+        use crate::btree::BTree;
+        if $wal_enabled {
+            let mut wal_storage = WalStorage::new($storage, $dirty_pages);
+            let mut btree_mut = BTree::new(&mut wal_storage, $root_page)?;
+            $btree_ops(&mut btree_mut)?;
+        } else {
+            let mut btree_mut = BTree::new($storage, $root_page)?;
+            $btree_ops(&mut btree_mut)?;
+        }
+    }};
+}
+
 fn convert_value_with_type(val: &Value<'_>, col_type: DataType) -> OwnedValue {
     match (val, col_type) {
         (Value::Int(i), DataType::Bool) => OwnedValue::Bool(*i != 0),
@@ -2837,24 +2861,14 @@ impl Database {
 
         let storage = file_manager.table_data_mut(schema_name, table_name)?;
 
-        if wal_enabled {
-            let mut wal_storage = WalStorage::new(storage, &self.dirty_pages);
-            let mut btree_mut = BTree::new(&mut wal_storage, root_page)?;
-
+        with_btree_storage!(wal_enabled, storage, &self.dirty_pages, root_page, |btree_mut: &mut crate::btree::BTree<_>| {
             for (key, _old_value, updated_values) in &rows_to_update {
                 btree_mut.delete(key)?;
                 let record_data = OwnedValue::build_record_from_values(updated_values, &schema)?;
                 btree_mut.insert(key, &record_data)?;
             }
-        } else {
-            let mut btree_mut = BTree::new(storage, root_page)?;
-
-            for (key, _old_value, updated_values) in &rows_to_update {
-                btree_mut.delete(key)?;
-                let record_data = OwnedValue::build_record_from_values(updated_values, &schema)?;
-                btree_mut.insert(key, &record_data)?;
-            }
-        }
+            Ok::<_, eyre::Report>(())
+        });
 
         // Flush WAL in autocommit mode; deferred to commit in explicit transactions
         self.flush_wal_if_autocommit(file_manager, schema_name, table_name)?;
@@ -3176,24 +3190,14 @@ impl Database {
 
         let storage = file_manager.table_data_mut(schema_name, table_name)?;
 
-        if wal_enabled {
-            let mut wal_storage = WalStorage::new(storage, &self.dirty_pages);
-            let mut btree_mut = BTree::new(&mut wal_storage, root_page)?;
-
+        with_btree_storage!(wal_enabled, storage, &self.dirty_pages, root_page, |btree_mut: &mut crate::btree::BTree<_>| {
             for (key, _old_value, updated_values) in &rows_to_update {
                 btree_mut.delete(key)?;
                 let record_data = OwnedValue::build_record_from_values(updated_values, schema)?;
                 btree_mut.insert(key, &record_data)?;
             }
-        } else {
-            let mut btree_mut = BTree::new(storage, root_page)?;
-
-            for (key, _old_value, updated_values) in &rows_to_update {
-                btree_mut.delete(key)?;
-                let record_data = OwnedValue::build_record_from_values(updated_values, schema)?;
-                btree_mut.insert(key, &record_data)?;
-            }
-        }
+            Ok::<_, eyre::Report>(())
+        });
 
         // Flush WAL in autocommit mode; deferred to commit in explicit transactions
         self.flush_wal_if_autocommit(file_manager, schema_name, table_name)?;
@@ -3606,20 +3610,12 @@ impl Database {
 
         let storage = file_manager.table_data_mut(schema_name, table_name)?;
 
-        if wal_enabled {
-            let mut wal_storage = WalStorage::new(storage, &self.dirty_pages);
-            let mut btree_mut = BTree::new(&mut wal_storage, root_page)?;
-
+        with_btree_storage!(wal_enabled, storage, &self.dirty_pages, root_page, |btree_mut: &mut crate::btree::BTree<_>| {
             for (key, _old_value, _row_values) in &rows_to_delete {
                 btree_mut.delete(key)?;
             }
-        } else {
-            let mut btree_mut = BTree::new(storage, root_page)?;
-
-            for (key, _old_value, _row_values) in &rows_to_delete {
-                btree_mut.delete(key)?;
-            }
-        }
+            Ok::<_, eyre::Report>(())
+        });
 
         // Flush WAL in autocommit mode; deferred to commit in explicit transactions
         self.flush_wal_if_autocommit(file_manager, schema_name, table_name)?;
