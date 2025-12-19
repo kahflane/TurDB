@@ -1728,10 +1728,16 @@ impl<'a, S: RowSource> Executor<'a> for DynamicExecutor<'a, S> {
                         // NaN represents NULL (from aggregates over all-NULL partitions)
                         if wval.is_nan() {
                             result_values.push(Value::Null);
-                        } else if wval.fract() == 0.0 && wval.abs() <= i64::MAX as f64 {
-                            // Output as Int if the value is a whole number
-                            // This preserves integer display for ROW_NUMBER, RANK, COUNT etc.
-                            result_values.push(Value::Int(wval as i64));
+                        } else if wval.fract() == 0.0 {
+                            // Output as Int if the value is a whole number that fits in i64
+                            // Use round-trip check to avoid precision loss near i64::MAX
+                            // (i64::MAX cannot be exactly represented as f64)
+                            let as_int = wval as i64;
+                            if (as_int as f64) == wval {
+                                result_values.push(Value::Int(as_int));
+                            } else {
+                                result_values.push(Value::Float(wval));
+                            }
                         } else {
                             result_values.push(Value::Float(wval));
                         }
