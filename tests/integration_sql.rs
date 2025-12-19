@@ -3121,4 +3121,151 @@ mod aggregate_window_function_tests {
         let blue_stats = get_team_stats(&rows, "Blue").expect("Blue team should exist");
         assert_eq!(blue_stats, (20, 40), "Blue: MIN=20, MAX=40");
     }
+
+    #[test]
+    fn sum_with_null_values_treats_null_as_zero() {
+        let dir = tempdir().unwrap();
+        let db = Database::create(dir.path().join("test_db")).unwrap();
+        db.execute("CREATE TABLE data (id INT, grp TEXT, val INT)")
+            .unwrap();
+        db.execute("INSERT INTO data VALUES (1, 'A', 10)").unwrap();
+        db.execute("INSERT INTO data VALUES (2, 'A', NULL)")
+            .unwrap();
+        db.execute("INSERT INTO data VALUES (3, 'A', 20)").unwrap();
+
+        let rows = db
+            .query("SELECT id, SUM(val) OVER (PARTITION BY grp) AS total FROM data")
+            .unwrap();
+
+        assert_eq!(rows.len(), 3);
+        // NULL is treated as 0 in aggregates, so sum should be 10 + 0 + 20 = 30
+        for row in &rows {
+            let total = match &row.values[1] {
+                OwnedValue::Int(n) => *n,
+                other => panic!("Expected Int for SUM, got {:?}", other),
+            };
+            assert_eq!(total, 30, "SUM with NULL should treat NULL as 0");
+        }
+    }
+
+    #[test]
+    fn window_function_single_row_partition() {
+        let dir = tempdir().unwrap();
+        let db = Database::create(dir.path().join("test_db")).unwrap();
+        db.execute("CREATE TABLE single (id INT, cat TEXT, val INT)")
+            .unwrap();
+        db.execute("INSERT INTO single VALUES (1, 'X', 100)")
+            .unwrap();
+
+        let rows = db
+            .query("SELECT id, AVG(val) OVER (PARTITION BY cat) AS avg_val FROM single")
+            .unwrap();
+
+        assert_eq!(rows.len(), 1);
+        let avg_val = match &rows[0].values[1] {
+            OwnedValue::Int(n) => *n as f64,
+            OwnedValue::Float(f) => *f,
+            other => panic!("Expected numeric for AVG, got {:?}", other),
+        };
+        assert!(
+            (avg_val - 100.0).abs() < 0.001,
+            "AVG of single row should equal that row's value"
+        );
+    }
+}
+
+mod wal_edge_case_tests {
+    use super::*;
+
+    #[test]
+    fn wal_large_transaction_batches_correctly() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("test_db");
+
+        {
+            let db = Database::create(&db_path).unwrap();
+            db.execute("PRAGMA WAL ON").unwrap();
+            db.execute("CREATE TABLE bulk (id INT, data TEXT)")
+                .unwrap();
+
+            // Start a transaction with many inserts
+            db.execute("BEGIN").unwrap();
+            for i in 0..100 {
+                db.execute(&format!(
+                    "INSERT INTO bulk VALUES ({}, 'data_{}') ",
+                    i, i
+                ))
+                .unwrap();
+            }
+            db.execute("COMMIT").unwrap();
+        }
+
+        // Reopen and verify all data persisted
+        {
+            let db = Database::open(&db_path).unwrap();
+            let rows = db.query("SELECT COUNT(*) FROM bulk").unwrap();
+            let count = match &rows[0].values[0] {
+                OwnedValue::Int(n) => *n,
+                other => panic!("Expected Int, got {:?}", other),
+            };
+            assert_eq!(count, 100, "All 100 rows should persist after large transaction");
+        }
+    }
+
+    #[test]
+    fn wal_transaction_rollback_does_not_persist() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("test_db");
+
+        {
+            let db = Database::create(&db_path).unwrap();
+            db.execute("PRAGMA WAL ON").unwrap();
+            db.execute("CREATE TABLE temp (id INT)").unwrap();
+            db.execute("INSERT INTO temp VALUES (1)").unwrap();
+
+            // Start transaction, insert, then rollback
+            db.execute("BEGIN").unwrap();
+            db.execute("INSERT INTO temp VALUES (2)").unwrap();
+            db.execute("INSERT INTO temp VALUES (3)").unwrap();
+            db.execute("ROLLBACK").unwrap();
+        }
+
+        // Reopen and verify rollback worked
+        {
+            let db = Database::open(&db_path).unwrap();
+            let rows = db.query("SELECT * FROM temp").unwrap();
+            assert_eq!(rows.len(), 1, "Only committed row should exist after rollback");
+            assert_eq!(rows[0].values[0], OwnedValue::Int(1));
+        }
+    }
+
+    #[test]
+    fn wal_multiple_tables_in_transaction() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("test_db");
+
+        {
+            let db = Database::create(&db_path).unwrap();
+            db.execute("PRAGMA WAL ON").unwrap();
+            db.execute("CREATE TABLE t1 (id INT)").unwrap();
+            db.execute("CREATE TABLE t2 (id INT)").unwrap();
+
+            db.execute("BEGIN").unwrap();
+            db.execute("INSERT INTO t1 VALUES (1)").unwrap();
+            db.execute("INSERT INTO t2 VALUES (2)").unwrap();
+            db.execute("UPDATE t1 SET id = 10 WHERE id = 1").unwrap();
+            db.execute("COMMIT").unwrap();
+        }
+
+        // Verify both tables persisted correctly
+        {
+            let db = Database::open(&db_path).unwrap();
+            let rows1 = db.query("SELECT * FROM t1").unwrap();
+            let rows2 = db.query("SELECT * FROM t2").unwrap();
+            assert_eq!(rows1.len(), 1);
+            assert_eq!(rows1[0].values[0], OwnedValue::Int(10));
+            assert_eq!(rows2.len(), 1);
+            assert_eq!(rows2[0].values[0], OwnedValue::Int(2));
+        }
+    }
 }
