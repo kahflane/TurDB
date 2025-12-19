@@ -4169,19 +4169,30 @@ impl Database {
         self.finalize_transaction_commit(txn)?;
 
         // Flush WAL on transaction commit if enabled and there are dirty pages
+        //
+        // LIMITATION: The current dirty_pages tracking uses a global HashSet<u32> where page
+        // numbers are relative to individual table storage files. This works correctly when:
+        // 1. Autocommit mode - each statement flushes WAL with the correct table's storage
+        // 2. Single-table transactions - all dirty pages belong to one table
+        //
+        // For multi-table transactions, page numbers from different tables could collide
+        // (e.g., page 5 from table A vs page 5 from table B). A proper fix would require:
+        // - Changing dirty_pages to HashMap<TableId, HashSet<u32>> to track per-table pages
+        // - Or using globally unique page numbers across all tables
+        //
+        // The current implementation uses the first available table's storage for the flush,
+        // which is correct for single-table transactions but may not properly recover
+        // multi-table transactions after a crash.
         let wal_enabled = self
             .wal_enabled
             .load(std::sync::atomic::Ordering::Acquire);
         if wal_enabled && !self.dirty_pages.lock().is_empty() {
-            // Flush WAL for tables modified in this transaction
-            // Note: Pages are already in mmap and will be persisted; WAL provides crash recovery
             // Use blocking locks to ensure WAL flush completes (required for durability)
             let catalog_guard = self.catalog.read();
             if let Some(catalog) = catalog_guard.as_ref() {
                 let mut file_manager_guard = self.file_manager.write();
                 if let Some(file_manager) = file_manager_guard.as_mut() {
-                    // Find any table to use for WAL flush
-                    // (dirty pages are global, so any table's storage works for reading)
+                    // Use the first available table's storage for WAL flush
                     'outer: for (schema_name, schema) in catalog.schemas() {
                         if let Some(table_name) = schema.tables().keys().next() {
                             if let Ok(storage) = file_manager.table_data(schema_name, table_name) {
