@@ -1777,6 +1777,37 @@ impl Database {
         storage.grow(2)?;
         crate::btree::BTree::create(storage, 1)?;
 
+        let needs_toast = {
+            let catalog_guard = self.catalog.read();
+            let catalog = catalog_guard.as_ref().unwrap();
+            catalog
+                .get_schema(schema_name)
+                .and_then(|s| s.get_table(table_name))
+                .map(|t| t.columns().iter().any(|c| c.data_type().is_toastable()))
+                .unwrap_or(false)
+        };
+
+        if needs_toast {
+            let toast_table_name = crate::storage::toast::toast_table_name(table_name);
+            let toast_id = self.allocate_table_id();
+            file_manager.create_table(schema_name, &toast_table_name, toast_id, 3)?;
+
+            let toast_storage = file_manager.table_data_mut(schema_name, &toast_table_name)?;
+            toast_storage.grow(2)?;
+            crate::btree::BTree::create(toast_storage, 1)?;
+
+            let mut catalog_guard = self.catalog.write();
+            let catalog = catalog_guard.as_mut().unwrap();
+            if let Some(schema) = catalog.get_schema_mut(schema_name) {
+                if let Some(table) = schema.get_table(table_name) {
+                    let mut table_clone = table.clone();
+                    table_clone.set_has_toast(true);
+                    schema.remove_table(table_name);
+                    schema.add_table(table_clone);
+                }
+            }
+        }
+
         for (col_name, is_primary_key) in &unique_columns {
             let index_name = if *is_primary_key {
                 format!("{}_pkey", col_name)
@@ -2011,6 +2042,7 @@ impl Database {
         let table_id = table_def.id();
         let columns = table_def.columns().to_vec();
         let table_def_for_validator = table_def.clone();
+        let has_toast = table_def.has_toast();
 
         let unique_columns: Vec<(usize, String, bool)> = columns
             .iter()
@@ -2405,9 +2437,41 @@ impl Database {
                 }
             }
 
-            let table_storage = file_manager.table_data_mut(schema_name, table_name)?;
             let row_id = self.next_row_id.fetch_add(1, Ordering::Relaxed);
             let row_key = Self::generate_row_key(row_id);
+
+            if has_toast {
+                use crate::storage::toast::needs_toast;
+
+                for (col_idx, col) in columns.iter().enumerate() {
+                    if !col.data_type().is_toastable() {
+                        continue;
+                    }
+
+                    let value = &values[col_idx];
+                    let data = match value {
+                        OwnedValue::Text(s) => Some(s.as_bytes()),
+                        OwnedValue::Blob(b) => Some(b.as_slice()),
+                        _ => None,
+                    };
+
+                    if let Some(data) = data {
+                        if needs_toast(data) {
+                            let toast_ptr = self.toast_value(
+                                file_manager,
+                                schema_name,
+                                table_name,
+                                row_id,
+                                col_idx as u16,
+                                data,
+                            )?;
+                            values[col_idx] = OwnedValue::Blob(toast_ptr);
+                        }
+                    }
+                }
+            }
+
+            let table_storage = file_manager.table_data_mut(schema_name, table_name)?;
             let record_data = OwnedValue::build_record_from_values(&values, &schema)?;
 
             if wal_enabled {
@@ -4764,6 +4828,98 @@ impl Database {
 
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    fn toast_value(
+        &self,
+        file_manager: &mut crate::storage::FileManager,
+        schema_name: &str,
+        table_name: &str,
+        row_id: u64,
+        column_index: u16,
+        data: &[u8],
+    ) -> Result<Vec<u8>> {
+        use crate::btree::BTree;
+        use crate::storage::toast::{make_chunk_key, ToastPointer, TOAST_CHUNK_SIZE};
+
+        let toast_table_name = crate::storage::toast::toast_table_name(table_name);
+        let toast_storage = file_manager.table_data_mut(schema_name, &toast_table_name)?;
+
+        let pointer = ToastPointer::new(row_id, column_index, data.len() as u64);
+        let chunk_id = pointer.chunk_id;
+
+        let mut btree = BTree::new(toast_storage, 1)?;
+
+        for (seq, chunk) in data.chunks(TOAST_CHUNK_SIZE).enumerate() {
+            let chunk_key = make_chunk_key(chunk_id, seq as u32);
+            btree.insert(&chunk_key, chunk)?;
+        }
+
+        Ok(pointer.encode().to_vec())
+    }
+
+    fn detoast_value(
+        &self,
+        file_manager: &mut crate::storage::FileManager,
+        schema_name: &str,
+        table_name: &str,
+        toast_pointer: &[u8],
+    ) -> Result<Vec<u8>> {
+        use crate::btree::BTree;
+        use crate::storage::toast::{chunk_count, make_chunk_key, ToastPointer};
+
+        let pointer = ToastPointer::decode(toast_pointer)?;
+        let chunk_id = pointer.chunk_id;
+        let total_size = pointer.total_size as usize;
+        let num_chunks = chunk_count(total_size);
+
+        let toast_table_name = crate::storage::toast::toast_table_name(table_name);
+        let toast_storage = file_manager.table_data_mut(schema_name, &toast_table_name)?;
+
+        let btree = BTree::new(toast_storage, 1)?;
+
+        let mut result = Vec::with_capacity(total_size);
+
+        for seq in 0..num_chunks {
+            let chunk_key = make_chunk_key(chunk_id, seq as u32);
+            let handle = btree
+                .search(&chunk_key)?
+                .ok_or_else(|| eyre::eyre!("TOAST chunk not found: {:?}", chunk_key))?;
+            let chunk_data = btree.get_value(&handle)?;
+            result.extend_from_slice(chunk_data);
+        }
+
+        result.truncate(total_size);
+        Ok(result)
+    }
+
+    fn delete_toast_chunks(
+        &self,
+        file_manager: &mut crate::storage::FileManager,
+        schema_name: &str,
+        table_name: &str,
+        row_id: u64,
+        column_index: u16,
+        total_size: u64,
+    ) -> Result<()> {
+        use crate::btree::BTree;
+        use crate::storage::toast::{chunk_count, make_chunk_key, ToastPointer};
+
+        let pointer = ToastPointer::new(row_id, column_index, total_size);
+        let chunk_id = pointer.chunk_id;
+        let num_chunks = chunk_count(total_size as usize);
+
+        let toast_table_name = crate::storage::toast::toast_table_name(table_name);
+        let toast_storage = file_manager.table_data_mut(schema_name, &toast_table_name)?;
+
+        let mut btree = BTree::new(toast_storage, 1)?;
+
+        for seq in 0..num_chunks {
+            let chunk_key = make_chunk_key(chunk_id, seq as u32);
+            let _ = btree.delete(&chunk_key);
+        }
+
+        Ok(())
     }
 }
 
