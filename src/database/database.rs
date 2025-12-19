@@ -4175,33 +4175,28 @@ impl Database {
         if wal_enabled && !self.dirty_pages.lock().is_empty() {
             // Flush WAL for tables modified in this transaction
             // Note: Pages are already in mmap and will be persisted; WAL provides crash recovery
-            if let Some(catalog_guard) = self.catalog.try_read() {
-                if let Some(catalog) = catalog_guard.as_ref() {
-                    if let Some(mut file_manager_guard) = self.file_manager.try_write() {
-                        if let Some(file_manager) = file_manager_guard.as_mut() {
-                            // Find any table to use for WAL flush
-                            // (dirty pages are global, so any table's storage works for reading)
-                            for schema in catalog.schemas().values() {
-                                if let Some(table_name) = schema.tables().keys().next() {
-                                    if let Ok(storage) = file_manager.table_data("root", table_name)
-                                    {
-                                        let mut wal_guard = self.wal.lock();
-                                        if let Some(ref mut wal) = *wal_guard {
-                                            let _ = WalStorage::flush_wal(
-                                                &self.dirty_pages,
-                                                storage,
-                                                wal,
-                                            );
-                                        }
-                                        break;
-                                    }
+            // Use blocking locks to ensure WAL flush completes (required for durability)
+            let catalog_guard = self.catalog.read();
+            if let Some(catalog) = catalog_guard.as_ref() {
+                let mut file_manager_guard = self.file_manager.write();
+                if let Some(file_manager) = file_manager_guard.as_mut() {
+                    // Find any table to use for WAL flush
+                    // (dirty pages are global, so any table's storage works for reading)
+                    'outer: for (schema_name, schema) in catalog.schemas() {
+                        if let Some(table_name) = schema.tables().keys().next() {
+                            if let Ok(storage) = file_manager.table_data(schema_name, table_name) {
+                                let mut wal_guard = self.wal.lock();
+                                if let Some(ref mut wal) = *wal_guard {
+                                    WalStorage::flush_wal(&self.dirty_pages, storage, wal)
+                                        .wrap_err("failed to flush WAL on commit")?;
                                 }
+                                break 'outer;
                             }
                         }
                     }
                 }
             }
-            // Clear any remaining dirty pages (safety fallback)
+            // Clear dirty pages after successful flush
             self.dirty_pages.lock().clear();
         }
 

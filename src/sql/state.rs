@@ -394,21 +394,21 @@ impl<'a, S: RowSource> WindowState<'a, S> {
     /// Returns the value as f64 to preserve precision for both integers and floats.
     /// Returns 0.0 for NULL values (matches SQL NULL handling in aggregates).
     fn get_arg_value(&self, row_idx: usize, window_func: &WindowFunctionDef<'a>) -> f64 {
-        if let Some(first_arg) = window_func.args.first() {
-            if let crate::sql::ast::Expr::Column(col_ref) = first_arg {
-                if let Some(col_idx) = self.find_column_index(col_ref.column) {
-                    if let Some(val) = self.rows.get(row_idx).and_then(|r| r.get(col_idx)) {
-                        return match val {
-                            Value::Int(i) => *i as f64,
-                            Value::Float(f) => *f,
-                            Value::Null => 0.0, // NULL treated as 0 in aggregates
-                            _ => 0.0,
-                        };
-                    }
-                }
-            }
+        let Some(crate::sql::ast::Expr::Column(col_ref)) = window_func.args.first() else {
+            return 0.0;
+        };
+        let Some(col_idx) = self.find_column_index(col_ref.column) else {
+            return 0.0;
+        };
+        let Some(val) = self.rows.get(row_idx).and_then(|r| r.get(col_idx)) else {
+            return 0.0;
+        };
+        match val {
+            Value::Int(i) => *i as f64,
+            Value::Float(f) => *f,
+            Value::Null => 0.0, // NULL treated as 0 in aggregates
+            _ => 0.0,
         }
-        0.0
     }
 
     fn get_partitions(&self, window_func: &WindowFunctionDef<'a>) -> Vec<Vec<usize>> {
