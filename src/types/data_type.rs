@@ -250,6 +250,19 @@ impl DataType {
     pub fn is_network(&self) -> bool {
         matches!(self, DataType::Inet4 | DataType::Inet6 | DataType::MacAddr)
     }
+
+    /// Returns true if this type can potentially store large values that may need TOAST.
+    pub fn is_toastable(&self) -> bool {
+        matches!(
+            self,
+            DataType::Text
+                | DataType::Blob
+                | DataType::Vector
+                | DataType::Jsonb
+                | DataType::Varchar
+                | DataType::Array
+        )
+    }
 }
 
 impl TryFrom<u8> for DataType {
