@@ -392,6 +392,46 @@ impl Database {
         Ok(())
     }
 
+    /// Flushes dirty pages to WAL if WAL is enabled and not in an explicit transaction.
+    /// In autocommit mode (no explicit transaction), this flushes immediately.
+    /// In explicit transaction mode, WAL flush is deferred to commit.
+    ///
+    /// Returns the number of frames written, or 0 if no flush was needed.
+    fn flush_wal_if_autocommit(
+        &self,
+        file_manager: &mut crate::storage::FileManager,
+        schema_name: &str,
+        table_name: &str,
+    ) -> Result<usize> {
+        use std::sync::atomic::Ordering;
+
+        let wal_enabled = self.wal_enabled.load(Ordering::Acquire);
+        if !wal_enabled {
+            return Ok(0);
+        }
+
+        // Check if we're in an explicit transaction - if so, defer flush to commit
+        let in_transaction = self.active_txn.lock().is_some();
+        if in_transaction {
+            return Ok(0);
+        }
+
+        // Check if there are dirty pages to flush
+        if self.dirty_pages.lock().is_empty() {
+            return Ok(0);
+        }
+
+        let table_storage = file_manager.table_data(schema_name, table_name)?;
+        let mut wal_guard = self.wal.lock();
+        if let Some(ref mut wal) = *wal_guard {
+            let frames_written = WalStorage::flush_wal(&self.dirty_pages, table_storage, wal)
+                .wrap_err("failed to flush WAL")?;
+            Ok(frames_written as usize)
+        } else {
+            Ok(0)
+        }
+    }
+
     fn load_catalog(path: &Path) -> Result<Catalog> {
         use crate::schema::persistence::CatalogPersistence;
 
@@ -2505,17 +2545,8 @@ impl Database {
             }
         }
 
-        // Flush dirty pages to WAL if WAL is enabled and not in explicit transaction (autocommit mode)
-        // In explicit transaction, WAL will be flushed on commit
-        let in_transaction = self.active_txn.lock().is_some();
-        if wal_enabled && !in_transaction && !self.dirty_pages.lock().is_empty() {
-            let table_storage = file_manager.table_data(schema_name, table_name)?;
-            let mut wal_guard = self.wal.lock();
-            if let Some(ref mut wal) = *wal_guard {
-                WalStorage::flush_wal(&self.dirty_pages, table_storage, wal)
-                    .wrap_err("failed to flush WAL after insert")?;
-            }
-        }
+        // Flush WAL in autocommit mode; deferred to commit in explicit transactions
+        self.flush_wal_if_autocommit(file_manager, schema_name, table_name)?;
 
         Ok(ExecuteResult::Insert {
             rows_affected: count,
@@ -2825,16 +2856,8 @@ impl Database {
             }
         }
 
-        // Flush dirty pages to WAL if WAL is enabled and not in explicit transaction
-        let in_transaction = self.active_txn.lock().is_some();
-        if wal_enabled && !in_transaction && !self.dirty_pages.lock().is_empty() {
-            let table_storage = file_manager.table_data(schema_name, table_name)?;
-            let mut wal_guard = self.wal.lock();
-            if let Some(ref mut wal) = *wal_guard {
-                WalStorage::flush_wal(&self.dirty_pages, table_storage, wal)
-                    .wrap_err("failed to flush WAL after update")?;
-            }
-        }
+        // Flush WAL in autocommit mode; deferred to commit in explicit transactions
+        self.flush_wal_if_autocommit(file_manager, schema_name, table_name)?;
 
         drop(file_manager_guard);
 
@@ -3172,16 +3195,8 @@ impl Database {
             }
         }
 
-        // Flush dirty pages to WAL if WAL is enabled and not in explicit transaction
-        let in_transaction = self.active_txn.lock().is_some();
-        if wal_enabled && !in_transaction && !self.dirty_pages.lock().is_empty() {
-            let table_storage = file_manager.table_data(schema_name, table_name)?;
-            let mut wal_guard = self.wal.lock();
-            if let Some(ref mut wal) = *wal_guard {
-                WalStorage::flush_wal(&self.dirty_pages, table_storage, wal)
-                    .wrap_err("failed to flush WAL after update with from")?;
-            }
-        }
+        // Flush WAL in autocommit mode; deferred to commit in explicit transactions
+        self.flush_wal_if_autocommit(file_manager, schema_name, table_name)?;
 
         drop(file_manager_guard);
 
@@ -3606,16 +3621,8 @@ impl Database {
             }
         }
 
-        // Flush dirty pages to WAL if WAL is enabled and not in explicit transaction
-        let in_transaction = self.active_txn.lock().is_some();
-        if wal_enabled && !in_transaction && !self.dirty_pages.lock().is_empty() {
-            let table_storage = file_manager.table_data(schema_name, table_name)?;
-            let mut wal_guard = self.wal.lock();
-            if let Some(ref mut wal) = *wal_guard {
-                WalStorage::flush_wal(&self.dirty_pages, table_storage, wal)
-                    .wrap_err("failed to flush WAL after delete")?;
-            }
-        }
+        // Flush WAL in autocommit mode; deferred to commit in explicit transactions
+        self.flush_wal_if_autocommit(file_manager, schema_name, table_name)?;
 
         drop(file_manager_guard);
 
@@ -4170,9 +4177,36 @@ impl Database {
             .wal_enabled
             .load(std::sync::atomic::Ordering::Acquire);
         if wal_enabled && !self.dirty_pages.lock().is_empty() {
-            // Try to flush for all tables - use checkpoint_table for a default table
-            // In a more complete implementation, we'd track which tables were modified
-            let _ = self.checkpoint_table("root", "");
+            // Flush WAL for tables modified in this transaction
+            // Note: Pages are already in mmap and will be persisted; WAL provides crash recovery
+            if let Some(catalog_guard) = self.catalog.try_read() {
+                if let Some(catalog) = catalog_guard.as_ref() {
+                    if let Some(mut file_manager_guard) = self.file_manager.try_write() {
+                        if let Some(file_manager) = file_manager_guard.as_mut() {
+                            // Find any table to use for WAL flush
+                            // (dirty pages are global, so any table's storage works for reading)
+                            for schema in catalog.schemas().values() {
+                                if let Some(table_name) = schema.tables().keys().next() {
+                                    if let Ok(storage) = file_manager.table_data("root", table_name)
+                                    {
+                                        let mut wal_guard = self.wal.lock();
+                                        if let Some(ref mut wal) = *wal_guard {
+                                            let _ = WalStorage::flush_wal(
+                                                &self.dirty_pages,
+                                                storage,
+                                                wal,
+                                            );
+                                        }
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            // Clear any remaining dirty pages (safety fallback)
+            self.dirty_pages.lock().clear();
         }
 
         Ok(ExecuteResult::Commit)
