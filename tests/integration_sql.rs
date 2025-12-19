@@ -2808,3 +2808,317 @@ mod update_from_tests {
         }
     }
 }
+
+mod wal_tests {
+    use super::*;
+
+    #[test]
+    fn pragma_wal_on_with_space_enables_wal() {
+        let dir = tempdir().unwrap();
+        let db = Database::create(dir.path().join("test_db")).unwrap();
+
+        // Test space-separated PRAGMA syntax
+        let result = db.execute("PRAGMA WAL ON").unwrap();
+        match result {
+            ExecuteResult::Pragma { name, value } => {
+                assert_eq!(name, "WAL");
+                assert_eq!(value, Some("ON".to_string()));
+            }
+            other => panic!("Expected Pragma result, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn pragma_wal_equals_on_enables_wal() {
+        let dir = tempdir().unwrap();
+        let db = Database::create(dir.path().join("test_db")).unwrap();
+
+        // Test equals syntax
+        let result = db.execute("PRAGMA WAL = ON").unwrap();
+        match result {
+            ExecuteResult::Pragma { name, value } => {
+                assert_eq!(name, "WAL");
+                assert_eq!(value, Some("ON".to_string()));
+            }
+            other => panic!("Expected Pragma result, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn wal_data_persists_after_close() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("test_db");
+
+        // Create database, enable WAL, insert data
+        {
+            let db = Database::create(&db_path).unwrap();
+            db.execute("CREATE TABLE test (id INT PRIMARY KEY, name TEXT)")
+                .unwrap();
+            db.execute("PRAGMA WAL ON").unwrap();
+            db.execute("INSERT INTO test VALUES (1, 'Alice')").unwrap();
+            db.execute("INSERT INTO test VALUES (2, 'Bob')").unwrap();
+            // Database closes here
+        }
+
+        // Reopen and verify data persists
+        {
+            let db = Database::open(&db_path).unwrap();
+            let rows = db.query("SELECT * FROM test ORDER BY id").unwrap();
+            assert_eq!(rows.len(), 2, "SHOULD have 2 rows after reopen");
+            assert_eq!(rows[0].values[1], OwnedValue::Text("Alice".to_string()));
+            assert_eq!(rows[1].values[1], OwnedValue::Text("Bob".to_string()));
+        }
+    }
+
+    #[test]
+    fn wal_with_transaction_batches_writes() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("test_db");
+
+        {
+            let db = Database::create(&db_path).unwrap();
+            db.execute("CREATE TABLE test (id INT PRIMARY KEY, value INT)")
+                .unwrap();
+            db.execute("PRAGMA WAL ON").unwrap();
+
+            // Use explicit transaction
+            db.execute("BEGIN").unwrap();
+            for i in 1..=100 {
+                db.execute(&format!("INSERT INTO test VALUES ({}, {})", i, i * 10))
+                    .unwrap();
+            }
+            db.execute("COMMIT").unwrap();
+        }
+
+        // Verify all data persists
+        {
+            let db = Database::open(&db_path).unwrap();
+            let rows = db.query("SELECT COUNT(*) FROM test").unwrap();
+            match &rows[0].values[0] {
+                OwnedValue::Int(count) => {
+                    assert_eq!(*count, 100, "SHOULD have 100 rows from batched insert");
+                }
+                other => panic!("Expected Int count, got {:?}", other),
+            }
+        }
+    }
+
+    #[test]
+    fn wal_update_persists_after_close() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("test_db");
+
+        {
+            let db = Database::create(&db_path).unwrap();
+            db.execute("CREATE TABLE test (id INT PRIMARY KEY, name TEXT)")
+                .unwrap();
+            db.execute("PRAGMA WAL ON").unwrap();
+            db.execute("INSERT INTO test VALUES (1, 'Alice')").unwrap();
+            db.execute("UPDATE test SET name = 'Alice Updated' WHERE id = 1")
+                .unwrap();
+        }
+
+        {
+            let db = Database::open(&db_path).unwrap();
+            let rows = db.query("SELECT name FROM test WHERE id = 1").unwrap();
+            assert_eq!(
+                rows[0].values[0],
+                OwnedValue::Text("Alice Updated".to_string()),
+                "Updated value SHOULD persist"
+            );
+        }
+    }
+
+    #[test]
+    fn wal_delete_persists_after_close() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("test_db");
+
+        {
+            let db = Database::create(&db_path).unwrap();
+            db.execute("CREATE TABLE test (id INT PRIMARY KEY, name TEXT)")
+                .unwrap();
+            db.execute("PRAGMA WAL ON").unwrap();
+            db.execute("INSERT INTO test VALUES (1, 'Alice')").unwrap();
+            db.execute("INSERT INTO test VALUES (2, 'Bob')").unwrap();
+            db.execute("DELETE FROM test WHERE id = 1").unwrap();
+        }
+
+        {
+            let db = Database::open(&db_path).unwrap();
+            let rows = db.query("SELECT * FROM test").unwrap();
+            assert_eq!(rows.len(), 1, "SHOULD have 1 row after delete");
+            assert_eq!(rows[0].values[0], OwnedValue::Int(2));
+        }
+    }
+}
+
+mod aggregate_window_function_tests {
+    use super::*;
+
+    #[test]
+    fn sum_over_partition_calculates_group_totals() {
+        let dir = tempdir().unwrap();
+        let db = Database::create(dir.path().join("test_db")).unwrap();
+        db.execute("CREATE TABLE sales (id INT, region TEXT, amount INT)")
+            .unwrap();
+        db.execute("INSERT INTO sales VALUES (1, 'East', 100)")
+            .unwrap();
+        db.execute("INSERT INTO sales VALUES (2, 'East', 200)")
+            .unwrap();
+        db.execute("INSERT INTO sales VALUES (3, 'West', 150)")
+            .unwrap();
+        db.execute("INSERT INTO sales VALUES (4, 'West', 250)")
+            .unwrap();
+
+        let rows = db
+            .query("SELECT id, region, SUM(amount) OVER (PARTITION BY region) AS total FROM sales")
+            .unwrap();
+
+        assert_eq!(rows.len(), 4, "SHOULD return 4 rows");
+
+        let mut region_totals: Vec<(String, i64)> = rows
+            .iter()
+            .map(|r| {
+                let region = match &r.values[1] {
+                    OwnedValue::Text(s) => s.clone(),
+                    other => panic!("Expected Text, got {:?}", other),
+                };
+                let total = match &r.values[2] {
+                    OwnedValue::Int(n) => *n,
+                    other => panic!("Expected Int for SUM, got {:?}", other),
+                };
+                (region, total)
+            })
+            .collect();
+        region_totals.sort_by_key(|(r, _)| r.clone());
+        region_totals.dedup();
+
+        assert!(
+            region_totals.contains(&("East".to_string(), 300)),
+            "East total SHOULD be 100 + 200 = 300"
+        );
+        assert!(
+            region_totals.contains(&("West".to_string(), 400)),
+            "West total SHOULD be 150 + 250 = 400"
+        );
+    }
+
+    #[test]
+    fn avg_over_preserves_float_precision() {
+        let dir = tempdir().unwrap();
+        let db = Database::create(dir.path().join("test_db")).unwrap();
+        db.execute("CREATE TABLE nums (id INT, value REAL)")
+            .unwrap();
+        db.execute("INSERT INTO nums VALUES (1, 10.5)").unwrap();
+        db.execute("INSERT INTO nums VALUES (2, 20.5)").unwrap();
+        db.execute("INSERT INTO nums VALUES (3, 30.0)").unwrap();
+
+        let rows = db
+            .query("SELECT id, AVG(value) OVER () AS avg_val FROM nums")
+            .unwrap();
+
+        assert_eq!(rows.len(), 3);
+
+        // Average of 10.5, 20.5, 30.0 = 61.0 / 3 = 20.333...
+        let avg = match &rows[0].values[1] {
+            OwnedValue::Float(f) => *f,
+            OwnedValue::Int(i) => *i as f64,
+            other => panic!("Expected Float for AVG, got {:?}", other),
+        };
+
+        let expected = 20.333333333333332;
+        assert!(
+            (avg - expected).abs() < 0.0001,
+            "AVG SHOULD be ~20.33, got {}",
+            avg
+        );
+    }
+
+    #[test]
+    fn count_over_partition_counts_group_rows() {
+        let dir = tempdir().unwrap();
+        let db = Database::create(dir.path().join("test_db")).unwrap();
+        db.execute("CREATE TABLE items (id INT, category TEXT)")
+            .unwrap();
+        db.execute("INSERT INTO items VALUES (1, 'A')").unwrap();
+        db.execute("INSERT INTO items VALUES (2, 'A')").unwrap();
+        db.execute("INSERT INTO items VALUES (3, 'A')").unwrap();
+        db.execute("INSERT INTO items VALUES (4, 'B')").unwrap();
+
+        let rows = db
+            .query("SELECT id, COUNT(*) OVER (PARTITION BY category) AS cnt FROM items")
+            .unwrap();
+
+        assert_eq!(rows.len(), 4);
+
+        let mut counts: Vec<(i64, i64)> = rows
+            .iter()
+            .map(|r| {
+                let id = match &r.values[0] {
+                    OwnedValue::Int(n) => *n,
+                    other => panic!("Expected Int, got {:?}", other),
+                };
+                let cnt = match &r.values[1] {
+                    OwnedValue::Int(n) => *n,
+                    other => panic!("Expected Int for COUNT, got {:?}", other),
+                };
+                (id, cnt)
+            })
+            .collect();
+        counts.sort_by_key(|(id, _)| *id);
+
+        // Items 1-3 are in category A (count = 3), item 4 is in B (count = 1)
+        assert_eq!(counts[0].1, 3, "Category A count SHOULD be 3");
+        assert_eq!(counts[1].1, 3, "Category A count SHOULD be 3");
+        assert_eq!(counts[2].1, 3, "Category A count SHOULD be 3");
+        assert_eq!(counts[3].1, 1, "Category B count SHOULD be 1");
+    }
+
+    #[test]
+    fn min_max_over_partition_finds_extremes() {
+        let dir = tempdir().unwrap();
+        let db = Database::create(dir.path().join("test_db")).unwrap();
+        db.execute("CREATE TABLE scores (id INT, team TEXT, score INT)")
+            .unwrap();
+        db.execute("INSERT INTO scores VALUES (1, 'Red', 10)")
+            .unwrap();
+        db.execute("INSERT INTO scores VALUES (2, 'Red', 30)")
+            .unwrap();
+        db.execute("INSERT INTO scores VALUES (3, 'Blue', 20)")
+            .unwrap();
+        db.execute("INSERT INTO scores VALUES (4, 'Blue', 40)")
+            .unwrap();
+
+        let rows = db
+            .query(
+                "SELECT team, MIN(score) OVER (PARTITION BY team) AS min_s, \
+                 MAX(score) OVER (PARTITION BY team) AS max_s FROM scores",
+            )
+            .unwrap();
+
+        assert_eq!(rows.len(), 4);
+
+        let get_team_stats = |rows: &[turdb::Row], team: &str| -> Option<(i64, i64)> {
+            rows.iter()
+                .find(|r| matches!(&r.values[0], OwnedValue::Text(t) if t == team))
+                .map(|r| {
+                    let min = match &r.values[1] {
+                        OwnedValue::Int(n) => *n,
+                        other => panic!("Expected Int for MIN, got {:?}", other),
+                    };
+                    let max = match &r.values[2] {
+                        OwnedValue::Int(n) => *n,
+                        other => panic!("Expected Int for MAX, got {:?}", other),
+                    };
+                    (min, max)
+                })
+        };
+
+        let red_stats = get_team_stats(&rows, "Red").expect("Red team should exist");
+        assert_eq!(red_stats, (10, 30), "Red: MIN=10, MAX=30");
+
+        let blue_stats = get_team_stats(&rows, "Blue").expect("Blue team should exist");
+        assert_eq!(blue_stats, (20, 40), "Blue: MIN=20, MAX=40");
+    }
+}

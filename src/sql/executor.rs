@@ -1725,7 +1725,13 @@ impl<'a, S: RowSource> Executor<'a> for DynamicExecutor<'a, S> {
                         .collect();
 
                     for &wval in window_vals.iter() {
-                        result_values.push(Value::Int(wval));
+                        // Output as Int if the value is a whole number, Float otherwise
+                        // This preserves integer display for ROW_NUMBER, RANK, COUNT etc.
+                        if wval.fract() == 0.0 && wval.abs() <= i64::MAX as f64 {
+                            result_values.push(Value::Int(wval as i64));
+                        } else {
+                            result_values.push(Value::Float(wval));
+                        }
                     }
 
                     let allocated = state.arena.alloc_slice_fill_iter(result_values);
