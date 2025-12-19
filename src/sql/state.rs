@@ -328,56 +328,79 @@ impl<'a, S: RowSource> WindowState<'a, S> {
                         }
                     }
                     "sum" => {
-                        // Compute SUM over the partition (preserves float precision)
-                        let sum: f64 = partition_indices
+                        // Compute SUM over the partition, ignoring NULLs per SQL standard
+                        let values: Vec<f64> = partition_indices
                             .iter()
-                            .map(|&row_idx| self.get_arg_value(row_idx, window_func))
-                            .sum();
+                            .filter_map(|&row_idx| self.get_arg_value(row_idx, window_func))
+                            .collect();
+                        let result = if values.is_empty() {
+                            f64::NAN // NULL when all values are NULL
+                        } else {
+                            values.iter().sum()
+                        };
                         for &row_idx in &partition_indices {
-                            self.window_results[row_idx][func_idx] = sum;
+                            self.window_results[row_idx][func_idx] = result;
                         }
                     }
                     "count" => {
-                        // COUNT over the partition
-                        let count = partition_indices.len() as f64;
+                        // COUNT(*) counts all rows; COUNT(column) counts non-NULL values
+                        let count = if window_func.args.is_empty() {
+                            // COUNT(*) - count all rows in partition
+                            partition_indices.len() as f64
+                        } else {
+                            // COUNT(column) - count non-NULL values
+                            partition_indices
+                                .iter()
+                                .filter(|&&row_idx| self.get_arg_value(row_idx, window_func).is_some())
+                                .count() as f64
+                        };
                         for &row_idx in &partition_indices {
                             self.window_results[row_idx][func_idx] = count;
                         }
                     }
                     "avg" => {
-                        // AVG over the partition (preserves float precision)
-                        if partition_indices.is_empty() {
-                            continue;
-                        }
-                        let sum: f64 = partition_indices
+                        // AVG over the partition, ignoring NULLs per SQL standard
+                        let values: Vec<f64> = partition_indices
                             .iter()
-                            .map(|&row_idx| self.get_arg_value(row_idx, window_func))
-                            .sum();
-                        let avg = sum / partition_indices.len() as f64;
+                            .filter_map(|&row_idx| self.get_arg_value(row_idx, window_func))
+                            .collect();
+                        let result = if values.is_empty() {
+                            f64::NAN // NULL when all values are NULL
+                        } else {
+                            values.iter().sum::<f64>() / values.len() as f64
+                        };
                         for &row_idx in &partition_indices {
-                            self.window_results[row_idx][func_idx] = avg;
+                            self.window_results[row_idx][func_idx] = result;
                         }
                     }
                     "min" => {
-                        // MIN over the partition
-                        let min = partition_indices
+                        // MIN over the partition, ignoring NULLs per SQL standard
+                        let values: Vec<f64> = partition_indices
                             .iter()
-                            .map(|&row_idx| self.get_arg_value(row_idx, window_func))
-                            .fold(f64::INFINITY, |a, b| a.min(b));
+                            .filter_map(|&row_idx| self.get_arg_value(row_idx, window_func))
+                            .collect();
+                        let result = if values.is_empty() {
+                            f64::NAN // NULL when all values are NULL
+                        } else {
+                            values.iter().cloned().fold(f64::INFINITY, f64::min)
+                        };
                         for &row_idx in &partition_indices {
-                            self.window_results[row_idx][func_idx] =
-                                if min == f64::INFINITY { 0.0 } else { min };
+                            self.window_results[row_idx][func_idx] = result;
                         }
                     }
                     "max" => {
-                        // MAX over the partition
-                        let max = partition_indices
+                        // MAX over the partition, ignoring NULLs per SQL standard
+                        let values: Vec<f64> = partition_indices
                             .iter()
-                            .map(|&row_idx| self.get_arg_value(row_idx, window_func))
-                            .fold(f64::NEG_INFINITY, |a, b| a.max(b));
+                            .filter_map(|&row_idx| self.get_arg_value(row_idx, window_func))
+                            .collect();
+                        let result = if values.is_empty() {
+                            f64::NAN // NULL when all values are NULL
+                        } else {
+                            values.iter().cloned().fold(f64::NEG_INFINITY, f64::max)
+                        };
                         for &row_idx in &partition_indices {
-                            self.window_results[row_idx][func_idx] =
-                                if max == f64::NEG_INFINITY { 0.0 } else { max };
+                            self.window_results[row_idx][func_idx] = result;
                         }
                     }
                     _ => {
@@ -391,23 +414,19 @@ impl<'a, S: RowSource> WindowState<'a, S> {
     }
 
     /// Gets the numeric value of the first argument for aggregate window functions.
-    /// Returns the value as f64 to preserve precision for both integers and floats.
-    /// Returns 0.0 for NULL values (matches SQL NULL handling in aggregates).
-    fn get_arg_value(&self, row_idx: usize, window_func: &WindowFunctionDef<'a>) -> f64 {
-        let Some(crate::sql::ast::Expr::Column(col_ref)) = window_func.args.first() else {
-            return 0.0;
+    /// Returns Some(f64) for numeric values, None for NULL values.
+    /// SQL standard: NULLs are ignored in aggregate functions (SUM, AVG, MIN, MAX).
+    fn get_arg_value(&self, row_idx: usize, window_func: &WindowFunctionDef<'a>) -> Option<f64> {
+        let crate::sql::ast::Expr::Column(col_ref) = window_func.args.first()? else {
+            return None;
         };
-        let Some(col_idx) = self.find_column_index(col_ref.column) else {
-            return 0.0;
-        };
-        let Some(val) = self.rows.get(row_idx).and_then(|r| r.get(col_idx)) else {
-            return 0.0;
-        };
+        let col_idx = self.find_column_index(col_ref.column)?;
+        let val = self.rows.get(row_idx).and_then(|r| r.get(col_idx))?;
         match val {
-            Value::Int(i) => *i as f64,
-            Value::Float(f) => *f,
-            Value::Null => 0.0, // NULL treated as 0 in aggregates
-            _ => 0.0,
+            Value::Int(i) => Some(*i as f64),
+            Value::Float(f) => Some(*f),
+            Value::Null => None, // NULL is ignored in aggregates per SQL standard
+            _ => None,
         }
     }
 

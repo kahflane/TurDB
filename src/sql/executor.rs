@@ -1725,9 +1725,12 @@ impl<'a, S: RowSource> Executor<'a> for DynamicExecutor<'a, S> {
                         .collect();
 
                     for &wval in window_vals.iter() {
-                        // Output as Int if the value is a whole number, Float otherwise
-                        // This preserves integer display for ROW_NUMBER, RANK, COUNT etc.
-                        if wval.fract() == 0.0 && wval.abs() <= i64::MAX as f64 {
+                        // NaN represents NULL (from aggregates over all-NULL partitions)
+                        if wval.is_nan() {
+                            result_values.push(Value::Null);
+                        } else if wval.fract() == 0.0 && wval.abs() <= i64::MAX as f64 {
+                            // Output as Int if the value is a whole number
+                            // This preserves integer display for ROW_NUMBER, RANK, COUNT etc.
                             result_values.push(Value::Int(wval as i64));
                         } else {
                             result_values.push(Value::Float(wval));

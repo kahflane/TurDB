@@ -3123,7 +3123,7 @@ mod aggregate_window_function_tests {
     }
 
     #[test]
-    fn sum_with_null_values_treats_null_as_zero() {
+    fn sum_ignores_null_values_per_sql_standard() {
         let dir = tempdir().unwrap();
         let db = Database::create(dir.path().join("test_db")).unwrap();
         db.execute("CREATE TABLE data (id INT, grp TEXT, val INT)")
@@ -3138,13 +3138,102 @@ mod aggregate_window_function_tests {
             .unwrap();
 
         assert_eq!(rows.len(), 3);
-        // NULL is treated as 0 in aggregates, so sum should be 10 + 0 + 20 = 30
+        // SQL standard: NULLs are ignored in aggregates, so sum should be 10 + 20 = 30
         for row in &rows {
             let total = match &row.values[1] {
                 OwnedValue::Int(n) => *n,
                 other => panic!("Expected Int for SUM, got {:?}", other),
             };
-            assert_eq!(total, 30, "SUM with NULL should treat NULL as 0");
+            assert_eq!(total, 30, "SUM should ignore NULLs per SQL standard");
+        }
+    }
+
+    #[test]
+    fn sum_all_nulls_returns_null() {
+        let dir = tempdir().unwrap();
+        let db = Database::create(dir.path().join("test_db")).unwrap();
+        db.execute("CREATE TABLE t (val INT)").unwrap();
+        db.execute("INSERT INTO t VALUES (NULL)").unwrap();
+        db.execute("INSERT INTO t VALUES (NULL)").unwrap();
+
+        let rows = db.query("SELECT SUM(val) OVER () FROM t").unwrap();
+
+        assert_eq!(rows.len(), 2);
+        // SQL standard: SUM of all NULLs returns NULL
+        for row in &rows {
+            assert!(
+                matches!(&row.values[0], OwnedValue::Null),
+                "SUM of all NULLs should return NULL, got {:?}",
+                row.values[0]
+            );
+        }
+    }
+
+    #[test]
+    fn avg_all_nulls_returns_null() {
+        let dir = tempdir().unwrap();
+        let db = Database::create(dir.path().join("test_db")).unwrap();
+        db.execute("CREATE TABLE t (val INT)").unwrap();
+        db.execute("INSERT INTO t VALUES (NULL)").unwrap();
+        db.execute("INSERT INTO t VALUES (NULL)").unwrap();
+
+        let rows = db.query("SELECT AVG(val) OVER () FROM t").unwrap();
+
+        assert_eq!(rows.len(), 2);
+        for row in &rows {
+            assert!(
+                matches!(&row.values[0], OwnedValue::Null),
+                "AVG of all NULLs should return NULL, got {:?}",
+                row.values[0]
+            );
+        }
+    }
+
+    #[test]
+    fn min_max_all_nulls_returns_null() {
+        let dir = tempdir().unwrap();
+        let db = Database::create(dir.path().join("test_db")).unwrap();
+        db.execute("CREATE TABLE t (val INT)").unwrap();
+        db.execute("INSERT INTO t VALUES (NULL)").unwrap();
+        db.execute("INSERT INTO t VALUES (NULL)").unwrap();
+
+        let min_rows = db.query("SELECT MIN(val) OVER () FROM t").unwrap();
+        let max_rows = db.query("SELECT MAX(val) OVER () FROM t").unwrap();
+
+        for row in &min_rows {
+            assert!(
+                matches!(&row.values[0], OwnedValue::Null),
+                "MIN of all NULLs should return NULL, got {:?}",
+                row.values[0]
+            );
+        }
+        for row in &max_rows {
+            assert!(
+                matches!(&row.values[0], OwnedValue::Null),
+                "MAX of all NULLs should return NULL, got {:?}",
+                row.values[0]
+            );
+        }
+    }
+
+    #[test]
+    fn count_all_nulls_returns_zero() {
+        let dir = tempdir().unwrap();
+        let db = Database::create(dir.path().join("test_db")).unwrap();
+        db.execute("CREATE TABLE t (val INT)").unwrap();
+        db.execute("INSERT INTO t VALUES (NULL)").unwrap();
+        db.execute("INSERT INTO t VALUES (NULL)").unwrap();
+
+        let rows = db.query("SELECT COUNT(val) OVER () FROM t").unwrap();
+
+        assert_eq!(rows.len(), 2);
+        // SQL standard: COUNT of column excludes NULLs
+        for row in &rows {
+            let count = match &row.values[0] {
+                OwnedValue::Int(n) => *n,
+                other => panic!("Expected Int for COUNT, got {:?}", other),
+            };
+            assert_eq!(count, 0, "COUNT of all NULLs should return 0");
         }
     }
 
