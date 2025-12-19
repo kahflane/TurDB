@@ -164,6 +164,10 @@ impl<'a> ExecutorRow<'a> {
                 digits: *digits,
                 scale: *scale,
             },
+            Value::ToastPointer(b) => {
+                let bytes = arena.alloc_slice_copy(b);
+                Value::ToastPointer(Cow::Borrowed(bytes))
+            }
         }
     }
 }
@@ -233,6 +237,7 @@ impl MaterializedRowSource {
                 digits: *digits,
                 scale: *scale,
             },
+            crate::types::OwnedValue::ToastPointer(b) => Value::ToastPointer(Cow::Owned(b.clone())),
         }
     }
 }
@@ -331,6 +336,16 @@ impl<'storage> StreamingBTreeSource<'storage> {
         column_types: Vec<crate::records::types::DataType>,
         projections: Option<Vec<usize>>,
     ) -> Result<Self> {
+        Self::from_btree_scan_with_detoaster(storage, root_page, column_types, projections, None)
+    }
+
+    pub fn from_btree_scan_with_detoaster(
+        storage: &'storage crate::storage::MmapStorage,
+        root_page: u32,
+        column_types: Vec<crate::records::types::DataType>,
+        projections: Option<Vec<usize>>,
+        detoaster: Option<std::sync::Arc<dyn crate::storage::toast::Detoaster + Send + Sync>>,
+    ) -> Result<Self> {
         use crate::btree::BTreeReader;
 
         let reader = BTreeReader::new(storage, root_page)?;
@@ -340,10 +355,14 @@ impl<'storage> StreamingBTreeSource<'storage> {
             .as_ref()
             .map(|p| p.len())
             .unwrap_or(column_types.len());
-        let decoder = match projections {
+        let mut decoder = match projections {
             Some(proj) => SimpleDecoder::with_projections(column_types, proj),
             None => SimpleDecoder::new(column_types),
         };
+
+        if let Some(d) = detoaster {
+            decoder.set_detoaster(d);
+        }
 
         Ok(Self::new(cursor, decoder, output_count))
     }

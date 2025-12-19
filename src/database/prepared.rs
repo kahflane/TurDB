@@ -344,6 +344,7 @@ fn value_to_sql_literal(value: &OwnedValue) -> String {
             }
         }
         OwnedValue::Enum(type_id, ordinal) => format!("{}:{}", type_id, ordinal),
+        OwnedValue::ToastPointer(b) => format!("<TOAST:{} bytes>", b.len()),
     }
 }
 

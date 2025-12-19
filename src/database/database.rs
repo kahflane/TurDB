@@ -763,10 +763,14 @@ impl Database {
 
         let plan_source = find_plan_source(physical_plan.root);
 
+        let mut toast_table_info: Option<(String, String)> = None;
+
         let rows = match plan_source {
             Some(PlanSource::TableScan(scan)) => {
                 let schema_name = scan.schema.unwrap_or("root");
                 let table_name = scan.table;
+
+                toast_table_info = Some((schema_name.to_string(), table_name.to_string()));
 
                 let table_def = catalog
                     .resolve_table(table_name)
@@ -848,6 +852,8 @@ impl Database {
             Some(PlanSource::IndexScan(scan)) => {
                 let schema_name = scan.schema.unwrap_or("root");
                 let table_name = scan.table;
+
+                toast_table_info = Some((schema_name.to_string(), table_name.to_string()));
 
                 let table_def = catalog
                     .resolve_table(table_name)
@@ -1211,6 +1217,12 @@ impl Database {
                     seen.insert(key)
                 })
                 .collect()
+        } else {
+            rows
+        };
+
+        let rows = if let Some((schema_name, table_name)) = toast_table_info {
+            self.detoast_rows(file_manager, &schema_name, &table_name, rows)?
         } else {
             rows
         };
@@ -2627,6 +2639,7 @@ impl Database {
             OwnedValue::Enum(type_id, ordinal) => {
                 key::encode_enum(*type_id as u32, *ordinal as u32, buf);
             }
+            OwnedValue::ToastPointer(b) => key::encode_blob(b, buf),
         }
     }
 
@@ -2651,6 +2664,7 @@ impl Database {
         let table_def = catalog.resolve_table(table_name)?.clone();
         let table_id = table_def.id();
         let columns = table_def.columns().to_vec();
+        let has_toast = table_def.has_toast();
 
         #[allow(clippy::type_complexity)]
         let from_tables_data: Option<Vec<(
@@ -2714,7 +2728,8 @@ impl Database {
         let btree = BTree::new(storage, root_page)?;
         let mut cursor = btree.cursor_first()?;
 
-        let mut rows_to_update: Vec<(Vec<u8>, Vec<u8>, Vec<OwnedValue>)> = Vec::new();
+        #[allow(clippy::type_complexity)]
+        let mut rows_to_update: Vec<(Vec<u8>, Vec<u8>, Vec<OwnedValue>, Vec<(usize, OwnedValue)>)> = Vec::new();
 
         while cursor.valid() {
             let key = cursor.key()?;
@@ -2738,7 +2753,11 @@ impl Database {
             if should_update {
                 let old_value = value.to_vec();
 
+                let mut old_toast_values: Vec<(usize, OwnedValue)> = Vec::new();
                 for (col_idx, value_expr) in &assignment_indices {
+                    if let OwnedValue::ToastPointer(_) = &row_values[*col_idx] {
+                        old_toast_values.push((*col_idx, row_values[*col_idx].clone()));
+                    }
                     let new_value = Self::eval_literal(value_expr)?;
                     row_values[*col_idx] = new_value;
                 }
@@ -2762,7 +2781,7 @@ impl Database {
                     }
                 }
 
-                rows_to_update.push((key.to_vec(), old_value, row_values));
+                rows_to_update.push((key.to_vec(), old_value, row_values, old_toast_values));
             }
 
             cursor.advance()?;
@@ -2785,7 +2804,7 @@ impl Database {
             let btree_for_check = BTree::new(storage_for_check, root_page)?;
             let mut check_cursor = btree_for_check.cursor_first()?;
 
-            for (update_key, _old_value, updated_values) in &rows_to_update {
+            for (update_key, _old_value, updated_values, _old_toast) in &rows_to_update {
                 while check_cursor.valid() {
                     let existing_key = check_cursor.key()?;
 
@@ -2823,7 +2842,7 @@ impl Database {
         let returned_rows: Option<Vec<Row>> = update.returning.map(|returning_cols| {
             rows_to_update
                 .iter()
-                .map(|(_key, _old_value, updated_values)| {
+                .map(|(_key, _old_value, updated_values, _old_toast)| {
                     let row_values: Vec<OwnedValue> = returning_cols
                         .iter()
                         .flat_map(|col| match col {
@@ -2850,10 +2869,73 @@ impl Database {
                 .collect()
         });
 
+        let mut processed_rows: Vec<(Vec<u8>, Vec<OwnedValue>)> = Vec::with_capacity(rows_to_update.len());
+
+        if has_toast {
+            use crate::storage::toast::ToastPointer;
+            for (key, _old_value, mut updated_values, old_toast_values) in rows_to_update.clone() {
+                for (_col_idx, old_val) in old_toast_values {
+                    if let OwnedValue::ToastPointer(ptr) = old_val {
+                        if let Ok(pointer) = ToastPointer::decode(&ptr) {
+                            let _ = self.delete_toast_chunks(
+                                file_manager,
+                                schema_name,
+                                table_name,
+                                pointer.row_id(),
+                                pointer.column_index(),
+                                pointer.total_size,
+                            );
+                        }
+                    }
+                }
+
+                let pk_value = if let Some(pk_idx) = columns.iter().position(|c| c.has_constraint(&crate::schema::table::Constraint::PrimaryKey)) {
+                    if let OwnedValue::Int(id) = &updated_values[pk_idx] {
+                        *id as u64
+                    } else {
+                        0
+                    }
+                } else {
+                    0
+                };
+
+                for (col_idx, val) in updated_values.iter_mut().enumerate() {
+                    if columns[col_idx].data_type().is_toastable() {
+                        let needs_toast = match val {
+                            OwnedValue::Text(s) => crate::storage::toast::needs_toast(s.as_bytes()),
+                            OwnedValue::Blob(b) => crate::storage::toast::needs_toast(b),
+                            _ => false,
+                        };
+                        if needs_toast {
+                            let data = match val {
+                                OwnedValue::Text(s) => s.as_bytes().to_vec(),
+                                OwnedValue::Blob(b) => b.clone(),
+                                _ => continue,
+                            };
+                            let pointer = self.toast_value(
+                                file_manager,
+                                schema_name,
+                                table_name,
+                                pk_value,
+                                col_idx as u16,
+                                &data,
+                            )?;
+                            *val = OwnedValue::ToastPointer(pointer);
+                        }
+                    }
+                }
+                processed_rows.push((key, updated_values));
+            }
+        } else {
+            for (key, _old_value, updated_values, _old_toast) in rows_to_update.clone() {
+                processed_rows.push((key, updated_values));
+            }
+        }
+
         let storage = file_manager.table_data_mut(schema_name, table_name)?;
         let mut btree_mut = BTree::new(storage, root_page)?;
 
-        for (key, _old_value, updated_values) in &rows_to_update {
+        for (key, updated_values) in &processed_rows {
             btree_mut.delete(key)?;
             let record_data = OwnedValue::build_record_from_values(updated_values, &schema)?;
             btree_mut.insert(key, &record_data)?;
@@ -2864,7 +2946,7 @@ impl Database {
         {
             let mut active_txn = self.active_txn.lock();
             if let Some(ref mut txn) = *active_txn {
-                for (key, old_value, _updated_values) in rows_to_update {
+                for (key, old_value, _updated_values, _old_toast) in rows_to_update {
                     txn.add_write_entry_with_undo(
                         WriteEntry {
                             table_id: table_id as u32,
@@ -3406,6 +3488,7 @@ impl Database {
         let table_def = catalog.resolve_table(table_name)?;
         let table_id = table_def.id();
         let columns = table_def.columns().to_vec();
+        let has_toast = table_def.has_toast();
 
         let mut fk_references: Vec<(String, String, String, usize)> = Vec::new();
         for (schema_key, schema_val) in catalog.schemas() {
@@ -3576,6 +3659,26 @@ impl Database {
         } else {
             None
         };
+
+        if has_toast {
+            use crate::storage::toast::ToastPointer;
+            for (_key, _old_value, row_values) in &rows_to_delete {
+                for val in row_values.iter() {
+                    if let OwnedValue::ToastPointer(ptr) = val {
+                        if let Ok(pointer) = ToastPointer::decode(ptr) {
+                            let _ = self.delete_toast_chunks(
+                                file_manager,
+                                schema_name,
+                                table_name,
+                                pointer.row_id(),
+                                pointer.column_index(),
+                                pointer.total_size,
+                            );
+                        }
+                    }
+                }
+            }
+        }
 
         let storage = file_manager.table_data_mut(schema_name, table_name)?;
         let mut btree_mut = BTree::new(storage, root_page)?;
@@ -4890,6 +4993,35 @@ impl Database {
         }
 
         result.truncate(total_size);
+        Ok(result)
+    }
+
+    fn detoast_rows(
+        &self,
+        file_manager: &mut crate::storage::FileManager,
+        schema_name: &str,
+        table_name: &str,
+        rows: Vec<crate::database::Row>,
+    ) -> Result<Vec<crate::database::Row>> {
+        let mut result = Vec::with_capacity(rows.len());
+        for row in rows {
+            let mut new_values = Vec::with_capacity(row.values.len());
+            for val in row.values {
+                let new_val = match val {
+                    OwnedValue::ToastPointer(ptr) => {
+                        let data = self.detoast_value(file_manager, schema_name, table_name, &ptr)?;
+                        if let Ok(s) = String::from_utf8(data.clone()) {
+                            OwnedValue::Text(s)
+                        } else {
+                            OwnedValue::Blob(data)
+                        }
+                    }
+                    other => other,
+                };
+                new_values.push(new_val);
+            }
+            result.push(crate::database::Row::new(new_values));
+        }
         Ok(result)
     }
 

@@ -203,6 +203,11 @@ impl<'a> RecordView<'a> {
         Ok(&self.data[start..end])
     }
 
+    pub fn get_var_raw(&self, col_idx: usize) -> Result<&'a [u8]> {
+        let (start, end) = self.get_var_bounds(col_idx)?;
+        Ok(&self.data[start..end])
+    }
+
     pub fn get_vector(&self, col_idx: usize) -> Result<&'a [f32]> {
         let (start, end) = self.get_var_bounds(col_idx)?;
         let bytes = &self.data[start..end];

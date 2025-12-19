@@ -70,6 +70,10 @@ pub const TOAST_POINTER_SIZE: usize = 17;
 pub const TOAST_THRESHOLD: usize = 1000;
 pub const TOAST_CHUNK_SIZE: usize = 4000;
 
+pub trait Detoaster {
+    fn detoast(&self, toast_pointer: &[u8]) -> Result<Vec<u8>>;
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct ToastPointer {
     pub total_size: u64,
@@ -137,7 +141,7 @@ pub fn toast_table_name(table_name: &str) -> String {
 }
 
 pub fn chunk_count(total_size: usize) -> usize {
-    (total_size + TOAST_CHUNK_SIZE - 1) / TOAST_CHUNK_SIZE
+    total_size.div_ceil(TOAST_CHUNK_SIZE)
 }
 
 pub fn make_chunk_key(chunk_id: u64, chunk_seq: u32) -> [u8; 12] {
@@ -152,6 +156,65 @@ pub fn parse_chunk_key(key: &[u8]) -> Result<(u64, u32)> {
     let chunk_id = u64::from_be_bytes(key[0..8].try_into().unwrap());
     let chunk_seq = u32::from_be_bytes(key[8..12].try_into().unwrap());
     Ok((chunk_id, chunk_seq))
+}
+
+use parking_lot::RwLock;
+use std::sync::Arc;
+
+pub struct TableDetoaster {
+    file_manager: Arc<RwLock<Option<crate::storage::FileManager>>>,
+    schema_name: String,
+    table_name: String,
+}
+
+impl TableDetoaster {
+    pub fn new(
+        file_manager: Arc<RwLock<Option<crate::storage::FileManager>>>,
+        schema_name: String,
+        table_name: String,
+    ) -> Self {
+        Self {
+            file_manager,
+            schema_name,
+            table_name,
+        }
+    }
+}
+
+impl Detoaster for TableDetoaster {
+    fn detoast(&self, toast_pointer: &[u8]) -> Result<Vec<u8>> {
+        use crate::btree::BTree;
+
+        let pointer = ToastPointer::decode(toast_pointer)?;
+        let chunk_id = pointer.chunk_id;
+        let total_size = pointer.total_size as usize;
+        let num_chunks = chunk_count(total_size);
+
+        let toast_table_name = toast_table_name(&self.table_name);
+
+        let mut file_manager_guard = self.file_manager.write();
+        let file_manager = file_manager_guard
+            .as_mut()
+            .ok_or_else(|| eyre::eyre!("file manager not available"))?;
+
+        let toast_storage = file_manager.table_data_mut(&self.schema_name, &toast_table_name)?;
+
+        let btree = BTree::new(toast_storage, 1)?;
+
+        let mut result = Vec::with_capacity(total_size);
+
+        for seq in 0..num_chunks {
+            let chunk_key = make_chunk_key(chunk_id, seq as u32);
+            let handle = btree
+                .search(&chunk_key)?
+                .ok_or_else(|| eyre::eyre!("TOAST chunk not found: {:?}", chunk_key))?;
+            let chunk_data = btree.get_value(&handle)?;
+            result.extend_from_slice(chunk_data);
+        }
+
+        result.truncate(total_size);
+        Ok(result)
+    }
 }
 
 #[cfg(test)]
@@ -181,10 +244,10 @@ mod tests {
     #[test]
     fn test_chunk_count() {
         assert_eq!(chunk_count(100), 1);
-        assert_eq!(chunk_count(8000), 1);
-        assert_eq!(chunk_count(8001), 2);
-        assert_eq!(chunk_count(16000), 2);
-        assert_eq!(chunk_count(16001), 3);
+        assert_eq!(chunk_count(4000), 1);
+        assert_eq!(chunk_count(4001), 2);
+        assert_eq!(chunk_count(8000), 2);
+        assert_eq!(chunk_count(8001), 3);
     }
 
     #[test]

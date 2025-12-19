@@ -79,6 +79,7 @@ pub enum Value<'a> {
     Circle { center: (f64, f64), radius: f64 },
     Enum { type_id: u16, ordinal: u16 },
     Decimal { digits: i128, scale: i16 },
+    ToastPointer(Cow<'a, [u8]>),
 }
 
 impl<'a> Value<'a> {
@@ -272,6 +273,10 @@ impl<'a> Value<'a> {
                     }
                 }
                 _ => bail!("cannot coerce decimal to affinity {:?}", target),
+            },
+            Value::ToastPointer(b) => match target {
+                TypeAffinity::Blob => Ok(Value::ToastPointer(b.clone())),
+                _ => bail!("cannot coerce toast pointer to affinity {:?}", target),
             },
         }
     }
@@ -486,6 +491,9 @@ impl<'a> Value<'a> {
 
             (Value::Decimal { .. }, _) => Some(Ordering::Greater),
             (_, Value::Decimal { .. }) => Some(Ordering::Less),
+
+            (Value::ToastPointer { .. }, _) => Some(Ordering::Greater),
+            (_, Value::ToastPointer { .. }) => Some(Ordering::Less),
         }
     }
 
@@ -541,6 +549,7 @@ impl<'a> Value<'a> {
                 digits: *digits,
                 scale: *scale,
             },
+            Value::ToastPointer(b) => Value::ToastPointer(Cow::Borrowed(arena.alloc_slice_copy(b))),
         }
     }
 
@@ -591,6 +600,7 @@ impl<'a> Value<'a> {
                 digits: *digits,
                 scale: *scale,
             },
+            Value::ToastPointer(b) => Value::ToastPointer(Cow::Owned(b.to_vec())),
         }
     }
 
@@ -681,6 +691,7 @@ impl<'a> Value<'a> {
                 buf.extend(digits.to_be_bytes());
                 buf.extend(scale.to_be_bytes());
             }
+            Value::ToastPointer(b) => encode_blob(b, buf),
         }
     }
 
@@ -741,6 +752,7 @@ impl<'a> Value<'a> {
                 digits.hash(hasher);
                 scale.hash(hasher);
             }
+            Value::ToastPointer(b) => b.hash(hasher),
         }
     }
 }
