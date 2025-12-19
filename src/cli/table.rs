@@ -162,6 +162,7 @@ fn format_value(value: &OwnedValue) -> String {
         OwnedValue::Circle(center, radius) => format!("<({}, {}), {}>", center.0, center.1, radius),
         OwnedValue::Decimal(value, scale) => format_decimal(*value, *scale),
         OwnedValue::Enum(type_id, variant) => format!("enum({}, {})", type_id, variant),
+        OwnedValue::ToastPointer(ptr) => format!("<toast: {} bytes>", ptr.len()),
     }
 }
 
