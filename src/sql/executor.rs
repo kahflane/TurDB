@@ -1724,7 +1724,7 @@ impl<'a, S: RowSource> Executor<'a> for DynamicExecutor<'a, S> {
                         .map(|v| clone_value_ref_to_arena(v, state.arena))
                         .collect();
 
-                    const MAX_EXACT_INT: f64 = 9007199254740992.0;
+                    const MAX_EXACT_INT: f64 = 9007199254740992.0; // 2^53
 
                     for (idx, &wval) in window_vals.iter().enumerate() {
                         if wval.is_nan() {
@@ -1739,9 +1739,9 @@ impl<'a, S: RowSource> Executor<'a> for DynamicExecutor<'a, S> {
                             .unwrap_or(false);
 
                         if returns_integer {
-                            result_values.push(Value::Int(wval as i64));
+                            result_values.push(Value::Int(wval.trunc() as i64));
                         } else if wval.fract() == 0.0 && wval.abs() <= MAX_EXACT_INT {
-                            result_values.push(Value::Int(wval as i64));
+                            result_values.push(Value::Int(wval.trunc() as i64));
                         } else {
                             result_values.push(Value::Float(wval));
                         }
