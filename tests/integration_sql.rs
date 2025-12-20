@@ -3329,30 +3329,32 @@ mod wal_edge_case_tests {
     }
 
     #[test]
-    fn wal_rejects_multi_table_transactions() {
-        // Multi-table transactions with WAL are not crash-safe because dirty_pages
-        // doesn't track which table each page belongs to. Verify this is rejected.
+    fn wal_supports_multi_table_transactions() {
         let dir = tempdir().unwrap();
         let db_path = dir.path().join("test_db");
 
-        let db = Database::create(&db_path).unwrap();
-        db.execute("PRAGMA WAL ON").unwrap();
-        db.execute("CREATE TABLE t1 (id INT)").unwrap();
-        db.execute("CREATE TABLE t2 (id INT)").unwrap();
+        {
+            let db = Database::create(&db_path).unwrap();
+            db.execute("PRAGMA WAL ON").unwrap();
+            db.execute("CREATE TABLE t1 (id INT)").unwrap();
+            db.execute("CREATE TABLE t2 (id INT)").unwrap();
 
-        db.execute("BEGIN").unwrap();
-        db.execute("INSERT INTO t1 VALUES (1)").unwrap();
-        db.execute("INSERT INTO t2 VALUES (2)").unwrap();
+            db.execute("BEGIN").unwrap();
+            db.execute("INSERT INTO t1 VALUES (1)").unwrap();
+            db.execute("INSERT INTO t2 VALUES (2)").unwrap();
+            db.execute("COMMIT").unwrap();
 
-        // COMMIT should fail because transaction modified multiple tables
-        let result = db.execute("COMMIT");
-        assert!(result.is_err(), "Multi-table transaction with WAL should be rejected");
-        let err_msg = result.unwrap_err().to_string();
-        assert!(
-            err_msg.contains("multi-table transactions are not supported with WAL"),
-            "Error should mention multi-table WAL limitation: {}",
-            err_msg
-        );
+            db.close().unwrap();
+        }
+
+        {
+            let db = Database::open(&db_path).unwrap();
+            let rows = db.query("SELECT id FROM t1").unwrap();
+            assert_eq!(rows.len(), 1);
+
+            let rows = db.query("SELECT id FROM t2").unwrap();
+            assert_eq!(rows.len(), 1);
+        }
     }
 
     #[test]

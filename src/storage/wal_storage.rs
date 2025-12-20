@@ -272,6 +272,106 @@ impl<'a> Storage for WalStorage<'a> {
     }
 }
 
+pub struct WalStoragePerTable<'a> {
+    storage: &'a mut MmapStorage,
+    dirty_pages: &'a Mutex<HashMap<u32, HashSet<u32>>>,
+    table_id: u32,
+}
+
+impl<'a> WalStoragePerTable<'a> {
+    pub fn new(
+        storage: &'a mut MmapStorage,
+        dirty_pages: &'a Mutex<HashMap<u32, HashSet<u32>>>,
+        table_id: u32,
+    ) -> Self {
+        Self {
+            storage,
+            dirty_pages,
+            table_id,
+        }
+    }
+
+    pub fn dirty_page_count(&self) -> usize {
+        let guard = self.dirty_pages.lock();
+        guard.get(&self.table_id).map(|s| s.len()).unwrap_or(0)
+    }
+
+    pub fn inner_storage(&self) -> &MmapStorage {
+        self.storage
+    }
+
+    pub fn flush_wal_for_table(
+        dirty_pages: &Mutex<HashMap<u32, HashSet<u32>>>,
+        storage: &MmapStorage,
+        wal: &mut Wal,
+        table_id: u32,
+    ) -> Result<u32> {
+        let dirty: Vec<u32> = {
+            let mut guard = dirty_pages.lock();
+            match guard.get_mut(&table_id) {
+                Some(pages) => {
+                    if pages.is_empty() {
+                        return Ok(0);
+                    }
+                    pages.drain().collect()
+                }
+                None => return Ok(0),
+            }
+        };
+
+        let db_size = storage.page_count();
+        let mut frames_written = 0;
+
+        for page_no in dirty {
+            let page_data = storage.page(page_no)?;
+
+            ensure!(
+                page_data.len() == PAGE_SIZE,
+                "page {} has unexpected size {} (expected {})",
+                page_no,
+                page_data.len(),
+                PAGE_SIZE
+            );
+
+            wal.write_frame(page_no, db_size, page_data)
+                .wrap_err_with(|| format!("failed to write page {} to WAL", page_no))?;
+
+            frames_written += 1;
+        }
+
+        Ok(frames_written)
+    }
+}
+
+impl<'a> Storage for WalStoragePerTable<'a> {
+    fn page(&self, page_no: u32) -> Result<&[u8]> {
+        self.storage.page(page_no)
+    }
+
+    fn page_mut(&mut self, page_no: u32) -> Result<&mut [u8]> {
+        let mut guard = self.dirty_pages.lock();
+        guard.entry(self.table_id).or_default().insert(page_no);
+        drop(guard);
+        self.storage.page_mut(page_no)
+    }
+
+    fn grow(&mut self, new_page_count: u32) -> Result<()> {
+        self.storage.grow(new_page_count)
+    }
+
+    fn page_count(&self) -> u32 {
+        self.storage.page_count()
+    }
+
+    fn sync(&self) -> Result<()> {
+        self.storage.sync()
+    }
+
+    fn prefetch_pages(&self, start_page: u32, count: u32) {
+        self.storage.prefetch_pages(start_page, count)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
