@@ -732,6 +732,39 @@ impl<'a> CompiledPredicate<'a> {
         use crate::sql::ast::FunctionArgs;
 
         let func_name = func.name.name.to_uppercase();
+
+        if func.over.is_none()
+            && matches!(
+                func_name.as_str(),
+                "COUNT" | "SUM" | "AVG" | "MIN" | "MAX"
+            )
+        {
+            let lookup_name = match &func.args {
+                FunctionArgs::Star => func_name.to_lowercase(),
+                FunctionArgs::Args(args) if args.len() == 1 => {
+                    if let crate::sql::ast::Expr::Column(col) = args[0].value {
+                        format!("{}_{}", func_name.to_lowercase(), col.column.to_lowercase())
+                    } else {
+                        func_name.to_lowercase()
+                    }
+                }
+                _ => func_name.to_lowercase(),
+            };
+
+            let col_idx = self
+                .column_map
+                .iter()
+                .find(|(name, _)| name.eq_ignore_ascii_case(&lookup_name))
+                .or_else(|| {
+                    self.column_map
+                        .iter()
+                        .find(|(name, _)| name.eq_ignore_ascii_case(&func_name.to_lowercase()))
+                })
+                .map(|(_, idx)| *idx)?;
+
+            return row.get(col_idx).cloned();
+        }
+
         let args: Vec<Option<Value<'a>>> = match &func.args {
             FunctionArgs::None | FunctionArgs::Star => vec![],
             FunctionArgs::Args(args) => args
