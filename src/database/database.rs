@@ -164,6 +164,7 @@ pub struct Database {
     foreign_keys_enabled: std::sync::atomic::AtomicBool,
     /// Session setting: page cache size in number of pages (default: 256 = 4MB)
     cache_size: std::sync::atomic::AtomicU32,
+    table_id_lookup: RwLock<hashbrown::HashMap<u32, (String, String)>>,
 }
 
 impl Database {
@@ -227,6 +228,7 @@ impl Database {
             active_txn: Mutex::new(None),
             foreign_keys_enabled: AtomicBool::new(true),
             cache_size: std::sync::atomic::AtomicU32::new(DEFAULT_CACHE_SIZE),
+            table_id_lookup: RwLock::new(hashbrown::HashMap::new()),
         };
 
         let recovery_info = RecoveryInfo {
@@ -282,6 +284,7 @@ impl Database {
             active_txn: Mutex::new(None),
             foreign_keys_enabled: AtomicBool::new(true),
             cache_size: std::sync::atomic::AtomicU32::new(DEFAULT_CACHE_SIZE),
+            table_id_lookup: RwLock::new(hashbrown::HashMap::new()),
         })
     }
 
@@ -396,9 +399,22 @@ impl Database {
         let mut guard = self.catalog.write();
         if guard.is_none() {
             let catalog = Self::load_catalog(&self.path)?;
+            self.populate_table_id_cache(&catalog);
             *guard = Some(catalog);
         }
         Ok(())
+    }
+
+    fn populate_table_id_cache(&self, catalog: &Catalog) {
+        let mut lookup = self.table_id_lookup.write();
+        for (schema_name, schema) in catalog.schemas() {
+            for (table_name, table_def) in schema.tables() {
+                lookup.insert(
+                    table_def.id() as u32,
+                    (schema_name.to_string(), table_name.to_string()),
+                );
+            }
+        }
     }
 
     pub fn ensure_wal(&self) -> Result<()> {
@@ -447,13 +463,12 @@ impl Database {
 
         let table_storage = file_manager.table_data(schema_name, table_name)?;
         let mut wal_guard = self.wal.lock();
-        if let Some(ref mut wal) = *wal_guard {
-            let frames_written = WalStorage::flush_wal(&self.dirty_pages, table_storage, wal)
-                .wrap_err("failed to flush WAL")?;
-            Ok(frames_written as usize)
-        } else {
-            Ok(0)
-        }
+        let wal = wal_guard.as_mut().ok_or_else(|| {
+            eyre::eyre!("WAL is enabled but not initialized - this is a bug")
+        })?;
+        let frames_written = WalStorage::flush_wal(&self.dirty_pages, table_storage, wal)
+            .wrap_err("failed to flush WAL")?;
+        Ok(frames_written as usize)
     }
 
     fn load_catalog(path: &Path) -> Result<Catalog> {
@@ -1832,6 +1847,11 @@ impl Database {
         catalog.create_table_with_id(schema_name, table_name, columns, table_id)?;
 
         drop(catalog_guard);
+
+        self.table_id_lookup.write().insert(
+            table_id as u32,
+            (schema_name.to_string(), table_name.to_string()),
+        );
 
         let mut file_manager_guard = self.file_manager.write();
         let file_manager = file_manager_guard.as_mut().unwrap();
@@ -4020,8 +4040,10 @@ impl Database {
             let table_name = table_ref.name;
 
             if let Some(schema) = catalog.get_schema_mut(schema_name) {
-                if schema.table_exists(table_name) {
+                if let Some(table_def) = schema.get_table(table_name) {
+                    let table_id = table_def.id() as u32;
                     schema.remove_table(table_name);
+                    self.table_id_lookup.write().remove(&table_id);
                     actually_dropped = true;
                 } else if !drop_stmt.if_exists {
                     bail!(
@@ -4180,8 +4202,9 @@ impl Database {
                 if unique_tables.len() > 1 {
                     bail!(
                         "multi-table transactions are not supported with WAL enabled \
-                         (transaction modified {} tables). Disable WAL or use separate \
-                         transactions per table.",
+                         (transaction modified {} tables). Workarounds: (1) use PRAGMA wal OFF \
+                         to disable WAL for this session, (2) use separate transactions per \
+                         table, or (3) use autocommit mode (no explicit BEGIN/COMMIT).",
                         unique_tables.len()
                     );
                 }
@@ -4197,54 +4220,37 @@ impl Database {
 
         self.finalize_transaction_commit(txn)?;
 
-        if wal_enabled && !self.dirty_pages.lock().is_empty() {
-            let table_id = modified_table_id.ok_or_else(|| {
-                eyre::eyre!(
-                    "dirty pages exist but no table was modified - this is a bug"
-                )
-            })?;
+        if wal_enabled {
+            if let Some(table_id) = modified_table_id {
+                let (schema_name, table_name) = {
+                    let lookup = self.table_id_lookup.read();
+                    lookup.get(&table_id).cloned().ok_or_else(|| {
+                        eyre::eyre!("modified table (id={}) not found in lookup cache", table_id)
+                    })?
+                };
 
-            let catalog_guard = self.catalog.read();
-            let catalog = catalog_guard
-                .as_ref()
-                .ok_or_else(|| eyre::eyre!("catalog not available for WAL flush"))?;
+                let mut file_manager_guard = self.file_manager.write();
+                let file_manager = file_manager_guard
+                    .as_mut()
+                    .ok_or_else(|| eyre::eyre!("file manager not available for WAL flush"))?;
 
-            let mut file_manager_guard = self.file_manager.write();
-            let file_manager = file_manager_guard
-                .as_mut()
-                .ok_or_else(|| eyre::eyre!("file manager not available for WAL flush"))?;
+                let storage = file_manager
+                    .table_data(&schema_name, &table_name)
+                    .wrap_err_with(|| {
+                        format!(
+                            "failed to get storage for table {}.{} during WAL flush",
+                            schema_name, table_name
+                        )
+                    })?;
 
-            let mut found = None;
-            'search: for (sname, schema) in catalog.schemas() {
-                for (tname, table_def) in schema.tables() {
-                    if table_def.id() == table_id as u64 {
-                        found = Some((sname.to_string(), tname.to_string()));
-                        break 'search;
-                    }
-                }
+                let mut wal_guard = self.wal.lock();
+                let wal = wal_guard
+                    .as_mut()
+                    .ok_or_else(|| eyre::eyre!("WAL not initialized but WAL mode is enabled"))?;
+
+                WalStorage::flush_wal(&self.dirty_pages, storage, wal)
+                    .wrap_err("failed to flush WAL on commit")?;
             }
-            let (schema_name, table_name) = found.ok_or_else(|| {
-                eyre::eyre!("modified table (id={}) not found for WAL flush", table_id)
-            })?;
-
-            let storage = file_manager
-                .table_data(&schema_name, &table_name)
-                .wrap_err_with(|| {
-                    format!(
-                        "failed to get storage for table {}.{} during WAL flush",
-                        schema_name, table_name
-                    )
-                })?;
-
-            let mut wal_guard = self.wal.lock();
-            let wal = wal_guard
-                .as_mut()
-                .ok_or_else(|| eyre::eyre!("WAL not initialized but WAL mode is enabled"))?;
-
-            WalStorage::flush_wal(&self.dirty_pages, storage, wal)
-                .wrap_err("failed to flush WAL on commit")?;
-
-            self.dirty_pages.lock().clear();
         }
 
         Ok(ExecuteResult::Commit)

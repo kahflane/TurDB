@@ -1732,17 +1732,13 @@ impl<'a, S: RowSource> Executor<'a> for DynamicExecutor<'a, S> {
                             continue;
                         }
 
-                        let func_name = state
+                        let returns_integer = state
                             .window_functions
                             .get(idx)
-                            .map(|f| f.function_name.to_uppercase());
+                            .map(|f| f.function_type.returns_integer())
+                            .unwrap_or(false);
 
-                        let is_ranking_function = matches!(
-                            func_name.as_deref(),
-                            Some("ROW_NUMBER") | Some("RANK") | Some("DENSE_RANK") | Some("COUNT")
-                        );
-
-                        if is_ranking_function {
+                        if returns_integer {
                             result_values.push(Value::Int(wval as i64));
                         } else if wval.fract() == 0.0 && wval.abs() <= MAX_EXACT_INT {
                             result_values.push(Value::Int(wval as i64));

@@ -308,9 +308,45 @@ pub struct LogicalWindow<'a> {
     pub window_functions: &'a [WindowFunctionDef<'a>],
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WindowFunctionType {
+    RowNumber,
+    Rank,
+    DenseRank,
+    Count,
+    Sum,
+    Avg,
+    Min,
+    Max,
+}
+
+impl WindowFunctionType {
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name.to_uppercase().as_str() {
+            "ROW_NUMBER" => Some(Self::RowNumber),
+            "RANK" => Some(Self::Rank),
+            "DENSE_RANK" => Some(Self::DenseRank),
+            "COUNT" => Some(Self::Count),
+            "SUM" => Some(Self::Sum),
+            "AVG" => Some(Self::Avg),
+            "MIN" => Some(Self::Min),
+            "MAX" => Some(Self::Max),
+            _ => None,
+        }
+    }
+
+    pub fn returns_integer(&self) -> bool {
+        matches!(
+            self,
+            Self::RowNumber | Self::Rank | Self::DenseRank | Self::Count
+        )
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct WindowFunctionDef<'a> {
     pub function_name: &'a str,
+    pub function_type: WindowFunctionType,
     pub args: &'a [&'a Expr<'a>],
     pub partition_by: &'a [&'a Expr<'a>],
     pub order_by: &'a [SortKey<'a>],
@@ -1025,13 +1061,16 @@ impl<'a> Planner<'a> {
                         crate::sql::ast::FunctionArgs::None => &[],
                     };
 
-                    window_funcs.push(WindowFunctionDef {
-                        function_name: func.name.name,
-                        args,
-                        partition_by: window_spec.partition_by,
-                        order_by: order_by_keys,
-                        alias: *alias,
-                    });
+                    if let Some(function_type) = WindowFunctionType::from_name(func.name.name) {
+                        window_funcs.push(WindowFunctionDef {
+                            function_name: func.name.name,
+                            function_type,
+                            args,
+                            partition_by: window_spec.partition_by,
+                            order_by: order_by_keys,
+                            alias: *alias,
+                        });
+                    }
                 }
             }
         }
