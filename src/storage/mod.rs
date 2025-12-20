@@ -90,6 +90,7 @@ mod freelist;
 mod headers;
 mod mmap;
 mod page;
+pub mod toast;
 mod wal;
 mod wal_storage;
 
