@@ -328,13 +328,12 @@ impl<'a, S: RowSource> WindowState<'a, S> {
                         }
                     }
                     "sum" => {
-                        // Compute SUM over the partition, ignoring NULLs per SQL standard
                         let values: Vec<f64> = partition_indices
                             .iter()
                             .filter_map(|&row_idx| self.get_arg_value(row_idx, window_func))
                             .collect();
                         let result = if values.is_empty() {
-                            f64::NAN // NULL when all values are NULL
+                            f64::NAN
                         } else {
                             values.iter().sum()
                         };
@@ -343,12 +342,9 @@ impl<'a, S: RowSource> WindowState<'a, S> {
                         }
                     }
                     "count" => {
-                        // COUNT(*) counts all rows; COUNT(column) counts non-NULL values
                         let count = if window_func.args.is_empty() {
-                            // COUNT(*) - count all rows in partition
                             partition_indices.len() as f64
                         } else {
-                            // COUNT(column) - count non-NULL values
                             partition_indices
                                 .iter()
                                 .filter(|&&row_idx| self.get_arg_value(row_idx, window_func).is_some())
@@ -359,13 +355,12 @@ impl<'a, S: RowSource> WindowState<'a, S> {
                         }
                     }
                     "avg" => {
-                        // AVG over the partition, ignoring NULLs per SQL standard
                         let values: Vec<f64> = partition_indices
                             .iter()
                             .filter_map(|&row_idx| self.get_arg_value(row_idx, window_func))
                             .collect();
                         let result = if values.is_empty() {
-                            f64::NAN // NULL when all values are NULL
+                            f64::NAN
                         } else {
                             values.iter().sum::<f64>() / values.len() as f64
                         };
@@ -374,13 +369,12 @@ impl<'a, S: RowSource> WindowState<'a, S> {
                         }
                     }
                     "min" => {
-                        // MIN over the partition, ignoring NULLs per SQL standard
                         let values: Vec<f64> = partition_indices
                             .iter()
                             .filter_map(|&row_idx| self.get_arg_value(row_idx, window_func))
                             .collect();
                         let result = if values.is_empty() {
-                            f64::NAN // NULL when all values are NULL
+                            f64::NAN
                         } else {
                             values.iter().cloned().fold(f64::INFINITY, f64::min)
                         };
@@ -389,13 +383,12 @@ impl<'a, S: RowSource> WindowState<'a, S> {
                         }
                     }
                     "max" => {
-                        // MAX over the partition, ignoring NULLs per SQL standard
                         let values: Vec<f64> = partition_indices
                             .iter()
                             .filter_map(|&row_idx| self.get_arg_value(row_idx, window_func))
                             .collect();
                         let result = if values.is_empty() {
-                            f64::NAN // NULL when all values are NULL
+                            f64::NAN
                         } else {
                             values.iter().cloned().fold(f64::NEG_INFINITY, f64::max)
                         };
@@ -425,7 +418,7 @@ impl<'a, S: RowSource> WindowState<'a, S> {
         match val {
             Value::Int(i) => Some(*i as f64),
             Value::Float(f) => Some(*f),
-            Value::Null => None, // NULL is ignored in aggregates per SQL standard
+            Value::Null => None,
             _ => None,
         }
     }

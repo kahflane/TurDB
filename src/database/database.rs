@@ -4165,15 +4165,12 @@ impl Database {
             .wal_enabled
             .load(std::sync::atomic::Ordering::Acquire);
 
-        // Validate transaction BEFORE removing from active state
-        // This ensures transaction remains active if validation fails
         {
             let active_txn = self.active_txn.lock();
             let txn = active_txn
                 .as_ref()
                 .ok_or_else(|| eyre::eyre!("no transaction in progress"))?;
 
-            // Check for multi-table transaction with WAL enabled
             if wal_enabled && !txn.write_entries.is_empty() {
                 let unique_tables: hashbrown::HashSet<u32> = txn
                     .write_entries
@@ -4191,19 +4188,22 @@ impl Database {
             }
         }
 
-        // Now safe to take the transaction - validation passed
         let mut active_txn = self.active_txn.lock();
         let txn = active_txn
             .take()
             .ok_or_else(|| eyre::eyre!("no transaction in progress"))?;
 
-        // Get the table that was modified (for WAL flush)
         let modified_table_id = txn.write_entries.first().map(|e| e.table_id);
 
         self.finalize_transaction_commit(txn)?;
 
-        // Flush WAL on transaction commit if enabled and there are dirty pages
         if wal_enabled && !self.dirty_pages.lock().is_empty() {
+            let table_id = modified_table_id.ok_or_else(|| {
+                eyre::eyre!(
+                    "dirty pages exist but no table was modified - this is a bug"
+                )
+            })?;
+
             let catalog_guard = self.catalog.read();
             let catalog = catalog_guard
                 .as_ref()
@@ -4214,32 +4214,18 @@ impl Database {
                 .as_mut()
                 .ok_or_else(|| eyre::eyre!("file manager not available for WAL flush"))?;
 
-            // Find the table to use for WAL flush
-            let (schema_name, table_name) = if let Some(table_id) = modified_table_id {
-                // Find the table that was modified by ID
-                let mut found = None;
-                'search: for (sname, schema) in catalog.schemas() {
-                    for (tname, table_def) in schema.tables() {
-                        if table_def.id() == table_id as u64 {
-                            found = Some((sname.to_string(), tname.to_string()));
-                            break 'search;
-                        }
-                    }
-                }
-                found.ok_or_else(|| {
-                    eyre::eyre!("modified table (id={}) not found for WAL flush", table_id)
-                })?
-            } else {
-                // No writes in transaction, use first available table
-                let mut found = None;
-                'search: for (sname, schema) in catalog.schemas() {
-                    if let Some(tname) = schema.tables().keys().next() {
+            let mut found = None;
+            'search: for (sname, schema) in catalog.schemas() {
+                for (tname, table_def) in schema.tables() {
+                    if table_def.id() == table_id as u64 {
                         found = Some((sname.to_string(), tname.to_string()));
                         break 'search;
                     }
                 }
-                found.ok_or_else(|| eyre::eyre!("no table available for WAL flush"))?
-            };
+            }
+            let (schema_name, table_name) = found.ok_or_else(|| {
+                eyre::eyre!("modified table (id={}) not found for WAL flush", table_id)
+            })?;
 
             let storage = file_manager
                 .table_data(&schema_name, &table_name)
@@ -4258,7 +4244,6 @@ impl Database {
             WalStorage::flush_wal(&self.dirty_pages, storage, wal)
                 .wrap_err("failed to flush WAL on commit")?;
 
-            // Clear dirty pages only after successful flush
             self.dirty_pages.lock().clear();
         }
 

@@ -1724,18 +1724,27 @@ impl<'a, S: RowSource> Executor<'a> for DynamicExecutor<'a, S> {
                         .map(|v| clone_value_ref_to_arena(v, state.arena))
                         .collect();
 
-                    // f64 can exactly represent integers only up to 2^53
-                    const MAX_EXACT_INT: f64 = 9007199254740992.0; // 2^53
+                    const MAX_EXACT_INT: f64 = 9007199254740992.0;
 
-                    for &wval in window_vals.iter() {
-                        // NaN represents NULL (from aggregates over all-NULL partitions)
+                    for (idx, &wval) in window_vals.iter().enumerate() {
                         if wval.is_nan() {
                             result_values.push(Value::Null);
+                            continue;
+                        }
+
+                        let func_name = state
+                            .window_functions
+                            .get(idx)
+                            .map(|f| f.function_name.to_uppercase());
+
+                        let is_ranking_function = matches!(
+                            func_name.as_deref(),
+                            Some("ROW_NUMBER") | Some("RANK") | Some("DENSE_RANK") | Some("COUNT")
+                        );
+
+                        if is_ranking_function {
+                            result_values.push(Value::Int(wval as i64));
                         } else if wval.fract() == 0.0 && wval.abs() <= MAX_EXACT_INT {
-                            // Output as Int if:
-                            // 1. Value is a whole number (no fractional part)
-                            // 2. Value is within f64's exact integer representation range
-                            // This preserves integer display for ROW_NUMBER, RANK, COUNT etc.
                             result_values.push(Value::Int(wval as i64));
                         } else {
                             result_values.push(Value::Float(wval));

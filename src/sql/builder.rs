@@ -80,14 +80,6 @@ impl<'a> ExecutorBuilder<'a> {
                     match expr {
                         Expr::Column(_) => false,
                         Expr::Function(func) => {
-                            // Window functions (with OVER clause) are NOT complex expressions.
-                            // Execution model: Window functions are evaluated in a separate pass
-                            // during query execution (see ExecuteState::compute_window_results).
-                            // The results are precomputed and stored in window_results[row_idx][func_idx].
-                            // During projection, we simply look up these precomputed values by index
-                            // (see Executor::execute where window_vals are retrieved), rather than
-                            // dynamically evaluating the expression. This is why window functions
-                            // don't require the complex expression evaluation path.
                             if func.over.is_some() {
                                 return false;
                             }
