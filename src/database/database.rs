@@ -4166,26 +4166,34 @@ impl Database {
             .take()
             .ok_or_else(|| eyre::eyre!("no transaction in progress"))?;
 
-        self.finalize_transaction_commit(txn)?;
-
-        // Flush WAL on transaction commit if enabled and there are dirty pages
-        //
-        // LIMITATION: The current dirty_pages tracking uses a global HashSet<u32> where page
-        // numbers are relative to individual table storage files. This works correctly when:
-        // 1. Autocommit mode - each statement flushes WAL with the correct table's storage
-        // 2. Single-table transactions - all dirty pages belong to one table
-        //
-        // For multi-table transactions, page numbers from different tables could collide
-        // (e.g., page 5 from table A vs page 5 from table B). A proper fix would require:
-        // - Changing dirty_pages to HashMap<TableId, HashSet<u32>> to track per-table pages
-        // - Or using globally unique page numbers across all tables
-        //
-        // The current implementation uses the first available table's storage for the flush,
-        // which is correct for single-table transactions but may not properly recover
-        // multi-table transactions after a crash.
+        // Check for multi-table transaction with WAL enabled - this is currently unsafe
+        // because dirty_pages doesn't track which table each page belongs to
         let wal_enabled = self
             .wal_enabled
             .load(std::sync::atomic::Ordering::Acquire);
+        if wal_enabled && !txn.write_entries.is_empty() {
+            let unique_tables: hashbrown::HashSet<u32> = txn
+                .write_entries
+                .iter()
+                .map(|e| e.table_id)
+                .collect();
+            if unique_tables.len() > 1 {
+                // SAFETY: Multi-table transactions with WAL enabled are not crash-safe.
+                // The dirty_pages tracking uses global page numbers without table identity,
+                // which could cause page collisions during recovery. Reject until fixed.
+                bail!(
+                    "multi-table transactions are not supported with WAL enabled \
+                     (transaction modified {} tables). Disable WAL or use separate \
+                     transactions per table.",
+                    unique_tables.len()
+                );
+            }
+        }
+
+        self.finalize_transaction_commit(txn)?;
+
+        // Flush WAL on transaction commit if enabled and there are dirty pages
+        // Note: We've already verified this is a single-table transaction above.
         if wal_enabled && !self.dirty_pages.lock().is_empty() {
             // Use blocking locks to ensure WAL flush completes (required for durability)
             let catalog_guard = self.catalog.read();
