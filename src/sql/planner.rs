@@ -969,11 +969,10 @@ impl<'a> Planner<'a> {
         aggregates.into_bump_slice()
     }
 
-    fn collect_aggregates_from_expr(
-        &self,
-        expr: &'a Expr<'a>,
-        aggregates: &mut bumpalo::collections::Vec<&'a Expr<'a>>,
-    ) {
+    fn traverse_expr_for_aggregates<F>(&self, expr: &'a Expr<'a>, on_aggregate: &mut F) -> bool
+    where
+        F: FnMut(&'a Expr<'a>) -> bool,
+    {
         use crate::sql::ast::{FunctionArgs, FunctionCall};
 
         match expr {
@@ -981,56 +980,15 @@ impl<'a> Planner<'a> {
                 if over.is_none() {
                     let func_name = name.name.to_ascii_lowercase();
                     if matches!(func_name.as_str(), "count" | "sum" | "avg" | "min" | "max") {
-                        aggregates.push(expr);
-                        return;
+                        if on_aggregate(expr) {
+                            return true;
+                        }
+                        return false;
                     }
                 }
                 if let FunctionArgs::Args(fn_args) = args {
                     for arg in *fn_args {
-                        self.collect_aggregates_from_expr(arg.value, aggregates);
-                    }
-                }
-            }
-            Expr::BinaryOp { left, right, .. } => {
-                self.collect_aggregates_from_expr(left, aggregates);
-                self.collect_aggregates_from_expr(right, aggregates);
-            }
-            Expr::UnaryOp { expr: inner, .. } => {
-                self.collect_aggregates_from_expr(inner, aggregates);
-            }
-            Expr::Cast { expr: inner, .. } => {
-                self.collect_aggregates_from_expr(inner, aggregates);
-            }
-            Expr::Case { operand, conditions, else_result } => {
-                if let Some(op) = operand {
-                    self.collect_aggregates_from_expr(op, aggregates);
-                }
-                for cond in *conditions {
-                    self.collect_aggregates_from_expr(cond.condition, aggregates);
-                    self.collect_aggregates_from_expr(cond.result, aggregates);
-                }
-                if let Some(e) = else_result {
-                    self.collect_aggregates_from_expr(e, aggregates);
-                }
-            }
-            _ => {}
-        }
-    }
-
-    fn contains_aggregate(&self, expr: &Expr<'a>) -> bool {
-        use crate::sql::ast::{FunctionArgs, FunctionCall};
-
-        match expr {
-            Expr::Function(FunctionCall { name, over, args, .. }) => {
-                if over.is_none() {
-                    let func_name = name.name.to_ascii_lowercase();
-                    if matches!(func_name.as_str(), "count" | "sum" | "avg" | "min" | "max") {
-                        return true;
-                    }
-                }
-                if let FunctionArgs::Args(fn_args) = args {
-                    for arg in *fn_args {
-                        if self.contains_aggregate(arg.value) {
+                        if self.traverse_expr_for_aggregates(arg.value, on_aggregate) {
                             return true;
                         }
                     }
@@ -1038,49 +996,89 @@ impl<'a> Planner<'a> {
                 false
             }
             Expr::BinaryOp { left, right, .. } => {
-                self.contains_aggregate(left) || self.contains_aggregate(right)
+                self.traverse_expr_for_aggregates(left, on_aggregate)
+                    || self.traverse_expr_for_aggregates(right, on_aggregate)
             }
-            Expr::UnaryOp { expr: inner, .. } => self.contains_aggregate(inner),
+            Expr::UnaryOp { expr: inner, .. } => {
+                self.traverse_expr_for_aggregates(inner, on_aggregate)
+            }
             Expr::Between { expr, low, high, .. } => {
-                self.contains_aggregate(expr)
-                    || self.contains_aggregate(low)
-                    || self.contains_aggregate(high)
+                self.traverse_expr_for_aggregates(expr, on_aggregate)
+                    || self.traverse_expr_for_aggregates(low, on_aggregate)
+                    || self.traverse_expr_for_aggregates(high, on_aggregate)
             }
             Expr::Like { expr, pattern, escape, .. } => {
-                self.contains_aggregate(expr)
-                    || self.contains_aggregate(pattern)
-                    || escape.map(|e| self.contains_aggregate(e)).unwrap_or(false)
+                self.traverse_expr_for_aggregates(expr, on_aggregate)
+                    || self.traverse_expr_for_aggregates(pattern, on_aggregate)
+                    || escape
+                        .map(|e| self.traverse_expr_for_aggregates(e, on_aggregate))
+                        .unwrap_or(false)
             }
             Expr::InList { expr, list, .. } => {
-                self.contains_aggregate(expr)
-                    || list.iter().any(|e| self.contains_aggregate(e))
+                self.traverse_expr_for_aggregates(expr, on_aggregate)
+                    || list
+                        .iter()
+                        .any(|e| self.traverse_expr_for_aggregates(e, on_aggregate))
             }
-            Expr::IsNull { expr, .. } => self.contains_aggregate(expr),
+            Expr::IsNull { expr, .. } => self.traverse_expr_for_aggregates(expr, on_aggregate),
             Expr::IsDistinctFrom { left, right, .. } => {
-                self.contains_aggregate(left) || self.contains_aggregate(right)
+                self.traverse_expr_for_aggregates(left, on_aggregate)
+                    || self.traverse_expr_for_aggregates(right, on_aggregate)
             }
             Expr::Case { operand, conditions, else_result } => {
-                operand.map(|o| self.contains_aggregate(o)).unwrap_or(false)
+                operand
+                    .map(|o| self.traverse_expr_for_aggregates(o, on_aggregate))
+                    .unwrap_or(false)
                     || conditions.iter().any(|c| {
-                        self.contains_aggregate(c.condition)
-                            || self.contains_aggregate(c.result)
+                        self.traverse_expr_for_aggregates(c.condition, on_aggregate)
+                            || self.traverse_expr_for_aggregates(c.result, on_aggregate)
                     })
-                    || else_result.map(|e| self.contains_aggregate(e)).unwrap_or(false)
+                    || else_result
+                        .map(|e| self.traverse_expr_for_aggregates(e, on_aggregate))
+                        .unwrap_or(false)
             }
-            Expr::Cast { expr, .. } => self.contains_aggregate(expr),
+            Expr::Cast { expr, .. } => self.traverse_expr_for_aggregates(expr, on_aggregate),
             Expr::ArraySubscript { array, index, .. } => {
-                self.contains_aggregate(array) || self.contains_aggregate(index)
+                self.traverse_expr_for_aggregates(array, on_aggregate)
+                    || self.traverse_expr_for_aggregates(index, on_aggregate)
             }
             Expr::ArraySlice { array, lower, upper } => {
-                self.contains_aggregate(array)
-                    || lower.map(|e| self.contains_aggregate(e)).unwrap_or(false)
-                    || upper.map(|e| self.contains_aggregate(e)).unwrap_or(false)
+                self.traverse_expr_for_aggregates(array, on_aggregate)
+                    || lower
+                        .map(|e| self.traverse_expr_for_aggregates(e, on_aggregate))
+                        .unwrap_or(false)
+                    || upper
+                        .map(|e| self.traverse_expr_for_aggregates(e, on_aggregate))
+                        .unwrap_or(false)
             }
-            Expr::Array(items) => items.iter().any(|e| self.contains_aggregate(e)),
-            Expr::Row(items) => items.iter().any(|e| self.contains_aggregate(e)),
-            Expr::Literal(_) | Expr::Column(_) | Expr::Parameter(_) 
-            | Expr::Subquery(_) | Expr::Exists { .. } | Expr::InSubquery { .. } => false,
+            Expr::Array(items) => items
+                .iter()
+                .any(|e| self.traverse_expr_for_aggregates(e, on_aggregate)),
+            Expr::Row(items) => items
+                .iter()
+                .any(|e| self.traverse_expr_for_aggregates(e, on_aggregate)),
+            Expr::Literal(_)
+            | Expr::Column(_)
+            | Expr::Parameter(_)
+            | Expr::Subquery(_)
+            | Expr::Exists { .. }
+            | Expr::InSubquery { .. } => false,
         }
+    }
+
+    fn collect_aggregates_from_expr(
+        &self,
+        expr: &'a Expr<'a>,
+        aggregates: &mut bumpalo::collections::Vec<&'a Expr<'a>>,
+    ) {
+        self.traverse_expr_for_aggregates(expr, &mut |agg| {
+            aggregates.push(agg);
+            false
+        });
+    }
+
+    fn contains_aggregate(&self, expr: &Expr<'a>) -> bool {
+        self.traverse_expr_for_aggregates(expr, &mut |_| true)
     }
 
     fn select_has_aggregates(&self, columns: &'a [crate::sql::ast::SelectColumn<'a>]) -> bool {

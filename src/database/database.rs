@@ -2281,13 +2281,21 @@ impl Database {
 
             if let Some(auto_col_idx) = auto_increment_col_idx {
                 if values.get(auto_col_idx).is_none_or(|v| v.is_null()) {
-                    auto_increment_current += 1;
+                    auto_increment_current = auto_increment_current.checked_add(1).ok_or_else(|| {
+                        eyre::eyre!("auto_increment overflow: exceeded maximum value")
+                    })?;
                     values[auto_col_idx] = OwnedValue::Int(auto_increment_current as i64);
                     if auto_increment_current > auto_increment_max {
                         auto_increment_max = auto_increment_current;
                     }
                 } else if let Some(OwnedValue::Int(provided_val)) = values.get(auto_col_idx) {
-                    if *provided_val > 0 && (*provided_val as u64) > auto_increment_max {
+                    if *provided_val < 0 {
+                        bail!(
+                            "auto_increment column cannot have negative value: {}",
+                            provided_val
+                        );
+                    }
+                    if (*provided_val as u64) > auto_increment_max {
                         auto_increment_max = *provided_val as u64;
                     }
                 }
@@ -2976,6 +2984,9 @@ impl Database {
 
         let mut processed_rows: Vec<(Vec<u8>, Vec<OwnedValue>)> = Vec::with_capacity(rows_to_update.len());
 
+        // WAL must be initialized before TOAST operations because toast_value() uses
+        // WalStoragePerTable when WAL is enabled. If we delay this, TOAST chunks
+        // would bypass WAL and be lost on crash recovery.
         let wal_enabled = self.wal_enabled.load(std::sync::atomic::Ordering::Acquire);
         if wal_enabled {
             self.ensure_wal()?;
@@ -5177,6 +5188,9 @@ impl Database {
         let pointer = ToastPointer::new(row_id, column_index, data.len() as u64);
         let chunk_id = pointer.chunk_id;
 
+        // NOTE: The if-else duplication below is intentional. WalStoragePerTable and
+        // MmapStorage have different types, and abstracting via trait objects would
+        // hurt performance in this hot path. The logic is identical in both branches.
         if wal_enabled {
             let mut wal_storage =
                 WalStoragePerTable::new(toast_storage, &self.dirty_pages, toast_table_id);
