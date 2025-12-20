@@ -230,7 +230,9 @@ pub struct WindowState<'a, S: RowSource> {
     pub window_functions: &'a [WindowFunctionDef<'a>],
     pub arena: &'a Bump,
     pub rows: Vec<Vec<Value<'static>>>,
-    pub window_results: Vec<Vec<i64>>,
+    /// Window function results stored as f64 to preserve precision for AVG and other float operations.
+    /// Integer results (ROW_NUMBER, RANK, COUNT) are stored as whole numbers.
+    pub window_results: Vec<Vec<f64>>,
     pub iter_idx: usize,
     pub computed: bool,
     pub column_map: Vec<(String, usize)>,
@@ -276,7 +278,7 @@ impl<'a, S: RowSource> WindowState<'a, S> {
         let num_rows = self.rows.len();
         let num_funcs = self.window_functions.len();
 
-        self.window_results = vec![vec![0i64; num_funcs]; num_rows];
+        self.window_results = vec![vec![0.0f64; num_funcs]; num_rows];
 
         for (func_idx, window_func) in self.window_functions.iter().enumerate() {
             let func_name = window_func.function_name.to_ascii_lowercase();
@@ -290,48 +292,134 @@ impl<'a, S: RowSource> WindowState<'a, S> {
                 match func_name.as_str() {
                     "row_number" => {
                         for (rank, &orig_idx) in sorted_indices.iter().enumerate() {
-                            self.window_results[orig_idx][func_idx] = (rank + 1) as i64;
+                            self.window_results[orig_idx][func_idx] = (rank + 1) as f64;
                         }
                     }
                     "rank" => {
-                        let mut current_rank = 1i64;
+                        let mut current_rank = 1.0f64;
                         for (sorted_pos, &orig_idx) in sorted_indices.iter().enumerate() {
                             if sorted_pos == 0 {
-                                self.window_results[orig_idx][func_idx] = 1;
+                                self.window_results[orig_idx][func_idx] = 1.0;
                             } else {
                                 let prev_orig_idx = sorted_indices[sorted_pos - 1];
                                 if self.compare_row_values(prev_orig_idx, orig_idx, window_func) {
                                     self.window_results[orig_idx][func_idx] = current_rank;
                                 } else {
-                                    current_rank = (sorted_pos + 1) as i64;
+                                    current_rank = (sorted_pos + 1) as f64;
                                     self.window_results[orig_idx][func_idx] = current_rank;
                                 }
                             }
                         }
                     }
                     "dense_rank" => {
-                        let mut current_rank = 1i64;
+                        let mut current_rank = 1.0f64;
                         for (sorted_pos, &orig_idx) in sorted_indices.iter().enumerate() {
                             if sorted_pos == 0 {
-                                self.window_results[orig_idx][func_idx] = 1;
+                                self.window_results[orig_idx][func_idx] = 1.0;
                             } else {
                                 let prev_orig_idx = sorted_indices[sorted_pos - 1];
                                 if self.compare_row_values(prev_orig_idx, orig_idx, window_func) {
                                     self.window_results[orig_idx][func_idx] = current_rank;
                                 } else {
-                                    current_rank += 1;
+                                    current_rank += 1.0;
                                     self.window_results[orig_idx][func_idx] = current_rank;
                                 }
                             }
                         }
                     }
+                    "sum" => {
+                        let values: Vec<f64> = partition_indices
+                            .iter()
+                            .filter_map(|&row_idx| self.get_arg_value(row_idx, window_func))
+                            .collect();
+                        let result = if values.is_empty() {
+                            f64::NAN
+                        } else {
+                            values.iter().sum()
+                        };
+                        for &row_idx in &partition_indices {
+                            self.window_results[row_idx][func_idx] = result;
+                        }
+                    }
+                    "count" => {
+                        let count = if window_func.args.is_empty() {
+                            partition_indices.len() as f64
+                        } else {
+                            partition_indices
+                                .iter()
+                                .filter(|&&row_idx| self.get_arg_value(row_idx, window_func).is_some())
+                                .count() as f64
+                        };
+                        for &row_idx in &partition_indices {
+                            self.window_results[row_idx][func_idx] = count;
+                        }
+                    }
+                    "avg" => {
+                        let values: Vec<f64> = partition_indices
+                            .iter()
+                            .filter_map(|&row_idx| self.get_arg_value(row_idx, window_func))
+                            .collect();
+                        let result = if values.is_empty() {
+                            f64::NAN
+                        } else {
+                            values.iter().sum::<f64>() / values.len() as f64
+                        };
+                        for &row_idx in &partition_indices {
+                            self.window_results[row_idx][func_idx] = result;
+                        }
+                    }
+                    "min" => {
+                        let values: Vec<f64> = partition_indices
+                            .iter()
+                            .filter_map(|&row_idx| self.get_arg_value(row_idx, window_func))
+                            .collect();
+                        let result = if values.is_empty() {
+                            f64::NAN
+                        } else {
+                            values.iter().cloned().fold(f64::INFINITY, f64::min)
+                        };
+                        for &row_idx in &partition_indices {
+                            self.window_results[row_idx][func_idx] = result;
+                        }
+                    }
+                    "max" => {
+                        let values: Vec<f64> = partition_indices
+                            .iter()
+                            .filter_map(|&row_idx| self.get_arg_value(row_idx, window_func))
+                            .collect();
+                        let result = if values.is_empty() {
+                            f64::NAN
+                        } else {
+                            values.iter().cloned().fold(f64::NEG_INFINITY, f64::max)
+                        };
+                        for &row_idx in &partition_indices {
+                            self.window_results[row_idx][func_idx] = result;
+                        }
+                    }
                     _ => {
                         for &row_idx in &partition_indices {
-                            self.window_results[row_idx][func_idx] = 0;
+                            self.window_results[row_idx][func_idx] = 0.0;
                         }
                     }
                 }
             }
+        }
+    }
+
+    /// Gets the numeric value of the first argument for aggregate window functions.
+    /// Returns Some(f64) for numeric values, None for NULL values.
+    /// SQL standard: NULLs are ignored in aggregate functions (SUM, AVG, MIN, MAX).
+    fn get_arg_value(&self, row_idx: usize, window_func: &WindowFunctionDef<'a>) -> Option<f64> {
+        let crate::sql::ast::Expr::Column(col_ref) = window_func.args.first()? else {
+            return None;
+        };
+        let col_idx = self.find_column_index(col_ref.column)?;
+        let val = self.rows.get(row_idx).and_then(|r| r.get(col_idx))?;
+        match val {
+            Value::Int(i) => Some(*i as f64),
+            Value::Float(f) => Some(*f),
+            Value::Null => None,
+            _ => None,
         }
     }
 
