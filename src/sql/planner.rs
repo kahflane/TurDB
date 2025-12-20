@@ -962,26 +962,124 @@ impl<'a> Planner<'a> {
 
         for col in columns {
             if let SelectColumn::Expr { expr, .. } = col {
-                if self.is_aggregate_function(expr) {
-                    aggregates.push(*expr);
-                }
+                self.collect_aggregates_from_expr(expr, &mut aggregates);
             }
         }
 
         aggregates.into_bump_slice()
     }
 
-    fn is_aggregate_function(&self, expr: &Expr<'a>) -> bool {
-        use crate::sql::ast::FunctionCall;
+    fn collect_aggregates_from_expr(
+        &self,
+        expr: &'a Expr<'a>,
+        aggregates: &mut bumpalo::collections::Vec<&'a Expr<'a>>,
+    ) {
+        use crate::sql::ast::{FunctionArgs, FunctionCall};
 
-        if let Expr::Function(FunctionCall { name, over, .. }) = expr {
-            if over.is_some() {
-                return false;
+        match expr {
+            Expr::Function(FunctionCall { name, over, args, .. }) => {
+                if over.is_none() {
+                    let func_name = name.name.to_ascii_lowercase();
+                    if matches!(func_name.as_str(), "count" | "sum" | "avg" | "min" | "max") {
+                        aggregates.push(expr);
+                        return;
+                    }
+                }
+                if let FunctionArgs::Args(fn_args) = args {
+                    for arg in *fn_args {
+                        self.collect_aggregates_from_expr(arg.value, aggregates);
+                    }
+                }
             }
-            let func_name = name.name.to_ascii_lowercase();
-            matches!(func_name.as_str(), "count" | "sum" | "avg" | "min" | "max")
-        } else {
-            false
+            Expr::BinaryOp { left, right, .. } => {
+                self.collect_aggregates_from_expr(left, aggregates);
+                self.collect_aggregates_from_expr(right, aggregates);
+            }
+            Expr::UnaryOp { expr: inner, .. } => {
+                self.collect_aggregates_from_expr(inner, aggregates);
+            }
+            Expr::Cast { expr: inner, .. } => {
+                self.collect_aggregates_from_expr(inner, aggregates);
+            }
+            Expr::Case { operand, conditions, else_result } => {
+                if let Some(op) = operand {
+                    self.collect_aggregates_from_expr(op, aggregates);
+                }
+                for cond in *conditions {
+                    self.collect_aggregates_from_expr(cond.condition, aggregates);
+                    self.collect_aggregates_from_expr(cond.result, aggregates);
+                }
+                if let Some(e) = else_result {
+                    self.collect_aggregates_from_expr(e, aggregates);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn contains_aggregate(&self, expr: &Expr<'a>) -> bool {
+        use crate::sql::ast::{FunctionArgs, FunctionCall};
+
+        match expr {
+            Expr::Function(FunctionCall { name, over, args, .. }) => {
+                if over.is_none() {
+                    let func_name = name.name.to_ascii_lowercase();
+                    if matches!(func_name.as_str(), "count" | "sum" | "avg" | "min" | "max") {
+                        return true;
+                    }
+                }
+                if let FunctionArgs::Args(fn_args) = args {
+                    for arg in *fn_args {
+                        if self.contains_aggregate(arg.value) {
+                            return true;
+                        }
+                    }
+                }
+                false
+            }
+            Expr::BinaryOp { left, right, .. } => {
+                self.contains_aggregate(left) || self.contains_aggregate(right)
+            }
+            Expr::UnaryOp { expr: inner, .. } => self.contains_aggregate(inner),
+            Expr::Between { expr, low, high, .. } => {
+                self.contains_aggregate(expr)
+                    || self.contains_aggregate(low)
+                    || self.contains_aggregate(high)
+            }
+            Expr::Like { expr, pattern, escape, .. } => {
+                self.contains_aggregate(expr)
+                    || self.contains_aggregate(pattern)
+                    || escape.map(|e| self.contains_aggregate(e)).unwrap_or(false)
+            }
+            Expr::InList { expr, list, .. } => {
+                self.contains_aggregate(expr)
+                    || list.iter().any(|e| self.contains_aggregate(e))
+            }
+            Expr::IsNull { expr, .. } => self.contains_aggregate(expr),
+            Expr::IsDistinctFrom { left, right, .. } => {
+                self.contains_aggregate(left) || self.contains_aggregate(right)
+            }
+            Expr::Case { operand, conditions, else_result } => {
+                operand.map(|o| self.contains_aggregate(o)).unwrap_or(false)
+                    || conditions.iter().any(|c| {
+                        self.contains_aggregate(c.condition)
+                            || self.contains_aggregate(c.result)
+                    })
+                    || else_result.map(|e| self.contains_aggregate(e)).unwrap_or(false)
+            }
+            Expr::Cast { expr, .. } => self.contains_aggregate(expr),
+            Expr::ArraySubscript { array, index, .. } => {
+                self.contains_aggregate(array) || self.contains_aggregate(index)
+            }
+            Expr::ArraySlice { array, lower, upper } => {
+                self.contains_aggregate(array)
+                    || lower.map(|e| self.contains_aggregate(e)).unwrap_or(false)
+                    || upper.map(|e| self.contains_aggregate(e)).unwrap_or(false)
+            }
+            Expr::Array(items) => items.iter().any(|e| self.contains_aggregate(e)),
+            Expr::Row(items) => items.iter().any(|e| self.contains_aggregate(e)),
+            Expr::Literal(_) | Expr::Column(_) | Expr::Parameter(_) 
+            | Expr::Subquery(_) | Expr::Exists { .. } | Expr::InSubquery { .. } => false,
         }
     }
 
@@ -990,7 +1088,7 @@ impl<'a> Planner<'a> {
 
         for col in columns {
             if let SelectColumn::Expr { expr, .. } = col {
-                if self.is_aggregate_function(expr) {
+                if self.contains_aggregate(expr) {
                     return true;
                 }
             }

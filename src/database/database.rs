@@ -2266,21 +2266,29 @@ impl Database {
         let mut key_buf: SmallVec<[u8; 64]> = SmallVec::new();
         let mut returned_rows: Option<Vec<Row>> = insert.returning.map(|_| Vec::new());
 
+        let mut auto_increment_current = if auto_increment_col_idx.is_some() {
+            let storage = file_manager.table_data_mut(schema_name, table_name)?;
+            let page = storage.page(0)?;
+            let header = TableFileHeader::from_bytes(page)?;
+            header.auto_increment()
+        } else {
+            0
+        };
+        let mut auto_increment_max = auto_increment_current;
+
         for row_values in rows_to_insert.iter() {
             let mut values: Vec<OwnedValue> = row_values.clone();
 
             if let Some(auto_col_idx) = auto_increment_col_idx {
-                let storage = file_manager.table_data_mut(schema_name, table_name)?;
-                let page = storage.page_mut(0)?;
-                let header = TableFileHeader::from_bytes_mut(page)?;
-
                 if values.get(auto_col_idx).is_none_or(|v| v.is_null()) {
-                    let next_val = header.next_auto_increment() + 1;
-                    values[auto_col_idx] = OwnedValue::Int(next_val as i64);
+                    auto_increment_current += 1;
+                    values[auto_col_idx] = OwnedValue::Int(auto_increment_current as i64);
+                    if auto_increment_current > auto_increment_max {
+                        auto_increment_max = auto_increment_current;
+                    }
                 } else if let Some(OwnedValue::Int(provided_val)) = values.get(auto_col_idx) {
-                    let current = header.auto_increment();
-                    if *provided_val as u64 > current {
-                        header.set_auto_increment(*provided_val as u64);
+                    if *provided_val as u64 > auto_increment_max {
+                        auto_increment_max = *provided_val as u64;
                     }
                 }
             }
@@ -2559,6 +2567,7 @@ impl Database {
                                 row_id,
                                 col_idx as u16,
                                 data,
+                                wal_enabled,
                             )?;
                             values[col_idx] = OwnedValue::Blob(toast_ptr);
                         }
@@ -2662,6 +2671,15 @@ impl Database {
                     })
                     .collect();
                 rows.push(Row::new(row_values));
+            }
+        }
+
+        if auto_increment_col_idx.is_some() && auto_increment_max > 0 {
+            let storage = file_manager.table_data_mut(schema_name, table_name)?;
+            let page = storage.page_mut(0)?;
+            let header = TableFileHeader::from_bytes_mut(page)?;
+            if auto_increment_max > header.auto_increment() {
+                header.set_auto_increment(auto_increment_max);
             }
         }
 
@@ -2958,6 +2976,11 @@ impl Database {
 
         let mut processed_rows: Vec<(Vec<u8>, Vec<OwnedValue>)> = Vec::with_capacity(rows_to_update.len());
 
+        let wal_enabled = self.wal_enabled.load(std::sync::atomic::Ordering::Acquire);
+        if wal_enabled {
+            self.ensure_wal()?;
+        }
+
         if has_toast {
             use crate::storage::toast::ToastPointer;
             for (key, _old_value, mut updated_values, old_toast_values) in rows_to_update.clone() {
@@ -3006,6 +3029,7 @@ impl Database {
                                 pk_value,
                                 col_idx as u16,
                                 &data,
+                                wal_enabled,
                             )?;
                             *val = OwnedValue::ToastPointer(pointer);
                         }
@@ -3017,11 +3041,6 @@ impl Database {
             for (key, _old_value, updated_values, _old_toast) in rows_to_update.clone() {
                 processed_rows.push((key, updated_values));
             }
-        }
-
-        let wal_enabled = self.wal_enabled.load(std::sync::atomic::Ordering::Acquire);
-        if wal_enabled {
-            self.ensure_wal()?;
         }
 
         let storage = file_manager.table_data_mut(schema_name, table_name)?;
@@ -5133,6 +5152,7 @@ impl Database {
         &self.path
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn toast_value(
         &self,
         file_manager: &mut crate::storage::FileManager,
@@ -5141,6 +5161,7 @@ impl Database {
         row_id: u64,
         column_index: u16,
         data: &[u8],
+        wal_enabled: bool,
     ) -> Result<Vec<u8>> {
         use crate::btree::BTree;
         use crate::storage::toast::{make_chunk_key, ToastPointer, TOAST_CHUNK_SIZE};
@@ -5148,14 +5169,28 @@ impl Database {
         let toast_table_name = crate::storage::toast::toast_table_name(table_name);
         let toast_storage = file_manager.table_data_mut(schema_name, &toast_table_name)?;
 
+        let toast_table_id = {
+            let page0 = toast_storage.page(0)?;
+            crate::storage::TableFileHeader::from_bytes(page0)?.table_id() as u32
+        };
+
         let pointer = ToastPointer::new(row_id, column_index, data.len() as u64);
         let chunk_id = pointer.chunk_id;
 
-        let mut btree = BTree::new(toast_storage, 1)?;
-
-        for (seq, chunk) in data.chunks(TOAST_CHUNK_SIZE).enumerate() {
-            let chunk_key = make_chunk_key(chunk_id, seq as u32);
-            btree.insert(&chunk_key, chunk)?;
+        if wal_enabled {
+            let mut wal_storage =
+                WalStoragePerTable::new(toast_storage, &self.dirty_pages, toast_table_id);
+            let mut btree = BTree::new(&mut wal_storage, 1)?;
+            for (seq, chunk) in data.chunks(TOAST_CHUNK_SIZE).enumerate() {
+                let chunk_key = make_chunk_key(chunk_id, seq as u32);
+                btree.insert(&chunk_key, chunk)?;
+            }
+        } else {
+            let mut btree = BTree::new(toast_storage, 1)?;
+            for (seq, chunk) in data.chunks(TOAST_CHUNK_SIZE).enumerate() {
+                let chunk_key = make_chunk_key(chunk_id, seq as u32);
+                btree.insert(&chunk_key, chunk)?;
+            }
         }
 
         Ok(pointer.encode().to_vec())
