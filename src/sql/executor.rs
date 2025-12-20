@@ -1738,9 +1738,7 @@ impl<'a, S: RowSource> Executor<'a> for DynamicExecutor<'a, S> {
                             .map(|f| f.function_type.returns_integer())
                             .unwrap_or(false);
 
-                        if returns_integer {
-                            result_values.push(Value::Int(wval.trunc() as i64));
-                        } else if wval.fract() == 0.0 && wval.abs() <= MAX_EXACT_INT {
+                        if returns_integer || (wval.fract() == 0.0 && wval.abs() <= MAX_EXACT_INT) {
                             result_values.push(Value::Int(wval.trunc() as i64));
                         } else {
                             result_values.push(Value::Float(wval));
