@@ -3329,7 +3329,35 @@ mod wal_edge_case_tests {
     }
 
     #[test]
-    fn wal_multiple_tables_in_transaction() {
+    fn wal_rejects_multi_table_transactions() {
+        // Multi-table transactions with WAL are not crash-safe because dirty_pages
+        // doesn't track which table each page belongs to. Verify this is rejected.
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("test_db");
+
+        let db = Database::create(&db_path).unwrap();
+        db.execute("PRAGMA WAL ON").unwrap();
+        db.execute("CREATE TABLE t1 (id INT)").unwrap();
+        db.execute("CREATE TABLE t2 (id INT)").unwrap();
+
+        db.execute("BEGIN").unwrap();
+        db.execute("INSERT INTO t1 VALUES (1)").unwrap();
+        db.execute("INSERT INTO t2 VALUES (2)").unwrap();
+
+        // COMMIT should fail because transaction modified multiple tables
+        let result = db.execute("COMMIT");
+        assert!(result.is_err(), "Multi-table transaction with WAL should be rejected");
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("multi-table transactions are not supported with WAL"),
+            "Error should mention multi-table WAL limitation: {}",
+            err_msg
+        );
+    }
+
+    #[test]
+    fn wal_allows_separate_single_table_transactions() {
+        // Verify that separate single-table transactions work correctly with WAL
         let dir = tempdir().unwrap();
         let db_path = dir.path().join("test_db");
 
@@ -3339,10 +3367,15 @@ mod wal_edge_case_tests {
             db.execute("CREATE TABLE t1 (id INT)").unwrap();
             db.execute("CREATE TABLE t2 (id INT)").unwrap();
 
+            // First transaction: only t1
             db.execute("BEGIN").unwrap();
             db.execute("INSERT INTO t1 VALUES (1)").unwrap();
-            db.execute("INSERT INTO t2 VALUES (2)").unwrap();
             db.execute("UPDATE t1 SET id = 10 WHERE id = 1").unwrap();
+            db.execute("COMMIT").unwrap();
+
+            // Second transaction: only t2
+            db.execute("BEGIN").unwrap();
+            db.execute("INSERT INTO t2 VALUES (2)").unwrap();
             db.execute("COMMIT").unwrap();
         }
 
