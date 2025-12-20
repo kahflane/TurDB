@@ -2287,7 +2287,7 @@ impl Database {
                         auto_increment_max = auto_increment_current;
                     }
                 } else if let Some(OwnedValue::Int(provided_val)) = values.get(auto_col_idx) {
-                    if *provided_val as u64 > auto_increment_max {
+                    if *provided_val > 0 && (*provided_val as u64) > auto_increment_max {
                         auto_increment_max = *provided_val as u64;
                     }
                 }
