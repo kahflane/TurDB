@@ -1743,8 +1743,25 @@ impl<'a, S: RowSource> Executor<'a> for DynamicExecutor<'a, S> {
                         .map(|v| clone_value_ref_to_arena(v, state.arena))
                         .collect();
 
-                    for &wval in window_vals.iter() {
-                        result_values.push(Value::Int(wval));
+                    const MAX_EXACT_INT: f64 = 9007199254740992.0; // 2^53
+
+                    for (idx, &wval) in window_vals.iter().enumerate() {
+                        if wval.is_nan() {
+                            result_values.push(Value::Null);
+                            continue;
+                        }
+
+                        let returns_integer = state
+                            .window_functions
+                            .get(idx)
+                            .map(|f| f.function_type.returns_integer())
+                            .unwrap_or(false);
+
+                        if returns_integer || (wval.fract() == 0.0 && wval.abs() <= MAX_EXACT_INT) {
+                            result_values.push(Value::Int(wval.trunc() as i64));
+                        } else {
+                            result_values.push(Value::Float(wval));
+                        }
                     }
 
                     let allocated = state.arena.alloc_slice_fill_iter(result_values);

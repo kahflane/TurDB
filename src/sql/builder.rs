@@ -80,6 +80,9 @@ impl<'a> ExecutorBuilder<'a> {
                     match expr {
                         Expr::Column(_) => false,
                         Expr::Function(func) => {
+                            if func.over.is_some() {
+                                return false;
+                            }
                             let name = func.name.name.to_uppercase();
                             !matches!(
                                 name.as_str(),

@@ -308,9 +308,45 @@ pub struct LogicalWindow<'a> {
     pub window_functions: &'a [WindowFunctionDef<'a>],
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WindowFunctionType {
+    RowNumber,
+    Rank,
+    DenseRank,
+    Count,
+    Sum,
+    Avg,
+    Min,
+    Max,
+}
+
+impl WindowFunctionType {
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name.to_uppercase().as_str() {
+            "ROW_NUMBER" => Some(Self::RowNumber),
+            "RANK" => Some(Self::Rank),
+            "DENSE_RANK" => Some(Self::DenseRank),
+            "COUNT" => Some(Self::Count),
+            "SUM" => Some(Self::Sum),
+            "AVG" => Some(Self::Avg),
+            "MIN" => Some(Self::Min),
+            "MAX" => Some(Self::Max),
+            _ => None,
+        }
+    }
+
+    pub fn returns_integer(&self) -> bool {
+        matches!(
+            self,
+            Self::RowNumber | Self::Rank | Self::DenseRank | Self::Count
+        )
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct WindowFunctionDef<'a> {
     pub function_name: &'a str,
+    pub function_type: WindowFunctionType,
     pub args: &'a [&'a Expr<'a>],
     pub partition_by: &'a [&'a Expr<'a>],
     pub order_by: &'a [SortKey<'a>],
@@ -674,7 +710,7 @@ impl<'a> Planner<'a> {
         let has_window_functions = self.select_has_window_functions(select.columns);
 
         if has_window_functions {
-            let window_functions = self.extract_window_functions(select.columns);
+            let window_functions = self.extract_window_functions(select.columns)?;
             let window = self.arena.alloc(LogicalOperator::Window(LogicalWindow {
                 input: current,
                 window_functions,
@@ -989,7 +1025,7 @@ impl<'a> Planner<'a> {
     fn extract_window_functions(
         &self,
         columns: &'a [crate::sql::ast::SelectColumn<'a>],
-    ) -> &'a [WindowFunctionDef<'a>] {
+    ) -> Result<&'a [WindowFunctionDef<'a>]> {
         use crate::sql::ast::{NullsOrder, OrderDirection, SelectColumn};
 
         let mut window_funcs = bumpalo::collections::Vec::new_in(self.arena);
@@ -1025,8 +1061,17 @@ impl<'a> Planner<'a> {
                         crate::sql::ast::FunctionArgs::None => &[],
                     };
 
+                    let function_type =
+                        WindowFunctionType::from_name(func.name.name).ok_or_else(|| {
+                            eyre::eyre!(
+                                "unsupported window function: '{}'. Supported: ROW_NUMBER, RANK, \
+                                 DENSE_RANK, COUNT, SUM, AVG, MIN, MAX",
+                                func.name.name
+                            )
+                        })?;
                     window_funcs.push(WindowFunctionDef {
                         function_name: func.name.name,
+                        function_type,
                         args,
                         partition_by: window_spec.partition_by,
                         order_by: order_by_keys,
@@ -1036,7 +1081,7 @@ impl<'a> Planner<'a> {
             }
         }
 
-        window_funcs.into_bump_slice()
+        Ok(window_funcs.into_bump_slice())
     }
 
     fn extract_select_expressions(
