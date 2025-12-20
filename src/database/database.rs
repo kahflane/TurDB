@@ -4161,61 +4161,104 @@ impl Database {
     }
 
     fn execute_commit(&self) -> Result<ExecuteResult> {
+        let wal_enabled = self
+            .wal_enabled
+            .load(std::sync::atomic::Ordering::Acquire);
+
+        // Validate transaction BEFORE removing from active state
+        // This ensures transaction remains active if validation fails
+        {
+            let active_txn = self.active_txn.lock();
+            let txn = active_txn
+                .as_ref()
+                .ok_or_else(|| eyre::eyre!("no transaction in progress"))?;
+
+            // Check for multi-table transaction with WAL enabled
+            if wal_enabled && !txn.write_entries.is_empty() {
+                let unique_tables: hashbrown::HashSet<u32> = txn
+                    .write_entries
+                    .iter()
+                    .map(|e| e.table_id)
+                    .collect();
+                if unique_tables.len() > 1 {
+                    bail!(
+                        "multi-table transactions are not supported with WAL enabled \
+                         (transaction modified {} tables). Disable WAL or use separate \
+                         transactions per table.",
+                        unique_tables.len()
+                    );
+                }
+            }
+        }
+
+        // Now safe to take the transaction - validation passed
         let mut active_txn = self.active_txn.lock();
         let txn = active_txn
             .take()
             .ok_or_else(|| eyre::eyre!("no transaction in progress"))?;
 
-        // Check for multi-table transaction with WAL enabled - this is currently unsafe
-        // because dirty_pages doesn't track which table each page belongs to
-        let wal_enabled = self
-            .wal_enabled
-            .load(std::sync::atomic::Ordering::Acquire);
-        if wal_enabled && !txn.write_entries.is_empty() {
-            let unique_tables: hashbrown::HashSet<u32> = txn
-                .write_entries
-                .iter()
-                .map(|e| e.table_id)
-                .collect();
-            if unique_tables.len() > 1 {
-                // SAFETY: Multi-table transactions with WAL enabled are not crash-safe.
-                // The dirty_pages tracking uses global page numbers without table identity,
-                // which could cause page collisions during recovery. Reject until fixed.
-                bail!(
-                    "multi-table transactions are not supported with WAL enabled \
-                     (transaction modified {} tables). Disable WAL or use separate \
-                     transactions per table.",
-                    unique_tables.len()
-                );
-            }
-        }
+        // Get the table that was modified (for WAL flush)
+        let modified_table_id = txn.write_entries.first().map(|e| e.table_id);
 
         self.finalize_transaction_commit(txn)?;
 
         // Flush WAL on transaction commit if enabled and there are dirty pages
-        // Note: We've already verified this is a single-table transaction above.
         if wal_enabled && !self.dirty_pages.lock().is_empty() {
-            // Use blocking locks to ensure WAL flush completes (required for durability)
             let catalog_guard = self.catalog.read();
-            if let Some(catalog) = catalog_guard.as_ref() {
-                let mut file_manager_guard = self.file_manager.write();
-                if let Some(file_manager) = file_manager_guard.as_mut() {
-                    // Use the first available table's storage for WAL flush
-                    'outer: for (schema_name, schema) in catalog.schemas() {
-                        if let Some(table_name) = schema.tables().keys().next() {
-                            if let Ok(storage) = file_manager.table_data(schema_name, table_name) {
-                                let mut wal_guard = self.wal.lock();
-                                if let Some(ref mut wal) = *wal_guard {
-                                    WalStorage::flush_wal(&self.dirty_pages, storage, wal)
-                                        .wrap_err("failed to flush WAL on commit")?;
-                                }
-                                break 'outer;
-                            }
+            let catalog = catalog_guard
+                .as_ref()
+                .ok_or_else(|| eyre::eyre!("catalog not available for WAL flush"))?;
+
+            let mut file_manager_guard = self.file_manager.write();
+            let file_manager = file_manager_guard
+                .as_mut()
+                .ok_or_else(|| eyre::eyre!("file manager not available for WAL flush"))?;
+
+            // Find the table to use for WAL flush
+            let (schema_name, table_name) = if let Some(table_id) = modified_table_id {
+                // Find the table that was modified by ID
+                let mut found = None;
+                'search: for (sname, schema) in catalog.schemas() {
+                    for (tname, table_def) in schema.tables() {
+                        if table_def.id() == table_id as u64 {
+                            found = Some((sname.to_string(), tname.to_string()));
+                            break 'search;
                         }
                     }
                 }
-            }
-            // Clear dirty pages after successful flush
+                found.ok_or_else(|| {
+                    eyre::eyre!("modified table (id={}) not found for WAL flush", table_id)
+                })?
+            } else {
+                // No writes in transaction, use first available table
+                let mut found = None;
+                'search: for (sname, schema) in catalog.schemas() {
+                    if let Some(tname) = schema.tables().keys().next() {
+                        found = Some((sname.to_string(), tname.to_string()));
+                        break 'search;
+                    }
+                }
+                found.ok_or_else(|| eyre::eyre!("no table available for WAL flush"))?
+            };
+
+            let storage = file_manager
+                .table_data(&schema_name, &table_name)
+                .wrap_err_with(|| {
+                    format!(
+                        "failed to get storage for table {}.{} during WAL flush",
+                        schema_name, table_name
+                    )
+                })?;
+
+            let mut wal_guard = self.wal.lock();
+            let wal = wal_guard
+                .as_mut()
+                .ok_or_else(|| eyre::eyre!("WAL not initialized but WAL mode is enabled"))?;
+
+            WalStorage::flush_wal(&self.dirty_pages, storage, wal)
+                .wrap_err("failed to flush WAL on commit")?;
+
+            // Clear dirty pages only after successful flush
             self.dirty_pages.lock().clear();
         }
 
