@@ -180,6 +180,8 @@ impl CatalogPersistence {
             Self::serialize_index(index, buf)?;
         }
 
+        buf.push(if table.has_toast() { 1 } else { 0 });
+
         Ok(())
     }
 
@@ -451,6 +453,14 @@ impl CatalogPersistence {
             let (index, new_pos) = Self::deserialize_index(bytes, pos)?;
             pos = new_pos;
             table = table.with_index(index);
+        }
+
+        if pos < bytes.len() {
+            let has_toast = bytes[pos] != 0;
+            pos += 1;
+            if has_toast {
+                table = table.with_toast();
+            }
         }
 
         Ok((table, pos))

@@ -34,7 +34,9 @@
       "Bash(cargo clean:*)",
       "Bash(ls:*)",
       "Bash(tee:*)",
-      "Bash(./target/release/turdb:*)"
+      "Bash(./target/release/turdb:*)",
+      "Bash(sqlite3:*)",
+      "Skill(superpowers:systematic-debugging)"
     ]
   }
 }
