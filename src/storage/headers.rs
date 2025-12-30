@@ -200,7 +200,8 @@ pub struct TableFileHeader {
     column_count: U32,
     first_free_page: U64,
     auto_increment: U64,
-    reserved: [u8; 72],
+    rightmost_hint: U32,
+    reserved: [u8; 68],
 }
 
 const _: () = assert!(std::mem::size_of::<TableFileHeader>() == FILE_HEADER_SIZE);
@@ -222,7 +223,8 @@ impl TableFileHeader {
             column_count: U32::new(column_count),
             first_free_page: U64::new(first_free_page),
             auto_increment: U64::new(auto_increment),
-            reserved: [0u8; 72],
+            rightmost_hint: U32::new(0),
+            reserved: [0u8; 68],
         }
     }
 
@@ -312,6 +314,14 @@ impl TableFileHeader {
         let current = self.auto_increment.get();
         self.auto_increment = U64::new(current + 1);
         current
+    }
+
+    pub fn rightmost_hint(&self) -> u32 {
+        self.rightmost_hint.get()
+    }
+
+    pub fn set_rightmost_hint(&mut self, page: u32) {
+        self.rightmost_hint = U32::new(page);
     }
 }
 

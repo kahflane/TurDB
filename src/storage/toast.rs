@@ -18,7 +18,7 @@
 //!
 //! ```sql
 //! CREATE TABLE <table>_toast (
-//!     chunk_id  BIGINT,   -- (row_id << 16) | column_index
+//!     chunk_id  BIGINT,   -- (column_index << 48) | row_id
 //!     chunk_seq INT,      -- 0-based sequence number
 //!     chunk_data BLOB,    -- actual data (up to TOAST_CHUNK_SIZE bytes)
 //!     PRIMARY KEY (chunk_id, chunk_seq)
@@ -39,10 +39,12 @@
 //!
 //! ## Chunk ID Encoding
 //!
-//! chunk_id = (row_id << 16) | column_index
+//! chunk_id = (column_index << 48) | row_id
 //!
-//! This allows up to 65536 columns per table (more than enough) and ensures
-//! unique chunk_id for each (row, column) pair.
+//! This ordering groups TOAST data by column first, then by row. This ensures
+//! that sequential row inserts produce monotonically increasing keys within
+//! each column's key space, enabling the B-tree rightmost hint optimization.
+//! Supports up to 65536 columns and 2^48 rows per table.
 //!
 //! ## Performance
 //!
@@ -82,7 +84,7 @@ pub struct ToastPointer {
 
 impl ToastPointer {
     pub fn new(row_id: u64, column_index: u16, total_size: u64) -> Self {
-        let chunk_id = (row_id << 16) | (column_index as u64);
+        let chunk_id = ((column_index as u64) << 48) | row_id;
         Self {
             total_size,
             chunk_id,
@@ -120,11 +122,11 @@ impl ToastPointer {
     }
 
     pub fn row_id(&self) -> u64 {
-        self.chunk_id >> 16
+        self.chunk_id & 0x0000_FFFF_FFFF_FFFF
     }
 
     pub fn column_index(&self) -> u16 {
-        (self.chunk_id & 0xFFFF) as u16
+        (self.chunk_id >> 48) as u16
     }
 }
 

@@ -107,7 +107,7 @@ pub use headers::{
 };
 pub use mmap::MmapStorage;
 pub use page::{validate_page, PageHeader, PageType};
-pub use wal::{Wal, WalFrameHeader, WalSegment};
+pub use wal::{SyncMode, Wal, WalFrameHeader, WalSegment};
 pub use wal_storage::{WalStorage, WalStoragePerTable};
 
 use eyre::{ensure, Result};

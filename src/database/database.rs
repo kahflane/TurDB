@@ -2139,19 +2139,20 @@ impl Database {
         let table_def_for_validator = table_def.clone();
         let has_toast = table_def.has_toast();
 
-        let unique_columns: Vec<(usize, String, bool)> = columns
+        let unique_columns: Vec<(usize, String, bool, bool)> = columns
             .iter()
             .enumerate()
             .filter_map(|(idx, col)| {
                 let is_pk = col.has_constraint(&Constraint::PrimaryKey);
                 let is_unique = col.has_constraint(&Constraint::Unique);
+                let is_auto_increment = col.has_constraint(&Constraint::AutoIncrement);
                 if is_pk || is_unique {
                     let index_name = if is_pk {
                         format!("{}_pkey", col.name())
                     } else {
                         format!("{}_key", col.name())
                     };
-                    Some((idx, index_name, is_pk))
+                    Some((idx, index_name, is_pk, is_auto_increment))
                 } else {
                     None
                 }
@@ -2160,7 +2161,7 @@ impl Database {
 
         let unique_column_index_names: HashSet<&str> = unique_columns
             .iter()
-            .map(|(_, name, _)| name.as_str())
+            .map(|(_, name, _, _)| name.as_str())
             .collect();
 
         let unique_indexes: Vec<(Vec<usize>, String)> = table_def
@@ -2276,6 +2277,19 @@ impl Database {
         };
         let mut auto_increment_max = auto_increment_current;
 
+        let mut rightmost_hint: Option<u32> = {
+            let storage = file_manager.table_data_mut(schema_name, table_name)?;
+            let page = storage.page(0)?;
+            let header = TableFileHeader::from_bytes(page)?;
+            let hint = header.rightmost_hint();
+            if hint > 0 { Some(hint) } else { None }
+        };
+
+        let mut toast_rightmost_hints: SmallVec<[Option<u32>; 8]> = SmallVec::new();
+        if has_toast {
+            toast_rightmost_hints.resize(columns.len(), None);
+        }
+
         for row_values in rows_to_insert.iter() {
             let mut values: Vec<OwnedValue> = row_values.clone();
 
@@ -2384,7 +2398,11 @@ impl Database {
             let mut has_conflict = false;
             let mut conflicting_key: Option<Vec<u8>> = None;
 
-            for (col_idx, index_name, is_pk) in &unique_columns {
+            for (col_idx, index_name, is_pk, is_auto_increment) in &unique_columns {
+                if *is_auto_increment {
+                    continue;
+                }
+                
                 if let Some(value) = values.get(*col_idx) {
                     if value.is_null() {
                         continue;
@@ -2568,7 +2586,8 @@ impl Database {
 
                     if let Some(data) = data {
                         if needs_toast(data) {
-                            let toast_ptr = self.toast_value(
+                            let col_hint = toast_rightmost_hints.get(col_idx).copied().flatten();
+                            let (toast_ptr, new_hint) = self.toast_value(
                                 file_manager,
                                 schema_name,
                                 table_name,
@@ -2576,7 +2595,11 @@ impl Database {
                                 col_idx as u16,
                                 data,
                                 wal_enabled,
+                                col_hint,
                             )?;
+                            if col_idx < toast_rightmost_hints.len() {
+                                toast_rightmost_hints[col_idx] = new_hint;
+                            }
                             values[col_idx] = OwnedValue::Blob(toast_ptr);
                         }
                     }
@@ -2589,11 +2612,13 @@ impl Database {
             if wal_enabled {
                 let mut wal_storage =
                     WalStoragePerTable::new(table_storage, &self.dirty_pages, table_id as u32);
-                let mut btree = BTree::new(&mut wal_storage, root_page)?;
+                let mut btree = BTree::with_rightmost_hint(&mut wal_storage, root_page, rightmost_hint)?;
                 btree.insert(&row_key, &record_data)?;
+                rightmost_hint = btree.rightmost_hint();
             } else {
-                let mut btree = BTree::new(table_storage, root_page)?;
+                let mut btree = BTree::with_rightmost_hint(table_storage, root_page, rightmost_hint)?;
                 btree.insert(&row_key, &record_data)?;
+                rightmost_hint = btree.rightmost_hint();
             }
 
             {
@@ -2611,7 +2636,7 @@ impl Database {
                 }
             }
 
-            for (col_idx, index_name, _) in &unique_columns {
+            for (col_idx, index_name, _, _) in &unique_columns {
                 if let Some(value) = values.get(*col_idx) {
                     if value.is_null() {
                         continue;
@@ -2689,6 +2714,13 @@ impl Database {
             if auto_increment_max > header.auto_increment() {
                 header.set_auto_increment(auto_increment_max);
             }
+        }
+
+        if let Some(hint) = rightmost_hint {
+            let storage = file_manager.table_data_mut(schema_name, table_name)?;
+            let page = storage.page_mut(0)?;
+            let header = TableFileHeader::from_bytes_mut(page)?;
+            header.set_rightmost_hint(hint);
         }
 
         // Flush WAL in autocommit mode; deferred to commit in explicit transactions
@@ -3033,7 +3065,7 @@ impl Database {
                                 OwnedValue::Blob(b) => b.clone(),
                                 _ => continue,
                             };
-                            let pointer = self.toast_value(
+                            let (pointer, _) = self.toast_value(
                                 file_manager,
                                 schema_name,
                                 table_name,
@@ -3041,6 +3073,7 @@ impl Database {
                                 col_idx as u16,
                                 &data,
                                 wal_enabled,
+                                None,
                             )?;
                             *val = OwnedValue::ToastPointer(pointer);
                         }
@@ -4320,6 +4353,7 @@ impl Database {
     }
 
     fn execute_pragma(&self, pragma: &crate::sql::ast::PragmaStmt<'_>) -> Result<ExecuteResult> {
+        use crate::storage::SyncMode;
         use std::sync::atomic::Ordering;
 
         let name = pragma.name.to_uppercase();
@@ -4347,6 +4381,34 @@ impl Database {
                     } else {
                         "OFF".to_string()
                     }),
+                })
+            }
+            "SYNCHRONOUS" => {
+                if let Some(ref val) = value {
+                    let mode = match val.as_str() {
+                        "OFF" | "0" => SyncMode::Off,
+                        "NORMAL" | "1" => SyncMode::Normal,
+                        "FULL" | "2" => SyncMode::Full,
+                        _ => bail!("invalid PRAGMA synchronous value: {} (use OFF, NORMAL, or FULL)", val),
+                    };
+                    let wal_guard = self.wal.lock();
+                    if let Some(ref wal) = *wal_guard {
+                        wal.set_sync_mode(mode);
+                    }
+                    drop(wal_guard);
+                }
+                let current_mode = {
+                    let wal_guard = self.wal.lock();
+                    wal_guard.as_ref().map(|w| w.sync_mode()).unwrap_or(SyncMode::Full)
+                };
+                let mode_str = match current_mode {
+                    SyncMode::Off => "OFF",
+                    SyncMode::Normal => "NORMAL",
+                    SyncMode::Full => "FULL",
+                };
+                Ok(ExecuteResult::Pragma {
+                    name: name.clone(),
+                    value: Some(mode_str.to_string()),
                 })
             }
             _ => bail!("unknown PRAGMA: {}", name),
@@ -5173,7 +5235,8 @@ impl Database {
         column_index: u16,
         data: &[u8],
         wal_enabled: bool,
-    ) -> Result<Vec<u8>> {
+        hint: Option<u32>,
+    ) -> Result<(Vec<u8>, Option<u32>)> {
         use crate::btree::BTree;
         use crate::storage::toast::{make_chunk_key, ToastPointer, TOAST_CHUNK_SIZE};
 
@@ -5188,26 +5251,25 @@ impl Database {
         let pointer = ToastPointer::new(row_id, column_index, data.len() as u64);
         let chunk_id = pointer.chunk_id;
 
-        // NOTE: The if-else duplication below is intentional. WalStoragePerTable and
-        // MmapStorage have different types, and abstracting via trait objects would
-        // hurt performance in this hot path. The logic is identical in both branches.
-        if wal_enabled {
+        let new_hint = if wal_enabled {
             let mut wal_storage =
                 WalStoragePerTable::new(toast_storage, &self.dirty_pages, toast_table_id);
-            let mut btree = BTree::new(&mut wal_storage, 1)?;
+            let mut btree = BTree::with_rightmost_hint(&mut wal_storage, 1, hint)?;
             for (seq, chunk) in data.chunks(TOAST_CHUNK_SIZE).enumerate() {
                 let chunk_key = make_chunk_key(chunk_id, seq as u32);
                 btree.insert(&chunk_key, chunk)?;
             }
+            btree.rightmost_hint()
         } else {
-            let mut btree = BTree::new(toast_storage, 1)?;
+            let mut btree = BTree::with_rightmost_hint(toast_storage, 1, hint)?;
             for (seq, chunk) in data.chunks(TOAST_CHUNK_SIZE).enumerate() {
                 let chunk_key = make_chunk_key(chunk_id, seq as u32);
                 btree.insert(&chunk_key, chunk)?;
             }
-        }
+            btree.rightmost_hint()
+        };
 
-        Ok(pointer.encode().to_vec())
+        Ok((pointer.encode().to_vec(), new_hint))
     }
 
     fn detoast_value(

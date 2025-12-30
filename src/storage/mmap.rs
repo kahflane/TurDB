@@ -228,7 +228,7 @@ impl MmapStorage {
         }
 
         self.mmap
-            .flush()
+            .flush_async()
             .wrap_err("failed to flush mmap before grow")?;
 
         let new_size = new_page_count as u64 * PAGE_SIZE as u64;

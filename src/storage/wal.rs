@@ -99,6 +99,20 @@ use zerocopy::{FromBytes, Immutable, IntoBytes};
 pub const WAL_FRAME_HEADER_SIZE: usize = 32;
 pub const MAX_SEGMENT_SIZE: u64 = 64 * 1024 * 1024;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SyncMode {
+    #[default]
+    Full,
+    Normal,
+    Off,
+}
+
+impl SyncMode {
+    pub fn should_sync(&self) -> bool {
+        matches!(self, SyncMode::Full | SyncMode::Normal)
+    }
+}
+
 const CRC64: Crc<u64> = Crc::<u64>::new(&CRC_64_ECMA_182);
 
 #[repr(C)]
@@ -180,6 +194,7 @@ pub struct Wal {
     read_mmap: RwLock<Option<(u64, Mmap)>>,
     salt1: u32,
     salt2: u32,
+    sync_mode: std::sync::atomic::AtomicU8,
 }
 
 impl Wal {
@@ -232,6 +247,7 @@ impl Wal {
             read_mmap: RwLock::new(None),
             salt1: Self::generate_salt(),
             salt2: Self::generate_salt(),
+            sync_mode: std::sync::atomic::AtomicU8::new(SyncMode::Full as u8),
         })
     }
 
@@ -277,7 +293,22 @@ impl Wal {
             read_mmap: RwLock::new(None),
             salt1,
             salt2,
+            sync_mode: std::sync::atomic::AtomicU8::new(SyncMode::Full as u8),
         })
+    }
+
+    pub fn set_sync_mode(&self, mode: SyncMode) {
+        use std::sync::atomic::Ordering;
+        self.sync_mode.store(mode as u8, Ordering::Release);
+    }
+
+    pub fn sync_mode(&self) -> SyncMode {
+        use std::sync::atomic::Ordering;
+        match self.sync_mode.load(Ordering::Acquire) {
+            0 => SyncMode::Full,
+            1 => SyncMode::Normal,
+            _ => SyncMode::Off,
+        }
     }
 
     pub fn recover(&mut self, storage: &mut super::MmapStorage) -> Result<u32> {
@@ -486,13 +517,14 @@ impl Wal {
         let mut header_with_checksum = header;
         header_with_checksum.checksum = checksum;
 
+        let should_sync = self.sync_mode().should_sync();
         let current_offset;
         let segment_num;
         {
             let mut segment = self.current_segment.lock();
             current_offset = segment.offset();
             segment_num = segment.sequence;
-            segment.write_frame(&header_with_checksum, page_data)?;
+            segment.write_frame_with_sync(&header_with_checksum, page_data, should_sync)?;
         }
 
         let mut index = self.page_index.write();
@@ -582,6 +614,15 @@ impl WalSegment {
     }
 
     pub fn write_frame(&mut self, header: &WalFrameHeader, page_data: &[u8]) -> Result<()> {
+        self.write_frame_with_sync(header, page_data, true)
+    }
+
+    pub fn write_frame_with_sync(
+        &mut self,
+        header: &WalFrameHeader,
+        page_data: &[u8],
+        sync: bool,
+    ) -> Result<()> {
         let header_bytes = header.as_bytes();
         self.file
             .write_all(header_bytes)
@@ -591,9 +632,11 @@ impl WalSegment {
             .write_all(page_data)
             .wrap_err("failed to write WAL frame page data")?;
 
-        self.file
-            .sync_all()
-            .wrap_err("failed to sync WAL frame to disk")?;
+        if sync {
+            self.file
+                .sync_all()
+                .wrap_err("failed to sync WAL frame to disk")?;
+        }
 
         self.offset += (WAL_FRAME_HEADER_SIZE + PAGE_SIZE) as u64;
 
