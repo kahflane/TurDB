@@ -811,6 +811,7 @@ fn import_small_tables_only() {
     let small_tables = [
         "Tags", "KernelLanguages", "Organizations", "CompetitionTags",
         "Competitions", "DatasetTasks", "DatasetTaskSubmissions", "UserOrganizations",
+        "DatasetVersions", "ForumMessages"
     ];
 
     let sqlite_conn = Connection::open(SQLITE_DB_PATH).expect("Failed to open SQLite DB");

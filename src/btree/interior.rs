@@ -59,12 +59,14 @@
 //!
 //! The `right_child` in PageHeader handles keys >= all separators.
 //!
-//! ## Suffix Truncation
+//! ## Suffix Truncation (Currently Disabled)
 //!
-//! When splitting a leaf node, the separator key promoted to the parent
-//! need only be long enough to distinguish the two children. The
-//! `separator_len()` function computes the minimal prefix of right_min
-//! that is strictly greater than left_max:
+//! NOTE: Suffix truncation is currently disabled because it can produce duplicate
+//! separators when two leaf splits have different left_max values that both allow
+//! truncation to the same prefix. Full keys are now used as separators instead.
+//!
+//! The `separator_len()` function (preserved for potential future use) computes 
+//! the minimal prefix of right_min that is strictly greater than left_max:
 //!
 //! ```text
 //! left_max = "apple", right_min = "banana" → separator = "b" (1 byte)
@@ -72,8 +74,8 @@
 //! left_max = "test",  right_min = "testing"→ separator = "testing" (7 bytes)
 //! ```
 //!
-//! This optimization significantly reduces interior node space usage,
-//! allowing more children per interior node and shallower trees.
+//! This optimization would reduce interior node space usage, but requires
+//! additional handling to ensure separator uniqueness across all splits.
 //!
 //! ## Capacity Calculation
 //!
@@ -148,6 +150,12 @@ impl InteriorSlot {
     }
 }
 
+/// Computes the minimal prefix length of `right_min` that is strictly greater than `left_max`.
+///
+/// NOTE: Currently unused. Separator truncation was disabled because it can produce
+/// duplicate separators when two leaf splits have different left_max values that both
+/// allow truncation to the same prefix. Full keys are now used as separators instead.
+#[allow(dead_code)]
 pub fn separator_len(left_max: &[u8], right_min: &[u8]) -> usize {
     for len in 1..=right_min.len() {
         if &right_min[..len] > left_max {

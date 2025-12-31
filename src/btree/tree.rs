@@ -127,7 +127,7 @@ use bumpalo::Bump;
 use eyre::{bail, ensure, Result};
 use smallvec::SmallVec;
 
-use super::interior::{separator_len, InteriorNode, InteriorNodeMut, INTERIOR_SLOT_SIZE};
+use super::interior::{InteriorNode, InteriorNodeMut, INTERIOR_SLOT_SIZE};
 use super::leaf::{LeafNode, LeafNodeMut, SearchResult, LEAF_CONTENT_START, SLOT_SIZE};
 use crate::encoding::varint::varint_len;
 use crate::storage::{Freelist, MmapStorage, PageHeader, PageType, Storage, PAGE_SIZE};
@@ -611,10 +611,7 @@ impl<'a, S: Storage> BTree<'a, S> {
             }
             new_leaf.set_next_leaf(old_next_leaf)?;
 
-            let left_max = all_keys[mid - 1];
-            let right_min = all_keys[mid];
-            let sep_len = separator_len(left_max, right_min);
-            separator_key = right_min[..sep_len].to_vec();
+            separator_key = all_keys[mid].to_vec();
         }
 
         Ok(InsertResult::Split {
