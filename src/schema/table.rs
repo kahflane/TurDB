@@ -293,7 +293,7 @@ pub struct TableDef {
     columns: Vec<ColumnDef>,
     primary_key: Option<Vec<String>>,
     indexes: Vec<IndexDef>,
-    has_toast: bool,
+    toast_id: Option<u64>,
 }
 
 impl TableDef {
@@ -304,7 +304,7 @@ impl TableDef {
             columns,
             primary_key: None,
             indexes: Vec::new(),
-            has_toast: false,
+            toast_id: None,
         }
     }
 
@@ -318,17 +318,21 @@ impl TableDef {
         self
     }
 
-    pub fn with_toast(mut self) -> Self {
-        self.has_toast = true;
+    pub fn with_toast_id(mut self, toast_id: u64) -> Self {
+        self.toast_id = Some(toast_id);
         self
     }
 
     pub fn has_toast(&self) -> bool {
-        self.has_toast
+        self.toast_id.is_some()
     }
 
-    pub fn set_has_toast(&mut self, has_toast: bool) {
-        self.has_toast = has_toast;
+    pub fn toast_id(&self) -> Option<u64> {
+        self.toast_id
+    }
+
+    pub fn set_toast_id(&mut self, toast_id: Option<u64>) {
+        self.toast_id = toast_id;
     }
 
     pub fn id(&self) -> u64 {

@@ -5,24 +5,18 @@
 //!
 //! ## Architecture
 //!
-//! The import uses a two-phase approach:
-//! 1. Schema Discovery: Read SQLite table schemas and convert to TurDB DDL
-//! 2. Batch Import: Read data in batches using LIMIT/OFFSET and insert into TurDB
+//! The import uses a multi-threaded pipeline:
+//! 1. Reader threads: Read from SQLite in parallel (one per table)
+//! 2. Writer thread: Single thread writes to TurDB (required for consistency)
+//! 3. Channel-based communication between readers and writer
 //!
 //! ## Performance Optimizations
 //!
+//! - Multi-threaded reading from SQLite
 //! - Multi-row VALUES syntax: INSERT INTO t VALUES (1,'a'), (2,'b'), ...
-//! - PRAGMA synchronous=OFF: Disables fsync for bulk loads (10-100x faster)
-//! - Explicit transactions: BEGIN/COMMIT to batch WAL writes
-//! - Table name precomputed outside inner loop
-//! - Batch size of 1000 rows per INSERT statement
-//!
-//! ## Table Statistics
-//!
-//! Small tables (<10K rows): 6 tables
-//! Medium tables (10K-1M rows): 13 tables
-//! Large tables (1M-10M rows): 8 tables
-//! Very large tables (>10M rows): 6 tables (Episodes, EpisodeAgents, Users, etc.)
+//! - PRAGMA synchronous=OFF: Disables fsync for bulk loads
+//! - Batch size of 10000 rows per INSERT statement
+//! - Channel buffering to keep writer busy
 //!
 //! ## Usage
 //!
@@ -32,13 +26,16 @@
 
 use rusqlite::Connection;
 use std::path::Path;
+use std::sync::mpsc;
+use std::thread;
 use std::time::Instant;
 use turdb::Database;
 
 const SQLITE_DB_PATH: &str = "/Users/julfikar/Downloads/_meta-kaggle.db";
 const TURDB_PATH: &str = "/Users/julfikar/Documents/PassionFruit.nosync/turdb/turdb-core/.worktrees/bismillah";
-const BATCH_SIZE: i64 = 10000;
-const INSERT_BATCH_SIZE: usize = 10000;
+const BATCH_SIZE: i64 = 50000;
+const INSERT_BATCH_SIZE: usize = 5000;
+const CHANNEL_BUFFER: usize = 32;
 const PROGRESS_INTERVAL: u64 = 100000;
 
 fn sqlite_db_exists() -> bool {
@@ -310,15 +307,156 @@ const TABLES: &[TableSchema] = &[
     },
 ];
 
+enum ImportMessage {
+    CreateTable {
+        ddl: String,
+    },
+    InsertBatch {
+        table_name: String,
+        values: String,
+    },
+    TableDone {
+        table_name: String,
+        rows: u64,
+        elapsed_secs: f64,
+    },
+}
+
 fn escape_sql_value(value: rusqlite::types::Value) -> String {
     use rusqlite::types::Value;
     match value {
         Value::Null => "NULL".to_string(),
         Value::Integer(i) => i.to_string(),
-        Value::Real(f) => f.to_string(),
+        Value::Real(f) => {
+            if f.is_nan() || f.is_infinite() {
+                "NULL".to_string()
+            } else {
+                format!("{:.15e}", f)
+            }
+        }
         Value::Text(s) => format!("'{}'", s.replace('\'', "''")),
         Value::Blob(_) => "NULL".to_string(),
     }
+}
+
+fn read_table_parallel(
+    table: &'static TableSchema,
+    tx: mpsc::SyncSender<ImportMessage>,
+) {
+    let start = Instant::now();
+    
+    let sqlite_conn = match Connection::open(SQLITE_DB_PATH) {
+        Ok(conn) => conn,
+        Err(e) => {
+            eprintln!("  {} - ERROR opening SQLite: {}", table.name, e);
+            return;
+        }
+    };
+
+    if tx.send(ImportMessage::CreateTable {
+        ddl: table.turdb_ddl.to_string(),
+    }).is_err() {
+        return;
+    }
+
+    let count: i64 = match sqlite_conn.query_row(
+        &format!("SELECT COUNT(*) FROM {}", table.name),
+        [],
+        |row| row.get(0),
+    ) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("  {} - ERROR counting: {}", table.name, e);
+            return;
+        }
+    };
+
+    if count == 0 {
+        let _ = tx.send(ImportMessage::TableDone {
+            table_name: table.name.to_string(),
+            rows: 0,
+            elapsed_secs: start.elapsed().as_secs_f64(),
+        });
+        return;
+    }
+
+    let col_count = table.columns.split(',').count();
+    let turdb_table = camel_to_snake(table.name);
+    let mut total_inserted: u64 = 0;
+    let mut offset: i64 = 0;
+
+    loop {
+        let query = format!(
+            "SELECT {} FROM {} LIMIT {} OFFSET {}",
+            table.columns, table.name, BATCH_SIZE, offset
+        );
+
+        let mut stmt = match sqlite_conn.prepare(&query) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("  {} - ERROR preparing: {}", table.name, e);
+                break;
+            }
+        };
+        
+        let mut rows = match stmt.query([]) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("  {} - ERROR querying: {}", table.name, e);
+                break;
+            }
+        };
+
+        let mut batch_count = 0u64;
+        let mut value_batches: Vec<String> = Vec::with_capacity(INSERT_BATCH_SIZE);
+
+        while let Ok(Some(row)) = rows.next() {
+            let mut values = Vec::with_capacity(col_count);
+            for i in 0..col_count {
+                if let Ok(val) = row.get_ref(i) {
+                    values.push(escape_sql_value(val.into()));
+                } else {
+                    values.push("NULL".to_string());
+                }
+            }
+
+            value_batches.push(format!("({})", values.join(", ")));
+            batch_count += 1;
+            total_inserted += 1;
+
+            if value_batches.len() >= INSERT_BATCH_SIZE {
+                let values_str = std::mem::take(&mut value_batches).join(", ");
+                if tx.send(ImportMessage::InsertBatch {
+                    table_name: turdb_table.clone(),
+                    values: values_str,
+                }).is_err() {
+                    return;
+                }
+            }
+        }
+
+        if !value_batches.is_empty() {
+            let values_str = value_batches.join(", ");
+            if tx.send(ImportMessage::InsertBatch {
+                table_name: turdb_table.clone(),
+                values: values_str,
+            }).is_err() {
+                return;
+            }
+        }
+
+        if batch_count == 0 || offset + BATCH_SIZE >= count {
+            break;
+        }
+
+        offset += BATCH_SIZE;
+    }
+
+    let _ = tx.send(ImportMessage::TableDone {
+        table_name: table.name.to_string(),
+        rows: total_inserted,
+        elapsed_secs: start.elapsed().as_secs_f64(),
+    });
 }
 
 fn import_table(
@@ -525,6 +663,96 @@ fn import_table_with_txn(
     );
 
     Ok(total_inserted)
+}
+
+#[test]
+fn import_all_tables_parallel() {
+    if !sqlite_db_exists() {
+        eprintln!("Skipping test: SQLite database not found at {}", SQLITE_DB_PATH);
+        return;
+    }
+
+    if Path::new(TURDB_PATH).exists() {
+        std::fs::remove_dir_all(TURDB_PATH).expect("Failed to remove existing TurDB directory");
+        println!("Removed existing TurDB directory at {}", TURDB_PATH);
+    }
+
+    let db = Database::create(TURDB_PATH).unwrap();
+    
+    db.execute("PRAGMA WAL=ON").expect("Failed to enable WAL");
+    db.execute("PRAGMA synchronous=OFF").expect("Failed to set synchronous mode");
+    db.execute("SET foreign_keys = OFF").expect("Failed to set foreign keys");
+    
+    println!("\n=== Starting Parallel SQLite to TurDB Import ===\n");
+    println!("Reading from {} tables in parallel...\n", TABLES.len());
+
+    let overall_start = Instant::now();
+    
+    let (tx, rx) = mpsc::sync_channel::<ImportMessage>(CHANNEL_BUFFER);
+
+    let reader_handles: Vec<_> = TABLES
+        .iter()
+        .map(|table| {
+            let tx = tx.clone();
+            thread::spawn(move || {
+                read_table_parallel(table, tx);
+            })
+        })
+        .collect();
+
+    drop(tx);
+
+    let mut total_rows: u64 = 0;
+    let mut tables_done = 0;
+    let mut insert_count = 0u64;
+
+    for msg in rx {
+        match msg {
+            ImportMessage::CreateTable { ddl } => {
+                if let Err(e) = db.execute(&ddl) {
+                    eprintln!("ERROR creating table: {}", e);
+                }
+            }
+            ImportMessage::InsertBatch { table_name, values } => {
+                let insert_sql = format!("INSERT INTO {} VALUES {}", table_name, values);
+                if let Err(e) = db.execute(&insert_sql) {
+                    eprintln!("ERROR inserting into {}: {}", table_name, e);
+                }
+                insert_count += 1;
+                if insert_count.is_multiple_of(100) {
+                    let elapsed = overall_start.elapsed().as_secs_f64();
+                    print!("\r  Batches: {} | Rows: ~{} | Time: {:.1}s    ", 
+                           insert_count, insert_count * INSERT_BATCH_SIZE as u64, elapsed);
+                    use std::io::Write;
+                    let _ = std::io::stdout().flush();
+                }
+            }
+            ImportMessage::TableDone { table_name, rows, elapsed_secs } => {
+                total_rows += rows;
+                tables_done += 1;
+                let rate = if elapsed_secs > 0.0 { rows as f64 / elapsed_secs } else { 0.0 };
+                println!("\n  {} - {} rows in {:.2}s ({:.0} rows/sec) [{}/{}]",
+                         table_name, rows, elapsed_secs, rate, tables_done, TABLES.len());
+            }
+
+        }
+    }
+
+    for handle in reader_handles {
+        let _ = handle.join();
+    }
+
+    db.execute("PRAGMA synchronous=FULL").expect("Failed to restore synchronous mode");
+    db.execute("SET foreign_keys = ON").expect("Failed to set foreign keys");
+    
+    let overall_elapsed = overall_start.elapsed();
+    let overall_rate = total_rows as f64 / overall_elapsed.as_secs_f64();
+
+    println!("\n=== Import Complete ===");
+    println!("Tables imported: {}", tables_done);
+    println!("Total rows: {}", total_rows);
+    println!("Total time: {:.2}s", overall_elapsed.as_secs_f64());
+    println!("Average rate: {:.0} rows/sec", overall_rate);
 }
 
 #[test]

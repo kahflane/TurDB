@@ -3393,3 +3393,54 @@ mod wal_edge_case_tests {
         }
     }
 }
+
+mod toast_tests {
+    use super::*;
+
+    #[test]
+    fn toast_insert_and_read_large_text() {
+        let dir = tempdir().unwrap();
+        let db = Database::create(dir.path().join("toast_test")).unwrap();
+        
+        db.execute("PRAGMA WAL=ON").unwrap();
+        
+        db.execute("CREATE TABLE test (id BIGINT PRIMARY KEY, description TEXT)").unwrap();
+        
+        // Insert a value larger than TOAST_THRESHOLD (1000 bytes)
+        let large_text = "x".repeat(5000);
+        let sql = format!("INSERT INTO test VALUES (1, '{}')", large_text);
+        db.execute(&sql).unwrap();
+        
+        // Read it back
+        let rows = db.query("SELECT id, description FROM test WHERE id = 1").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].values[0], OwnedValue::Int(1));
+        if let OwnedValue::Text(text) = &rows[0].values[1] {
+            assert_eq!(text.len(), 5000);
+            assert!(text.chars().all(|c| c == 'x'));
+        } else {
+            panic!("Expected Text value");
+        }
+    }
+    
+    #[test]
+    fn toast_insert_multiple_large_values() {
+        let dir = tempdir().unwrap();
+        let db = Database::create(dir.path().join("toast_test2")).unwrap();
+        
+        db.execute("PRAGMA WAL=ON").unwrap();
+        
+        db.execute("CREATE TABLE test (id BIGINT PRIMARY KEY, description TEXT)").unwrap();
+        
+        // Insert 10 large values
+        for i in 1..=10 {
+            let large_text = format!("{}", i).repeat(2000);
+            let sql = format!("INSERT INTO test VALUES ({}, '{}')", i, large_text);
+            db.execute(&sql).unwrap();
+        }
+        
+        // Read them back
+        let rows = db.query("SELECT id, LENGTH(description) as len FROM test ORDER BY id").unwrap();
+        assert_eq!(rows.len(), 10);
+    }
+}

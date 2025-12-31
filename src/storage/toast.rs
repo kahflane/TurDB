@@ -201,7 +201,12 @@ impl Detoaster for TableDetoaster {
 
         let toast_storage = file_manager.table_data_mut(&self.schema_name, &toast_table_name)?;
 
-        let btree = BTree::new(toast_storage, 1)?;
+        let root_page = {
+            let page0 = toast_storage.page(0)?;
+            crate::storage::TableFileHeader::from_bytes(page0)?.root_page()
+        };
+
+        let btree = BTree::new(toast_storage, root_page)?;
 
         let mut result = Vec::with_capacity(total_size);
 

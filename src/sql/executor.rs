@@ -392,6 +392,104 @@ impl<'storage> RowSource for StreamingBTreeSource<'storage> {
     }
 }
 
+pub struct ReverseBTreeSource<'storage> {
+    cursor: crate::btree::Cursor<'storage, crate::storage::MmapStorage>,
+    decoder: SimpleDecoder,
+    started: bool,
+    row_buffer: Vec<Value<'static>>,
+}
+
+impl<'storage> ReverseBTreeSource<'storage> {
+    pub fn new(
+        cursor: crate::btree::Cursor<'storage, crate::storage::MmapStorage>,
+        decoder: SimpleDecoder,
+        column_count: usize,
+    ) -> Self {
+        Self {
+            cursor,
+            decoder,
+            started: false,
+            row_buffer: Vec::with_capacity(column_count),
+        }
+    }
+
+    pub fn from_btree_scan_reverse(
+        storage: &'storage crate::storage::MmapStorage,
+        root_page: u32,
+        column_types: Vec<crate::records::types::DataType>,
+    ) -> Result<Self> {
+        Self::from_btree_scan_reverse_with_projections(storage, root_page, column_types, None)
+    }
+
+    pub fn from_btree_scan_reverse_with_projections(
+        storage: &'storage crate::storage::MmapStorage,
+        root_page: u32,
+        column_types: Vec<crate::records::types::DataType>,
+        projections: Option<Vec<usize>>,
+    ) -> Result<Self> {
+        use crate::btree::BTreeReader;
+
+        let reader = BTreeReader::new(storage, root_page)?;
+        let cursor = reader.cursor_last()?;
+
+        let output_count = projections
+            .as_ref()
+            .map(|p| p.len())
+            .unwrap_or(column_types.len());
+        let decoder = match projections {
+            Some(proj) => SimpleDecoder::with_projections(column_types, proj),
+            None => SimpleDecoder::new(column_types),
+        };
+
+        Ok(Self::new(cursor, decoder, output_count))
+    }
+}
+
+impl<'storage> RowSource for ReverseBTreeSource<'storage> {
+    fn reset(&mut self) -> Result<()> {
+        self.started = false;
+        Ok(())
+    }
+
+    fn next_row(&mut self) -> Result<Option<Vec<Value<'static>>>> {
+        if !self.started {
+            self.started = true;
+            if !self.cursor.valid() {
+                return Ok(None);
+            }
+        } else if !self.cursor.prev()? {
+            return Ok(None);
+        }
+
+        let key = self.cursor.key()?;
+        let value = self.cursor.value()?;
+        self.row_buffer.clear();
+        self.decoder.decode_into(key, value, &mut self.row_buffer)?;
+        Ok(Some(std::mem::take(&mut self.row_buffer)))
+    }
+}
+
+pub enum BTreeSource<'storage> {
+    Forward(StreamingBTreeSource<'storage>),
+    Reverse(ReverseBTreeSource<'storage>),
+}
+
+impl<'storage> RowSource for BTreeSource<'storage> {
+    fn reset(&mut self) -> Result<()> {
+        match self {
+            BTreeSource::Forward(s) => s.reset(),
+            BTreeSource::Reverse(s) => s.reset(),
+        }
+    }
+
+    fn next_row(&mut self) -> Result<Option<Vec<Value<'static>>>> {
+        match self {
+            BTreeSource::Forward(s) => s.next_row(),
+            BTreeSource::Reverse(s) => s.next_row(),
+        }
+    }
+}
+
 pub struct TableScanExecutor<'a, S: RowSource> {
     source: S,
     arena: &'a Bump,

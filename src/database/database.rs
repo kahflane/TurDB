@@ -9,7 +9,7 @@ use crate::schema::{Catalog, ColumnDef as SchemaColumnDef};
 use crate::sql::ast::IsolationLevel;
 use crate::sql::builder::ExecutorBuilder;
 use crate::sql::context::ExecutionContext;
-use crate::sql::executor::{Executor, ExecutorRow, MaterializedRowSource, RowSource, StreamingBTreeSource};
+use crate::sql::executor::{BTreeSource, Executor, ExecutorRow, MaterializedRowSource, ReverseBTreeSource, RowSource, StreamingBTreeSource};
 use crate::sql::planner::Planner;
 use crate::sql::predicate::CompiledPredicate;
 use crate::sql::Parser;
@@ -409,6 +409,10 @@ impl Database {
                     table_def.id() as u32,
                     (schema_name.to_string(), table_name.to_string()),
                 );
+                if let Some(toast_id) = table_def.toast_id() {
+                    let toast_table_name = crate::storage::toast::toast_table_name(table_name);
+                    lookup.insert(toast_id as u32, (schema_name.to_string(), toast_table_name));
+                }
             }
         }
     }
@@ -841,6 +845,58 @@ impl Database {
 
         let plan_source = find_plan_source(physical_plan.root);
 
+        fn is_simple_count_star<'a>(
+            op: &'a crate::sql::planner::PhysicalOperator<'a>,
+        ) -> Option<&'a crate::sql::planner::PhysicalTableScan<'a>> {
+            use crate::sql::planner::{AggregateFunction, PhysicalOperator};
+            match op {
+                PhysicalOperator::HashAggregate(agg) => {
+                    if !agg.group_by.is_empty() {
+                        return None;
+                    }
+                    if agg.aggregates.len() != 1 {
+                        return None;
+                    }
+                    let agg_expr = &agg.aggregates[0];
+                    if agg_expr.function != AggregateFunction::Count || agg_expr.distinct {
+                        return None;
+                    }
+                    match agg.input {
+                        PhysicalOperator::TableScan(scan) => {
+                            if scan.post_scan_filter.is_none() {
+                                Some(scan)
+                            } else {
+                                None
+                            }
+                        }
+                        _ => None,
+                    }
+                }
+                PhysicalOperator::ProjectExec(proj) => is_simple_count_star(proj.input),
+                _ => None,
+            }
+        }
+
+        if let Some(scan) = is_simple_count_star(physical_plan.root) {
+            let schema_name = scan.schema.unwrap_or("root");
+            let table_name = scan.table;
+
+            let storage = file_manager
+                .table_data(schema_name, table_name)
+                .wrap_err_with(|| {
+                    format!(
+                        "failed to open table storage for {}.{}",
+                        schema_name, table_name
+                    )
+                })?;
+
+            let page = storage.page(0)?;
+            let header = TableFileHeader::from_bytes(page)?;
+            let count = header.row_count() as i64;
+
+            return Ok((column_names, vec![Row::new(vec![OwnedValue::Int(count)])]));
+        }
+
         let mut toast_table_info: Option<(String, String)> = None;
 
         let rows = match plan_source {
@@ -877,13 +933,27 @@ impl Database {
                     })?;
 
                 let root_page = 1u32;
-                let source = StreamingBTreeSource::from_btree_scan_with_projections(
-                    storage,
-                    root_page,
-                    column_types,
-                    projections,
-                )
-                .wrap_err("failed to create table scan")?;
+                let source: BTreeSource = if scan.reverse {
+                    BTreeSource::Reverse(
+                        ReverseBTreeSource::from_btree_scan_reverse_with_projections(
+                            storage,
+                            root_page,
+                            column_types,
+                            projections,
+                        )
+                        .wrap_err("failed to create reverse table scan")?,
+                    )
+                } else {
+                    BTreeSource::Forward(
+                        StreamingBTreeSource::from_btree_scan_with_projections(
+                            storage,
+                            root_page,
+                            column_types,
+                            projections,
+                        )
+                        .wrap_err("failed to create table scan")?,
+                    )
+                };
 
                 let ctx = ExecutionContext::new(&arena);
                 let builder = ExecutorBuilder::new(&ctx);
@@ -1891,12 +1961,17 @@ impl Database {
             toast_storage.grow(2)?;
             crate::btree::BTree::create(toast_storage, 1)?;
 
+            self.table_id_lookup.write().insert(
+                toast_id as u32,
+                (schema_name.to_string(), toast_table_name.clone()),
+            );
+
             let mut catalog_guard = self.catalog.write();
             let catalog = catalog_guard.as_mut().unwrap();
             if let Some(schema) = catalog.get_schema_mut(schema_name) {
                 if let Some(table) = schema.get_table(table_name) {
                     let mut table_clone = table.clone();
-                    table_clone.set_has_toast(true);
+                    table_clone.set_toast_id(Some(toast_id));
                     schema.remove_table(table_name);
                     schema.add_table(table_clone);
                 }
@@ -2721,6 +2796,14 @@ impl Database {
             let page = storage.page_mut(0)?;
             let header = TableFileHeader::from_bytes_mut(page)?;
             header.set_rightmost_hint(hint);
+        }
+
+        if count > 0 {
+            let storage = file_manager.table_data_mut(schema_name, table_name)?;
+            let page = storage.page_mut(0)?;
+            let header = TableFileHeader::from_bytes_mut(page)?;
+            let new_row_count = header.row_count().saturating_add(count as u64);
+            header.set_row_count(new_row_count);
         }
 
         // Flush WAL in autocommit mode; deferred to commit in explicit transactions
@@ -3888,6 +3971,16 @@ impl Database {
                     );
                 }
             }
+        }
+
+        if rows_affected > 0 {
+            let mut file_manager_guard = self.file_manager.write();
+            let file_manager = file_manager_guard.as_mut().unwrap();
+            let storage = file_manager.table_data_mut(schema_name, table_name)?;
+            let page = storage.page_mut(0)?;
+            let header = TableFileHeader::from_bytes_mut(page)?;
+            let new_row_count = header.row_count().saturating_sub(rows_affected as u64);
+            header.set_row_count(new_row_count);
         }
 
         Ok(ExecuteResult::Delete {
@@ -5243,31 +5336,39 @@ impl Database {
         let toast_table_name = crate::storage::toast::toast_table_name(table_name);
         let toast_storage = file_manager.table_data_mut(schema_name, &toast_table_name)?;
 
-        let toast_table_id = {
+        let (toast_table_id, root_page) = {
             let page0 = toast_storage.page(0)?;
-            crate::storage::TableFileHeader::from_bytes(page0)?.table_id() as u32
+            let header = crate::storage::TableFileHeader::from_bytes(page0)?;
+            (header.table_id() as u32, header.root_page())
         };
 
         let pointer = ToastPointer::new(row_id, column_index, data.len() as u64);
         let chunk_id = pointer.chunk_id;
 
-        let new_hint = if wal_enabled {
+        let (new_hint, new_root) = if wal_enabled {
             let mut wal_storage =
                 WalStoragePerTable::new(toast_storage, &self.dirty_pages, toast_table_id);
-            let mut btree = BTree::with_rightmost_hint(&mut wal_storage, 1, hint)?;
+            let mut btree = BTree::with_rightmost_hint(&mut wal_storage, root_page, hint)?;
             for (seq, chunk) in data.chunks(TOAST_CHUNK_SIZE).enumerate() {
                 let chunk_key = make_chunk_key(chunk_id, seq as u32);
                 btree.insert(&chunk_key, chunk)?;
             }
-            btree.rightmost_hint()
+            (btree.rightmost_hint(), btree.root_page())
         } else {
-            let mut btree = BTree::with_rightmost_hint(toast_storage, 1, hint)?;
+            let mut btree = BTree::with_rightmost_hint(toast_storage, root_page, hint)?;
             for (seq, chunk) in data.chunks(TOAST_CHUNK_SIZE).enumerate() {
                 let chunk_key = make_chunk_key(chunk_id, seq as u32);
                 btree.insert(&chunk_key, chunk)?;
             }
-            btree.rightmost_hint()
+            (btree.rightmost_hint(), btree.root_page())
         };
+
+        if new_root != root_page {
+            let toast_storage = file_manager.table_data_mut(schema_name, &toast_table_name)?;
+            let page0 = toast_storage.page_mut(0)?;
+            let header = crate::storage::TableFileHeader::from_bytes_mut(page0)?;
+            header.set_root_page(new_root);
+        }
 
         Ok((pointer.encode().to_vec(), new_hint))
     }
@@ -5290,7 +5391,12 @@ impl Database {
         let toast_table_name = crate::storage::toast::toast_table_name(table_name);
         let toast_storage = file_manager.table_data_mut(schema_name, &toast_table_name)?;
 
-        let btree = BTree::new(toast_storage, 1)?;
+        let root_page = {
+            let page0 = toast_storage.page(0)?;
+            crate::storage::TableFileHeader::from_bytes(page0)?.root_page()
+        };
+
+        let btree = BTree::new(toast_storage, root_page)?;
 
         let mut result = Vec::with_capacity(total_size);
 

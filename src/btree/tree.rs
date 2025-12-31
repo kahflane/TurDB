@@ -121,15 +121,16 @@
 //! - Interior nodes: ~800+ children with suffix truncation
 //! - Tree depth for 1M rows: typically 2-3 levels (fits in SmallVec)
 
+use bumpalo::collections::CollectIn;
 use bumpalo::collections::Vec as BumpVec;
 use bumpalo::Bump;
 use eyre::{bail, ensure, Result};
 use smallvec::SmallVec;
 
 use super::interior::{separator_len, InteriorNode, InteriorNodeMut, INTERIOR_SLOT_SIZE};
-use super::leaf::{LeafNode, LeafNodeMut, SearchResult, SLOT_SIZE};
+use super::leaf::{LeafNode, LeafNodeMut, SearchResult, LEAF_CONTENT_START, SLOT_SIZE};
 use crate::encoding::varint::varint_len;
-use crate::storage::{Freelist, MmapStorage, PageHeader, PageType, Storage};
+use crate::storage::{Freelist, MmapStorage, PageHeader, PageType, Storage, PAGE_SIZE};
 
 pub const MAX_TREE_DEPTH: usize = 8;
 
@@ -211,6 +212,47 @@ impl<'a> BTreeReader<'a> {
                 }
                 _ => bail!(
                     "unexpected page type {:?} during cursor_first at page {}",
+                    header.page_type(),
+                    current_page
+                ),
+            }
+        }
+    }
+
+    pub fn cursor_last(&self) -> Result<Cursor<'a, MmapStorage>> {
+        let mut current_page = self.root_page;
+
+        loop {
+            let page_data = self.storage.page(current_page)?;
+            let header = PageHeader::from_bytes(page_data)?;
+
+            match header.page_type() {
+                PageType::BTreeLeaf => {
+                    let leaf = LeafNode::from_page(page_data)?;
+                    let cell_count = leaf.cell_count() as usize;
+                    if cell_count == 0 {
+                        return Ok(Cursor {
+                            storage: self.storage,
+                            root_page: self.root_page,
+                            current_page,
+                            current_index: 0,
+                            exhausted: true,
+                        });
+                    }
+                    return Ok(Cursor {
+                        storage: self.storage,
+                        root_page: self.root_page,
+                        current_page,
+                        current_index: cell_count - 1,
+                        exhausted: false,
+                    });
+                }
+                PageType::BTreeInterior => {
+                    let interior = InteriorNode::from_page(page_data)?;
+                    current_page = interior.right_child();
+                }
+                _ => bail!(
+                    "unexpected page type {:?} during cursor_last at page {}",
                     header.page_type(),
                     current_page
                 ),
@@ -512,19 +554,44 @@ impl<'a, S: Storage> BTree<'a, S> {
             old_next_leaf = leaf.next_leaf();
         }
 
+        // Calculate cell sizes for proper split point selection
+        let cell_sizes: BumpVec<usize> = all_keys
+            .iter()
+            .zip(all_values.iter())
+            .map(|(k, v)| k.len() + varint_len(v.len() as u64) + v.len() + SLOT_SIZE)
+            .collect_in(&arena);
+        let page_capacity = PAGE_SIZE - LEAF_CONTENT_START;
+
         // PostgreSQL-style optimization: use 90/10 split for rightmost leaf.
         // This optimizes for monotonically increasing keys (e.g., auto-increment, timestamps)
         // by leaving more space in the new rightmost page for future inserts.
         let is_rightmost = old_next_leaf == 0;
-        let mid = if is_rightmost {
-            // 90/10 split: keep only ~10% in old page, move ~90% to new page
-            // This leaves room for more sequential inserts in the new rightmost page
-            // Minimum of 1 to ensure at least one key stays in old page
+        let mut mid = if is_rightmost {
+            // Target: ~10% in old page, ~90% in new page
+            // But must ensure both pages fit their data
             (all_keys.len() / 10).max(1)
         } else {
             // Normal 50/50 split for non-rightmost pages
             all_keys.len() / 2
         };
+
+        // Ensure the right page can hold its data by moving split point left if needed
+        loop {
+            let right_size: usize = cell_sizes[mid..].iter().sum();
+            if right_size <= page_capacity || mid >= all_keys.len() - 1 {
+                break;
+            }
+            mid += 1;
+        }
+
+        // Ensure the left page can hold its data by moving split point right if needed  
+        while mid > 1 {
+            let left_size: usize = cell_sizes[..mid].iter().sum();
+            if left_size <= page_capacity {
+                break;
+            }
+            mid -= 1;
+        }
 
         {
             let page_data = self.storage.page_mut(page_no)?;

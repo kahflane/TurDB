@@ -391,6 +391,7 @@ pub struct PhysicalTableScan<'a> {
     pub alias: Option<&'a str>,
     pub post_scan_filter: Option<&'a Expr<'a>>,
     pub table_def: Option<&'a TableDef>,
+    pub reverse: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -2013,6 +2014,7 @@ impl<'a> Planner<'a> {
                         alias: scan.alias,
                         post_scan_filter: None,
                         table_def,
+                        reverse: false,
                     }));
                 Ok(physical)
             }
@@ -2072,6 +2074,9 @@ impl<'a> Planner<'a> {
                 }
             }
             LogicalOperator::Sort(sort) => {
+                if let Some(optimized) = self.try_optimize_sort_to_index_scan(sort) {
+                    return Ok(optimized);
+                }
                 let input = self.logical_to_physical(sort.input)?;
                 let physical = self
                     .arena
@@ -2215,6 +2220,78 @@ impl<'a> Planner<'a> {
         // The executor doesn't currently support IndexScan properly - it needs
         // explicit BTreeCursorAdapter setup via build_index_scan method.
         // For now, fall back to TableScan + FilterExec which works correctly.
+    }
+
+    fn try_optimize_sort_to_index_scan(
+        &self,
+        sort: &LogicalSort<'a>,
+    ) -> Option<&'a PhysicalOperator<'a>> {
+        if sort.order_by.len() != 1 {
+            return None;
+        }
+
+        let sort_key = &sort.order_by[0];
+
+        let col_name = match sort_key.expr {
+            Expr::Column(col_ref) => col_ref.column,
+            _ => return None,
+        };
+
+        fn find_scan<'b>(op: &'b LogicalOperator<'b>) -> Option<&'b LogicalScan<'b>> {
+            match op {
+                LogicalOperator::Scan(scan) => Some(scan),
+                LogicalOperator::Project(proj) => find_scan(proj.input),
+                LogicalOperator::Filter(filter) => find_scan(filter.input),
+                _ => None,
+            }
+        }
+
+        fn has_filter(op: &LogicalOperator<'_>) -> bool {
+            match op {
+                LogicalOperator::Filter(_) => true,
+                LogicalOperator::Project(proj) => has_filter(proj.input),
+                _ => false,
+            }
+        }
+
+        if has_filter(sort.input) {
+            return None;
+        }
+
+        let scan = find_scan(sort.input)?;
+        let table_def = self.catalog.resolve_table(scan.table).ok()?;
+
+        let pk_col = table_def.columns().iter().find(|c| {
+            c.has_constraint(&crate::schema::table::Constraint::PrimaryKey)
+        })?;
+
+        if !pk_col.name().eq_ignore_ascii_case(col_name) {
+            return None;
+        }
+
+        let reverse = !sort_key.ascending;
+
+        let table_scan = self.arena.alloc(PhysicalOperator::TableScan(PhysicalTableScan {
+            schema: scan.schema,
+            table: scan.table,
+            alias: scan.alias,
+            post_scan_filter: None,
+            table_def: Some(table_def),
+            reverse,
+        }));
+
+        match sort.input {
+            LogicalOperator::Scan(_) => Some(table_scan),
+            LogicalOperator::Project(proj) => {
+                let physical_proj = self.arena.alloc(PhysicalOperator::ProjectExec(PhysicalProjectExec {
+                    input: table_scan,
+                    expressions: proj.expressions,
+                    aliases: proj.aliases,
+                }));
+                Some(physical_proj)
+            }
+            _ => None,
+        }
     }
 
     #[allow(dead_code)]
