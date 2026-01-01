@@ -511,6 +511,17 @@ impl OwnedValue {
         builder.build()
     }
 
+    pub fn build_record_with_builder(
+        values: &[OwnedValue],
+        builder: &mut crate::records::RecordBuilder<'_>,
+    ) -> Result<Vec<u8>> {
+        builder.reset();
+        for (idx, val) in values.iter().enumerate() {
+            val.set_in_builder(builder, idx)?;
+        }
+        builder.build()
+    }
+
     pub fn jsonb_get(&self, key: &str) -> Result<Option<OwnedValue>> {
         use crate::records::jsonb::JsonbView;
 

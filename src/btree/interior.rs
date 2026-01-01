@@ -234,23 +234,39 @@ impl<'a> InteriorNode<'a> {
 
     pub fn find_child(&self, key: &[u8]) -> Result<(u32, Option<usize>)> {
         let count = self.cell_count() as usize;
-        let key_prefix = u32::from_be_bytes(extract_prefix(key));
+        if count == 0 {
+            return Ok((self.right_child(), None));
+        }
 
-        for i in 0..count {
-            let slot = self.slot_at(i)?;
+        let key_prefix = u32::from_be_bytes(extract_prefix(key));
+        let mut left = 0usize;
+        let mut right = count;
+
+        while left < right {
+            let mid = left + (right - left) / 2;
+            let slot = self.slot_at(mid)?;
             let slot_prefix = slot.prefix_as_u32();
 
-            if key_prefix < slot_prefix {
-                return Ok((slot.child_page(), Some(i)));
-            }
-            if key_prefix == slot_prefix {
-                let separator = self.key_at(i)?;
-                if key < separator {
-                    return Ok((slot.child_page(), Some(i)));
+            match key_prefix.cmp(&slot_prefix) {
+                std::cmp::Ordering::Less => right = mid,
+                std::cmp::Ordering::Greater => left = mid + 1,
+                std::cmp::Ordering::Equal => {
+                    let separator = self.key_at(mid)?;
+                    if key < separator {
+                        right = mid;
+                    } else {
+                        left = mid + 1;
+                    }
                 }
             }
         }
-        Ok((self.right_child(), None))
+
+        if left < count {
+            let slot = self.slot_at(left)?;
+            Ok((slot.child_page(), Some(left)))
+        } else {
+            Ok((self.right_child(), None))
+        }
     }
 }
 
@@ -345,23 +361,39 @@ impl<'a> InteriorNodeMut<'a> {
 
     pub fn find_child(&self, key: &[u8]) -> Result<(u32, Option<usize>)> {
         let count = self.cell_count() as usize;
-        let key_prefix = u32::from_be_bytes(extract_prefix(key));
+        if count == 0 {
+            return Ok((self.right_child(), None));
+        }
 
-        for i in 0..count {
-            let slot = self.slot_at(i)?;
+        let key_prefix = u32::from_be_bytes(extract_prefix(key));
+        let mut left = 0usize;
+        let mut right = count;
+
+        while left < right {
+            let mid = left + (right - left) / 2;
+            let slot = self.slot_at(mid)?;
             let slot_prefix = slot.prefix_as_u32();
 
-            if key_prefix < slot_prefix {
-                return Ok((slot.child_page(), Some(i)));
-            }
-            if key_prefix == slot_prefix {
-                let separator = self.key_at(i)?;
-                if key < separator {
-                    return Ok((slot.child_page(), Some(i)));
+            match key_prefix.cmp(&slot_prefix) {
+                std::cmp::Ordering::Less => right = mid,
+                std::cmp::Ordering::Greater => left = mid + 1,
+                std::cmp::Ordering::Equal => {
+                    let separator = self.key_at(mid)?;
+                    if key < separator {
+                        right = mid;
+                    } else {
+                        left = mid + 1;
+                    }
                 }
             }
         }
-        Ok((self.right_child(), None))
+
+        if left < count {
+            let slot = self.slot_at(left)?;
+            Ok((slot.child_page(), Some(left)))
+        } else {
+            Ok((self.right_child(), None))
+        }
     }
 
     pub fn insert_separator(&mut self, key: &[u8], left_child: u32) -> Result<()> {

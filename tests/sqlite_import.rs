@@ -645,3 +645,201 @@ fn import_small_tables() {
     aggregate.print_summary(overall_elapsed);
     assert!(aggregate.total_rows > 0, "Should have imported some rows");
 }
+
+#[test]
+fn benchmark_sqlite_vs_turdb() {
+    if !sqlite_db_exists() {
+        eprintln!("Skipping test: SQLite database not found at {}", SQLITE_DB_PATH);
+        return;
+    }
+
+    const SQLITE_TARGET: &str = "/Users/julfikar/Documents/PassionFruit.nosync/turdb/turdb-core/.worktrees/turdb_benchmark_sqlite.db";
+    const TURDB_TARGET: &str = "/Users/julfikar/Documents/PassionFruit.nosync/turdb/turdb-core/.worktrees/turdb_benchmark_turdb";
+    const ROW_COUNT: usize = 100_000;
+    const BATCH_SIZE: usize = 5000;
+
+    let _ = std::fs::remove_file(SQLITE_TARGET);
+    let _ = std::fs::remove_dir_all(TURDB_TARGET);
+
+    println!("\n============================================================");
+    println!("  SQLite vs TurDB Benchmark - {} rows", ROW_COUNT);
+    println!("============================================================\n");
+
+    let source_conn = Connection::open(SQLITE_DB_PATH).expect("Failed to open source SQLite");
+
+    let query = format!(
+        "SELECT Id, DatasetId, DatasourceVersionId, CreatorUserId, LicenseName, CreationDate, \
+         VersionNumber, Title, Slug, Subtitle, Description, VersionNotes, \
+         TotalCompressedBytes, TotalUncompressedBytes FROM DatasetVersions LIMIT {}",
+        ROW_COUNT
+    );
+
+    println!("Reading {} rows from source...", ROW_COUNT);
+    let read_start = Instant::now();
+    let mut stmt = source_conn.prepare(&query).expect("Failed to prepare");
+    let rows: Vec<Vec<rusqlite::types::Value>> = stmt
+        .query_map([], |row| {
+            Ok((0..14).map(|i| row.get_ref(i).unwrap().into()).collect())
+        })
+        .expect("Failed to query")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("Failed to collect");
+    println!("Read {} rows in {:.2}s\n", rows.len(), read_start.elapsed().as_secs_f64());
+
+    // ========== SQLITE BENCHMARK (Optimized for bulk insert) ==========
+    println!("--- SQLite Insert Benchmark (Optimized) ---");
+    let sqlite_conn = Connection::open(SQLITE_TARGET).expect("Failed to create SQLite DB");
+
+    sqlite_conn.execute_batch("
+        PRAGMA journal_mode = OFF;
+        PRAGMA synchronous = OFF;
+        PRAGMA cache_size = -64000;
+        PRAGMA temp_store = MEMORY;
+        PRAGMA locking_mode = EXCLUSIVE;
+        PRAGMA mmap_size = 268435456;
+        CREATE TABLE dataset_versions (
+            id INTEGER PRIMARY KEY,
+            dataset_id INTEGER,
+            datasource_version_id INTEGER,
+            creator_user_id INTEGER,
+            license_name TEXT,
+            creation_date TEXT,
+            version_number REAL,
+            title TEXT,
+            slug TEXT,
+            subtitle TEXT,
+            description TEXT,
+            version_notes TEXT,
+            total_compressed_bytes REAL,
+            total_uncompressed_bytes REAL
+        );
+    ").expect("Failed to create SQLite table");
+
+    let sqlite_start = Instant::now();
+
+    {
+        let mut insert_stmt = sqlite_conn.prepare_cached(
+            "INSERT INTO dataset_versions VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+        ).expect("Failed to prepare insert");
+
+        sqlite_conn.execute("BEGIN IMMEDIATE", []).expect("BEGIN failed");
+
+        for row in &rows {
+            insert_stmt.execute(rusqlite::params_from_iter(row.iter())).expect("Insert failed");
+        }
+
+        sqlite_conn.execute("COMMIT", []).expect("COMMIT failed");
+    }
+
+    let sqlite_elapsed = sqlite_start.elapsed();
+    println!("SQLite: {} rows in {:.3}s = {:.0} rows/sec\n",
+        rows.len(), sqlite_elapsed.as_secs_f64(),
+        rows.len() as f64 / sqlite_elapsed.as_secs_f64());
+
+    // ========== TURDB BENCHMARK ==========
+    println!("--- TurDB Insert Benchmark ---");
+    let turdb = Database::create(TURDB_TARGET).expect("Failed to create TurDB");
+
+    turdb.execute("
+        CREATE TABLE dataset_versions (
+          id BIGINT,
+          dataset_id BIGINT,
+          datasource_version_id BIGINT,
+          creator_user_id BIGINT,
+          license_name VARCHAR(100),
+          creation_date VARCHAR(20),
+          version_number FLOAT,
+          title VARCHAR(300),
+          slug VARCHAR(100),
+          subtitle VARCHAR(100),
+          description TEXT,
+          version_notes TEXT,
+          total_compressed_bytes FLOAT,
+          total_uncompressed_bytes FLOAT
+        )
+    ").expect("Failed to create TurDB table");
+
+    let avg_row_size = 200;
+    let sql_capacity = BATCH_SIZE * avg_row_size + 100;
+
+    let turdb_start = Instant::now();
+    let mut sql_build_time = std::time::Duration::ZERO;
+    let mut execute_time = std::time::Duration::ZERO;
+
+    for batch in rows.chunks(BATCH_SIZE) {
+        let build_start = Instant::now();
+        let mut sql = String::with_capacity(sql_capacity);
+        sql.push_str("INSERT INTO dataset_versions VALUES ");
+        for (i, row) in batch.iter().enumerate() {
+            if i > 0 { sql.push_str(", "); }
+            sql.push('(');
+            for (j, val) in row.iter().enumerate() {
+                if j > 0 { sql.push_str(", "); }
+                write_sql_value(&mut sql, val);
+            }
+            sql.push(')');
+        }
+        sql_build_time += build_start.elapsed();
+
+        let exec_start = Instant::now();
+        turdb.execute(&sql).expect("TurDB insert failed");
+        execute_time += exec_start.elapsed();
+    }
+
+    let turdb_elapsed = turdb_start.elapsed();
+    println!("  SQL build: {:.3}s, Execute: {:.3}s",
+        sql_build_time.as_secs_f64(), execute_time.as_secs_f64());
+
+    println!("TurDB:  {} rows in {:.3}s = {:.0} rows/sec\n",
+        rows.len(), turdb_elapsed.as_secs_f64(),
+        rows.len() as f64 / turdb_elapsed.as_secs_f64());
+
+    // ========== COMPARISON ==========
+    println!("============================================================");
+    println!("  RESULTS");
+    println!("============================================================");
+    println!("SQLite: {:.3}s ({:.0} rows/sec)",
+        sqlite_elapsed.as_secs_f64(),
+        rows.len() as f64 / sqlite_elapsed.as_secs_f64());
+    println!("TurDB:  {:.3}s ({:.0} rows/sec)",
+        turdb_elapsed.as_secs_f64(),
+        rows.len() as f64 / turdb_elapsed.as_secs_f64());
+
+    let ratio = sqlite_elapsed.as_secs_f64() / turdb_elapsed.as_secs_f64();
+    if ratio > 1.0 {
+        println!("\nTurDB is {:.2}x FASTER than SQLite!", ratio);
+    } else {
+        println!("\nTurDB is {:.2}x SLOWER than SQLite (target: 2-3x faster)", 1.0/ratio);
+    }
+
+    let _ = std::fs::remove_file(SQLITE_TARGET);
+    let _ = std::fs::remove_dir_all(TURDB_TARGET);
+}
+
+fn write_sql_value(buf: &mut String, value: &rusqlite::types::Value) {
+    use rusqlite::types::Value;
+    use std::fmt::Write;
+    match value {
+        Value::Null => buf.push_str("NULL"),
+        Value::Integer(i) => { let _ = write!(buf, "{}", i); }
+        Value::Real(f) => {
+            if f.is_nan() || f.is_infinite() {
+                buf.push_str("NULL");
+            } else {
+                let _ = write!(buf, "{:.15e}", f);
+            }
+        }
+        Value::Text(s) => {
+            buf.push('\'');
+            for c in s.chars() {
+                if c == '\'' {
+                    buf.push_str("''");
+                } else {
+                    buf.push(c);
+                }
+            }
+            buf.push('\'');
+        }
+        Value::Blob(_) => buf.push_str("NULL"),
+    }
+}

@@ -600,6 +600,29 @@ impl FileManager {
         Ok(self.open_files.get_mut(&key).unwrap())
     }
 
+    pub fn table_data_mut_with_key(&mut self, key: &FileKey) -> Option<&mut MmapStorage> {
+        self.open_files.get_mut(key)
+    }
+
+    pub fn make_table_key(schema: &str, table: &str) -> FileKey {
+        FileKey::TableData {
+            schema: schema.to_string(),
+            table: table.to_string(),
+        }
+    }
+
+    pub fn make_index_key(schema: &str, table: &str, index_name: &str) -> FileKey {
+        FileKey::Index {
+            schema: schema.to_string(),
+            table: table.to_string(),
+            index_name: index_name.to_string(),
+        }
+    }
+
+    pub fn index_data_mut_with_key(&mut self, key: &FileKey) -> Option<&mut MmapStorage> {
+        self.open_files.get_mut(key)
+    }
+
     pub fn index_data(
         &mut self,
         schema: &str,

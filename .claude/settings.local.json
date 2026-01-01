@@ -36,7 +36,8 @@
       "Bash(tee:*)",
       "Bash(./target/release/turdb:*)",
       "Bash(sqlite3:*)",
-      "Skill(superpowers:systematic-debugging)"
+      "Skill(superpowers:systematic-debugging)",
+      "WebSearch"
     ]
   }
 }

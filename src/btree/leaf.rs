@@ -288,33 +288,40 @@ impl<'a> LeafNode<'a> {
         let target_prefix = u32::from_be_bytes(extract_prefix(key));
         let count = self.cell_count() as usize;
 
-        for i in 0..count {
-            let slot = match self.slot_at(i) {
+        if count == 0 {
+            return SearchResult::NotFound(0);
+        }
+
+        let mut left = 0usize;
+        let mut right = count;
+
+        while left < right {
+            let mid = left + (right - left) / 2;
+            let slot = match self.slot_at(mid) {
                 Ok(s) => s,
-                Err(_) => return SearchResult::NotFound(i),
+                Err(_) => return SearchResult::NotFound(mid),
             };
 
             let slot_prefix = slot.prefix_as_u32();
 
-            if slot_prefix > target_prefix {
-                return SearchResult::NotFound(i);
-            }
-
-            if slot_prefix == target_prefix {
-                let full_key = match self.key_at(i) {
-                    Ok(k) => k,
-                    Err(_) => return SearchResult::NotFound(i),
-                };
-
-                match full_key.cmp(key) {
-                    std::cmp::Ordering::Equal => return SearchResult::Found(i),
-                    std::cmp::Ordering::Greater => return SearchResult::NotFound(i),
-                    std::cmp::Ordering::Less => continue,
+            match slot_prefix.cmp(&target_prefix) {
+                std::cmp::Ordering::Less => left = mid + 1,
+                std::cmp::Ordering::Greater => right = mid,
+                std::cmp::Ordering::Equal => {
+                    let full_key = match self.key_at(mid) {
+                        Ok(k) => k,
+                        Err(_) => return SearchResult::NotFound(mid),
+                    };
+                    match full_key.cmp(key) {
+                        std::cmp::Ordering::Equal => return SearchResult::Found(mid),
+                        std::cmp::Ordering::Less => left = mid + 1,
+                        std::cmp::Ordering::Greater => right = mid,
+                    }
                 }
             }
         }
 
-        SearchResult::NotFound(count)
+        SearchResult::NotFound(left)
     }
 
     pub fn next_leaf(&self) -> u32 {
@@ -435,33 +442,40 @@ impl<'a> LeafNodeMut<'a> {
         let target_prefix = u32::from_be_bytes(extract_prefix(key));
         let count = self.cell_count() as usize;
 
-        for i in 0..count {
-            let slot = match self.slot_at(i) {
+        if count == 0 {
+            return SearchResult::NotFound(0);
+        }
+
+        let mut left = 0usize;
+        let mut right = count;
+
+        while left < right {
+            let mid = left + (right - left) / 2;
+            let slot = match self.slot_at(mid) {
                 Ok(s) => s,
-                Err(_) => return SearchResult::NotFound(i),
+                Err(_) => return SearchResult::NotFound(mid),
             };
 
             let slot_prefix = slot.prefix_as_u32();
 
-            if slot_prefix > target_prefix {
-                return SearchResult::NotFound(i);
-            }
-
-            if slot_prefix == target_prefix {
-                let full_key = match self.key_at(i) {
-                    Ok(k) => k,
-                    Err(_) => return SearchResult::NotFound(i),
-                };
-
-                match full_key.cmp(key) {
-                    std::cmp::Ordering::Equal => return SearchResult::Found(i),
-                    std::cmp::Ordering::Greater => return SearchResult::NotFound(i),
-                    std::cmp::Ordering::Less => continue,
+            match slot_prefix.cmp(&target_prefix) {
+                std::cmp::Ordering::Less => left = mid + 1,
+                std::cmp::Ordering::Greater => right = mid,
+                std::cmp::Ordering::Equal => {
+                    let full_key = match self.key_at(mid) {
+                        Ok(k) => k,
+                        Err(_) => return SearchResult::NotFound(mid),
+                    };
+                    match full_key.cmp(key) {
+                        std::cmp::Ordering::Equal => return SearchResult::Found(mid),
+                        std::cmp::Ordering::Less => left = mid + 1,
+                        std::cmp::Ordering::Greater => right = mid,
+                    }
                 }
             }
         }
 
-        SearchResult::NotFound(count)
+        SearchResult::NotFound(left)
     }
 
     pub fn insert_cell(&mut self, key: &[u8], value: &[u8]) -> Result<()> {

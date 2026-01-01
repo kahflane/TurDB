@@ -1957,14 +1957,12 @@ impl Database {
 
     pub fn execute(&self, sql: &str) -> Result<ExecuteResult> {
         let arena = Bump::new();
-
         let mut parser = Parser::new(sql, &arena);
         let stmt = parser
             .parse_statement()
             .wrap_err("failed to parse SQL statement")?;
 
         use crate::sql::ast::Statement;
-
         match stmt {
             Statement::CreateTable(create) => self.execute_create_table(create, &arena),
             Statement::CreateSchema(create) => self.execute_create_schema(create),
@@ -2665,9 +2663,55 @@ impl Database {
         };
 
         let mut toast_rightmost_hints: SmallVec<[Option<u32>; 8]> = SmallVec::new();
-        if has_toast {
+        let toastable_col_indices: SmallVec<[usize; 8]> = if has_toast {
             toast_rightmost_hints.resize(columns.len(), None);
+            columns.iter()
+                .enumerate()
+                .filter(|(_, col)| col.data_type().is_toastable())
+                .map(|(idx, _)| idx)
+                .collect()
+        } else {
+            SmallVec::new()
+        };
+
+        let table_file_key = crate::storage::FileManager::make_table_key(schema_name, table_name);
+        let mut record_builder = crate::records::RecordBuilder::new(&schema);
+
+        // Pre-compute toast table info for performance
+        use crate::storage::FileKey;
+        let toast_file_key: Option<FileKey>;
+        let mut toast_table_id: u32 = 0;
+        let mut toast_root_page: u32 = 1;
+        let mut toast_rightmost_hint: Option<u32> = None;
+        if has_toast {
+            let toast_table_name_owned = crate::storage::toast::toast_table_name(table_name);
+            toast_file_key = Some(crate::storage::FileManager::make_table_key(schema_name, &toast_table_name_owned));
+            // Pre-fetch toast table info
+            let toast_storage = file_manager.table_data_mut(schema_name, &toast_table_name_owned)?;
+            let page0 = toast_storage.page(0)?;
+            let header = crate::storage::TableFileHeader::from_bytes(page0)?;
+            toast_table_id = header.table_id() as u32;
+            toast_root_page = header.root_page();
+            let hint = header.rightmost_hint();
+            toast_rightmost_hint = if hint > 0 { Some(hint) } else { None };
+        } else {
+            toast_file_key = None;
         }
+
+        let unique_column_keys: Vec<(usize, FileKey, bool, bool)> = unique_columns
+            .iter()
+            .filter(|(_, _, _, is_auto_increment)| !is_auto_increment)
+            .filter_map(|(col_idx, index_name, is_pk, _is_auto_increment)| {
+                if file_manager.index_exists(schema_name, table_name, index_name) {
+                    // Pre-open the index to ensure it's in the cache
+                    let _ = file_manager.index_data_mut(schema_name, table_name, index_name);
+                    let key = crate::storage::FileManager::make_index_key(schema_name, table_name, index_name);
+                    Some((*col_idx, key, *is_pk, false))
+                } else {
+                    None
+                }
+            })
+            .collect();
 
         for row_values in rows_to_insert.iter() {
             let mut values: Vec<OwnedValue> = row_values.clone();
@@ -2777,39 +2821,33 @@ impl Database {
             let mut has_conflict = false;
             let mut conflicting_key: Option<Vec<u8>> = None;
 
-            for (col_idx, index_name, is_pk, is_auto_increment) in &unique_columns {
-                if *is_auto_increment {
-                    continue;
-                }
-                
+            for (col_idx, index_key, is_pk, _) in &unique_column_keys {
                 if let Some(value) = values.get(*col_idx) {
                     if value.is_null() {
                         continue;
                     }
 
-                    if file_manager.index_exists(schema_name, table_name, index_name) {
-                        let index_storage =
-                            file_manager.index_data_mut(schema_name, table_name, index_name)?;
-                        let index_btree = BTree::new(index_storage, root_page)?;
+                    let index_storage = file_manager.index_data_mut_with_key(index_key)
+                        .ok_or_else(|| eyre::eyre!("index storage not found"))?;
+                    let index_btree = BTree::new(index_storage, root_page)?;
 
-                        key_buf.clear();
-                        Self::encode_value_as_key(value, &mut key_buf);
+                    key_buf.clear();
+                    Self::encode_value_as_key(value, &mut key_buf);
 
-                        if let Some(handle) = index_btree.search(&key_buf)? {
-                            if insert.on_conflict.is_some() {
-                                has_conflict = true;
-                                let row_key_bytes = index_btree.get_value(&handle)?;
-                                conflicting_key = Some(row_key_bytes.to_vec());
-                                break;
-                            } else {
-                                let constraint_type = if *is_pk { "PRIMARY KEY" } else { "UNIQUE" };
-                                bail!(
-                                    "{} constraint violated on column '{}' in table '{}': value already exists",
-                                    constraint_type,
-                                    columns[*col_idx].name(),
-                                    table_name
-                                );
-                            }
+                    if let Some(handle) = index_btree.search(&key_buf)? {
+                        if insert.on_conflict.is_some() {
+                            has_conflict = true;
+                            let row_key_bytes = index_btree.get_value(&handle)?;
+                            conflicting_key = Some(row_key_bytes.to_vec());
+                            break;
+                        } else {
+                            let constraint_type = if *is_pk { "PRIMARY KEY" } else { "UNIQUE" };
+                            bail!(
+                                "{} constraint violated on column '{}' in table '{}': value already exists",
+                                constraint_type,
+                                columns[*col_idx].name(),
+                                table_name
+                            );
                         }
                     }
                 }
@@ -2948,14 +2986,10 @@ impl Database {
             let row_id = self.next_row_id.fetch_add(1, Ordering::Relaxed);
             let row_key = Self::generate_row_key(row_id);
 
-            if has_toast {
-                use crate::storage::toast::needs_toast;
+            if !toastable_col_indices.is_empty() {
+                use crate::storage::toast::{needs_toast, make_chunk_key, ToastPointer, TOAST_CHUNK_SIZE};
 
-                for (col_idx, col) in columns.iter().enumerate() {
-                    if !col.data_type().is_toastable() {
-                        continue;
-                    }
-
+                for &col_idx in &toastable_col_indices {
                     let value = &values[col_idx];
                     let data = match value {
                         OwnedValue::Text(s) => Some(s.as_bytes()),
@@ -2965,28 +2999,46 @@ impl Database {
 
                     if let Some(data) = data {
                         if needs_toast(data) {
-                            let col_hint = toast_rightmost_hints.get(col_idx).copied().flatten();
-                            let (toast_ptr, new_hint) = self.toast_value(
-                                file_manager,
-                                schema_name,
-                                table_name,
-                                row_id,
-                                col_idx as u16,
-                                data,
-                                wal_enabled,
-                                col_hint,
-                            )?;
-                            if col_idx < toast_rightmost_hints.len() {
-                                toast_rightmost_hints[col_idx] = new_hint;
+                            let toast_key = toast_file_key.as_ref().unwrap();
+                            let toast_storage = file_manager.table_data_mut_with_key(toast_key)
+                                .ok_or_else(|| eyre::eyre!("toast storage not found"))?;
+
+                            let pointer = ToastPointer::new(row_id, col_idx as u16, data.len() as u64);
+                            let chunk_id = pointer.chunk_id;
+
+                            let (new_hint, new_root) = if wal_enabled {
+                                let mut wal_storage =
+                                    WalStoragePerTable::new(toast_storage, &self.dirty_tracker, toast_table_id);
+                                let mut btree = BTree::with_rightmost_hint(&mut wal_storage, toast_root_page, toast_rightmost_hint)?;
+                                for (seq, chunk) in data.chunks(TOAST_CHUNK_SIZE).enumerate() {
+                                    let chunk_key = make_chunk_key(chunk_id, seq as u32);
+                                    btree.insert(&chunk_key, chunk)?;
+                                }
+                                (btree.rightmost_hint(), btree.root_page())
+                            } else {
+                                let mut btree = BTree::with_rightmost_hint(toast_storage, toast_root_page, toast_rightmost_hint)?;
+                                for (seq, chunk) in data.chunks(TOAST_CHUNK_SIZE).enumerate() {
+                                    let chunk_key = make_chunk_key(chunk_id, seq as u32);
+                                    btree.insert(&chunk_key, chunk)?;
+                                }
+                                (btree.rightmost_hint(), btree.root_page())
+                            };
+
+                            toast_rightmost_hint = new_hint;
+                            if new_root != toast_root_page {
+                                toast_root_page = new_root;
                             }
-                            values[col_idx] = OwnedValue::Blob(toast_ptr);
+
+                            values[col_idx] = OwnedValue::Blob(pointer.encode().to_vec());
                         }
                     }
                 }
             }
 
-            let table_storage = file_manager.table_data_mut(schema_name, table_name)?;
-            let record_data = OwnedValue::build_record_from_values(&values, &schema)?;
+            let table_storage = file_manager.table_data_mut_with_key(&table_file_key)
+                .ok_or_else(|| eyre::eyre!("table storage not found in cache"))?;
+
+            let record_data = OwnedValue::build_record_with_builder(&values, &mut record_builder)?;
 
             if wal_enabled {
                 let mut wal_storage =
@@ -3005,7 +3057,7 @@ impl Database {
                 if let Some(ref mut txn) = *active_txn {
                     txn.add_write_entry(WriteEntry {
                         table_id: table_id as u32,
-                        key: row_key.clone(),
+                        key: row_key.to_vec(),
                         page_id: 0,
                         offset: 0,
                         undo_page_id: None,
@@ -3015,24 +3067,22 @@ impl Database {
                 }
             }
 
-            for (col_idx, index_name, _, _) in &unique_columns {
+            for (col_idx, index_key, _, _) in &unique_column_keys {
                 if let Some(value) = values.get(*col_idx) {
                     if value.is_null() {
                         continue;
                     }
 
-                    if file_manager.index_exists(schema_name, table_name, index_name) {
-                        let index_storage =
-                            file_manager.index_data_mut(schema_name, table_name, index_name)?;
+                    let index_storage = file_manager.index_data_mut_with_key(index_key)
+                        .ok_or_else(|| eyre::eyre!("index storage not found"))?;
 
-                        key_buf.clear();
-                        Self::encode_value_as_key(value, &mut key_buf);
+                    key_buf.clear();
+                    Self::encode_value_as_key(value, &mut key_buf);
 
-                        let row_id_bytes = row_id.to_be_bytes();
+                    let row_id_bytes = row_id.to_be_bytes();
 
-                        let mut index_btree = BTree::new(index_storage, root_page)?;
-                        index_btree.insert(&key_buf, &row_id_bytes)?;
-                    }
+                    let mut index_btree = BTree::new(index_storage, root_page)?;
+                    index_btree.insert(&key_buf, &row_id_bytes)?;
                 }
             }
 
@@ -5501,8 +5551,8 @@ impl Database {
         Ok(JsonbBuilderValue::Array(elements))
     }
 
-    fn generate_row_key(row_id: u64) -> Vec<u8> {
-        row_id.to_be_bytes().to_vec()
+    fn generate_row_key(row_id: u64) -> [u8; 8] {
+        row_id.to_be_bytes()
     }
 
     pub fn checkpoint(&self) -> Result<CheckpointInfo> {

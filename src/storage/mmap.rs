@@ -227,10 +227,6 @@ impl MmapStorage {
             return Ok(());
         }
 
-        self.mmap
-            .flush_async()
-            .wrap_err("failed to flush mmap before grow")?;
-
         let new_size = new_page_count as u64 * PAGE_SIZE as u64;
 
         self.file
@@ -240,9 +236,9 @@ impl MmapStorage {
         // SAFETY: MmapMut::map_mut is unsafe because the old mmap becomes invalid.
         // This is safe because:
         // 1. grow() requires &mut self, so no page references can exist (borrow checker)
-        // 2. We flushed the old mmap above, ensuring data is written to disk
-        // 3. The file was extended to new_size before remapping
-        // 4. The old mmap is dropped when we assign the new one
+        // 2. The file was extended to new_size before remapping
+        // 3. The old mmap is dropped when we assign the new one
+        // 4. Data written to the old mmap persists in the file (mmap is backed by file)
         self.mmap =
             unsafe { MmapMut::map_mut(&self.file).wrap_err("failed to remap file after grow")? };
 
