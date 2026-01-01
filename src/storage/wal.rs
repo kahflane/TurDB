@@ -109,7 +109,7 @@ pub enum SyncMode {
 
 impl SyncMode {
     pub fn should_sync(&self) -> bool {
-        matches!(self, SyncMode::Full | SyncMode::Normal)
+        matches!(self, SyncMode::Full)
     }
 }
 
@@ -389,6 +389,8 @@ impl Wal {
     pub fn checkpoint(&mut self, storage: &mut super::MmapStorage) -> Result<u32> {
         let frames_applied = self.recover(storage)?;
 
+        storage.sync().wrap_err("failed to sync storage during checkpoint")?;
+
         self.truncate()?;
 
         Ok(frames_applied)
@@ -634,7 +636,7 @@ impl WalSegment {
 
         if sync {
             self.file
-                .sync_all()
+                .sync_data()
                 .wrap_err("failed to sync WAL frame to disk")?;
         }
 

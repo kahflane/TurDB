@@ -484,107 +484,6 @@ fn import_table(
 
     let start = Instant::now();
 
-    loop {
-        let query = format!(
-            "SELECT {} FROM {} LIMIT {} OFFSET {}",
-            table.columns, table.name, BATCH_SIZE, offset
-        );
-
-        let mut stmt = sqlite_conn.prepare(&query)?;
-        let mut rows = stmt.query([])?;
-
-        let mut batch_count = 0u64;
-        let mut value_batches: Vec<String> = Vec::with_capacity(INSERT_BATCH_SIZE);
-
-        while let Some(row) = rows.next()? {
-            let mut values = Vec::with_capacity(col_count);
-            for i in 0..col_count {
-                let val = row.get_ref(i)?.into();
-                values.push(escape_sql_value(val));
-            }
-
-            value_batches.push(format!("({})", values.join(", ")));
-            batch_count += 1;
-            total_inserted += 1;
-
-            if value_batches.len() >= INSERT_BATCH_SIZE {
-                let insert_sql = format!(
-                    "INSERT INTO {} VALUES {}",
-                    turdb_table,
-                    value_batches.join(", ")
-                );
-                turdb.execute(&insert_sql)?;
-                value_batches.clear();
-            }
-
-            if total_inserted.is_multiple_of(PROGRESS_INTERVAL) {
-                let elapsed = start.elapsed().as_secs_f64();
-                let rate = total_inserted as f64 / elapsed;
-                println!(
-                    "  {} - {}/{} rows ({:.0} rows/sec)",
-                    table.name, total_inserted, count, rate
-                );
-            }
-        }
-
-        if !value_batches.is_empty() {
-            let insert_sql = format!(
-                "INSERT INTO {} VALUES {}",
-                turdb_table,
-                value_batches.join(", ")
-            );
-            turdb.execute(&insert_sql)?;
-        }
-
-        if batch_count == 0 {
-            break;
-        }
-
-        offset += BATCH_SIZE;
-
-        if offset >= count {
-            break;
-        }
-    }
-
-    let elapsed = start.elapsed();
-    let rate = total_inserted as f64 / elapsed.as_secs_f64();
-    println!(
-        "  {} - DONE: {} rows in {:.2}s ({:.0} rows/sec)",
-        table.name,
-        total_inserted,
-        elapsed.as_secs_f64(),
-        rate
-    );
-
-    Ok(total_inserted)
-}
-
-fn import_table_with_txn(
-    sqlite_conn: &Connection,
-    turdb: &Database,
-    table: &TableSchema,
-) -> eyre::Result<u64> {
-    turdb.execute(table.turdb_ddl)?;
-
-    let count: i64 = sqlite_conn.query_row(
-        &format!("SELECT COUNT(*) FROM {}", table.name),
-        [],
-        |row| row.get(0),
-    )?;
-
-    if count == 0 {
-        println!("  {} - 0 rows (empty table)", table.name);
-        return Ok(0);
-    }
-
-    let col_count = table.columns.split(',').count();
-    let turdb_table = camel_to_snake(table.name);
-    let mut total_inserted: u64 = 0;
-    let mut offset: i64 = 0;
-
-    let start = Instant::now();
-
     turdb.execute("BEGIN")?;
 
     loop {
@@ -680,9 +579,9 @@ fn import_all_tables_parallel() {
     let db = Database::create(TURDB_PATH).unwrap();
     
     db.execute("PRAGMA WAL=ON").expect("Failed to enable WAL");
-    db.execute("PRAGMA synchronous=OFF").expect("Failed to set synchronous mode");
+    db.execute("PRAGMA synchronous=NORMAL").expect("Failed to set synchronous mode");
     db.execute("SET foreign_keys = OFF").expect("Failed to set foreign keys");
-    
+
     println!("\n=== Starting Parallel SQLite to TurDB Import ===\n");
     println!("Reading from {} tables in parallel...\n", TABLES.len());
 
@@ -766,10 +665,10 @@ fn import_all_tables_from_sqlite() {
     let db = Database::create(TURDB_PATH).unwrap();
     
     db.execute("PRAGMA WAL=ON").expect("Failed to enable WAL");
-    db.execute("PRAGMA synchronous=OFF").expect("Failed to set synchronous mode");
+    db.execute("PRAGMA synchronous=NORMAL").expect("Failed to set synchronous mode");
     db.execute("SET foreign_keys = OFF").expect("Failed to set foreign keys");
     db.execute("SET cache_size = 1024").expect("Failed to set cache size");
-    
+
     println!("\n=== Starting SQLite to TurDB Import ===\n");
 
     let overall_start = Instant::now();
@@ -817,7 +716,7 @@ fn import_small_tables_only() {
     let sqlite_conn = Connection::open(SQLITE_DB_PATH).expect("Failed to open SQLite DB");
     let db = Database::create(TURDB_PATH).unwrap();
     db.execute("PRAGMA WAL=ON").expect("Failed to enable WAL");
-    db.execute("PRAGMA synchronous=OFF").expect("Failed to set synchronous mode");
+    db.execute("PRAGMA synchronous=NORMAL").expect("Failed to set synchronous mode");
 
     println!("\n=== Importing Small Tables Only ===\n");
 
@@ -847,43 +746,15 @@ fn import_users_table_batch() {
 
     let sqlite_conn = Connection::open(SQLITE_DB_PATH).expect("Failed to open SQLite DB");
     let db = Database::create(TURDB_PATH).unwrap();
-    
+
     db.execute("PRAGMA WAL=ON").expect("Failed to enable WAL");
-    db.execute("PRAGMA synchronous=OFF").expect("Failed to set synchronous mode");
+    db.execute("PRAGMA synchronous=NORMAL").expect("Failed to set synchronous mode");
 
     let users_table = TABLES.iter().find(|t| t.name == "Users").unwrap();
 
     println!("\n=== Importing Users Table (16M rows) ===\n");
 
     match import_table(&sqlite_conn, &db, users_table) {
-        Ok(rows) => {
-            println!("Imported {} user rows", rows);
-            assert!(rows > 15_000_000, "Should have imported 16M+ users");
-        }
-        Err(e) => panic!("Failed to import users: {}", e),
-    }
-    
-    db.execute("PRAGMA synchronous=FULL").expect("Failed to restore synchronous mode");
-}
-
-#[test]
-fn import_users_table_with_txn() {
-    if !sqlite_db_exists() {
-        eprintln!("Skipping test: SQLite database not found at {}", SQLITE_DB_PATH);
-        return;
-    }
-
-    let sqlite_conn = Connection::open(SQLITE_DB_PATH).expect("Failed to open SQLite DB");
-    let db = Database::create(TURDB_PATH).unwrap();
-    
-    db.execute("PRAGMA WAL=ON").expect("Failed to enable WAL");
-    db.execute("PRAGMA synchronous=OFF").expect("Failed to set synchronous mode");
-
-    let users_table = TABLES.iter().find(|t| t.name == "Users").unwrap();
-
-    println!("\n=== Importing Users Table with Transaction (16M rows) ===\n");
-
-    match import_table_with_txn(&sqlite_conn, &db, users_table) {
         Ok(rows) => {
             println!("Imported {} user rows", rows);
             assert!(rows > 15_000_000, "Should have imported 16M+ users");
