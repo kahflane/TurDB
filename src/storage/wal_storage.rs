@@ -70,6 +70,7 @@
 //! 3. Free up disk space and improve read performance
 
 use super::{MmapStorage, Storage, Wal, PAGE_SIZE};
+use crate::database::dirty_tracker::ShardedDirtyTracker;
 use eyre::{ensure, Result, WrapErr};
 use hashbrown::{HashMap, HashSet};
 use parking_lot::Mutex;
@@ -274,26 +275,25 @@ impl<'a> Storage for WalStorage<'a> {
 
 pub struct WalStoragePerTable<'a> {
     storage: &'a mut MmapStorage,
-    dirty_pages: &'a Mutex<HashMap<u32, HashSet<u32>>>,
+    dirty_tracker: &'a ShardedDirtyTracker,
     table_id: u32,
 }
 
 impl<'a> WalStoragePerTable<'a> {
     pub fn new(
         storage: &'a mut MmapStorage,
-        dirty_pages: &'a Mutex<HashMap<u32, HashSet<u32>>>,
+        dirty_tracker: &'a ShardedDirtyTracker,
         table_id: u32,
     ) -> Self {
         Self {
             storage,
-            dirty_pages,
+            dirty_tracker,
             table_id,
         }
     }
 
     pub fn dirty_page_count(&self) -> usize {
-        let guard = self.dirty_pages.lock();
-        guard.get(&self.table_id).map(|s| s.len()).unwrap_or(0)
+        self.dirty_tracker.dirty_count(self.table_id) as usize
     }
 
     pub fn inner_storage(&self) -> &MmapStorage {
@@ -301,23 +301,15 @@ impl<'a> WalStoragePerTable<'a> {
     }
 
     pub fn flush_wal_for_table(
-        dirty_pages: &Mutex<HashMap<u32, HashSet<u32>>>,
+        dirty_tracker: &ShardedDirtyTracker,
         storage: &MmapStorage,
         wal: &mut Wal,
         table_id: u32,
     ) -> Result<u32> {
-        let dirty: Vec<u32> = {
-            let mut guard = dirty_pages.lock();
-            match guard.get_mut(&table_id) {
-                Some(pages) => {
-                    if pages.is_empty() {
-                        return Ok(0);
-                    }
-                    pages.drain().collect()
-                }
-                None => return Ok(0),
-            }
-        };
+        let dirty = dirty_tracker.drain_for_table(table_id);
+        if dirty.is_empty() {
+            return Ok(0);
+        }
 
         let db_size = storage.page_count();
         let mut frames_written = 0;
@@ -349,9 +341,7 @@ impl<'a> Storage for WalStoragePerTable<'a> {
     }
 
     fn page_mut(&mut self, page_no: u32) -> Result<&mut [u8]> {
-        let mut guard = self.dirty_pages.lock();
-        guard.entry(self.table_id).or_default().insert(page_no);
-        drop(guard);
+        self.dirty_tracker.mark_dirty(self.table_id, page_no);
         self.storage.page_mut(page_no)
     }
 

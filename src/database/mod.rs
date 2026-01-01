@@ -90,6 +90,7 @@
 
 #[allow(clippy::module_inception)]
 mod database;
+pub mod dirty_tracker;
 pub mod prepared;
 pub mod row;
 

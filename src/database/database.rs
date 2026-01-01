@@ -1,3 +1,4 @@
+use crate::database::dirty_tracker::ShardedDirtyTracker;
 use crate::database::row::Row;
 use crate::database::{CheckpointInfo, ExecuteResult, RecoveryInfo};
 use crate::mvcc::{TransactionManager, TxnId, TxnState, WriteEntry};
@@ -33,10 +34,10 @@ use std::path::{Path, PathBuf};
 /// # Arguments
 /// * `$wal_enabled` - boolean indicating if WAL mode is active
 macro_rules! with_btree_storage {
-    ($wal_enabled:expr, $storage:expr, $dirty_pages:expr, $table_id:expr, $root_page:expr, $btree_ops:expr) => {{
+    ($wal_enabled:expr, $storage:expr, $dirty_tracker:expr, $table_id:expr, $root_page:expr, $btree_ops:expr) => {{
         use crate::btree::BTree;
         if $wal_enabled {
-            let mut wal_storage = WalStoragePerTable::new($storage, $dirty_pages, $table_id);
+            let mut wal_storage = WalStoragePerTable::new($storage, $dirty_tracker, $table_id);
             let mut btree_mut = BTree::new(&mut wal_storage, $root_page)?;
             $btree_ops(&mut btree_mut)?;
         } else {
@@ -153,7 +154,7 @@ pub struct Database {
     next_index_id: std::sync::atomic::AtomicU64,
     closed: std::sync::atomic::AtomicBool,
     wal_enabled: std::sync::atomic::AtomicBool,
-    dirty_pages: Mutex<hashbrown::HashMap<u32, HashSet<u32>>>,
+    dirty_tracker: ShardedDirtyTracker,
     txn_manager: TransactionManager,
     active_txn: Mutex<Option<ActiveTransaction>>,
     /// Session setting: whether foreign key constraints are checked (default: true)
@@ -219,7 +220,7 @@ impl Database {
             next_index_id: AtomicU64::new(next_index_id),
             closed: AtomicBool::new(false),
             wal_enabled: AtomicBool::new(false),
-            dirty_pages: Mutex::new(hashbrown::HashMap::new()),
+            dirty_tracker: ShardedDirtyTracker::new(),
             txn_manager: TransactionManager::new(),
             active_txn: Mutex::new(None),
             foreign_keys_enabled: AtomicBool::new(true),
@@ -275,7 +276,7 @@ impl Database {
             next_index_id: AtomicU64::new(1),
             closed: AtomicBool::new(false),
             wal_enabled: AtomicBool::new(false),
-            dirty_pages: Mutex::new(hashbrown::HashMap::new()),
+            dirty_tracker: ShardedDirtyTracker::new(),
             txn_manager: TransactionManager::new(),
             active_txn: Mutex::new(None),
             foreign_keys_enabled: AtomicBool::new(true),
@@ -456,11 +457,8 @@ impl Database {
             return Ok(0);
         }
 
-        {
-            let dirty = self.dirty_pages.lock();
-            if dirty.get(&table_id).map(|s| s.is_empty()).unwrap_or(true) {
-                return Ok(0);
-            }
+        if !self.dirty_tracker.has_dirty_pages(table_id) {
+            return Ok(0);
         }
 
         let table_storage = file_manager.table_data(schema_name, table_name)?;
@@ -469,7 +467,7 @@ impl Database {
             eyre::eyre!("WAL is enabled but not initialized - this is a bug")
         })?;
         let frames_written =
-            WalStoragePerTable::flush_wal_for_table(&self.dirty_pages, table_storage, wal, table_id)
+            WalStoragePerTable::flush_wal_for_table(&self.dirty_tracker, table_storage, wal, table_id)
                 .wrap_err("failed to flush WAL")?;
         Ok(frames_written as usize)
     }
@@ -2992,7 +2990,7 @@ impl Database {
 
             if wal_enabled {
                 let mut wal_storage =
-                    WalStoragePerTable::new(table_storage, &self.dirty_pages, table_id as u32);
+                    WalStoragePerTable::new(table_storage, &self.dirty_tracker, table_id as u32);
                 let mut btree = BTree::with_rightmost_hint(&mut wal_storage, root_page, rightmost_hint)?;
                 btree.insert(&row_key, &record_data)?;
                 rightmost_hint = btree.rightmost_hint();
@@ -3478,7 +3476,7 @@ impl Database {
 
         let storage = file_manager.table_data_mut(schema_name, table_name)?;
 
-        with_btree_storage!(wal_enabled, storage, &self.dirty_pages, table_id as u32, root_page, |btree_mut: &mut crate::btree::BTree<_>| {
+        with_btree_storage!(wal_enabled, storage, &self.dirty_tracker, table_id as u32, root_page, |btree_mut: &mut crate::btree::BTree<_>| {
             for (key, updated_values) in &processed_rows {
                 btree_mut.delete(key)?;
                 let record_data = OwnedValue::build_record_from_values(updated_values, &schema)?;
@@ -3807,7 +3805,7 @@ impl Database {
 
         let storage = file_manager.table_data_mut(schema_name, table_name)?;
 
-        with_btree_storage!(wal_enabled, storage, &self.dirty_pages, table_id as u32, root_page, |btree_mut: &mut crate::btree::BTree<_>| {
+        with_btree_storage!(wal_enabled, storage, &self.dirty_tracker, table_id as u32, root_page, |btree_mut: &mut crate::btree::BTree<_>| {
             for (key, _old_value, updated_values) in &rows_to_update {
                 btree_mut.delete(key)?;
                 let record_data = OwnedValue::build_record_from_values(updated_values, schema)?;
@@ -4247,7 +4245,7 @@ impl Database {
 
         let storage = file_manager.table_data_mut(schema_name, table_name)?;
 
-        with_btree_storage!(wal_enabled, storage, &self.dirty_pages, table_id as u32, root_page, |btree_mut: &mut crate::btree::BTree<_>| {
+        with_btree_storage!(wal_enabled, storage, &self.dirty_tracker, table_id as u32, root_page, |btree_mut: &mut crate::btree::BTree<_>| {
             for (key, _old_value, _row_values) in &rows_to_delete {
                 btree_mut.delete(key)?;
             }
@@ -4898,7 +4896,7 @@ impl Database {
                         )
                     })?;
 
-                WalStoragePerTable::flush_wal_for_table(&self.dirty_pages, storage, wal, table_id)
+                WalStoragePerTable::flush_wal_for_table(&self.dirty_tracker, storage, wal, table_id)
                     .wrap_err_with(|| {
                         format!(
                             "failed to flush WAL for table {}.{} on commit",
@@ -5514,16 +5512,13 @@ impl Database {
             bail!("database is closed");
         }
 
-        let table_ids: Vec<u32> = {
-            let dirty = self.dirty_pages.lock();
-            if dirty.is_empty() {
-                return Ok(CheckpointInfo {
-                    frames_checkpointed: 0,
-                    wal_truncated: false,
-                });
-            }
-            dirty.keys().copied().collect()
-        };
+        if self.dirty_tracker.is_empty() {
+            return Ok(CheckpointInfo {
+                frames_checkpointed: 0,
+                wal_truncated: false,
+            });
+        }
+        let table_ids = self.dirty_tracker.all_dirty_table_ids();
 
         self.ensure_file_manager()?;
 
@@ -5531,7 +5526,7 @@ impl Database {
         let wal = match wal_guard.as_mut() {
             Some(w) => w,
             None => {
-                self.dirty_pages.lock().clear();
+                self.dirty_tracker.clear_all();
                 return Ok(CheckpointInfo {
                     frames_checkpointed: 0,
                     wal_truncated: false,
@@ -5543,7 +5538,7 @@ impl Database {
         let file_manager = match file_manager_guard.as_mut() {
             Some(fm) => fm,
             None => {
-                self.dirty_pages.lock().clear();
+                self.dirty_tracker.clear_all();
                 return Ok(CheckpointInfo {
                     frames_checkpointed: 0,
                     wal_truncated: false,
@@ -5567,7 +5562,7 @@ impl Database {
         for (table_id, schema_name, table_name) in table_infos {
             if let Ok(storage) = file_manager.table_data(&schema_name, &table_name) {
                 let frames =
-                    WalStoragePerTable::flush_wal_for_table(&self.dirty_pages, storage, wal, table_id)
+                    WalStoragePerTable::flush_wal_for_table(&self.dirty_tracker, storage, wal, table_id)
                         .wrap_err_with(|| {
                             format!(
                                 "failed to flush dirty pages for table {}.{}",
@@ -5653,7 +5648,7 @@ impl Database {
 
         let (new_hint, new_root) = if wal_enabled {
             let mut wal_storage =
-                WalStoragePerTable::new(toast_storage, &self.dirty_pages, toast_table_id);
+                WalStoragePerTable::new(toast_storage, &self.dirty_tracker, toast_table_id);
             let mut btree = BTree::with_rightmost_hint(&mut wal_storage, root_page, hint)?;
             for (seq, chunk) in data.chunks(TOAST_CHUNK_SIZE).enumerate() {
                 let chunk_key = make_chunk_key(chunk_id, seq as u32);
