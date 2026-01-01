@@ -363,6 +363,7 @@ pub enum PhysicalOperator<'a> {
     TableScan(PhysicalTableScan<'a>),
     DualScan,
     IndexScan(PhysicalIndexScan<'a>),
+    SecondaryIndexScan(PhysicalSecondaryIndexScan<'a>),
     FilterExec(PhysicalFilterExec<'a>),
     ProjectExec(PhysicalProjectExec<'a>),
     NestedLoopJoin(PhysicalNestedLoopJoin<'a>),
@@ -414,6 +415,16 @@ pub struct PhysicalIndexScan<'a> {
     pub key_range: ScanRange<'a>,
     pub residual_filter: Option<&'a Expr<'a>>,
     pub is_covering: bool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct PhysicalSecondaryIndexScan<'a> {
+    pub schema: Option<&'a str>,
+    pub table: &'a str,
+    pub index_name: &'a str,
+    pub table_def: Option<&'a TableDef>,
+    pub reverse: bool,
+    pub is_unique_index: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1612,6 +1623,24 @@ impl<'a> Planner<'a> {
                     columns: columns.into_bump_slice(),
                 })
             }
+            PhysicalOperator::SecondaryIndexScan(scan) => {
+                let table_def = scan.table_def.ok_or_else(|| {
+                    eyre::eyre!("SecondaryIndexScan missing table_def for {}", scan.table)
+                })?;
+                let mut columns = bumpalo::collections::Vec::new_in(self.arena);
+
+                for col in table_def.columns() {
+                    columns.push(OutputColumn {
+                        name: self.arena.alloc_str(col.name()),
+                        data_type: col.data_type(),
+                        nullable: col.is_nullable(),
+                    });
+                }
+
+                Ok(OutputSchema {
+                    columns: columns.into_bump_slice(),
+                })
+            }
             PhysicalOperator::FilterExec(filter) => self.compute_output_schema(filter.input),
             PhysicalOperator::LimitExec(limit) => self.compute_output_schema(limit.input),
             PhysicalOperator::SortExec(sort) => self.compute_output_schema(sort.input),
@@ -2261,37 +2290,84 @@ impl<'a> Planner<'a> {
         let scan = find_scan(sort.input)?;
         let table_def = self.catalog.resolve_table(scan.table).ok()?;
 
-        let pk_col = table_def.columns().iter().find(|c| {
-            c.has_constraint(&crate::schema::table::Constraint::PrimaryKey)
-        })?;
-
-        if !pk_col.name().eq_ignore_ascii_case(col_name) {
-            return None;
-        }
-
         let reverse = !sort_key.ascending;
 
-        let table_scan = self.arena.alloc(PhysicalOperator::TableScan(PhysicalTableScan {
-            schema: scan.schema,
-            table: scan.table,
-            alias: scan.alias,
-            post_scan_filter: None,
-            table_def: Some(table_def),
-            reverse,
-        }));
+        let pk_col = table_def.columns().iter().find(|c| {
+            c.has_constraint(&crate::schema::table::Constraint::PrimaryKey)
+        });
 
-        match sort.input {
-            LogicalOperator::Scan(_) => Some(table_scan),
-            LogicalOperator::Project(proj) => {
-                let physical_proj = self.arena.alloc(PhysicalOperator::ProjectExec(PhysicalProjectExec {
-                    input: table_scan,
-                    expressions: proj.expressions,
-                    aliases: proj.aliases,
-                }));
-                Some(physical_proj)
+        if let Some(pk) = pk_col {
+            if pk.name().eq_ignore_ascii_case(col_name) {
+                let table_scan =
+                    self.arena
+                        .alloc(PhysicalOperator::TableScan(PhysicalTableScan {
+                            schema: scan.schema,
+                            table: scan.table,
+                            alias: scan.alias,
+                            post_scan_filter: None,
+                            table_def: Some(table_def),
+                            reverse,
+                        }));
+
+                return match sort.input {
+                    LogicalOperator::Scan(_) => Some(table_scan),
+                    LogicalOperator::Project(proj) => {
+                        let physical_proj =
+                            self.arena
+                                .alloc(PhysicalOperator::ProjectExec(PhysicalProjectExec {
+                                    input: table_scan,
+                                    expressions: proj.expressions,
+                                    aliases: proj.aliases,
+                                }));
+                        Some(physical_proj)
+                    }
+                    _ => None,
+                };
             }
-            _ => None,
         }
+
+        let matching_index = table_def.indexes().iter().find(|idx| {
+            if idx.has_expressions() || idx.is_partial() {
+                return false;
+            }
+            let cols = idx.columns();
+            cols.first()
+                .map(|first_col| first_col.eq_ignore_ascii_case(col_name))
+                .unwrap_or(false)
+        });
+
+        if let Some(idx) = matching_index {
+            let index_name = self.arena.alloc_str(idx.name());
+            let table_def_alloc = self.arena.alloc(table_def.clone());
+
+            let index_scan = self.arena.alloc(PhysicalOperator::SecondaryIndexScan(
+                PhysicalSecondaryIndexScan {
+                    schema: scan.schema,
+                    table: scan.table,
+                    index_name,
+                    table_def: Some(table_def_alloc),
+                    reverse,
+                    is_unique_index: idx.is_unique(),
+                },
+            ));
+
+            return match sort.input {
+                LogicalOperator::Scan(_) => Some(index_scan),
+                LogicalOperator::Project(proj) => {
+                    let physical_proj =
+                        self.arena
+                            .alloc(PhysicalOperator::ProjectExec(PhysicalProjectExec {
+                                input: index_scan,
+                                expressions: proj.expressions,
+                                aliases: proj.aliases,
+                            }));
+                    Some(physical_proj)
+                }
+                _ => None,
+            };
+        }
+
+        None
     }
 
     #[allow(dead_code)]

@@ -1876,6 +1876,290 @@ mod tests {
     }
 
     #[test]
+    fn test_create_index_populates_from_existing_data() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("test_db");
+
+        let db = Database::create(&db_path).unwrap();
+
+        db.execute("CREATE TABLE products (id INT PRIMARY KEY, category TEXT, price INT)")
+            .unwrap();
+
+        db.execute("INSERT INTO products VALUES (1, 'electronics', 100)")
+            .unwrap();
+        db.execute("INSERT INTO products VALUES (2, 'clothing', 50)")
+            .unwrap();
+        db.execute("INSERT INTO products VALUES (3, 'electronics', 200)")
+            .unwrap();
+        db.execute("INSERT INTO products VALUES (4, 'food', 25)")
+            .unwrap();
+        db.execute("INSERT INTO products VALUES (5, 'electronics', 150)")
+            .unwrap();
+
+        db.execute("CREATE INDEX idx_category ON products (category)")
+            .unwrap();
+
+        let rows = db
+            .query("SELECT id FROM products WHERE category = 'electronics' ORDER BY id")
+            .unwrap();
+
+        assert_eq!(rows.len(), 3, "Should find 3 electronics products");
+        let ids: Vec<i64> = rows
+            .iter()
+            .filter_map(|r| match &r.values[0] {
+                OwnedValue::Int(i) => Some(*i),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(ids, vec![1, 3, 5], "Should find products 1, 3, 5");
+    }
+
+    #[test]
+    fn test_create_index_on_empty_table() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("test_db");
+
+        let db = Database::create(&db_path).unwrap();
+
+        db.execute("CREATE TABLE empty_table (id INT, name TEXT)")
+            .unwrap();
+
+        let result = db.execute("CREATE INDEX idx_name ON empty_table (name)");
+        assert!(result.is_ok(), "CREATE INDEX on empty table should succeed");
+
+        db.execute("INSERT INTO empty_table VALUES (1, 'alice')")
+            .unwrap();
+
+        let rows = db
+            .query("SELECT id FROM empty_table WHERE name = 'alice'")
+            .unwrap();
+
+        assert_eq!(rows.len(), 1);
+    }
+
+    #[test]
+    fn test_create_composite_index_populates_from_existing_data() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("test_db");
+
+        let db = Database::create(&db_path).unwrap();
+
+        db.execute("CREATE TABLE orders (id INT PRIMARY KEY, customer_id INT, status TEXT, amount INT)")
+            .unwrap();
+
+        db.execute("INSERT INTO orders VALUES (1, 100, 'pending', 50)")
+            .unwrap();
+        db.execute("INSERT INTO orders VALUES (2, 100, 'shipped', 75)")
+            .unwrap();
+        db.execute("INSERT INTO orders VALUES (3, 200, 'pending', 100)")
+            .unwrap();
+        db.execute("INSERT INTO orders VALUES (4, 100, 'pending', 25)")
+            .unwrap();
+
+        db.execute("CREATE INDEX idx_customer_status ON orders (customer_id, status)")
+            .unwrap();
+
+        let rows = db
+            .query("SELECT id FROM orders WHERE customer_id = 100 AND status = 'pending' ORDER BY id")
+            .unwrap();
+
+        assert_eq!(rows.len(), 2, "Should find 2 pending orders for customer 100");
+        let ids: Vec<i64> = rows
+            .iter()
+            .filter_map(|r| match &r.values[0] {
+                OwnedValue::Int(i) => Some(*i),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(ids, vec![1, 4], "Should find orders 1 and 4");
+    }
+
+    #[test]
+    fn test_order_by_secondary_index_desc() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("test_db");
+
+        let db = Database::create(&db_path).unwrap();
+
+        db.execute("CREATE TABLE items (id INT PRIMARY KEY, score INT, name TEXT)")
+            .unwrap();
+
+        db.execute("INSERT INTO items VALUES (1, 50, 'apple')")
+            .unwrap();
+        db.execute("INSERT INTO items VALUES (2, 30, 'banana')")
+            .unwrap();
+        db.execute("INSERT INTO items VALUES (3, 70, 'cherry')")
+            .unwrap();
+        db.execute("INSERT INTO items VALUES (4, 20, 'date')")
+            .unwrap();
+        db.execute("INSERT INTO items VALUES (5, 90, 'elderberry')")
+            .unwrap();
+
+        db.execute("CREATE INDEX idx_score ON items (score)")
+            .unwrap();
+
+        let rows = db
+            .query("SELECT id, score FROM items ORDER BY score DESC LIMIT 3")
+            .unwrap();
+
+        assert_eq!(rows.len(), 3);
+        let ids: Vec<i64> = rows
+            .iter()
+            .filter_map(|r| match &r.values[0] {
+                OwnedValue::Int(i) => Some(*i),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(ids, vec![5, 3, 1], "Should return top 3 by score DESC");
+    }
+
+    #[test]
+    fn test_order_by_secondary_index_asc() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("test_db");
+
+        let db = Database::create(&db_path).unwrap();
+
+        db.execute("CREATE TABLE items (id INT PRIMARY KEY, score INT, name TEXT)")
+            .unwrap();
+
+        db.execute("INSERT INTO items VALUES (1, 50, 'apple')")
+            .unwrap();
+        db.execute("INSERT INTO items VALUES (2, 30, 'banana')")
+            .unwrap();
+        db.execute("INSERT INTO items VALUES (3, 70, 'cherry')")
+            .unwrap();
+        db.execute("INSERT INTO items VALUES (4, 20, 'date')")
+            .unwrap();
+        db.execute("INSERT INTO items VALUES (5, 90, 'elderberry')")
+            .unwrap();
+
+        db.execute("CREATE INDEX idx_score ON items (score)")
+            .unwrap();
+
+        let rows = db
+            .query("SELECT id, score FROM items ORDER BY score ASC LIMIT 3")
+            .unwrap();
+
+        assert_eq!(rows.len(), 3);
+        let ids: Vec<i64> = rows
+            .iter()
+            .filter_map(|r| match &r.values[0] {
+                OwnedValue::Int(i) => Some(*i),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(ids, vec![4, 2, 1], "Should return bottom 3 by score ASC");
+    }
+
+    #[test]
+    fn test_order_by_text_secondary_index() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("test_db");
+
+        let db = Database::create(&db_path).unwrap();
+
+        db.execute("CREATE TABLE products (id INT PRIMARY KEY, category TEXT, price INT)")
+            .unwrap();
+
+        db.execute("INSERT INTO products VALUES (1, 'electronics', 100)")
+            .unwrap();
+        db.execute("INSERT INTO products VALUES (2, 'books', 20)")
+            .unwrap();
+        db.execute("INSERT INTO products VALUES (3, 'clothing', 50)")
+            .unwrap();
+        db.execute("INSERT INTO products VALUES (4, 'appliances', 200)")
+            .unwrap();
+
+        db.execute("CREATE INDEX idx_category ON products (category)")
+            .unwrap();
+
+        let rows = db
+            .query("SELECT id, category FROM products ORDER BY category ASC")
+            .unwrap();
+
+        assert_eq!(rows.len(), 4);
+
+        fn get_text(val: &OwnedValue) -> Option<&str> {
+            match val {
+                OwnedValue::Text(s) => Some(s.as_str()),
+                _ => None,
+            }
+        }
+
+        let categories: Vec<&str> = rows
+            .iter()
+            .filter_map(|r| get_text(&r.values[1]))
+            .collect();
+        assert_eq!(
+            categories,
+            vec!["appliances", "books", "clothing", "electronics"]
+        );
+    }
+
+    #[test]
+    fn test_join_with_limit() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("test_db");
+
+        let db = Database::create(&db_path).unwrap();
+
+        db.execute("CREATE TABLE orders (id INT PRIMARY KEY, customer_id INT)")
+            .unwrap();
+        db.execute("CREATE TABLE customers (id INT PRIMARY KEY, name TEXT)")
+            .unwrap();
+
+        db.execute("INSERT INTO customers VALUES (1, 'Alice')")
+            .unwrap();
+        db.execute("INSERT INTO customers VALUES (2, 'Bob')")
+            .unwrap();
+
+        db.execute("INSERT INTO orders VALUES (101, 1)").unwrap();
+        db.execute("INSERT INTO orders VALUES (102, 1)").unwrap();
+        db.execute("INSERT INTO orders VALUES (103, 2)").unwrap();
+        db.execute("INSERT INTO orders VALUES (104, 1)").unwrap();
+        db.execute("INSERT INTO orders VALUES (105, 2)").unwrap();
+
+        let rows = db
+            .query("SELECT o.id, c.name FROM orders o JOIN customers c ON o.customer_id = c.id LIMIT 2")
+            .unwrap();
+
+        assert_eq!(rows.len(), 2, "JOIN with LIMIT 2 should return exactly 2 rows");
+    }
+
+    #[test]
+    fn test_left_join_with_limit() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("test_db");
+
+        let db = Database::create(&db_path).unwrap();
+
+        db.execute("CREATE TABLE tasks (id INT PRIMARY KEY, name TEXT)")
+            .unwrap();
+        db.execute("CREATE TABLE submissions (id INT PRIMARY KEY, task_id INT)")
+            .unwrap();
+
+        db.execute("INSERT INTO tasks VALUES (1, 'task1')").unwrap();
+        db.execute("INSERT INTO tasks VALUES (2, 'task2')").unwrap();
+        db.execute("INSERT INTO tasks VALUES (3, 'task3')").unwrap();
+
+        db.execute("INSERT INTO submissions VALUES (100, 1)")
+            .unwrap();
+        db.execute("INSERT INTO submissions VALUES (101, 1)")
+            .unwrap();
+
+        let rows = db
+            .query("SELECT t.id, s.id FROM tasks t LEFT JOIN submissions s ON s.task_id = t.id LIMIT 1")
+            .unwrap();
+
+        assert_eq!(
+            rows.len(),
+            1,
+            "LEFT JOIN with LIMIT 1 should return exactly 1 row"
+        );
+    }
+
+    #[test]
     fn test_begin_transaction() {
         let dir = tempdir().unwrap();
         let db_path = dir.path().join("test_db");

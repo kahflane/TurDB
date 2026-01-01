@@ -259,6 +259,41 @@ impl<'a> BTreeReader<'a> {
             }
         }
     }
+
+    pub fn get(&self, key: &[u8]) -> Result<Option<&'a [u8]>> {
+        use crate::btree::leaf::SearchResult;
+
+        let mut current_page = self.root_page;
+
+        loop {
+            let page_data = self.storage.page(current_page)?;
+            let header = PageHeader::from_bytes(page_data)?;
+
+            match header.page_type() {
+                PageType::BTreeLeaf => {
+                    let leaf = LeafNode::from_page(page_data)?;
+                    match leaf.find_key(key) {
+                        SearchResult::Found(idx) => {
+                            return Ok(Some(leaf.value_at(idx)?));
+                        }
+                        SearchResult::NotFound(_) => {
+                            return Ok(None);
+                        }
+                    }
+                }
+                PageType::BTreeInterior => {
+                    let interior = InteriorNode::from_page(page_data)?;
+                    let (child_page, _) = interior.find_child(key)?;
+                    current_page = child_page;
+                }
+                _ => bail!(
+                    "unexpected page type {:?} during get at page {}",
+                    header.page_type(),
+                    current_page
+                ),
+            }
+        }
+    }
 }
 
 impl<'a, S: Storage> BTree<'a, S> {

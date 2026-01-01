@@ -604,6 +604,7 @@ impl Database {
         enum PlanSource<'a> {
             TableScan(&'a crate::sql::planner::PhysicalTableScan<'a>),
             IndexScan(&'a crate::sql::planner::PhysicalIndexScan<'a>),
+            SecondaryIndexScan(&'a crate::sql::planner::PhysicalSecondaryIndexScan<'a>),
             Subquery(&'a crate::sql::planner::PhysicalSubqueryExec<'a>),
             NestedLoopJoin(&'a crate::sql::planner::PhysicalNestedLoopJoin<'a>),
             GraceHashJoin(&'a crate::sql::planner::PhysicalGraceHashJoin<'a>),
@@ -619,6 +620,9 @@ impl Database {
                 PhysicalOperator::TableScan(scan) => Some(PlanSource::TableScan(scan)),
                 PhysicalOperator::DualScan => Some(PlanSource::DualScan),
                 PhysicalOperator::IndexScan(scan) => Some(PlanSource::IndexScan(scan)),
+                PhysicalOperator::SecondaryIndexScan(scan) => {
+                    Some(PlanSource::SecondaryIndexScan(scan))
+                }
                 PhysicalOperator::SubqueryExec(subq) => Some(PlanSource::Subquery(subq)),
                 PhysicalOperator::NestedLoopJoin(join) => Some(PlanSource::NestedLoopJoin(join)),
                 PhysicalOperator::GraceHashJoin(join) => Some(PlanSource::GraceHashJoin(join)),
@@ -702,6 +706,19 @@ impl Database {
                 PhysicalOperator::SortExec(sort) => has_window(sort.input),
                 PhysicalOperator::FilterExec(filter) => has_window(filter.input),
                 _ => false,
+            }
+        }
+
+        fn find_limit<'a>(
+            op: &'a crate::sql::planner::PhysicalOperator<'a>,
+        ) -> Option<(Option<u64>, Option<u64>)> {
+            use crate::sql::planner::PhysicalOperator;
+            match op {
+                PhysicalOperator::LimitExec(limit) => Some((limit.limit, limit.offset)),
+                PhysicalOperator::ProjectExec(project) => find_limit(project.input),
+                PhysicalOperator::FilterExec(filter) => find_limit(filter.input),
+                PhysicalOperator::SortExec(sort) => find_limit(sort.input),
+                _ => None,
             }
         }
 
@@ -1064,6 +1081,153 @@ impl Database {
                 executor.close()?;
                 rows
             }
+            Some(PlanSource::SecondaryIndexScan(scan)) => {
+                use crate::btree::BTreeReader;
+                use crate::records::RecordView;
+
+                let schema_name = scan.schema.unwrap_or("root");
+                let table_name = scan.table;
+                let index_name = scan.index_name;
+
+                toast_table_info = Some((schema_name.to_string(), table_name.to_string()));
+
+                let table_def = scan.table_def.ok_or_else(|| {
+                    eyre::eyre!("SecondaryIndexScan missing table_def for {}", table_name)
+                })?;
+
+                let columns = table_def.columns();
+                let schema = create_record_schema(columns);
+
+                let row_id_suffix_len = if scan.is_unique_index { 0 } else { 8 };
+
+                let row_keys: Vec<[u8; 8]> = {
+                    let index_storage = file_manager
+                        .index_data(schema_name, table_name, index_name)
+                        .wrap_err_with(|| {
+                            format!(
+                                "failed to open index storage for {}.{}.{}",
+                                schema_name, table_name, index_name
+                            )
+                        })?;
+
+                    let root_page = 1u32;
+                    let index_reader = BTreeReader::new(index_storage, root_page)?;
+
+                    let mut keys = Vec::new();
+
+                    if scan.reverse {
+                        let mut cursor = index_reader.cursor_last()?;
+                        if cursor.valid() {
+                            loop {
+                                let index_key = cursor.key()?;
+                                let row_id_bytes = if scan.is_unique_index {
+                                    cursor.value()?
+                                } else {
+                                    &index_key[index_key.len().saturating_sub(row_id_suffix_len)..]
+                                };
+
+                                if row_id_bytes.len() == 8 {
+                                    let row_key: [u8; 8] = row_id_bytes.try_into().unwrap();
+                                    keys.push(row_key);
+                                }
+
+                                if !cursor.prev()? {
+                                    break;
+                                }
+                            }
+                        }
+                    } else {
+                        let mut cursor = index_reader.cursor_first()?;
+                        if cursor.valid() {
+                            loop {
+                                let index_key = cursor.key()?;
+                                let row_id_bytes = if scan.is_unique_index {
+                                    cursor.value()?
+                                } else {
+                                    &index_key[index_key.len().saturating_sub(row_id_suffix_len)..]
+                                };
+
+                                if row_id_bytes.len() == 8 {
+                                    let row_key: [u8; 8] = row_id_bytes.try_into().unwrap();
+                                    keys.push(row_key);
+                                }
+
+                                if !cursor.advance()? {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    keys
+                };
+
+                let mut materialized_rows: Vec<Vec<OwnedValue>> = Vec::with_capacity(row_keys.len());
+
+                {
+                    let table_storage = file_manager
+                        .table_data(schema_name, table_name)
+                        .wrap_err_with(|| {
+                            format!(
+                                "failed to open table storage for {}.{}",
+                                schema_name, table_name
+                            )
+                        })?;
+
+                    let root_page = 1u32;
+                    let table_reader = BTreeReader::new(table_storage, root_page)?;
+
+                    for row_key in &row_keys {
+                        if let Some(row_data) = table_reader.get(row_key)? {
+                            let record = RecordView::new(row_data, &schema)?;
+                            let row_values =
+                                OwnedValue::extract_row_from_record(&record, columns)?;
+                            materialized_rows.push(row_values);
+                        }
+                    }
+                }
+
+                let materialized_source = MaterializedRowSource::new(materialized_rows);
+
+                let ctx = ExecutionContext::new(&arena);
+                let builder = ExecutorBuilder::new(&ctx);
+
+                let all_columns_map: Vec<(String, usize)> = table_def
+                    .columns()
+                    .iter()
+                    .enumerate()
+                    .map(|(idx, col)| (col.name().to_lowercase(), idx))
+                    .collect();
+
+                let mut executor = builder
+                    .build_with_source_and_column_map(
+                        &physical_plan,
+                        materialized_source,
+                        &all_columns_map,
+                    )
+                    .wrap_err("failed to build executor for secondary index scan")?;
+
+                let output_columns = physical_plan.output_schema.columns;
+
+                let mut rows = Vec::new();
+                executor.open()?;
+                while let Some(row) = executor.next()? {
+                    let owned: Vec<OwnedValue> = row
+                        .values
+                        .iter()
+                        .enumerate()
+                        .map(|(idx, val)| {
+                            let col_type = output_columns
+                                .get(idx)
+                                .map(|c| c.data_type)
+                                .unwrap_or(DataType::Int8);
+                            convert_value_with_type(val, col_type)
+                        })
+                        .collect();
+                    rows.push(Row::new(owned));
+                }
+                executor.close()?;
+                rows
+            }
             Some(PlanSource::Subquery(subq)) => {
                 let inner_rows = execute_subquery_recursive(subq, catalog, file_manager)?;
 
@@ -1255,8 +1419,14 @@ impl Database {
                     }
                 }).collect();
 
+                let limit_info = find_limit(physical_plan.root);
+                let offset = limit_info.and_then(|(_, o)| o).unwrap_or(0) as usize;
+                let limit = limit_info.and_then(|(l, _)| l).map(|l| l as usize);
+
                 let mut result_rows: Vec<Row> = Vec::new();
-                for left_row in &left_rows {
+                let mut skipped = 0usize;
+
+                'outer: for left_row in &left_rows {
                     let mut matched = false;
                     for right_row in &right_rows {
                         let mut combined: Vec<OwnedValue> = left_row.clone();
@@ -1276,6 +1446,12 @@ impl Database {
 
                         if should_include {
                             matched = true;
+
+                            if skipped < offset {
+                                skipped += 1;
+                                continue;
+                            }
+
                             let output_columns = physical_plan.output_schema.columns;
                             let owned: Vec<OwnedValue> = output_columns.iter().map(|col| {
                                 let col_name = col.name.to_lowercase();
@@ -1287,9 +1463,20 @@ impl Database {
                                 convert_value_with_type(&val.to_value(), col.data_type)
                             }).collect();
                             result_rows.push(Row::new(owned));
+
+                            if let Some(lim) = limit {
+                                if result_rows.len() >= lim {
+                                    break 'outer;
+                                }
+                            }
                         }
                     }
                     if !matched && matches!(join_type, crate::sql::ast::JoinType::Left | crate::sql::ast::JoinType::Full) {
+                        if skipped < offset {
+                            skipped += 1;
+                            continue;
+                        }
+
                         let mut combined: Vec<OwnedValue> = left_row.clone();
                         combined.extend(std::iter::repeat_n(OwnedValue::Null, right_col_count));
                         let output_columns = physical_plan.output_schema.columns;
@@ -1303,6 +1490,12 @@ impl Database {
                             convert_value_with_type(&val.to_value(), col.data_type)
                         }).collect();
                         result_rows.push(Row::new(owned));
+
+                        if let Some(lim) = limit {
+                            if result_rows.len() >= lim {
+                                break 'outer;
+                            }
+                        }
                     }
                 }
                 result_rows
@@ -2111,6 +2304,8 @@ impl Database {
         create: &crate::sql::ast::CreateIndexStmt<'_>,
         _arena: &Bump,
     ) -> Result<ExecuteResult> {
+        use crate::btree::BTree;
+        use crate::records::RecordView;
         use crate::schema::IndexColumnDef;
         use crate::sql::ast::Expr;
 
@@ -2134,9 +2329,11 @@ impl Database {
             .collect();
         let key_column_count = column_defs.len() as u32;
 
+        let has_expressions = column_defs.iter().any(|cd| cd.is_expression());
+
         let mut index_def = crate::schema::table::IndexDef::new_expression(
             index_name.to_string(),
-            column_defs,
+            column_defs.clone(),
             create.unique,
             crate::schema::table::IndexType::BTree,
         );
@@ -2148,11 +2345,28 @@ impl Database {
         let mut catalog_guard = self.catalog.write();
         let catalog = catalog_guard.as_mut().unwrap();
 
-        if let Some(schema) = catalog.get_schema_mut(schema_name) {
-            if let Some(table) = schema.get_table(table_name) {
+        let table_def = catalog.resolve_table(table_name)?;
+        let columns = table_def.columns().to_vec();
+        let schema = create_record_schema(&columns);
+
+        let index_col_indices: Vec<usize> = column_defs
+            .iter()
+            .filter_map(|cd| {
+                cd.as_column().and_then(|col_name| {
+                    columns
+                        .iter()
+                        .position(|c| c.name().eq_ignore_ascii_case(col_name))
+                })
+            })
+            .collect();
+
+        let can_populate = !has_expressions && index_col_indices.len() == column_defs.len();
+
+        if let Some(schema_obj) = catalog.get_schema_mut(schema_name) {
+            if let Some(table) = schema_obj.get_table(table_name) {
                 let table_with_index = table.clone().with_index(index_def);
-                schema.remove_table(table_name);
-                schema.add_table(table_with_index);
+                schema_obj.remove_table(table_name);
+                schema_obj.add_table(table_with_index);
             }
         }
 
@@ -2176,7 +2390,71 @@ impl Database {
 
         let index_storage = file_manager.index_data_mut(schema_name, table_name, index_name)?;
         index_storage.grow(2)?;
-        crate::btree::BTree::create(index_storage, 1)?;
+        BTree::create(index_storage, 1)?;
+
+        if can_populate {
+            let root_page = 1u32;
+
+            let index_entries: Vec<(SmallVec<[u8; 64]>, u64)> = {
+                let table_storage = file_manager.table_data_mut(schema_name, table_name)?;
+                let table_btree = BTree::new(table_storage, root_page)?;
+                let mut cursor = table_btree.cursor_first()?;
+
+                let mut entries = Vec::new();
+                let mut key_buf: SmallVec<[u8; 64]> = SmallVec::new();
+
+                if cursor.valid() {
+                    loop {
+                        let row_key = cursor.key()?;
+                        let row_data = cursor.value()?;
+
+                        let row_id = u64::from_be_bytes(
+                            row_key
+                                .try_into()
+                                .wrap_err("Invalid row key length in table")?,
+                        );
+
+                        let record = RecordView::new(row_data, &schema)?;
+
+                        key_buf.clear();
+                        let mut all_non_null = true;
+                        for &col_idx in &index_col_indices {
+                            let col_def = &columns[col_idx];
+                            let value = OwnedValue::from_record_column(
+                                &record,
+                                col_idx,
+                                col_def.data_type(),
+                            )?;
+                            if value.is_null() {
+                                all_non_null = false;
+                                break;
+                            }
+                            Self::encode_value_as_key(&value, &mut key_buf);
+                        }
+
+                        if all_non_null {
+                            entries.push((key_buf.clone(), row_id));
+                        }
+
+                        if !cursor.advance()? {
+                            break;
+                        }
+                    }
+                }
+                entries
+            };
+
+            for (mut key_buf, row_id) in index_entries {
+                let row_id_bytes = row_id.to_be_bytes();
+                if !create.unique {
+                    key_buf.extend_from_slice(&row_id_bytes);
+                }
+                let index_storage =
+                    file_manager.index_data_mut(schema_name, table_name, index_name)?;
+                let mut index_btree = BTree::new(index_storage, root_page)?;
+                index_btree.insert(&key_buf, &row_id_bytes)?;
+            }
+        }
 
         self.save_catalog()?;
         self.save_meta()?;

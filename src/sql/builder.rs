@@ -232,6 +232,9 @@ impl<'a> ExecutorBuilder<'a> {
             PhysicalOperator::IndexScan(_) => Ok(DynamicExecutor::TableScan(
                 TableScanExecutor::new(source, self.ctx.arena),
             )),
+            PhysicalOperator::SecondaryIndexScan(_) => Ok(DynamicExecutor::TableScan(
+                TableScanExecutor::new(source, self.ctx.arena),
+            )),
             PhysicalOperator::HashAggregate(agg) => {
                 let child = self.build_operator(agg.input, source, column_map)?;
                 let group_by_indices: Vec<usize> = agg
@@ -682,6 +685,18 @@ impl<'a> ExecutorBuilder<'a> {
                 result
             }
             PhysicalOperator::SetOpExec(_) => Vec::new(),
+            PhysicalOperator::SecondaryIndexScan(scan) => {
+                if let Some(table_def) = scan.table_def {
+                    table_def
+                        .columns()
+                        .iter()
+                        .enumerate()
+                        .map(|(idx, col)| (col.name().to_lowercase(), idx))
+                        .collect()
+                } else {
+                    Vec::new()
+                }
+            }
         }
     }
 }
