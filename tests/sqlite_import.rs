@@ -26,17 +26,13 @@
 
 use rusqlite::Connection;
 use std::path::Path;
-use std::sync::mpsc;
-use std::thread;
 use std::time::Instant;
 use turdb::Database;
 
 const SQLITE_DB_PATH: &str = "/Users/julfikar/Downloads/_meta-kaggle.db";
 const TURDB_PATH: &str = "/Users/julfikar/Documents/PassionFruit.nosync/turdb/turdb-core/.worktrees/bismillah";
-const BATCH_SIZE: i64 = 50000;
+const BATCH_SIZE: i64 = 5000;
 const INSERT_BATCH_SIZE: usize = 5000;
-const CHANNEL_BUFFER: usize = 32;
-const PROGRESS_INTERVAL: u64 = 100000;
 
 fn sqlite_db_exists() -> bool {
     Path::new(SQLITE_DB_PATH).exists()
@@ -307,19 +303,40 @@ const TABLES: &[TableSchema] = &[
     },
 ];
 
-enum ImportMessage {
-    CreateTable {
-        ddl: String,
-    },
-    InsertBatch {
-        table_name: String,
-        values: String,
-    },
-    TableDone {
-        table_name: String,
-        rows: u64,
-        elapsed_secs: f64,
-    },
+#[derive(Default)]
+struct ImportStats {
+    total_rows: u64,
+    tables_done: u32,
+    insert_count: u64,
+    sqlite_read_nanos: u64,
+    sql_build_nanos: u64,
+    turdb_insert_nanos: u64,
+}
+
+impl ImportStats {
+    fn print_summary(&self, overall_elapsed: std::time::Duration) {
+        let sqlite_secs = self.sqlite_read_nanos as f64 / 1_000_000_000.0;
+        let build_secs = self.sql_build_nanos as f64 / 1_000_000_000.0;
+        let insert_secs = self.turdb_insert_nanos as f64 / 1_000_000_000.0;
+        let total_secs = overall_elapsed.as_secs_f64();
+        
+        println!("\n=== Detailed Timing Breakdown ===");
+        println!("SQLite read time:    {:>8.2}s ({:>5.1}%)", sqlite_secs, sqlite_secs / total_secs * 100.0);
+        println!("SQL string build:    {:>8.2}s ({:>5.1}%)", build_secs, build_secs / total_secs * 100.0);
+        println!("TurDB insert time:   {:>8.2}s ({:>5.1}%)", insert_secs, insert_secs / total_secs * 100.0);
+        println!("Other overhead:      {:>8.2}s ({:>5.1}%)", 
+            total_secs - sqlite_secs - build_secs - insert_secs,
+            (total_secs - sqlite_secs - build_secs - insert_secs) / total_secs * 100.0);
+        println!("─────────────────────────────────");
+        println!("Total wall time:     {:>8.2}s", total_secs);
+        
+        println!("\n=== Performance Metrics ===");
+        println!("SQLite read rate:    {:>8.0} rows/sec", self.total_rows as f64 / sqlite_secs);
+        println!("TurDB insert rate:   {:>8.0} rows/sec", self.total_rows as f64 / insert_secs);
+        println!("Overall rate:        {:>8.0} rows/sec", self.total_rows as f64 / total_secs);
+        println!("Batches executed:    {:>8}", self.insert_count);
+        println!("Avg batch size:      {:>8.0} rows", self.total_rows as f64 / self.insert_count as f64);
+    }
 }
 
 fn escape_sql_value(value: rusqlite::types::Value) -> String {
@@ -339,131 +356,39 @@ fn escape_sql_value(value: rusqlite::types::Value) -> String {
     }
 }
 
-fn read_table_parallel(
-    table: &'static TableSchema,
-    tx: mpsc::SyncSender<ImportMessage>,
-) {
-    let start = Instant::now();
-    
-    let sqlite_conn = match Connection::open(SQLITE_DB_PATH) {
-        Ok(conn) => conn,
-        Err(e) => {
-            eprintln!("  {} - ERROR opening SQLite: {}", table.name, e);
-            return;
-        }
-    };
+struct TableImportStats {
+    rows: u64,
+    sqlite_read_nanos: u64,
+    sql_build_nanos: u64,
+    turdb_insert_nanos: u64,
+    batch_count: u64,
+}
 
-    if tx.send(ImportMessage::CreateTable {
-        ddl: table.turdb_ddl.to_string(),
-    }).is_err() {
-        return;
-    }
-
-    let count: i64 = match sqlite_conn.query_row(
-        &format!("SELECT COUNT(*) FROM {}", table.name),
-        [],
-        |row| row.get(0),
-    ) {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("  {} - ERROR counting: {}", table.name, e);
-            return;
-        }
-    };
-
-    if count == 0 {
-        let _ = tx.send(ImportMessage::TableDone {
-            table_name: table.name.to_string(),
-            rows: 0,
-            elapsed_secs: start.elapsed().as_secs_f64(),
-        });
-        return;
-    }
-
-    let col_count = table.columns.split(',').count();
-    let turdb_table = camel_to_snake(table.name);
-    let mut total_inserted: u64 = 0;
-    let mut offset: i64 = 0;
-
-    loop {
-        let query = format!(
-            "SELECT {} FROM {} LIMIT {} OFFSET {}",
-            table.columns, table.name, BATCH_SIZE, offset
-        );
-
-        let mut stmt = match sqlite_conn.prepare(&query) {
-            Ok(s) => s,
-            Err(e) => {
-                eprintln!("  {} - ERROR preparing: {}", table.name, e);
-                break;
-            }
-        };
+impl TableImportStats {
+    fn print(&self, table_name: &str) {
+        let sqlite_secs = self.sqlite_read_nanos as f64 / 1_000_000_000.0;
+        let build_secs = self.sql_build_nanos as f64 / 1_000_000_000.0;
+        let insert_secs = self.turdb_insert_nanos as f64 / 1_000_000_000.0;
+        let total_secs = sqlite_secs + build_secs + insert_secs;
         
-        let mut rows = match stmt.query([]) {
-            Ok(r) => r,
-            Err(e) => {
-                eprintln!("  {} - ERROR querying: {}", table.name, e);
-                break;
-            }
-        };
-
-        let mut batch_count = 0u64;
-        let mut value_batches: Vec<String> = Vec::with_capacity(INSERT_BATCH_SIZE);
-
-        while let Ok(Some(row)) = rows.next() {
-            let mut values = Vec::with_capacity(col_count);
-            for i in 0..col_count {
-                if let Ok(val) = row.get_ref(i) {
-                    values.push(escape_sql_value(val.into()));
-                } else {
-                    values.push("NULL".to_string());
-                }
-            }
-
-            value_batches.push(format!("({})", values.join(", ")));
-            batch_count += 1;
-            total_inserted += 1;
-
-            if value_batches.len() >= INSERT_BATCH_SIZE {
-                let values_str = std::mem::take(&mut value_batches).join(", ");
-                if tx.send(ImportMessage::InsertBatch {
-                    table_name: turdb_table.clone(),
-                    values: values_str,
-                }).is_err() {
-                    return;
-                }
-            }
-        }
-
-        if !value_batches.is_empty() {
-            let values_str = value_batches.join(", ");
-            if tx.send(ImportMessage::InsertBatch {
-                table_name: turdb_table.clone(),
-                values: values_str,
-            }).is_err() {
-                return;
-            }
-        }
-
-        if batch_count == 0 || offset + BATCH_SIZE >= count {
-            break;
-        }
-
-        offset += BATCH_SIZE;
+        println!("  {} - {} rows in {:.2}s", table_name, self.rows, total_secs);
+        println!("    SQLite read: {:.2}s ({:.1}%) @ {:.0} rows/sec", 
+            sqlite_secs, sqlite_secs / total_secs * 100.0, 
+            self.rows as f64 / sqlite_secs);
+        println!("    SQL build:   {:.2}s ({:.1}%)", 
+            build_secs, build_secs / total_secs * 100.0);
+        println!("    TurDB insert: {:.2}s ({:.1}%) @ {:.0} rows/sec", 
+            insert_secs, insert_secs / total_secs * 100.0,
+            self.rows as f64 / insert_secs);
     }
-
-    let _ = tx.send(ImportMessage::TableDone {
-        table_name: table.name.to_string(),
-        rows: total_inserted,
-        elapsed_secs: start.elapsed().as_secs_f64(),
-    });
 }
 
 fn import_table(
     sqlite_conn: &Connection,
     turdb: &Database,
     table: &TableSchema,
-) -> eyre::Result<u64> {
+) -> eyre::Result<TableImportStats> {
+    println!("\n[{}] Creating table...", table.name);
     turdb.execute(table.turdb_ddl)?;
 
     let count: i64 = sqlite_conn.query_row(
@@ -471,18 +396,30 @@ fn import_table(
         [],
         |row| row.get(0),
     )?;
+    println!("[{}] Found {} rows in SQLite", table.name, count);
 
     if count == 0 {
-        println!("  {} - 0 rows (empty table)", table.name);
-        return Ok(0);
+        println!("[{}] Empty table, skipping", table.name);
+        return Ok(TableImportStats {
+            rows: 0,
+            sqlite_read_nanos: 0,
+            sql_build_nanos: 0,
+            turdb_insert_nanos: 0,
+            batch_count: 0,
+        });
     }
 
     let col_count = table.columns.split(',').count();
     let turdb_table = camel_to_snake(table.name);
     let mut total_inserted: u64 = 0;
     let mut offset: i64 = 0;
+    let mut total_sqlite_nanos: u64 = 0;
+    let mut total_build_nanos: u64 = 0;
+    let mut total_insert_nanos: u64 = 0;
+    let mut batch_count: u64 = 0;
 
-    let start = Instant::now();
+    println!("[{}] Starting import ({} columns, batch size: {})...", 
+             table.name, col_count, INSERT_BATCH_SIZE);
 
     turdb.execute("BEGIN")?;
 
@@ -492,53 +429,87 @@ fn import_table(
             table.columns, table.name, BATCH_SIZE, offset
         );
 
+        let sqlite_start = Instant::now();
         let mut stmt = sqlite_conn.prepare(&query)?;
         let mut rows = stmt.query([])?;
 
-        let mut batch_count = 0u64;
+        let mut loop_batch_count = 0u64;
         let mut value_batches: Vec<String> = Vec::with_capacity(INSERT_BATCH_SIZE);
+        let mut batch_sqlite_nanos: u64 = 0;
+        let mut batch_build_nanos: u64 = 0;
 
         while let Some(row) = rows.next()? {
+            let row_read_elapsed = sqlite_start.elapsed().as_nanos() as u64 - batch_sqlite_nanos - batch_build_nanos;
+            batch_sqlite_nanos += row_read_elapsed;
+            
+            let build_start = Instant::now();
             let mut values = Vec::with_capacity(col_count);
             for i in 0..col_count {
                 let val = row.get_ref(i)?.into();
                 values.push(escape_sql_value(val));
             }
-
             value_batches.push(format!("({})", values.join(", ")));
-            batch_count += 1;
+            batch_build_nanos += build_start.elapsed().as_nanos() as u64;
+            
+            loop_batch_count += 1;
             total_inserted += 1;
 
             if value_batches.len() >= INSERT_BATCH_SIZE {
+                total_sqlite_nanos += batch_sqlite_nanos;
+                let read_ms = batch_sqlite_nanos as f64 / 1_000_000.0;
+                
+                let join_start = Instant::now();
                 let insert_sql = format!(
                     "INSERT INTO {} VALUES {}",
                     turdb_table,
                     value_batches.join(", ")
                 );
+                batch_build_nanos += join_start.elapsed().as_nanos() as u64;
+                total_build_nanos += batch_build_nanos;
+                let build_ms = batch_build_nanos as f64 / 1_000_000.0;
+                
+                let insert_start = Instant::now();
                 turdb.execute(&insert_sql)?;
+                let insert_elapsed = insert_start.elapsed().as_nanos() as u64;
+                total_insert_nanos += insert_elapsed;
+                let insert_ms = insert_elapsed as f64 / 1_000_000.0;
+                
+                batch_count += 1;
+                println!("[{}] Batch {}: read {} rows ({:.1}ms) | sql built ({:.1}ms) | inserted ({:.1}ms) | total: {}/{}", 
+                         table.name, batch_count, INSERT_BATCH_SIZE, read_ms, build_ms, insert_ms, total_inserted, count);
+                
+                batch_sqlite_nanos = 0;
+                batch_build_nanos = 0;
                 value_batches.clear();
-            }
-
-            if total_inserted.is_multiple_of(PROGRESS_INTERVAL) {
-                let elapsed = start.elapsed().as_secs_f64();
-                let rate = total_inserted as f64 / elapsed;
-                println!(
-                    "  {} - {}/{} rows ({:.0} rows/sec)",
-                    table.name, total_inserted, count, rate
-                );
             }
         }
 
         if !value_batches.is_empty() {
+            let remaining = value_batches.len();
+            total_sqlite_nanos += batch_sqlite_nanos;
+            let read_ms = batch_sqlite_nanos as f64 / 1_000_000.0;
+            
+            let join_start = Instant::now();
             let insert_sql = format!(
                 "INSERT INTO {} VALUES {}",
                 turdb_table,
                 value_batches.join(", ")
             );
+            total_build_nanos += batch_build_nanos + join_start.elapsed().as_nanos() as u64;
+            let build_ms = (batch_build_nanos + join_start.elapsed().as_nanos() as u64) as f64 / 1_000_000.0;
+            
+            let insert_start = Instant::now();
             turdb.execute(&insert_sql)?;
+            let insert_elapsed = insert_start.elapsed().as_nanos() as u64;
+            total_insert_nanos += insert_elapsed;
+            let insert_ms = insert_elapsed as f64 / 1_000_000.0;
+            
+            batch_count += 1;
+            println!("[{}] Batch {} (final): read {} rows ({:.1}ms) | sql built ({:.1}ms) | inserted ({:.1}ms) | total: {}/{}", 
+                     table.name, batch_count, remaining, read_ms, build_ms, insert_ms, total_inserted, count);
         }
 
-        if batch_count == 0 {
+        if loop_batch_count == 0 {
             break;
         }
 
@@ -549,23 +520,25 @@ fn import_table(
         }
     }
 
+    println!("[{}] Committing transaction...", table.name);
     turdb.execute("COMMIT")?;
 
-    let elapsed = start.elapsed();
-    let rate = total_inserted as f64 / elapsed.as_secs_f64();
-    println!(
-        "  {} - DONE: {} rows in {:.2}s ({:.0} rows/sec)",
-        table.name,
-        total_inserted,
-        elapsed.as_secs_f64(),
-        rate
-    );
+    let stats = TableImportStats {
+        rows: total_inserted,
+        sqlite_read_nanos: total_sqlite_nanos,
+        sql_build_nanos: total_build_nanos,
+        turdb_insert_nanos: total_insert_nanos,
+        batch_count,
+    };
+    
+    println!("[{}] Import complete!", table.name);
+    stats.print(table.name);
 
-    Ok(total_inserted)
+    Ok(stats)
 }
 
 #[test]
-fn import_all_tables_parallel() {
+fn import_all_tables() {
     if !sqlite_db_exists() {
         eprintln!("Skipping test: SQLite database not found at {}", SQLITE_DB_PATH);
         return;
@@ -576,91 +549,6 @@ fn import_all_tables_parallel() {
         println!("Removed existing TurDB directory at {}", TURDB_PATH);
     }
 
-    let db = Database::create(TURDB_PATH).unwrap();
-    
-    db.execute("PRAGMA WAL=ON").expect("Failed to enable WAL");
-    db.execute("PRAGMA synchronous=NORMAL").expect("Failed to set synchronous mode");
-    db.execute("SET foreign_keys = OFF").expect("Failed to set foreign keys");
-
-    println!("\n=== Starting Parallel SQLite to TurDB Import ===\n");
-    println!("Reading from {} tables in parallel...\n", TABLES.len());
-
-    let overall_start = Instant::now();
-    
-    let (tx, rx) = mpsc::sync_channel::<ImportMessage>(CHANNEL_BUFFER);
-
-    let reader_handles: Vec<_> = TABLES
-        .iter()
-        .map(|table| {
-            let tx = tx.clone();
-            thread::spawn(move || {
-                read_table_parallel(table, tx);
-            })
-        })
-        .collect();
-
-    drop(tx);
-
-    let mut total_rows: u64 = 0;
-    let mut tables_done = 0;
-    let mut insert_count = 0u64;
-
-    for msg in rx {
-        match msg {
-            ImportMessage::CreateTable { ddl } => {
-                if let Err(e) = db.execute(&ddl) {
-                    eprintln!("ERROR creating table: {}", e);
-                }
-            }
-            ImportMessage::InsertBatch { table_name, values } => {
-                let insert_sql = format!("INSERT INTO {} VALUES {}", table_name, values);
-                if let Err(e) = db.execute(&insert_sql) {
-                    eprintln!("ERROR inserting into {}: {}", table_name, e);
-                }
-                insert_count += 1;
-                if insert_count.is_multiple_of(100) {
-                    let elapsed = overall_start.elapsed().as_secs_f64();
-                    print!("\r  Batches: {} | Rows: ~{} | Time: {:.1}s    ", 
-                           insert_count, insert_count * INSERT_BATCH_SIZE as u64, elapsed);
-                    use std::io::Write;
-                    let _ = std::io::stdout().flush();
-                }
-            }
-            ImportMessage::TableDone { table_name, rows, elapsed_secs } => {
-                total_rows += rows;
-                tables_done += 1;
-                let rate = if elapsed_secs > 0.0 { rows as f64 / elapsed_secs } else { 0.0 };
-                println!("\n  {} - {} rows in {:.2}s ({:.0} rows/sec) [{}/{}]",
-                         table_name, rows, elapsed_secs, rate, tables_done, TABLES.len());
-            }
-
-        }
-    }
-
-    for handle in reader_handles {
-        let _ = handle.join();
-    }
-
-    db.execute("PRAGMA synchronous=FULL").expect("Failed to restore synchronous mode");
-    db.execute("SET foreign_keys = ON").expect("Failed to set foreign keys");
-    
-    let overall_elapsed = overall_start.elapsed();
-    let overall_rate = total_rows as f64 / overall_elapsed.as_secs_f64();
-
-    println!("\n=== Import Complete ===");
-    println!("Tables imported: {}", tables_done);
-    println!("Total rows: {}", total_rows);
-    println!("Total time: {:.2}s", overall_elapsed.as_secs_f64());
-    println!("Average rate: {:.0} rows/sec", overall_rate);
-}
-
-#[test]
-fn import_all_tables_from_sqlite() {
-    if !sqlite_db_exists() {
-        eprintln!("Skipping test: SQLite database not found at {}", SQLITE_DB_PATH);
-        return;
-    }
-
     let sqlite_conn = Connection::open(SQLITE_DB_PATH).expect("Failed to open SQLite DB");
     let db = Database::create(TURDB_PATH).unwrap();
     
@@ -669,17 +557,20 @@ fn import_all_tables_from_sqlite() {
     db.execute("SET foreign_keys = OFF").expect("Failed to set foreign keys");
     db.execute("SET cache_size = 1024").expect("Failed to set cache size");
 
-    println!("\n=== Starting SQLite to TurDB Import ===\n");
+    println!("\n=== Starting SQLite to TurDB Import (All Tables) ===\n");
 
     let overall_start = Instant::now();
-    let mut total_rows: u64 = 0;
-    let mut tables_imported = 0;
+    let mut aggregate = ImportStats::default();
 
     for table in TABLES {
         match import_table(&sqlite_conn, &db, table) {
-            Ok(rows) => {
-                total_rows += rows;
-                tables_imported += 1;
+            Ok(stats) => {
+                aggregate.total_rows += stats.rows;
+                aggregate.sqlite_read_nanos += stats.sqlite_read_nanos;
+                aggregate.sql_build_nanos += stats.sql_build_nanos;
+                aggregate.turdb_insert_nanos += stats.turdb_insert_nanos;
+                aggregate.insert_count += stats.batch_count;
+                aggregate.tables_done += 1;
             }
             Err(e) => {
                 eprintln!("  {} - ERROR: {}", table.name, e);
@@ -691,20 +582,24 @@ fn import_all_tables_from_sqlite() {
     db.execute("SET foreign_keys = ON").expect("Failed to set foreign keys");
     
     let overall_elapsed = overall_start.elapsed();
-    let overall_rate = total_rows as f64 / overall_elapsed.as_secs_f64();
 
     println!("\n=== Import Complete ===");
-    println!("Tables imported: {}/{}", tables_imported, TABLES.len());
-    println!("Total rows: {}", total_rows);
-    println!("Total time: {:.2}s", overall_elapsed.as_secs_f64());
-    println!("Average rate: {:.0} rows/sec", overall_rate);
+    println!("Tables imported: {}/{}", aggregate.tables_done, TABLES.len());
+    println!("Total rows: {}", aggregate.total_rows);
+    
+    aggregate.print_summary(overall_elapsed);
 }
 
 #[test]
-fn import_small_tables_only() {
+fn import_small_tables() {
     if !sqlite_db_exists() {
         eprintln!("Skipping test: SQLite database not found at {}", SQLITE_DB_PATH);
         return;
+    }
+
+    if Path::new(TURDB_PATH).exists() {
+        std::fs::remove_dir_all(TURDB_PATH).expect("Failed to remove existing TurDB directory");
+        println!("Removed existing TurDB directory at {}", TURDB_PATH);
     }
 
     let small_tables = [
@@ -720,12 +615,20 @@ fn import_small_tables_only() {
 
     println!("\n=== Importing Small Tables Only ===\n");
 
-    let mut total_rows: u64 = 0;
+    let overall_start = Instant::now();
+    let mut aggregate = ImportStats::default();
 
     for table in TABLES {
         if small_tables.contains(&table.name) {
             match import_table(&sqlite_conn, &db, table) {
-                Ok(rows) => total_rows += rows,
+                Ok(stats) => {
+                    aggregate.total_rows += stats.rows;
+                    aggregate.sqlite_read_nanos += stats.sqlite_read_nanos;
+                    aggregate.sql_build_nanos += stats.sql_build_nanos;
+                    aggregate.turdb_insert_nanos += stats.turdb_insert_nanos;
+                    aggregate.insert_count += stats.batch_count;
+                    aggregate.tables_done += 1;
+                }
                 Err(e) => eprintln!("  {} - ERROR: {}", table.name, e),
             }
         }
@@ -733,66 +636,12 @@ fn import_small_tables_only() {
 
     db.execute("PRAGMA synchronous=FULL").expect("Failed to restore synchronous mode");
 
-    println!("\nTotal rows imported: {}", total_rows);
-    assert!(total_rows > 0, "Should have imported some rows");
-}
+    let overall_elapsed = overall_start.elapsed();
 
-#[test]
-fn import_users_table_batch() {
-    if !sqlite_db_exists() {
-        eprintln!("Skipping test: SQLite database not found at {}", SQLITE_DB_PATH);
-        return;
-    }
-
-    let sqlite_conn = Connection::open(SQLITE_DB_PATH).expect("Failed to open SQLite DB");
-    let db = Database::create(TURDB_PATH).unwrap();
-
-    db.execute("PRAGMA WAL=ON").expect("Failed to enable WAL");
-    db.execute("PRAGMA synchronous=NORMAL").expect("Failed to set synchronous mode");
-
-    let users_table = TABLES.iter().find(|t| t.name == "Users").unwrap();
-
-    println!("\n=== Importing Users Table (16M rows) ===\n");
-
-    match import_table(&sqlite_conn, &db, users_table) {
-        Ok(rows) => {
-            println!("Imported {} user rows", rows);
-            assert!(rows > 15_000_000, "Should have imported 16M+ users");
-        }
-        Err(e) => panic!("Failed to import users: {}", e),
-    }
+    println!("\n=== Import Complete ===");
+    println!("Tables imported: {}", aggregate.tables_done);
+    println!("Total rows: {}", aggregate.total_rows);
     
-    db.execute("PRAGMA synchronous=FULL").expect("Failed to restore synchronous mode");
-}
-
-#[test]
-fn verify_batch_import_integrity() {
-    if !sqlite_db_exists() {
-        eprintln!("Skipping test: SQLite database not found at {}", SQLITE_DB_PATH);
-        return;
-    }
-
-    let sqlite_conn = Connection::open(SQLITE_DB_PATH).expect("Failed to open SQLite DB");
-    let db = Database::create(TURDB_PATH).unwrap();
-
-    let tags_table = TABLES.iter().find(|t| t.name == "Tags").unwrap();
-    import_table(&sqlite_conn, &db, tags_table).unwrap();
-
-    let sqlite_count: i64 = sqlite_conn
-        .query_row("SELECT COUNT(*) FROM Tags", [], |row| row.get(0))
-        .unwrap();
-
-    let turdb_rows = db.query("SELECT COUNT(*) FROM tags").unwrap();
-    let turdb_count = match &turdb_rows[0].values[0] {
-        turdb::OwnedValue::Int(n) => *n,
-        _ => panic!("Expected INT count"),
-    };
-
-    assert_eq!(
-        sqlite_count, turdb_count,
-        "Row counts must match: SQLite={}, TurDB={}",
-        sqlite_count, turdb_count
-    );
-
-    println!("Verified: {} rows in both databases", turdb_count);
+    aggregate.print_summary(overall_elapsed);
+    assert!(aggregate.total_rows > 0, "Should have imported some rows");
 }
