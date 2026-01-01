@@ -889,7 +889,35 @@ impl Database {
                         _ => None,
                     }
                 }
-                PhysicalOperator::ProjectExec(proj) => is_simple_count_star(proj.input),
+                PhysicalOperator::ProjectExec(proj) => {
+                    fn is_simple_aggregate_projection(
+                        expressions: &[&crate::sql::ast::Expr<'_>],
+                    ) -> bool {
+                        use crate::sql::ast::{Expr, FunctionArgs};
+                        if expressions.len() != 1 {
+                            return false;
+                        }
+                        match expressions[0] {
+                            Expr::Function(func) => {
+                                let name = func.name.name.to_uppercase();
+                                if !matches!(
+                                    name.as_str(),
+                                    "COUNT" | "SUM" | "AVG" | "MIN" | "MAX"
+                                ) {
+                                    return false;
+                                }
+                                matches!(func.args, FunctionArgs::Star | FunctionArgs::None)
+                                    || matches!(&func.args, FunctionArgs::Args(args) if args.len() <= 1)
+                            }
+                            _ => false,
+                        }
+                    }
+                    if is_simple_aggregate_projection(proj.expressions) {
+                        is_simple_count_star(proj.input)
+                    } else {
+                        None
+                    }
+                }
                 _ => None,
             }
         }

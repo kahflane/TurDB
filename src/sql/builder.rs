@@ -214,10 +214,18 @@ impl<'a> ExecutorBuilder<'a> {
                 let sort_keys: Vec<SortKey> = sort
                     .order_by
                     .iter()
-                    .enumerate()
-                    .map(|(idx, key)| SortKey {
-                        column: idx,
-                        ascending: key.ascending,
+                    .filter_map(|key| {
+                        if let crate::sql::ast::Expr::Column(col) = key.expr {
+                            column_map
+                                .iter()
+                                .find(|(n, _)| n.eq_ignore_ascii_case(col.column))
+                                .map(|(_, idx)| SortKey {
+                                    column: *idx,
+                                    ascending: key.ascending,
+                                })
+                        } else {
+                            None
+                        }
                     })
                     .collect();
                 Ok(DynamicExecutor::Sort(SortState {
