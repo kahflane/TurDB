@@ -2567,6 +2567,76 @@ mod returning_clause_tests {
             "Bob's total SHOULD be 30"
         );
     }
+
+    #[test]
+    fn left_join_with_one_to_many_relationship_returns_correct_number_of_rows() {
+        let dir = tempdir().unwrap();
+        let db = Database::create(dir.path().join("test_db")).unwrap();
+
+        db.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)")
+            .unwrap();
+        db.execute("CREATE TABLE orders (id INTEGER PRIMARY KEY, user_id INTEGER, product TEXT)")
+            .unwrap();
+
+        db.execute("INSERT INTO users VALUES (1, 'Alice')").unwrap();
+        db.execute("INSERT INTO users VALUES (2, 'Bob')").unwrap();
+        db.execute("INSERT INTO users VALUES (3, 'Charlie')")
+            .unwrap();
+
+        db.execute("INSERT INTO orders VALUES (10, 1, 'Widget')")
+            .unwrap();
+        db.execute("INSERT INTO orders VALUES (11, 1, 'Gadget')")
+            .unwrap();
+        db.execute("INSERT INTO orders VALUES (12, 2, 'Thing')")
+            .unwrap();
+
+        let rows = db
+            .query("SELECT u.id, u.name, o.product FROM users u LEFT JOIN orders o ON o.user_id = u.id ORDER BY u.id, o.id")
+            .unwrap();
+
+        assert_eq!(
+            rows.len(),
+            4,
+            "LEFT JOIN SHOULD return 4 rows: 2 for Alice (with orders), 1 for Bob (with order), 1 for Charlie (with NULL)"
+        );
+
+        assert_eq!(rows[0].values[0], OwnedValue::Int(1));
+        assert_eq!(
+            rows[0].values[1],
+            OwnedValue::Text("Alice".to_string())
+        );
+        assert_eq!(
+            rows[0].values[2],
+            OwnedValue::Text("Widget".to_string())
+        );
+
+        assert_eq!(rows[1].values[0], OwnedValue::Int(1));
+        assert_eq!(
+            rows[1].values[1],
+            OwnedValue::Text("Alice".to_string())
+        );
+        assert_eq!(
+            rows[1].values[2],
+            OwnedValue::Text("Gadget".to_string())
+        );
+
+        assert_eq!(rows[2].values[0], OwnedValue::Int(2));
+        assert_eq!(
+            rows[2].values[1],
+            OwnedValue::Text("Bob".to_string())
+        );
+        assert_eq!(
+            rows[2].values[2],
+            OwnedValue::Text("Thing".to_string())
+        );
+
+        assert_eq!(rows[3].values[0], OwnedValue::Int(3));
+        assert_eq!(
+            rows[3].values[1],
+            OwnedValue::Text("Charlie".to_string())
+        );
+        assert_eq!(rows[3].values[2], OwnedValue::Null);
+    }
 }
 
 mod update_from_tests {

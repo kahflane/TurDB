@@ -1441,22 +1441,32 @@ impl Database {
                         PhysicalOperator::SortedAggregate(agg) => find_subquery_in_join(agg.input),
                         PhysicalOperator::SortExec(s) => find_subquery_in_join(s.input),
                         PhysicalOperator::LimitExec(l) => find_subquery_in_join(l.input),
+                        PhysicalOperator::WindowExec(w) => find_subquery_in_join(w.input),
                         _ => None,
                     }
                 }
 
-                fn find_table_in_join<'a>(
+                enum JoinScanInfo<'a> {
+                    TableScan(&'a crate::sql::planner::PhysicalTableScan<'a>),
+                    IndexScan(&'a crate::sql::planner::PhysicalIndexScan<'a>),
+                    SecondaryIndexScan(&'a crate::sql::planner::PhysicalSecondaryIndexScan<'a>),
+                }
+
+                fn find_scan_in_join<'a>(
                     op: &'a crate::sql::planner::PhysicalOperator<'a>,
-                ) -> Option<&'a crate::sql::planner::PhysicalTableScan<'a>> {
+                ) -> Option<JoinScanInfo<'a>> {
                     use crate::sql::planner::PhysicalOperator;
                     match op {
-                        PhysicalOperator::TableScan(scan) => Some(scan),
-                        PhysicalOperator::FilterExec(f) => find_table_in_join(f.input),
-                        PhysicalOperator::ProjectExec(p) => find_table_in_join(p.input),
-                        PhysicalOperator::HashAggregate(agg) => find_table_in_join(agg.input),
-                        PhysicalOperator::SortedAggregate(agg) => find_table_in_join(agg.input),
-                        PhysicalOperator::SortExec(s) => find_table_in_join(s.input),
-                        PhysicalOperator::LimitExec(l) => find_table_in_join(l.input),
+                        PhysicalOperator::TableScan(scan) => Some(JoinScanInfo::TableScan(scan)),
+                        PhysicalOperator::IndexScan(scan) => Some(JoinScanInfo::IndexScan(scan)),
+                        PhysicalOperator::SecondaryIndexScan(scan) => Some(JoinScanInfo::SecondaryIndexScan(scan)),
+                        PhysicalOperator::FilterExec(f) => find_scan_in_join(f.input),
+                        PhysicalOperator::ProjectExec(p) => find_scan_in_join(p.input),
+                        PhysicalOperator::HashAggregate(agg) => find_scan_in_join(agg.input),
+                        PhysicalOperator::SortedAggregate(agg) => find_scan_in_join(agg.input),
+                        PhysicalOperator::SortExec(s) => find_scan_in_join(s.input),
+                        PhysicalOperator::LimitExec(l) => find_scan_in_join(l.input),
+                        PhysicalOperator::WindowExec(w) => find_scan_in_join(w.input),
                         _ => None,
                     }
                 }
@@ -1469,18 +1479,28 @@ impl Database {
 
                 let left_subq = find_subquery_in_join(left_op);
                 let right_subq = find_subquery_in_join(right_op);
-                let left_table = find_table_in_join(left_op);
-                let right_table = find_table_in_join(right_op);
+                let left_scan = find_scan_in_join(left_op);
+                let right_scan = find_scan_in_join(right_op);
 
                 let mut left_rows: Vec<Vec<OwnedValue>> = Vec::new();
                 let mut right_rows: Vec<Vec<OwnedValue>> = Vec::new();
                 let mut right_col_count = 0usize;
 
+                let mut left_table_name: Option<&str> = None;
+                let mut left_alias: Option<&str> = None;
+                let mut right_table_name: Option<&str> = None;
+                let mut right_alias: Option<&str> = None;
+
                 if let Some(subq) = left_subq {
                     left_rows = execute_subquery_recursive(subq, catalog, file_manager)?;
-                } else if let Some(scan) = left_table {
-                    let schema_name = scan.schema.unwrap_or("root");
-                    let table_name = scan.table;
+                } else if let Some(scan_info) = &left_scan {
+                    let (schema_name, table_name, alias) = match scan_info {
+                        JoinScanInfo::TableScan(scan) => (scan.schema.unwrap_or("root"), scan.table, scan.alias),
+                        JoinScanInfo::IndexScan(scan) => (scan.schema.unwrap_or("root"), scan.table, None),
+                        JoinScanInfo::SecondaryIndexScan(scan) => (scan.schema.unwrap_or("root"), scan.table, None),
+                    };
+                    left_table_name = Some(table_name);
+                    left_alias = alias;
                     let table_def = catalog.resolve_table(table_name)?;
                     let column_types: Vec<_> = table_def.columns().iter().map(|c| c.data_type()).collect();
                     let storage = file_manager.table_data(schema_name, table_name)?;
@@ -1496,9 +1516,14 @@ impl Database {
                 if let Some(subq) = right_subq {
                     right_rows = execute_subquery_recursive(subq, catalog, file_manager)?;
                     right_col_count = subq.output_schema.columns.len();
-                } else if let Some(scan) = right_table {
-                    let schema_name = scan.schema.unwrap_or("root");
-                    let table_name = scan.table;
+                } else if let Some(scan_info) = &right_scan {
+                    let (schema_name, table_name, alias) = match scan_info {
+                        JoinScanInfo::TableScan(scan) => (scan.schema.unwrap_or("root"), scan.table, scan.alias),
+                        JoinScanInfo::IndexScan(scan) => (scan.schema.unwrap_or("root"), scan.table, None),
+                        JoinScanInfo::SecondaryIndexScan(scan) => (scan.schema.unwrap_or("root"), scan.table, None),
+                    };
+                    right_table_name = Some(table_name);
+                    right_alias = alias;
                     let table_def = catalog.resolve_table(table_name)?;
                     let column_types: Vec<_> = table_def.columns().iter().map(|c| c.data_type()).collect();
                     let storage = file_manager.table_data(schema_name, table_name)?;
@@ -1521,12 +1546,12 @@ impl Database {
                         join_column_map.push((format!("{}.{}", subq.alias, col.name).to_lowercase(), idx));
                         idx += 1;
                     }
-                } else if let Some(scan) = left_table {
-                    let table_def = catalog.resolve_table(scan.table)?;
+                } else if let Some(table_name) = left_table_name {
+                    let table_def = catalog.resolve_table(table_name)?;
                     for col in table_def.columns() {
                         join_column_map.push((col.name().to_lowercase(), idx));
-                        join_column_map.push((format!("{}.{}", scan.table, col.name()).to_lowercase(), idx));
-                        if let Some(alias) = scan.alias {
+                        join_column_map.push((format!("{}.{}", table_name, col.name()).to_lowercase(), idx));
+                        if let Some(alias) = left_alias {
                             join_column_map.push((format!("{}.{}", alias, col.name()).to_lowercase(), idx));
                         }
                         idx += 1;
@@ -1539,12 +1564,12 @@ impl Database {
                         join_column_map.push((format!("{}.{}", subq.alias, col.name).to_lowercase(), idx));
                         idx += 1;
                     }
-                } else if let Some(scan) = right_table {
-                    let table_def = catalog.resolve_table(scan.table)?;
+                } else if let Some(table_name) = right_table_name {
+                    let table_def = catalog.resolve_table(table_name)?;
                     for col in table_def.columns() {
                         join_column_map.push((col.name().to_lowercase(), idx));
-                        join_column_map.push((format!("{}.{}", scan.table, col.name()).to_lowercase(), idx));
-                        if let Some(alias) = scan.alias {
+                        join_column_map.push((format!("{}.{}", table_name, col.name()).to_lowercase(), idx));
+                        if let Some(alias) = right_alias {
                             join_column_map.push((format!("{}.{}", alias, col.name()).to_lowercase(), idx));
                         }
                         idx += 1;
@@ -1584,6 +1609,7 @@ impl Database {
 
                 let mut result_rows: Vec<Row> = Vec::new();
                 let mut skipped = 0usize;
+                let mut seen: std::collections::HashSet<Vec<u64>> = std::collections::HashSet::new();
 
                 'outer: for left_row in &left_rows {
                     let mut matched = false;
@@ -1606,11 +1632,6 @@ impl Database {
                         if should_include {
                             matched = true;
 
-                            if skipped < offset {
-                                skipped += 1;
-                                continue;
-                            }
-
                             let output_columns = physical_plan.output_schema.columns;
                             let owned: Vec<OwnedValue> = output_columns.iter().map(|col| {
                                 let col_name = col.name.to_lowercase();
@@ -1621,6 +1642,27 @@ impl Database {
                                 let val = combined.get(source_idx).cloned().unwrap_or(OwnedValue::Null);
                                 convert_value_with_type(&val.to_value(), col.data_type)
                             }).collect();
+
+                            if is_distinct {
+                                let key: Vec<u64> = owned
+                                    .iter()
+                                    .map(|v| {
+                                        use std::hash::{Hash, Hasher};
+                                        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                                        format!("{:?}", v).hash(&mut hasher);
+                                        hasher.finish()
+                                    })
+                                    .collect();
+                                if !seen.insert(key) {
+                                    continue;
+                                }
+                            }
+
+                            if skipped < offset {
+                                skipped += 1;
+                                continue;
+                            }
+
                             result_rows.push(Row::new(owned));
 
                             if let Some(lim) = limit {
@@ -1631,11 +1673,6 @@ impl Database {
                         }
                     }
                     if !matched && matches!(join_type, crate::sql::ast::JoinType::Left | crate::sql::ast::JoinType::Full) {
-                        if skipped < offset {
-                            skipped += 1;
-                            continue;
-                        }
-
                         let mut combined: Vec<OwnedValue> = left_row.clone();
                         combined.extend(std::iter::repeat_n(OwnedValue::Null, right_col_count));
                         let output_columns = physical_plan.output_schema.columns;
@@ -1648,6 +1685,27 @@ impl Database {
                             let val = combined.get(source_idx).cloned().unwrap_or(OwnedValue::Null);
                             convert_value_with_type(&val.to_value(), col.data_type)
                         }).collect();
+
+                        if is_distinct {
+                            let key: Vec<u64> = owned
+                                .iter()
+                                .map(|v| {
+                                    use std::hash::{Hash, Hasher};
+                                    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                                    format!("{:?}", v).hash(&mut hasher);
+                                    hasher.finish()
+                                })
+                                .collect();
+                            if !seen.insert(key) {
+                                continue;
+                            }
+                        }
+
+                        if skipped < offset {
+                            skipped += 1;
+                            continue;
+                        }
+
                         result_rows.push(Row::new(owned));
 
                         if let Some(lim) = limit {
@@ -1701,8 +1759,13 @@ impl Database {
         };
 
         let rows = if is_distinct {
+            let limit_info = find_limit(physical_plan.root);
+            let offset = limit_info.and_then(|(_, o)| o).unwrap_or(0) as usize;
+            let limit = limit_info.and_then(|(l, _)| l);
+
             let mut seen: std::collections::HashSet<Vec<u64>> = std::collections::HashSet::new();
-            rows.into_iter()
+            let deduplicated: Vec<Row> = rows
+                .into_iter()
                 .filter(|row| {
                     let key: Vec<u64> = row
                         .values
@@ -1716,7 +1779,15 @@ impl Database {
                         .collect();
                     seen.insert(key)
                 })
-                .collect()
+                .collect();
+
+            if let Some(lim) = limit {
+                deduplicated.into_iter().skip(offset).take(lim as usize).collect()
+            } else if offset > 0 {
+                deduplicated.into_iter().skip(offset).collect()
+            } else {
+                deduplicated
+            }
         } else {
             rows
         };
