@@ -1,7 +1,7 @@
 # TurDB
 
 <p align="center">
-  <img src="book/mascot.jpeg" alt="TurDB Mascot" width="200"/>
+  <img src="assets/mascot.jpeg" alt="TurDB Mascot" width="200"/>
 </p>
 
 <p align="center">
