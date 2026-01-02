@@ -109,7 +109,6 @@ pub struct Savepoint {
 
 /// Active transaction state with write log and undo information.
 #[derive(Debug)]
-#[allow(dead_code)]
 pub struct ActiveTransaction {
     pub txn_id: TxnId,
     pub slot_idx: usize,

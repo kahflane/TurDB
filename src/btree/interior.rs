@@ -150,21 +150,6 @@ impl InteriorSlot {
     }
 }
 
-/// Computes the minimal prefix length of `right_min` that is strictly greater than `left_max`.
-///
-/// NOTE: Currently unused. Separator truncation was disabled because it can produce
-/// duplicate separators when two leaf splits have different left_max values that both
-/// allow truncation to the same prefix. Full keys are now used as separators instead.
-#[allow(dead_code)]
-pub fn separator_len(left_max: &[u8], right_min: &[u8]) -> usize {
-    for len in 1..=right_min.len() {
-        if &right_min[..len] > left_max {
-            return len;
-        }
-    }
-    right_min.len()
-}
-
 #[derive(Debug)]
 pub struct InteriorNode<'a> {
     data: &'a [u8],

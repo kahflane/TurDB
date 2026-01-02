@@ -95,7 +95,7 @@ mod leaf;
 mod tree;
 
 pub use interior::{
-    separator_len, InteriorNode, InteriorNodeMut, InteriorSlot, INTERIOR_CONTENT_START,
+    InteriorNode, InteriorNodeMut, InteriorSlot, INTERIOR_CONTENT_START,
     INTERIOR_SLOT_SIZE,
 };
 pub use leaf::{

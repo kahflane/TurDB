@@ -97,7 +97,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 pub const MAX_CONCURRENT_TXNS: usize = 64;
 
-#[allow(dead_code)]
 pub struct TransactionManager {
     pub(crate) global_ts: AtomicU64,
     pub(crate) active_slots: [AtomicU64; MAX_CONCURRENT_TXNS],
