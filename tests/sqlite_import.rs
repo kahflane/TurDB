@@ -47,8 +47,8 @@ fn rusqlite_to_owned(val: &rusqlite::types::Value) -> OwnedValue {
 
 const SQLITE_DB_PATH: &str = "/Users/julfikar/Downloads/_meta-kaggle.db";
 const TURDB_PATH: &str = "/Users/julfikar/Documents/PassionFruit.nosync/turdb/turdb-core/.worktrees/bismillah";
-const BATCH_SIZE: i64 = 55000;
-const INSERT_BATCH_SIZE: usize = 55000;
+const BATCH_SIZE: i64 = 15000;
+const INSERT_BATCH_SIZE: usize = 15000;
 
 fn sqlite_db_exists() -> bool {
     Path::new(SQLITE_DB_PATH).exists()
