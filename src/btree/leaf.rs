@@ -527,6 +527,41 @@ impl<'a> LeafNodeMut<'a> {
         Ok(())
     }
 
+    pub fn insert_at_end(&mut self, key: &[u8], value: &[u8]) -> Result<()> {
+        let value_len_size = varint_len(value.len() as u64);
+        let cell_size = key.len() + value_len_size + value.len();
+        let space_needed = cell_size + SLOT_SIZE;
+
+        ensure!(
+            self.free_space() as usize >= space_needed,
+            "not enough free space: need {}, have {}",
+            space_needed,
+            self.free_space()
+        );
+
+        let cell_count = self.cell_count() as usize;
+        let new_free_end = self.free_end() as usize - cell_size;
+        let mut offset = new_free_end;
+
+        self.data[offset..offset + key.len()].copy_from_slice(key);
+        offset += key.len();
+
+        offset += encode_varint(value.len() as u64, &mut self.data[offset..]);
+
+        self.data[offset..offset + value.len()].copy_from_slice(value);
+
+        let slot = Slot::new(key, new_free_end as u16);
+        let slot_offset = self.slot_offset(cell_count);
+        self.data[slot_offset..slot_offset + SLOT_SIZE].copy_from_slice(slot.as_bytes());
+
+        let header = PageHeader::from_bytes_mut(self.data)?;
+        header.set_cell_count(cell_count as u16 + 1);
+        header.set_free_start(header.free_start() + SLOT_SIZE as u16);
+        header.set_free_end(new_free_end as u16);
+
+        Ok(())
+    }
+
     pub fn delete_cell(&mut self, index: usize) -> Result<()> {
         let cell_count = self.cell_count() as usize;
         ensure!(

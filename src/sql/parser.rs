@@ -1439,6 +1439,84 @@ impl<'a> Parser<'a> {
         Ok(self.arena.alloc_slice_copy(&exprs))
     }
 
+    fn parse_literal_value_list(&mut self) -> Result<&'a [&'a Expr<'a>]> {
+        let mut exprs: Vec<&Expr<'a>> = Vec::new();
+        loop {
+            let expr = match self.peek() {
+                Token::Integer(s) => {
+                    let s = *s;
+                    self.advance();
+                    Expr::Literal(Literal::Integer(s))
+                }
+                Token::Float(s) => {
+                    let s = *s;
+                    self.advance();
+                    Expr::Literal(Literal::Float(s))
+                }
+                Token::String(s) => {
+                    let s = *s;
+                    self.advance();
+                    let unescaped = if s.contains("''") {
+                        self.arena.alloc_str(&s.replace("''", "'"))
+                    } else {
+                        s
+                    };
+                    Expr::Literal(Literal::String(unescaped))
+                }
+                Token::Keyword(Keyword::Null) => {
+                    self.advance();
+                    Expr::Literal(Literal::Null)
+                }
+                Token::Keyword(Keyword::True) => {
+                    self.advance();
+                    Expr::Literal(Literal::Boolean(true))
+                }
+                Token::Keyword(Keyword::False) => {
+                    self.advance();
+                    Expr::Literal(Literal::Boolean(false))
+                }
+                Token::Minus => {
+                    self.advance();
+                    match self.peek() {
+                        Token::Integer(s) => {
+                            let s = *s;
+                            self.advance();
+                            let neg = self.arena.alloc_str(&format!("-{}", s));
+                            Expr::Literal(Literal::Integer(neg))
+                        }
+                        Token::Float(s) => {
+                            let s = *s;
+                            self.advance();
+                            let neg = self.arena.alloc_str(&format!("-{}", s));
+                            Expr::Literal(Literal::Float(neg))
+                        }
+                        _ => {
+                            return self.parse_expr_list_fallback(exprs);
+                        }
+                    }
+                }
+                _ => {
+                    return self.parse_expr_list_fallback(exprs);
+                }
+            };
+            exprs.push(self.arena.alloc(expr));
+            if !self.consume_token(&Token::Comma) {
+                break;
+            }
+        }
+        Ok(self.arena.alloc_slice_copy(&exprs))
+    }
+
+    fn parse_expr_list_fallback(&mut self, mut exprs: Vec<&'a Expr<'a>>) -> Result<&'a [&'a Expr<'a>]> {
+        loop {
+            exprs.push(self.arena.alloc(self.parse_expr(0)?));
+            if !self.consume_token(&Token::Comma) {
+                break;
+            }
+        }
+        Ok(self.arena.alloc_slice_copy(&exprs))
+    }
+
     fn parse_ident_list(&mut self) -> Result<&'a [&'a str]> {
         let mut idents = Vec::new();
         loop {
@@ -1477,7 +1555,7 @@ impl<'a> Parser<'a> {
             let mut rows = Vec::new();
             loop {
                 self.expect_token(&Token::LParen)?;
-                let exprs = self.parse_expr_list()?;
+                let exprs = self.parse_literal_value_list()?;
                 self.expect_token(&Token::RParen)?;
                 rows.push(exprs);
                 if !self.consume_token(&Token::Comma) {

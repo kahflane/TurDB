@@ -95,5 +95,7 @@ pub mod storage;
 pub mod types;
 pub use database::{
     BoundStatement, CheckpointInfo, Database, ExecuteResult, PreparedStatement, RecoveryInfo, Row,
+    get_timing_stats, reset_timing_stats, get_batch_timing_stats,
 };
+pub use btree::{get_fastpath_stats, reset_fastpath_stats, get_fastpath_fail_stats, get_slowpath_stats};
 pub use types::OwnedValue;

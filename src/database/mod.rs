@@ -95,6 +95,7 @@ pub mod prepared;
 pub mod row;
 
 pub use database::Database;
+pub use database::{get_timing_stats, reset_timing_stats, get_batch_timing_stats};
 pub use prepared::{BoundStatement, PreparedStatement};
 pub use row::Row;
 

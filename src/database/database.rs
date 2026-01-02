@@ -26,6 +26,28 @@ use hashbrown::HashSet;
 use parking_lot::{Mutex, RwLock};
 use smallvec::SmallVec;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+
+static PARSE_TIME_NS: AtomicU64 = AtomicU64::new(0);
+static INSERT_TIME_NS: AtomicU64 = AtomicU64::new(0);
+
+static RECORD_BUILD_NS: AtomicU64 = AtomicU64::new(0);
+static BTREE_INSERT_NS: AtomicU64 = AtomicU64::new(0);
+
+pub fn reset_timing_stats() {
+    PARSE_TIME_NS.store(0, AtomicOrdering::Relaxed);
+    INSERT_TIME_NS.store(0, AtomicOrdering::Relaxed);
+    RECORD_BUILD_NS.store(0, AtomicOrdering::Relaxed);
+    BTREE_INSERT_NS.store(0, AtomicOrdering::Relaxed);
+}
+
+pub fn get_timing_stats() -> (u64, u64) {
+    (PARSE_TIME_NS.load(AtomicOrdering::Relaxed), INSERT_TIME_NS.load(AtomicOrdering::Relaxed))
+}
+
+pub fn get_batch_timing_stats() -> (u64, u64) {
+    (RECORD_BUILD_NS.load(AtomicOrdering::Relaxed), BTREE_INSERT_NS.load(AtomicOrdering::Relaxed))
+}
 
 /// Macro to execute BTree operations with or without WAL tracking.
 /// This eliminates code duplication across UPDATE and DELETE operations where we need
@@ -559,6 +581,117 @@ impl Database {
 
         let param_count = count_parameters(sql);
         Ok(super::PreparedStatement::new(sql.to_string(), param_count))
+    }
+
+    pub fn insert_batch(&self, table: &str, rows: &[Vec<OwnedValue>]) -> Result<usize> {
+        let (schema_name, table_name) = if let Some(dot_pos) = table.find('.') {
+            (&table[..dot_pos], &table[dot_pos + 1..])
+        } else {
+            ("root", table)
+        };
+        self.insert_batch_into_schema(schema_name, table_name, rows)
+    }
+
+    pub fn insert_batch_into_schema(
+        &self,
+        schema_name: &str,
+        table_name: &str,
+        rows: &[Vec<OwnedValue>],
+    ) -> Result<usize> {
+        use crate::btree::BTree;
+        use std::sync::atomic::Ordering;
+
+        if rows.is_empty() {
+            return Ok(0);
+        }
+
+        self.ensure_catalog()?;
+        self.ensure_file_manager()?;
+
+        let wal_enabled = self.wal_enabled.load(Ordering::Acquire);
+        if wal_enabled {
+            self.ensure_wal()?;
+        }
+
+        let catalog_guard = self.catalog.read();
+        let catalog = catalog_guard.as_ref().unwrap();
+
+        let table_def = catalog.resolve_table(table_name)?;
+        let table_id = table_def.id();
+        let columns = table_def.columns().to_vec();
+
+        let schema = create_record_schema(&columns);
+
+        drop(catalog_guard);
+
+        let mut file_manager_guard = self.file_manager.write();
+        let file_manager = file_manager_guard.as_mut().unwrap();
+
+        let (mut root_page, mut rightmost_hint): (u32, Option<u32>) = {
+            let storage = file_manager.table_data_mut(schema_name, table_name)?;
+            let page = storage.page(0)?;
+            let header = TableFileHeader::from_bytes(page)?;
+            let stored_root = header.root_page();
+            let hint = header.rightmost_hint();
+            let root = if stored_root > 0 { stored_root } else { 1 };
+            (root, if hint > 0 { Some(hint) } else { Some(root) })
+        };
+
+        let table_file_key = crate::storage::FileManager::make_table_key(schema_name, table_name);
+        let mut record_builder = crate::records::RecordBuilder::new(&schema);
+        let mut record_buffer = Vec::with_capacity(256);
+
+        let count;
+
+        if wal_enabled {
+            let table_storage = file_manager.table_data_mut_with_key(&table_file_key)
+                .ok_or_else(|| eyre::eyre!("table storage not found in cache"))?;
+            let mut wal_storage =
+                WalStoragePerTable::new(table_storage, &self.dirty_tracker, table_id as u32);
+            let mut btree = BTree::with_rightmost_hint(&mut wal_storage, root_page, rightmost_hint)?;
+
+            for row_values in rows {
+                let row_id = self.next_row_id.fetch_add(1, Ordering::Relaxed);
+                let row_key = Self::generate_row_key(row_id);
+                OwnedValue::build_record_into_buffer(row_values, &mut record_builder, &mut record_buffer)?;
+                btree.insert_append(&row_key, &record_buffer)?;
+            }
+
+            root_page = btree.root_page();
+            rightmost_hint = btree.rightmost_hint();
+            count = rows.len();
+        } else {
+            let table_storage = file_manager.table_data_mut_with_key(&table_file_key)
+                .ok_or_else(|| eyre::eyre!("table storage not found in cache"))?;
+            let mut btree = BTree::with_rightmost_hint(table_storage, root_page, rightmost_hint)?;
+
+            for row_values in rows {
+                let row_id = self.next_row_id.fetch_add(1, Ordering::Relaxed);
+                let row_key = Self::generate_row_key(row_id);
+                OwnedValue::build_record_into_buffer(row_values, &mut record_builder, &mut record_buffer)?;
+                btree.insert_append(&row_key, &record_buffer)?;
+            }
+
+            root_page = btree.root_page();
+            rightmost_hint = btree.rightmost_hint();
+            count = rows.len();
+        }
+
+        {
+            let storage = file_manager.table_data_mut(schema_name, table_name)?;
+            let page = storage.page_mut(0)?;
+            let header = TableFileHeader::from_bytes_mut(page)?;
+            header.set_root_page(root_page);
+            if let Some(hint) = rightmost_hint {
+                header.set_rightmost_hint(hint);
+            }
+            let new_row_count = header.row_count().saturating_add(count as u64);
+            header.set_row_count(new_row_count);
+        }
+
+        self.flush_wal_if_autocommit(file_manager, schema_name, table_name, table_id as u32)?;
+
+        Ok(count)
     }
 
     pub fn query(&self, sql: &str) -> Result<Vec<Row>> {
@@ -1956,18 +2089,25 @@ impl Database {
     }
 
     pub fn execute(&self, sql: &str) -> Result<ExecuteResult> {
+        let parse_start = std::time::Instant::now();
         let arena = Bump::new();
         let mut parser = Parser::new(sql, &arena);
         let stmt = parser
             .parse_statement()
             .wrap_err("failed to parse SQL statement")?;
+        PARSE_TIME_NS.fetch_add(parse_start.elapsed().as_nanos() as u64, AtomicOrdering::Relaxed);
 
         use crate::sql::ast::Statement;
         match stmt {
             Statement::CreateTable(create) => self.execute_create_table(create, &arena),
             Statement::CreateSchema(create) => self.execute_create_schema(create),
             Statement::CreateIndex(create) => self.execute_create_index(create, &arena),
-            Statement::Insert(insert) => self.execute_insert(insert, &arena),
+            Statement::Insert(insert) => {
+                let insert_start = std::time::Instant::now();
+                let result = self.execute_insert(insert, &arena);
+                INSERT_TIME_NS.fetch_add(insert_start.elapsed().as_nanos() as u64, AtomicOrdering::Relaxed);
+                result
+            }
             Statement::Update(update) => self.execute_update(update, &arena),
             Statement::Delete(delete) => self.execute_delete(delete, &arena),
             Statement::Select(_) => {

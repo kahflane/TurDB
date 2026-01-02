@@ -27,7 +27,23 @@
 use rusqlite::Connection;
 use std::path::Path;
 use std::time::Instant;
-use turdb::Database;
+use turdb::{Database, OwnedValue, reset_timing_stats, get_batch_timing_stats, reset_fastpath_stats, get_fastpath_stats, get_fastpath_fail_stats, get_slowpath_stats};
+
+fn rusqlite_to_owned(val: &rusqlite::types::Value) -> OwnedValue {
+    match val {
+        rusqlite::types::Value::Null => OwnedValue::Null,
+        rusqlite::types::Value::Integer(i) => OwnedValue::Int(*i),
+        rusqlite::types::Value::Real(f) => {
+            if f.is_nan() || f.is_infinite() {
+                OwnedValue::Null
+            } else {
+                OwnedValue::Float(*f)
+            }
+        }
+        rusqlite::types::Value::Text(s) => OwnedValue::Text(s.clone()),
+        rusqlite::types::Value::Blob(b) => OwnedValue::Blob(b.clone()),
+    }
+}
 
 const SQLITE_DB_PATH: &str = "/Users/julfikar/Downloads/_meta-kaggle.db";
 const TURDB_PATH: &str = "/Users/julfikar/Documents/PassionFruit.nosync/turdb/turdb-core/.worktrees/bismillah";
@@ -669,7 +685,7 @@ fn benchmark_sqlite_vs_turdb() {
 
     let query = format!(
         "SELECT Id, DatasetId, DatasourceVersionId, CreatorUserId, LicenseName, CreationDate, \
-         VersionNumber, Title, Slug, Subtitle, Description, VersionNotes, \
+         VersionNumber, Title, Slug, Subtitle, \
          TotalCompressedBytes, TotalUncompressedBytes FROM DatasetVersions LIMIT {}",
         ROW_COUNT
     );
@@ -679,7 +695,7 @@ fn benchmark_sqlite_vs_turdb() {
     let mut stmt = source_conn.prepare(&query).expect("Failed to prepare");
     let rows: Vec<Vec<rusqlite::types::Value>> = stmt
         .query_map([], |row| {
-            Ok((0..14).map(|i| row.get_ref(i).unwrap().into()).collect())
+            Ok((0..12).map(|i| row.get_ref(i).unwrap().into()).collect())
         })
         .expect("Failed to query")
         .collect::<Result<Vec<_>, _>>()
@@ -708,8 +724,6 @@ fn benchmark_sqlite_vs_turdb() {
             title TEXT,
             slug TEXT,
             subtitle TEXT,
-            description TEXT,
-            version_notes TEXT,
             total_compressed_bytes REAL,
             total_uncompressed_bytes REAL
         );
@@ -719,7 +733,7 @@ fn benchmark_sqlite_vs_turdb() {
 
     {
         let mut insert_stmt = sqlite_conn.prepare_cached(
-            "INSERT INTO dataset_versions VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+            "INSERT INTO dataset_versions VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
         ).expect("Failed to prepare insert");
 
         sqlite_conn.execute("BEGIN IMMEDIATE", []).expect("BEGIN failed");
@@ -737,7 +751,7 @@ fn benchmark_sqlite_vs_turdb() {
         rows.len() as f64 / sqlite_elapsed.as_secs_f64());
 
     // ========== TURDB BENCHMARK ==========
-    println!("--- TurDB Insert Benchmark ---");
+    println!("--- TurDB Insert Benchmark (batch API) ---");
     let turdb = Database::create(TURDB_TARGET).expect("Failed to create TurDB");
 
     turdb.execute("
@@ -752,43 +766,46 @@ fn benchmark_sqlite_vs_turdb() {
           title VARCHAR(300),
           slug VARCHAR(100),
           subtitle VARCHAR(100),
-          description TEXT,
-          version_notes TEXT,
           total_compressed_bytes FLOAT,
           total_uncompressed_bytes FLOAT
         )
     ").expect("Failed to create TurDB table");
 
-    let avg_row_size = 200;
-    let sql_capacity = BATCH_SIZE * avg_row_size + 100;
-
+    reset_timing_stats();
+    reset_fastpath_stats();
     let turdb_start = Instant::now();
-    let mut sql_build_time = std::time::Duration::ZERO;
-    let mut execute_time = std::time::Duration::ZERO;
+    let mut convert_time = std::time::Duration::ZERO;
+    let mut insert_time = std::time::Duration::ZERO;
 
     for batch in rows.chunks(BATCH_SIZE) {
-        let build_start = Instant::now();
-        let mut sql = String::with_capacity(sql_capacity);
-        sql.push_str("INSERT INTO dataset_versions VALUES ");
-        for (i, row) in batch.iter().enumerate() {
-            if i > 0 { sql.push_str(", "); }
-            sql.push('(');
-            for (j, val) in row.iter().enumerate() {
-                if j > 0 { sql.push_str(", "); }
-                write_sql_value(&mut sql, val);
-            }
-            sql.push(')');
-        }
-        sql_build_time += build_start.elapsed();
+        let convert_start = Instant::now();
+        let owned_rows: Vec<Vec<turdb::OwnedValue>> = batch.iter().map(|row| {
+            row.iter().map(|val| rusqlite_to_owned(val)).collect()
+        }).collect();
+        convert_time += convert_start.elapsed();
 
-        let exec_start = Instant::now();
-        turdb.execute(&sql).expect("TurDB insert failed");
-        execute_time += exec_start.elapsed();
+        let insert_start = Instant::now();
+        turdb.insert_batch("dataset_versions", &owned_rows).expect("TurDB batch insert failed");
+        insert_time += insert_start.elapsed();
     }
 
+    let (record_ns, btree_ns) = get_batch_timing_stats();
+    let record_time = std::time::Duration::from_nanos(record_ns);
+    let btree_time = std::time::Duration::from_nanos(btree_ns);
+    let (fastpath_hits, fastpath_misses) = get_fastpath_stats();
+    let (fail_next_leaf, fail_space) = get_fastpath_fail_stats();
+    let (slowpath_splits, slowpath_no_split) = get_slowpath_stats();
+
     let turdb_elapsed = turdb_start.elapsed();
-    println!("  SQL build: {:.3}s, Execute: {:.3}s",
-        sql_build_time.as_secs_f64(), execute_time.as_secs_f64());
+    println!("  Convert: {:.3}s, Insert: {:.3}s",
+        convert_time.as_secs_f64(), insert_time.as_secs_f64());
+    println!("  -> Record build: {:.3}s, BTree insert: {:.3}s",
+        record_time.as_secs_f64(), btree_time.as_secs_f64());
+    println!("  -> Fastpath: {} hits, {} misses ({:.2}% hit rate)",
+        fastpath_hits, fastpath_misses,
+        100.0 * fastpath_hits as f64 / (fastpath_hits + fastpath_misses) as f64);
+    println!("  -> Fail reasons: next_leaf={}, space={}", fail_next_leaf, fail_space);
+    println!("  -> Slowpath: {} splits, {} no-split", slowpath_splits, slowpath_no_split);
 
     println!("TurDB:  {} rows in {:.3}s = {:.0} rows/sec\n",
         rows.len(), turdb_elapsed.as_secs_f64(),

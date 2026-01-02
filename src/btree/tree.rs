@@ -126,13 +126,44 @@ use bumpalo::collections::Vec as BumpVec;
 use bumpalo::Bump;
 use eyre::{bail, ensure, Result};
 use smallvec::SmallVec;
+use zerocopy::IntoBytes;
 
 use super::interior::{InteriorNode, InteriorNodeMut, INTERIOR_SLOT_SIZE};
-use super::leaf::{LeafNode, LeafNodeMut, SearchResult, LEAF_CONTENT_START, SLOT_SIZE};
-use crate::encoding::varint::varint_len;
+use super::leaf::{LeafNode, LeafNodeMut, SearchResult, Slot, LEAF_CONTENT_START, SLOT_SIZE};
+use crate::encoding::varint::{encode_varint, varint_len};
 use crate::storage::{Freelist, MmapStorage, PageHeader, PageType, Storage, PAGE_SIZE};
 
 pub const MAX_TREE_DEPTH: usize = 8;
+
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+
+static FASTPATH_HITS: AtomicU64 = AtomicU64::new(0);
+static FASTPATH_MISSES: AtomicU64 = AtomicU64::new(0);
+static FASTPATH_FAIL_NEXT_LEAF: AtomicU64 = AtomicU64::new(0);
+static FASTPATH_FAIL_SPACE: AtomicU64 = AtomicU64::new(0);
+static SLOWPATH_SPLITS: AtomicU64 = AtomicU64::new(0);
+static SLOWPATH_NO_SPLIT: AtomicU64 = AtomicU64::new(0);
+
+pub fn get_fastpath_stats() -> (u64, u64) {
+    (FASTPATH_HITS.load(AtomicOrdering::Relaxed), FASTPATH_MISSES.load(AtomicOrdering::Relaxed))
+}
+
+pub fn get_fastpath_fail_stats() -> (u64, u64) {
+    (FASTPATH_FAIL_NEXT_LEAF.load(AtomicOrdering::Relaxed), FASTPATH_FAIL_SPACE.load(AtomicOrdering::Relaxed))
+}
+
+pub fn get_slowpath_stats() -> (u64, u64) {
+    (SLOWPATH_SPLITS.load(AtomicOrdering::Relaxed), SLOWPATH_NO_SPLIT.load(AtomicOrdering::Relaxed))
+}
+
+pub fn reset_fastpath_stats() {
+    FASTPATH_HITS.store(0, AtomicOrdering::Relaxed);
+    FASTPATH_MISSES.store(0, AtomicOrdering::Relaxed);
+    FASTPATH_FAIL_NEXT_LEAF.store(0, AtomicOrdering::Relaxed);
+    FASTPATH_FAIL_SPACE.store(0, AtomicOrdering::Relaxed);
+    SLOWPATH_SPLITS.store(0, AtomicOrdering::Relaxed);
+    SLOWPATH_NO_SPLIT.store(0, AtomicOrdering::Relaxed);
+}
 
 type PathStack = SmallVec<[u32; MAX_TREE_DEPTH]>;
 
@@ -426,6 +457,128 @@ impl<'a, S: Storage> BTree<'a, S> {
         }
     }
 
+    /// Inserts a key-value pair assuming keys are monotonically increasing.
+    /// This is optimized for bulk inserts with sequential keys (e.g., auto-increment IDs).
+    /// SAFETY: Caller must guarantee key > all existing keys. No key comparison is performed.
+    pub fn insert_append(&mut self, key: &[u8], value: &[u8]) -> Result<()> {
+        if let Some(hint_page) = self.rightmost_hint {
+            if let Ok(true) = self.try_append_fastpath(hint_page, key, value) {
+                FASTPATH_HITS.fetch_add(1, AtomicOrdering::Relaxed);
+                return Ok(());
+            }
+        }
+        FASTPATH_MISSES.fetch_add(1, AtomicOrdering::Relaxed);
+
+        let mut path: PathStack = SmallVec::new();
+        let mut current_page = self.root_page;
+
+        loop {
+            let page_data = self.storage.page(current_page)?;
+            let header = PageHeader::from_bytes(page_data)?;
+
+            match header.page_type() {
+                PageType::BTreeLeaf => break,
+                PageType::BTreeInterior => {
+                    let interior = InteriorNode::from_page(page_data)?;
+                    let (child_page, _) = interior.find_child(key)?;
+                    path.push(current_page);
+                    current_page = child_page;
+                }
+                _ => bail!(
+                    "unexpected page type {:?} during insert at page {}",
+                    header.page_type(),
+                    current_page
+                ),
+            }
+        }
+
+        let result = self.insert_into_leaf_append(current_page, key, value)?;
+        self.update_rightmost_hint(current_page);
+
+        if let InsertResult::Split {
+            separator,
+            new_page,
+        } = result
+        {
+            SLOWPATH_SPLITS.fetch_add(1, AtomicOrdering::Relaxed);
+            self.propagate_split(path, &separator, current_page, new_page)?;
+            self.update_rightmost_hint(new_page);
+        } else {
+            SLOWPATH_NO_SPLIT.fetch_add(1, AtomicOrdering::Relaxed);
+        }
+
+        Ok(())
+    }
+
+    #[inline(always)]
+    fn try_append_fastpath(&mut self, hint_page: u32, key: &[u8], value: &[u8]) -> Result<bool> {
+        if hint_page >= self.storage.page_count() {
+            return Ok(false);
+        }
+
+        let page_data = self.storage.page_mut(hint_page)?;
+        
+        if page_data[0] != PageType::BTreeLeaf as u8 {
+            return Ok(false);
+        }
+
+        let next_leaf = u32::from_le_bytes([page_data[12], page_data[13], page_data[14], page_data[15]]);
+        if next_leaf != 0 {
+            FASTPATH_FAIL_NEXT_LEAF.fetch_add(1, AtomicOrdering::Relaxed);
+            return Ok(false);
+        }
+
+        let free_start = u16::from_le_bytes([page_data[4], page_data[5]]) as usize;
+        let free_end = u16::from_le_bytes([page_data[6], page_data[7]]) as usize;
+        let cell_count = u16::from_le_bytes([page_data[2], page_data[3]]) as usize;
+
+        let value_len_size = varint_len(value.len() as u64);
+        let cell_size = key.len() + value_len_size + value.len();
+        let space_needed = cell_size + SLOT_SIZE;
+
+        if free_end - free_start < space_needed {
+            FASTPATH_FAIL_SPACE.fetch_add(1, AtomicOrdering::Relaxed);
+            return Ok(false);
+        }
+
+        let new_free_end = free_end - cell_size;
+        let mut offset = new_free_end;
+
+        page_data[offset..offset + key.len()].copy_from_slice(key);
+        offset += key.len();
+        offset += encode_varint(value.len() as u64, &mut page_data[offset..]);
+        page_data[offset..offset + value.len()].copy_from_slice(value);
+
+        let slot = Slot::new(key, new_free_end as u16);
+        let slot_offset = LEAF_CONTENT_START + cell_count * SLOT_SIZE;
+        page_data[slot_offset..slot_offset + SLOT_SIZE].copy_from_slice(slot.as_bytes());
+
+        let new_cell_count = (cell_count + 1) as u16;
+        let new_free_start = (free_start + SLOT_SIZE) as u16;
+        page_data[2..4].copy_from_slice(&new_cell_count.to_le_bytes());
+        page_data[4..6].copy_from_slice(&new_free_start.to_le_bytes());
+        page_data[6..8].copy_from_slice(&(new_free_end as u16).to_le_bytes());
+
+        Ok(true)
+    }
+
+    /// Insert into leaf assuming key is greater than all existing keys.
+    fn insert_into_leaf_append(&mut self, page_no: u32, key: &[u8], value: &[u8]) -> Result<InsertResult> {
+        let page_data = self.storage.page_mut(page_no)?;
+        let mut leaf = LeafNodeMut::from_page(page_data)?;
+
+        let value_len_size = varint_len(value.len() as u64);
+        let cell_size = key.len() + value_len_size + value.len();
+        let space_needed = cell_size + SLOT_SIZE;
+
+        if leaf.free_space() as usize >= space_needed {
+            leaf.insert_at_end(key, value)?;
+            return Ok(InsertResult::Ok);
+        }
+
+        self.split_leaf(page_no, key, value)
+    }
+
     pub fn insert(&mut self, key: &[u8], value: &[u8]) -> Result<()> {
         // PostgreSQL-style fastpath optimization: try the cached rightmost leaf first.
         // This avoids tree traversal for monotonically increasing keys.
@@ -460,8 +613,6 @@ impl<'a, S: Storage> BTree<'a, S> {
         }
 
         let result = self.insert_into_leaf(current_page, key, value)?;
-
-        // Update rightmost hint after successful insert
         self.update_rightmost_hint(current_page);
 
         if let InsertResult::Split {
@@ -470,22 +621,18 @@ impl<'a, S: Storage> BTree<'a, S> {
         } = result
         {
             self.propagate_split(path, &separator, current_page, new_page)?;
-            // After split, the new page becomes the rightmost
             self.update_rightmost_hint(new_page);
         }
 
         Ok(())
     }
 
-    /// Attempts a fastpath insert into the hinted rightmost leaf page.
-    /// Returns Ok(true) if successful, Ok(false) if fastpath conditions not met.
     fn try_fastpath_insert(&mut self, hint_page: u32, key: &[u8], value: &[u8]) -> Result<bool> {
-        // Verify hint page is valid and is a leaf
         if hint_page >= self.storage.page_count() {
             return Ok(false);
         }
 
-        let page_data = self.storage.page(hint_page)?;
+        let page_data = self.storage.page_mut(hint_page)?;
         let header = PageHeader::from_bytes(page_data)?;
 
         if header.page_type() != PageType::BTreeLeaf {
@@ -494,33 +641,28 @@ impl<'a, S: Storage> BTree<'a, S> {
 
         let leaf = LeafNode::from_page(page_data)?;
 
-        // Check if this is still the rightmost leaf (next_leaf == 0)
         if leaf.next_leaf() != 0 {
             return Ok(false);
         }
 
-        // Check if key is greater than all existing keys (should go at the end)
         let cell_count = leaf.cell_count() as usize;
         if cell_count > 0 {
             let last_key = leaf.key_at(cell_count - 1)?;
             if key <= last_key {
-                return Ok(false); // Key doesn't belong at the end
+                return Ok(false);
             }
         }
 
-        // Check if there's enough space
         let value_len_size = varint_len(value.len() as u64);
         let cell_size = key.len() + value_len_size + value.len();
         let space_needed = cell_size + SLOT_SIZE;
 
         if (leaf.free_space() as usize) < space_needed {
-            return Ok(false); // Not enough space, need split
+            return Ok(false);
         }
 
-        // Fastpath conditions met! Insert directly.
-        let page_data = self.storage.page_mut(hint_page)?;
         let mut leaf = LeafNodeMut::from_page(page_data)?;
-        leaf.insert_cell(key, value)?;
+        leaf.insert_at_end(key, value)?;
 
         Ok(true)
     }
@@ -597,20 +739,13 @@ impl<'a, S: Storage> BTree<'a, S> {
             .collect_in(&arena);
         let page_capacity = PAGE_SIZE - LEAF_CONTENT_START;
 
-        // PostgreSQL-style optimization: use 90/10 split for rightmost leaf.
-        // This optimizes for monotonically increasing keys (e.g., auto-increment, timestamps)
-        // by leaving more space in the new rightmost page for future inserts.
         let is_rightmost = old_next_leaf == 0;
         let mut mid = if is_rightmost {
-            // Target: ~10% in old page, ~90% in new page
-            // But must ensure both pages fit their data
-            (all_keys.len() / 10).max(1)
+            (all_keys.len() * 9 / 10).min(all_keys.len() - 1)
         } else {
-            // Normal 50/50 split for non-rightmost pages
             all_keys.len() / 2
         };
 
-        // Ensure the right page can hold its data by moving split point left if needed
         loop {
             let right_size: usize = cell_sizes[mid..].iter().sum();
             if right_size <= page_capacity || mid >= all_keys.len() - 1 {
@@ -619,7 +754,6 @@ impl<'a, S: Storage> BTree<'a, S> {
             mid += 1;
         }
 
-        // Ensure the left page can hold its data by moving split point right if needed  
         while mid > 1 {
             let left_size: usize = cell_sizes[..mid].iter().sum();
             if left_size <= page_capacity {

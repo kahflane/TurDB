@@ -535,4 +535,34 @@ impl<'a> RecordBuilder<'a> {
 
         Ok(result)
     }
+
+    pub fn build_into(&self, buffer: &mut Vec<u8>) -> Result<()> {
+        let bitmap_size = self.null_bitmap.len();
+        let offset_table_size = self.schema.var_column_count() * 2;
+        let header_len = 2 + bitmap_size + offset_table_size;
+
+        buffer.clear();
+        buffer.reserve(
+            header_len
+                + self.fixed_data.len()
+                + self.var_data.iter().map(|v| v.len()).sum::<usize>(),
+        );
+
+        buffer.extend((header_len as u16).to_le_bytes());
+        buffer.extend(&self.null_bitmap);
+
+        let mut var_offset: u16 = 0;
+        for var_data in &self.var_data {
+            var_offset += var_data.len() as u16;
+            buffer.extend(var_offset.to_le_bytes());
+        }
+
+        buffer.extend(&self.fixed_data);
+
+        for var_data in &self.var_data {
+            buffer.extend(var_data);
+        }
+
+        Ok(())
+    }
 }
