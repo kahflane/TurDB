@@ -2822,16 +2822,17 @@ impl Database {
         let toast_file_key: Option<FileKey>;
         let mut toast_table_id: u32 = 0;
         let mut toast_root_page: u32 = 1;
+        let mut toast_initial_root_page: u32 = 1;
         let mut toast_rightmost_hint: Option<u32> = None;
         if has_toast {
             let toast_table_name_owned = crate::storage::toast::toast_table_name(table_name);
             toast_file_key = Some(crate::storage::FileManager::make_table_key(schema_name, &toast_table_name_owned));
-            // Pre-fetch toast table info
             let toast_storage = file_manager.table_data_mut(schema_name, &toast_table_name_owned)?;
             let page0 = toast_storage.page(0)?;
             let header = crate::storage::TableFileHeader::from_bytes(page0)?;
             toast_table_id = header.table_id() as u32;
             toast_root_page = header.root_page();
+            toast_initial_root_page = toast_root_page;
             let hint = header.rightmost_hint();
             toast_rightmost_hint = if hint > 0 { Some(hint) } else { None };
         } else {
@@ -3298,6 +3299,14 @@ impl Database {
             let header = TableFileHeader::from_bytes_mut(page)?;
             let new_row_count = header.row_count().saturating_add(count as u64);
             header.set_row_count(new_row_count);
+        }
+
+        if has_toast && toast_root_page != toast_initial_root_page {
+            let toast_table_name_owned = crate::storage::toast::toast_table_name(table_name);
+            let toast_storage = file_manager.table_data_mut(schema_name, &toast_table_name_owned)?;
+            let page0 = toast_storage.page_mut(0)?;
+            let header = crate::storage::TableFileHeader::from_bytes_mut(page0)?;
+            header.set_root_page(toast_root_page);
         }
 
         // Flush WAL in autocommit mode; deferred to commit in explicit transactions
@@ -5950,7 +5959,12 @@ impl Database {
         let toast_table_name = crate::storage::toast::toast_table_name(table_name);
         let toast_storage = file_manager.table_data_mut(schema_name, &toast_table_name)?;
 
-        let mut btree = BTree::new(toast_storage, 1)?;
+        let root_page = {
+            let page0 = toast_storage.page(0)?;
+            crate::storage::TableFileHeader::from_bytes(page0)?.root_page()
+        };
+
+        let mut btree = BTree::new(toast_storage, root_page)?;
 
         for seq in 0..num_chunks {
             let chunk_key = make_chunk_key(chunk_id, seq as u32);

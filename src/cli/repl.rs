@@ -65,10 +65,24 @@ use crate::Database;
 use eyre::{Result, WrapErr};
 use rustyline::error::ReadlineError;
 use rustyline::DefaultEditor;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 const PRIMARY_PROMPT: &str = "turdb> ";
 const CONTINUATION_PROMPT: &str = "    -> ";
+
+fn format_duration(d: Duration) -> String {
+    let secs = d.as_secs_f64();
+    let human = if secs >= 1.0 {
+        format!("{:.2}s", secs)
+    } else if secs >= 0.001 {
+        format!("{:.2}ms", secs * 1000.0)
+    } else if secs >= 0.000_001 {
+        format!("{:.2}µs", secs * 1_000_000.0)
+    } else {
+        format!("{:.0}ns", secs * 1_000_000_000.0)
+    };
+    format!("{:.3} sec ≈ {}", secs, human)
+}
 
 pub struct Repl {
     db: Database,
@@ -185,15 +199,15 @@ impl Repl {
         match result {
             ExecuteResult::Select { columns, rows } => {
                 if rows.is_empty() {
-                    println!("Empty set ({:.3} sec)", elapsed.as_secs_f64());
+                    println!("Empty set ({})", format_duration(elapsed));
                 } else {
                     let formatter = TableFormatter::new(columns, &rows);
                     println!("{}", formatter.render());
                     println!(
-                        "{} row{} in set ({:.3} sec)",
+                        "{} row{} in set ({})",
                         formatter.row_count(),
                         if formatter.row_count() == 1 { "" } else { "s" },
-                        elapsed.as_secs_f64()
+                        format_duration(elapsed)
                     );
                 }
             }
@@ -206,10 +220,10 @@ impl Repl {
                     }
                 }
                 println!(
-                    "Query OK, {} row{} affected ({:.3} sec)",
+                    "Query OK, {} row{} affected ({})",
                     rows_affected,
                     if rows_affected == 1 { "" } else { "s" },
-                    elapsed.as_secs_f64()
+                    format_duration(elapsed)
                 );
             }
             ExecuteResult::Update { rows_affected, returned } => {
@@ -221,10 +235,10 @@ impl Repl {
                     }
                 }
                 println!(
-                    "Query OK, {} row{} affected ({:.3} sec)",
+                    "Query OK, {} row{} affected ({})",
                     rows_affected,
                     if rows_affected == 1 { "" } else { "s" },
-                    elapsed.as_secs_f64()
+                    format_duration(elapsed)
                 );
             }
             ExecuteResult::Delete { rows_affected, returned } => {
@@ -236,60 +250,60 @@ impl Repl {
                     }
                 }
                 println!(
-                    "Query OK, {} row{} affected ({:.3} sec)",
+                    "Query OK, {} row{} affected ({})",
                     rows_affected,
                     if rows_affected == 1 { "" } else { "s" },
-                    elapsed.as_secs_f64()
+                    format_duration(elapsed)
                 );
             }
             ExecuteResult::Truncate { rows_affected } => {
                 println!(
-                    "Query OK, {} row{} affected ({:.3} sec)",
+                    "Query OK, {} row{} affected ({})",
                     rows_affected,
                     if rows_affected == 1 { "" } else { "s" },
-                    elapsed.as_secs_f64()
+                    format_duration(elapsed)
                 );
             }
             ExecuteResult::CreateTable { created } => {
                 if created {
-                    println!("Table created ({:.3} sec)", elapsed.as_secs_f64());
+                    println!("Table created ({})", format_duration(elapsed));
                 } else {
-                    println!("Table already exists ({:.3} sec)", elapsed.as_secs_f64());
+                    println!("Table already exists ({})", format_duration(elapsed));
                 }
             }
             ExecuteResult::CreateSchema { created } => {
                 if created {
-                    println!("Schema created ({:.3} sec)", elapsed.as_secs_f64());
+                    println!("Schema created ({})", format_duration(elapsed));
                 } else {
-                    println!("Schema already exists ({:.3} sec)", elapsed.as_secs_f64());
+                    println!("Schema already exists ({})", format_duration(elapsed));
                 }
             }
             ExecuteResult::CreateIndex { created } => {
                 if created {
-                    println!("Index created ({:.3} sec)", elapsed.as_secs_f64());
+                    println!("Index created ({})", format_duration(elapsed));
                 } else {
-                    println!("Index already exists ({:.3} sec)", elapsed.as_secs_f64());
+                    println!("Index already exists ({})", format_duration(elapsed));
                 }
             }
             ExecuteResult::DropTable { dropped } => {
                 if dropped {
-                    println!("Table dropped ({:.3} sec)", elapsed.as_secs_f64());
+                    println!("Table dropped ({})", format_duration(elapsed));
                 } else {
-                    println!("Table does not exist ({:.3} sec)", elapsed.as_secs_f64());
+                    println!("Table does not exist ({})", format_duration(elapsed));
                 }
             }
             ExecuteResult::DropIndex { dropped } => {
                 if dropped {
-                    println!("Index dropped ({:.3} sec)", elapsed.as_secs_f64());
+                    println!("Index dropped ({})", format_duration(elapsed));
                 } else {
-                    println!("Index does not exist ({:.3} sec)", elapsed.as_secs_f64());
+                    println!("Index does not exist ({})", format_duration(elapsed));
                 }
             }
             ExecuteResult::DropSchema { dropped } => {
                 if dropped {
-                    println!("Schema dropped ({:.3} sec)", elapsed.as_secs_f64());
+                    println!("Schema dropped ({})", format_duration(elapsed));
                 } else {
-                    println!("Schema does not exist ({:.3} sec)", elapsed.as_secs_f64());
+                    println!("Schema does not exist ({})", format_duration(elapsed));
                 }
             }
             ExecuteResult::Pragma { name, value } => {
@@ -300,25 +314,25 @@ impl Repl {
                 }
             }
             ExecuteResult::Begin => {
-                println!("Transaction started ({:.3} sec)", elapsed.as_secs_f64());
+                println!("Transaction started ({})", format_duration(elapsed));
             }
             ExecuteResult::Commit => {
-                println!("Transaction committed ({:.3} sec)", elapsed.as_secs_f64());
+                println!("Transaction committed ({})", format_duration(elapsed));
             }
             ExecuteResult::Rollback => {
-                println!("Transaction rolled back ({:.3} sec)", elapsed.as_secs_f64());
+                println!("Transaction rolled back ({})", format_duration(elapsed));
             }
             ExecuteResult::Savepoint { name } => {
-                println!("Savepoint '{}' created ({:.3} sec)", name, elapsed.as_secs_f64());
+                println!("Savepoint '{}' created ({})", name, format_duration(elapsed));
             }
             ExecuteResult::Release { name } => {
-                println!("Savepoint '{}' released ({:.3} sec)", name, elapsed.as_secs_f64());
+                println!("Savepoint '{}' released ({})", name, format_duration(elapsed));
             }
             ExecuteResult::AlterTable { action } => {
-                println!("Table altered: {} ({:.3} sec)", action, elapsed.as_secs_f64());
+                println!("Table altered: {} ({})", action, format_duration(elapsed));
             }
             ExecuteResult::Set { name, value } => {
-                println!("{} = {} ({:.3} sec)", name, value, elapsed.as_secs_f64());
+                println!("{} = {} ({})", name, value, format_duration(elapsed));
             }
         }
     }

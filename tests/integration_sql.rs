@@ -3443,4 +3443,102 @@ mod toast_tests {
         let rows = db.query("SELECT id, LENGTH(description) as len FROM test ORDER BY id").unwrap();
         assert_eq!(rows.len(), 10);
     }
+    
+    #[test]
+    fn toast_delete_rows_should_not_corrupt_other_rows() {
+        let dir = tempdir().unwrap();
+        let db = Database::create(dir.path().join("toast_delete_test")).unwrap();
+        
+        db.execute("CREATE TABLE test (id BIGINT PRIMARY KEY, description TEXT)").unwrap();
+        
+        // Insert 20 rows with large text values
+        for i in 1..=20 {
+            let large_text = format!("row_{}_", i).repeat(500);
+            let sql = format!("INSERT INTO test VALUES ({}, '{}')", i, large_text);
+            db.execute(&sql).unwrap();
+        }
+        
+        // Verify all rows can be read with just id column (no TOAST deref)
+        let rows = db.query("SELECT id FROM test ORDER BY id").unwrap();
+        assert_eq!(rows.len(), 20, "Should have 20 rows before delete");
+        
+        // Delete first row - this is the critical operation
+        db.execute("DELETE FROM test WHERE id = 6").unwrap();
+        
+        // Check count after delete
+        let count_after = db.query("SELECT COUNT(*) FROM test").unwrap();
+        assert_eq!(count_after[0].values[0], OwnedValue::Int(19), "Should have 19 rows after delete");
+        
+        // Get all IDs after delete (no TOAST deref needed)
+        let ids_after = db.query("SELECT id FROM test ORDER BY id").unwrap();
+        assert_eq!(ids_after.len(), 19, "Should have 19 rows after delete");
+        
+        // Print all IDs to see what we have
+        let id_values: Vec<i64> = ids_after.iter().filter_map(|row| {
+            if let OwnedValue::Int(i) = row.values[0] {
+                Some(i)
+            } else {
+                None
+            }
+        }).collect();
+        
+        // Row 10 should still be present
+        assert!(id_values.contains(&10), "ID 10 should be in the list");
+        
+        // Now try to read row 10's description (this will deref TOAST)
+        let row10 = db.query("SELECT id, description FROM test WHERE id = 10").unwrap();
+        assert_eq!(row10.len(), 1, "Should find row 10");
+        if let OwnedValue::Text(text) = &row10[0].values[1] {
+            assert!(text.starts_with("row_10_"), "Row 10 description should start with row_10_");
+        } else {
+            panic!("Expected Text value for row 10 description");
+        }
+        
+        // Delete more rows and verify remaining data is intact
+        db.execute("DELETE FROM test WHERE id < 10").unwrap();
+        
+        // Verify we can read all remaining rows with their full TOAST data
+        let remaining = db.query("SELECT * FROM test ORDER BY id").unwrap();
+        assert_eq!(remaining.len(), 11, "Should have 11 rows after deleting id < 10");
+        
+        for row in &remaining {
+            if let OwnedValue::Text(text) = &row.values[1] {
+                assert!(text.len() > 1000, "Each row should have large text value");
+            } else {
+                panic!("Expected Text value");
+            }
+        }
+    }
+    
+    #[test]
+    fn toast_delete_with_wal_enabled() {
+        let dir = tempdir().unwrap();
+        let db = Database::create(dir.path().join("toast_wal_test")).unwrap();
+        
+        db.execute("PRAGMA WAL=ON").unwrap();
+        
+        db.execute("CREATE TABLE test (id BIGINT PRIMARY KEY, description TEXT)").unwrap();
+        
+        // Insert rows with large text values
+        for i in 1..=10 {
+            let large_text = format!("wal_row_{}_", i).repeat(500);
+            let sql = format!("INSERT INTO test VALUES ({}, '{}')", i, large_text);
+            db.execute(&sql).unwrap();
+        }
+        
+        // Delete some rows
+        db.execute("DELETE FROM test WHERE id <= 5").unwrap();
+        
+        // Verify remaining rows
+        let remaining = db.query("SELECT * FROM test ORDER BY id").unwrap();
+        assert_eq!(remaining.len(), 5, "Should have 5 rows after deleting id <= 5");
+        
+        for row in &remaining {
+            if let OwnedValue::Text(text) = &row.values[1] {
+                assert!(text.starts_with("wal_row_"), "Each row should have correct text");
+            } else {
+                panic!("Expected Text value");
+            }
+        }
+    }
 }
