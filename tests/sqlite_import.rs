@@ -47,8 +47,8 @@ fn rusqlite_to_owned(val: &rusqlite::types::Value) -> OwnedValue {
 
 const SQLITE_DB_PATH: &str = "/Users/julfikar/Downloads/_meta-kaggle.db";
 const TURDB_PATH: &str = "/Users/julfikar/Documents/PassionFruit.nosync/turdb/turdb-core/.worktrees/bismillah";
-const BATCH_SIZE: i64 = 5000;
-const INSERT_BATCH_SIZE: usize = 5000;
+const BATCH_SIZE: i64 = 55000;
+const INSERT_BATCH_SIZE: usize = 55000;
 
 fn sqlite_db_exists() -> bool {
     Path::new(SQLITE_DB_PATH).exists()
@@ -671,7 +671,7 @@ fn benchmark_sqlite_vs_turdb() {
 
     const SQLITE_TARGET: &str = "/Users/julfikar/Documents/PassionFruit.nosync/turdb/turdb-core/.worktrees/turdb_benchmark_sqlite.db";
     const TURDB_TARGET: &str = "/Users/julfikar/Documents/PassionFruit.nosync/turdb/turdb-core/.worktrees/turdb_benchmark_turdb";
-    const ROW_COUNT: usize = 100_000;
+    const ROW_COUNT: usize = 1_000_000;
     const BATCH_SIZE: usize = 5000;
 
     let _ = std::fs::remove_file(SQLITE_TARGET);
@@ -780,7 +780,7 @@ fn benchmark_sqlite_vs_turdb() {
     for batch in rows.chunks(BATCH_SIZE) {
         let convert_start = Instant::now();
         let owned_rows: Vec<Vec<turdb::OwnedValue>> = batch.iter().map(|row| {
-            row.iter().map(|val| rusqlite_to_owned(val)).collect()
+            row.iter().map(rusqlite_to_owned).collect()
         }).collect();
         convert_time += convert_start.elapsed();
 
@@ -833,6 +833,7 @@ fn benchmark_sqlite_vs_turdb() {
     let _ = std::fs::remove_dir_all(TURDB_TARGET);
 }
 
+#[allow(dead_code)]
 fn write_sql_value(buf: &mut String, value: &rusqlite::types::Value) {
     use rusqlite::types::Value;
     use std::fmt::Write;

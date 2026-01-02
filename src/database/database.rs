@@ -5043,20 +5043,17 @@ impl Database {
             .take()
             .ok_or_else(|| eyre::eyre!("no transaction in progress"))?;
 
-        let modified_table_ids: Vec<u32> = txn
-            .write_entries
-            .iter()
-            .map(|e| e.table_id)
-            .collect::<hashbrown::HashSet<_>>()
-            .into_iter()
-            .collect();
-
         self.finalize_transaction_commit(txn)?;
 
-        if wal_enabled && !modified_table_ids.is_empty() {
+        if wal_enabled {
+            let dirty_table_ids = self.dirty_tracker.all_dirty_table_ids();
+            if dirty_table_ids.is_empty() {
+                return Ok(ExecuteResult::Commit);
+            }
+
             let table_infos: Vec<(u32, String, String)> = {
                 let lookup = self.table_id_lookup.read();
-                modified_table_ids
+                dirty_table_ids
                     .iter()
                     .filter_map(|&table_id| {
                         lookup
@@ -5702,16 +5699,6 @@ impl Database {
             bail!("database is closed");
         }
 
-        if self.dirty_tracker.is_empty() {
-            return Ok(CheckpointInfo {
-                frames_checkpointed: 0,
-                wal_truncated: false,
-            });
-        }
-        let table_ids = self.dirty_tracker.all_dirty_table_ids();
-
-        self.ensure_file_manager()?;
-
         let mut wal_guard = self.wal.lock();
         let wal = match wal_guard.as_mut() {
             Some(w) => w,
@@ -5723,6 +5710,17 @@ impl Database {
                 });
             }
         };
+
+        if self.dirty_tracker.is_empty() {
+            wal.cleanup_old_segments()?;
+            return Ok(CheckpointInfo {
+                frames_checkpointed: 0,
+                wal_truncated: false,
+            });
+        }
+        let table_ids = self.dirty_tracker.all_dirty_table_ids();
+
+        self.ensure_file_manager()?;
 
         let mut file_manager_guard = self.file_manager.write();
         let file_manager = match file_manager_guard.as_mut() {
@@ -5749,10 +5747,10 @@ impl Database {
         };
 
         let mut total_frames = 0u32;
-        for (table_id, schema_name, table_name) in table_infos {
-            if let Ok(storage) = file_manager.table_data(&schema_name, &table_name) {
+        for (table_id, schema_name, table_name) in &table_infos {
+            if let Ok(storage) = file_manager.table_data(schema_name, table_name) {
                 let frames =
-                    WalStoragePerTable::flush_wal_for_table(&self.dirty_tracker, storage, wal, table_id)
+                    WalStoragePerTable::flush_wal_for_table(&self.dirty_tracker, storage, wal, *table_id)
                         .wrap_err_with(|| {
                             format!(
                                 "failed to flush dirty pages for table {}.{}",

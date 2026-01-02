@@ -180,14 +180,13 @@ use eyre::{bail, ensure, Result, WrapErr};
 use hashbrown::HashMap;
 use memmap2::Mmap;
 use parking_lot::{Mutex, RwLock};
-use std::fs::{create_dir_all, read_dir, File, OpenOptions};
+use std::fs::{create_dir_all, read_dir, remove_file, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use super::PAGE_SIZE;
 
 pub struct Wal {
-    #[allow(dead_code)]
     dir: PathBuf,
     current_segment: Mutex<WalSegment>,
     page_index: RwLock<HashMap<(u64, u32), (u64, u64)>>,
@@ -421,6 +420,40 @@ impl Wal {
 
         let mut mmap = self.read_mmap.write();
         *mmap = None;
+
+        self.cleanup_old_segments()?;
+
+        Ok(())
+    }
+
+    pub fn cleanup_old_segments(&self) -> Result<()> {
+        let current_sequence = {
+            let segment = self.current_segment.lock();
+            segment.sequence()
+        };
+
+        let entries = read_dir(&self.dir)
+            .wrap_err_with(|| format!("failed to read WAL directory {:?}", self.dir))?;
+
+        for entry in entries {
+            let entry = match entry {
+                Ok(e) => e,
+                Err(_) => continue,
+            };
+
+            let file_name = entry.file_name();
+            let file_name_str = file_name.to_string_lossy();
+
+            if file_name_str.starts_with("wal.") && file_name_str.len() == 10 {
+                let num_part = &file_name_str[4..];
+                if let Ok(segment_num) = num_part.parse::<u64>() {
+                    if segment_num < current_sequence {
+                        let path = entry.path();
+                        let _ = remove_file(&path);
+                    }
+                }
+            }
+        }
 
         Ok(())
     }
@@ -1569,6 +1602,48 @@ mod tests {
             assert!(read_page.is_some(), "should be able to read page {}", i);
             assert_eq!(read_page.unwrap()[0], (i % 256) as u8);
         }
+
+        temp_dir.close().ok();
+    }
+
+    #[test]
+    fn truncate_cleans_up_old_segments() {
+        use super::super::MmapStorage;
+
+        let temp_dir = tempdir().expect("should create temp dir");
+        let wal_dir = temp_dir.path().join("wal");
+        let db_path = temp_dir.path().join("test.db");
+
+        let mut storage = MmapStorage::create(&db_path, 4).expect("should create storage");
+        let mut wal = Wal::create(&wal_dir).expect("should create WAL");
+
+        let frames_needed = (MAX_SEGMENT_SIZE / (WAL_FRAME_HEADER_SIZE + PAGE_SIZE) as u64) + 10;
+
+        for i in 0..frames_needed {
+            let page_data = vec![(i % 256) as u8; PAGE_SIZE];
+            wal.write_frame(i as u32, 100, &page_data)
+                .expect("should write frame");
+        }
+
+        assert!(
+            wal_dir.join("wal.000001").exists(),
+            "segment 1 should exist before checkpoint"
+        );
+        assert!(
+            wal_dir.join("wal.000002").exists(),
+            "segment 2 should exist before checkpoint"
+        );
+
+        wal.checkpoint(&mut storage).expect("checkpoint should succeed");
+
+        assert!(
+            !wal_dir.join("wal.000001").exists(),
+            "segment 1 should be deleted after checkpoint"
+        );
+        assert!(
+            wal_dir.join("wal.000002").exists(),
+            "segment 2 (current) should still exist after checkpoint"
+        );
 
         temp_dir.close().ok();
     }
