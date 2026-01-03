@@ -89,7 +89,11 @@ pub struct MetaFileHeader {
     next_table_id: U64,
     next_index_id: U64,
     flags: U64,
-    reserved: [u8; 64],
+    /// Global row ID counter for generating unique row keys across all tables.
+    /// This is critical for TOAST: chunk_id = (column_index << 48) | row_id
+    /// If row_id is not unique, TOAST chunks will collide.
+    next_row_id: U64,
+    reserved: [u8; 56],
 }
 
 const _: () = assert!(std::mem::size_of::<MetaFileHeader>() == FILE_HEADER_SIZE);
@@ -105,7 +109,8 @@ impl MetaFileHeader {
             next_table_id: U64::new(1),
             next_index_id: U64::new(1),
             flags: U64::new(0),
-            reserved: [0u8; 64],
+            next_row_id: U64::new(1),
+            reserved: [0u8; 56],
         }
     }
 
@@ -181,6 +186,40 @@ impl MetaFileHeader {
 
     pub fn set_flags(&mut self, flags: u64) {
         self.flags = U64::new(flags);
+    }
+
+    pub fn next_row_id(&self) -> u64 {
+        self.next_row_id.get()
+    }
+
+    pub fn set_next_row_id(&mut self, id: u64) {
+        self.next_row_id = U64::new(id);
+    }
+
+    pub fn from_bytes_mut(bytes: &mut [u8]) -> Result<&mut Self> {
+        ensure!(
+            bytes.len() >= FILE_HEADER_SIZE,
+            "buffer too small for MetaFileHeader: {} < {}",
+            bytes.len(),
+            FILE_HEADER_SIZE
+        );
+
+        let header = Self::mut_from_bytes(&mut bytes[..FILE_HEADER_SIZE])
+            .map_err(|e| eyre::eyre!("failed to parse MetaFileHeader: {:?}", e))?;
+
+        ensure!(
+            &header.magic == META_MAGIC,
+            "invalid magic bytes in turdb.meta"
+        );
+
+        ensure!(
+            header.version.get() == CURRENT_VERSION,
+            "unsupported version: {} (expected {})",
+            header.version.get(),
+            CURRENT_VERSION
+        );
+
+        Ok(header)
     }
 }
 

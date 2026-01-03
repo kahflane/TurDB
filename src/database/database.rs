@@ -76,6 +76,12 @@ impl Database {
 
         let next_table_id = header.next_table_id();
         let next_index_id = header.next_index_id();
+        // Restore next_row_id from metadata (critical for TOAST chunk_id uniqueness)
+        // Use 1 if stored value is 0 (backward compatibility with older databases)
+        let next_row_id = {
+            let stored = header.next_row_id();
+            if stored == 0 { 1 } else { stored }
+        };
 
         let wal_dir = path.join("wal");
 
@@ -100,7 +106,7 @@ impl Database {
             catalog: RwLock::new(None),
             wal: Mutex::new(None),
             wal_dir,
-            next_row_id: AtomicU64::new(1),
+            next_row_id: AtomicU64::new(next_row_id),
             next_table_id: AtomicU64::new(next_table_id),
             next_index_id: AtomicU64::new(next_index_id),
             closed: AtomicBool::new(false),
@@ -320,6 +326,8 @@ impl Database {
         let mut new_header = *header;
         new_header.set_next_table_id(self.next_table_id.load(Ordering::Acquire));
         new_header.set_next_index_id(self.next_index_id.load(Ordering::Acquire));
+        // Critical: persist next_row_id to prevent TOAST chunk collisions after restart
+        new_header.set_next_row_id(self.next_row_id.load(Ordering::Acquire));
 
         page[..128].copy_from_slice(new_header.as_bytes());
 
@@ -2353,6 +2361,8 @@ impl Database {
         *wal_guard = None;
 
         self.save_catalog()?;
+        // Critical: persist next_row_id to prevent TOAST chunk collisions after restart
+        self.save_meta()?;
 
         let mut file_manager_guard = self.file_manager.write();
         if let Some(ref mut file_manager) = *file_manager_guard {
@@ -2388,6 +2398,8 @@ impl Drop for Database {
         *wal_guard = None;
 
         let _ = self.save_catalog();
+        // Critical: persist next_row_id to prevent TOAST chunk collisions after restart
+        let _ = self.save_meta();
 
         if let Some(mut file_manager_guard) = self.file_manager.try_write() {
             if let Some(ref mut file_manager) = *file_manager_guard {
