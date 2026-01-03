@@ -53,7 +53,7 @@ impl BTreeCursorAdapter {
         if cursor.valid() {
             loop {
                 keys.push(cursor.key()?.to_vec());
-                values.push(cursor.value()?.to_vec());
+                values.push(cursor.value_decoded()?);
                 if !cursor.advance()? {
                     break;
                 }
@@ -113,7 +113,7 @@ impl BTreeCursorAdapter {
                     }
                 }
                 keys.push(current_key.to_vec());
-                values.push(cursor.value()?.to_vec());
+                values.push(cursor.value_decoded()?);
                 if !cursor.advance()? {
                     break;
                 }

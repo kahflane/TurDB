@@ -188,9 +188,10 @@ impl Database {
 
         while cursor.valid() {
             let key = cursor.key()?;
-            let value = cursor.value()?;
+            let encoded_value = cursor.value()?;
+            let decoded_value = cursor.value_decoded()?;
 
-            let record = RecordView::new(value, &schema)?;
+            let record = RecordView::new(&decoded_value, &schema)?;
             let row_values = OwnedValue::extract_row_from_record(&record, &columns)?;
 
             let should_delete = if let Some(ref pred) = predicate {
@@ -212,7 +213,8 @@ impl Database {
                         }
                     }
                 }
-                rows_to_delete.push((key.to_vec(), value.to_vec(), row_values));
+                // Store encoded value for undo log
+                rows_to_delete.push((key.to_vec(), encoded_value.to_vec(), row_values));
             }
 
             cursor.advance()?;
@@ -226,8 +228,8 @@ impl Database {
                 let child_record_schema = create_record_schema(child_columns);
 
                 while child_cursor.valid() {
-                    let child_value = child_cursor.value()?;
-                    let child_record = RecordView::new(child_value, &child_record_schema)?;
+                    let child_value = child_cursor.value_decoded()?;
+                    let child_record = RecordView::new(&child_value, &child_record_schema)?;
                     let child_row =
                         OwnedValue::extract_row_from_record(&child_record, child_columns)?;
 

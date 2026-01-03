@@ -236,7 +236,7 @@ pub fn write_overflow<S: Storage, F: FnMut(&mut S) -> Result<u32>>(
 ///
 /// # Returns
 /// The complete value data
-pub fn read_overflow<S: Storage>(
+pub fn read_overflow<S: Storage + ?Sized>(
     storage: &S,
     first_page: u32,
     total_size: usize,
@@ -285,7 +285,7 @@ pub fn read_overflow<S: Storage>(
 ///
 /// This is more efficient than `read_overflow` when the caller already has
 /// a buffer of the correct size.
-pub fn read_overflow_into<S: Storage>(
+pub fn read_overflow_into<S: Storage + ?Sized>(
     storage: &S,
     first_page: u32,
     buffer: &mut [u8],

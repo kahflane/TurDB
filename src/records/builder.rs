@@ -509,7 +509,8 @@ impl<'a> RecordBuilder<'a> {
 
     pub fn build(&self) -> Result<Vec<u8>> {
         let bitmap_size = self.null_bitmap.len();
-        let offset_table_size = self.schema.var_column_count() * 2;
+        // Use 4 bytes per variable column offset to support large blobs (up to 4GB)
+        let offset_table_size = self.schema.var_column_count() * 4;
         let header_len = 2 + bitmap_size + offset_table_size;
 
         let mut result = Vec::with_capacity(
@@ -521,9 +522,10 @@ impl<'a> RecordBuilder<'a> {
         result.extend((header_len as u16).to_le_bytes());
         result.extend(&self.null_bitmap);
 
-        let mut var_offset: u16 = 0;
+        // Use u32 for offsets to support large values (up to 4GB each)
+        let mut var_offset: u32 = 0;
         for var_data in &self.var_data {
-            var_offset += var_data.len() as u16;
+            var_offset += var_data.len() as u32;
             result.extend(var_offset.to_le_bytes());
         }
 
@@ -538,7 +540,8 @@ impl<'a> RecordBuilder<'a> {
 
     pub fn build_into(&self, buffer: &mut Vec<u8>) -> Result<()> {
         let bitmap_size = self.null_bitmap.len();
-        let offset_table_size = self.schema.var_column_count() * 2;
+        // Use 4 bytes per variable column offset to support large blobs (up to 4GB)
+        let offset_table_size = self.schema.var_column_count() * 4;
         let header_len = 2 + bitmap_size + offset_table_size;
 
         buffer.clear();
@@ -551,9 +554,10 @@ impl<'a> RecordBuilder<'a> {
         buffer.extend((header_len as u16).to_le_bytes());
         buffer.extend(&self.null_bitmap);
 
-        let mut var_offset: u16 = 0;
+        // Use u32 for offsets to support large values (up to 4GB each)
+        let mut var_offset: u32 = 0;
         for var_data in &self.var_data {
-            var_offset += var_data.len() as u16;
+            var_offset += var_data.len() as u32;
             buffer.extend(var_offset.to_le_bytes());
         }
 

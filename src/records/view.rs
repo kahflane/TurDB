@@ -57,7 +57,8 @@ impl<'a> RecordView<'a> {
     pub fn offset_table(&self) -> &'a [u8] {
         let bitmap_size = Schema::null_bitmap_size(self.schema.column_count());
         let offset_table_start = 2 + bitmap_size;
-        let offset_table_bytes = self.schema.var_column_count() * 2;
+        // 4 bytes per variable column offset to support large blobs (up to 4GB)
+        let offset_table_bytes = self.schema.var_column_count() * 4;
         &self.data[offset_table_start..offset_table_start + offset_table_bytes]
     }
 
@@ -85,15 +86,22 @@ impl<'a> RecordView<'a> {
         let offset_table = self.offset_table();
         let var_data_start = self.data_offset() + self.schema.total_fixed_size();
 
-        let end_offset =
-            u16::from_le_bytes([offset_table[var_idx * 2], offset_table[var_idx * 2 + 1]]) as usize;
+        // Read u32 offsets to support large blobs (up to 4GB each)
+        let end_offset = u32::from_le_bytes([
+            offset_table[var_idx * 4],
+            offset_table[var_idx * 4 + 1],
+            offset_table[var_idx * 4 + 2],
+            offset_table[var_idx * 4 + 3],
+        ]) as usize;
 
         let start_offset = if var_idx == 0 {
             0
         } else {
-            u16::from_le_bytes([
-                offset_table[(var_idx - 1) * 2],
-                offset_table[(var_idx - 1) * 2 + 1],
+            u32::from_le_bytes([
+                offset_table[(var_idx - 1) * 4],
+                offset_table[(var_idx - 1) * 4 + 1],
+                offset_table[(var_idx - 1) * 4 + 2],
+                offset_table[(var_idx - 1) * 4 + 3],
             ]) as usize
         };
 

@@ -74,7 +74,8 @@ impl SimpleDecoder {
 
     fn compute_header_len(schema: &crate::records::Schema) -> u16 {
         let bitmap_size = crate::records::Schema::null_bitmap_size(schema.column_count());
-        let offset_table_size = schema.var_column_count() * 2;
+        // 4 bytes per variable column offset to support large blobs (up to 4GB)
+        let offset_table_size = schema.var_column_count() * 4;
         (2 + bitmap_size + offset_table_size) as u16
     }
 
@@ -95,14 +96,20 @@ impl SimpleDecoder {
 
         let bitmap_size = crate::records::Schema::null_bitmap_size(schema.column_count());
         let offset_table_start = 2 + bitmap_size;
-        let last_offset_pos = offset_table_start + (var_count - 1) * 2;
+        // 4 bytes per variable column offset to support large blobs
+        let last_offset_pos = offset_table_start + (var_count - 1) * 4;
 
-        if last_offset_pos + 2 > value.len() {
+        if last_offset_pos + 4 > value.len() {
             return false;
         }
 
-        let last_var_offset =
-            u16::from_le_bytes([value[last_offset_pos], value[last_offset_pos + 1]]) as usize;
+        // Read u32 offset to support large values (up to 4GB)
+        let last_var_offset = u32::from_le_bytes([
+            value[last_offset_pos],
+            value[last_offset_pos + 1],
+            value[last_offset_pos + 2],
+            value[last_offset_pos + 3],
+        ]) as usize;
 
         let expected_len = header_len + fixed_size + last_var_offset;
         value.len() == expected_len
@@ -191,7 +198,7 @@ impl SimpleDecoder {
                     Value::Blob(Cow::Owned(raw.to_vec()))
                 }
                 DataType::Uuid => Value::Uuid(*view.get_uuid(idx)?),
-                DataType::Vector => Value::Vector(Cow::Owned(view.get_vector(idx)?.to_vec())),
+                DataType::Vector => Value::Vector(Cow::Owned(view.get_vector_copy(idx)?)),
                 DataType::Jsonb => {
                     let jsonb_view = view.get_jsonb(idx)?;
                     Value::Jsonb(Cow::Owned(jsonb_view.data().to_vec()))

@@ -408,7 +408,7 @@ impl Database {
                 if cursor.valid() {
                     loop {
                         let row_key = cursor.key()?;
-                        let row_data = cursor.value()?;
+                        let row_data = cursor.value_decoded()?;
 
                         let row_id = u64::from_be_bytes(
                             row_key
@@ -416,7 +416,7 @@ impl Database {
                                 .wrap_err("Invalid row key length in table")?,
                         );
 
-                        let record = RecordView::new(row_data, &schema)?;
+                        let record = RecordView::new(&row_data, &schema)?;
 
                         key_buf.clear();
                         let mut all_non_null = true;
@@ -742,8 +742,8 @@ impl Database {
                     let btree = BTree::new(storage, root_page)?;
                     for key in chunk {
                         if let Some(handle) = btree.search(key)? {
-                            let value = btree.get_value(&handle)?;
-                            let values = decoder.decode(key, value)?;
+                            let value = btree.get_value_decoded(&handle)?;
+                            let values = decoder.decode(key, &value)?;
                             let mut owned_values: Vec<OwnedValue> =
                                 values.into_iter().map(OwnedValue::from).collect();
                             owned_values.remove(drop_idx);
@@ -760,7 +760,7 @@ impl Database {
                     btree_mut.delete(key)?;
                 }
                 for (key, new_value) in &batch {
-                    btree_mut.insert(key, new_value)?;
+                    btree_mut.insert_with_overflow(key, new_value)?;
                 }
             }
 

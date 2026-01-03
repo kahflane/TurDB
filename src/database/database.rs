@@ -484,7 +484,7 @@ impl Database {
                 let row_id = self.next_row_id.fetch_add(1, Ordering::Relaxed);
                 let row_key = Self::generate_row_key(row_id);
                 OwnedValue::build_record_into_buffer(row_values, &mut record_builder, &mut record_buffer)?;
-                btree.insert_append(&row_key, &record_buffer)?;
+                btree.insert_append_with_overflow(&row_key, &record_buffer)?;
             }
 
             root_page = btree.root_page();
@@ -499,7 +499,7 @@ impl Database {
                 let row_id = self.next_row_id.fetch_add(1, Ordering::Relaxed);
                 let row_key = Self::generate_row_key(row_id);
                 OwnedValue::build_record_into_buffer(row_values, &mut record_builder, &mut record_buffer)?;
-                btree.insert_append(&row_key, &record_buffer)?;
+                btree.insert_append_with_overflow(&row_key, &record_buffer)?;
             }
 
             root_page = btree.root_page();
@@ -1189,8 +1189,8 @@ impl Database {
                     let table_reader = BTreeReader::new(table_storage, root_page)?;
 
                     for row_key in &row_keys {
-                        if let Some(row_data) = table_reader.get(row_key)? {
-                            let record = RecordView::new(row_data, &schema)?;
+                        if let Some(row_data) = table_reader.get_decoded(row_key)? {
+                            let record = RecordView::new(&row_data, &schema)?;
                             let row_values =
                                 OwnedValue::extract_row_from_record(&record, columns)?;
                             materialized_rows.push(row_values);

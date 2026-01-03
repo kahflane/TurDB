@@ -362,9 +362,9 @@ impl Database {
 
                         let mut found = false;
                         while ref_cursor.valid() {
-                            let existing_value = ref_cursor.value()?;
+                            let existing_value = ref_cursor.value_decoded()?;
                             let existing_record =
-                                crate::records::RecordView::new(existing_value, &ref_schema)?;
+                                crate::records::RecordView::new(&existing_value, &ref_schema)?;
                             let existing_values =
                                 OwnedValue::extract_row_from_record(&existing_record, ref_columns)?;
 
@@ -483,8 +483,8 @@ impl Database {
                                 let btree = BTree::new(table_storage, root_page)?;
 
                                 if let Some(handle) = btree.search(&existing_key)? {
-                                    let existing_value = btree.get_value(&handle)?;
-                                    let record = crate::records::RecordView::new(existing_value, &schema)?;
+                                    let existing_value = btree.get_value_decoded(&handle)?;
+                                    let record = crate::records::RecordView::new(&existing_value, &schema)?;
                                     let mut existing_values =
                                         OwnedValue::extract_row_from_record(&record, &columns)?;
 
@@ -508,7 +508,7 @@ impl Database {
                                         file_manager.table_data_mut(schema_name, table_name)?;
                                     let mut btree_mut = BTree::new(table_storage, root_page)?;
                                     btree_mut.delete(&existing_key)?;
-                                    btree_mut.insert(&existing_key, &updated_record)?;
+                                    btree_mut.insert_with_overflow(&existing_key, &updated_record)?;
 
                                     count += 1;
 
@@ -567,11 +567,11 @@ impl Database {
                 let mut wal_storage =
                     WalStoragePerTable::new(table_storage, &self.dirty_tracker, table_id as u32);
                 let mut btree = BTree::with_rightmost_hint(&mut wal_storage, root_page, rightmost_hint)?;
-                btree.insert(&row_key, &record_data)?;
+                btree.insert_with_overflow(&row_key, &record_data)?;
                 rightmost_hint = btree.rightmost_hint();
             } else {
                 let mut btree = BTree::with_rightmost_hint(table_storage, root_page, rightmost_hint)?;
-                btree.insert(&row_key, &record_data)?;
+                btree.insert_with_overflow(&row_key, &record_data)?;
                 rightmost_hint = btree.rightmost_hint();
             }
 

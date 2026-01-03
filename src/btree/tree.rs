@@ -326,6 +326,16 @@ impl<'a> BTreeReader<'a> {
         }
     }
 
+    /// Gets a value by key and decodes it, reading from overflow pages if necessary.
+    pub fn get_decoded(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        use super::overflow_value::decode_value;
+
+        match self.get(key)? {
+            Some(encoded) => Ok(Some(decode_value(self.storage, encoded)?)),
+            None => Ok(None),
+        }
+    }
+
     pub fn cursor_seek(&self, key: &[u8]) -> Result<Cursor<'a, MmapStorage>> {
         use crate::btree::leaf::SearchResult;
 
@@ -1148,6 +1158,84 @@ impl<'a, S: Storage> BTree<'a, S> {
             }
         }
     }
+
+    /// Inserts a key-value pair, using overflow pages for large values.
+    ///
+    /// This method automatically handles values that are too large to fit
+    /// in a single B-tree cell by writing overflow pages.
+    pub fn insert_with_overflow(&mut self, key: &[u8], value: &[u8]) -> Result<()> {
+        use super::overflow_value::{encode_value, MAX_INLINE_VALUE, VALUE_TYPE_INLINE};
+
+        // Fast path: small values don't need overflow
+        if value.len() <= MAX_INLINE_VALUE {
+            // Encode as inline value
+            let mut encoded = Vec::with_capacity(1 + 5 + value.len());
+            encoded.push(VALUE_TYPE_INLINE);
+            let mut len_buf = [0u8; 10];
+            let len_size = encode_varint(value.len() as u64, &mut len_buf);
+            encoded.extend_from_slice(&len_buf[..len_size]);
+            encoded.extend_from_slice(value);
+            return self.insert(key, &encoded);
+        }
+
+        // Large value: use full encoding with overflow
+        let available_space = PAGE_SIZE - LEAF_CONTENT_START - SLOT_SIZE - key.len() - 10;
+        let encoded = encode_value(self.storage, value, available_space, |s| {
+            let page_count = s.page_count();
+            s.grow(page_count + 1)?;
+            Ok(page_count)
+        })?;
+
+        self.insert(key, &encoded)
+    }
+
+    /// Inserts a key-value pair using append optimization, with overflow page support.
+    ///
+    /// Combines the sequential insert optimization with overflow page handling
+    /// for large values. Use this for bulk inserts with auto-incrementing keys.
+    pub fn insert_append_with_overflow(&mut self, key: &[u8], value: &[u8]) -> Result<()> {
+        use super::overflow_value::{encode_value, MAX_INLINE_VALUE, VALUE_TYPE_INLINE};
+
+        // Fast path: small values don't need overflow
+        if value.len() <= MAX_INLINE_VALUE {
+            // Encode as inline value
+            let mut encoded = Vec::with_capacity(1 + 5 + value.len());
+            encoded.push(VALUE_TYPE_INLINE);
+            let mut len_buf = [0u8; 10];
+            let len_size = encode_varint(value.len() as u64, &mut len_buf);
+            encoded.extend_from_slice(&len_buf[..len_size]);
+            encoded.extend_from_slice(value);
+            return self.insert_append(key, &encoded);
+        }
+
+        // Large value: use full encoding with overflow
+        let available_space = PAGE_SIZE - LEAF_CONTENT_START - SLOT_SIZE - key.len() - 10;
+        let encoded = encode_value(self.storage, value, available_space, |s| {
+            let page_count = s.page_count();
+            s.grow(page_count + 1)?;
+            Ok(page_count)
+        })?;
+
+        self.insert_append(key, &encoded)
+    }
+
+    /// Retrieves and decodes a value, reading from overflow pages if necessary.
+    ///
+    /// Returns the complete value data, reassembled from overflow pages if needed.
+    pub fn get_value_decoded(&self, handle: &SearchHandle) -> Result<Vec<u8>> {
+        use super::overflow_value::decode_value;
+
+        let encoded = self.get_value(handle)?;
+        decode_value(self.storage, encoded)
+    }
+
+    /// Retrieves and decodes a value by key, reading from overflow pages if necessary.
+    pub fn get_decoded(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        match self.search(key)? {
+            Some(handle) => Ok(Some(self.get_value_decoded(&handle)?)),
+            None => Ok(None),
+        }
+    }
 }
 
 impl<'a, S: Storage + ?Sized> Cursor<'a, S> {
@@ -1167,6 +1255,14 @@ impl<'a, S: Storage + ?Sized> Cursor<'a, S> {
         let page_data = self.storage.page(self.current_page)?;
         let leaf = LeafNode::from_page(page_data)?;
         leaf.value_at(self.current_index)
+    }
+
+    /// Returns the decoded value, reading from overflow pages if necessary.
+    pub fn value_decoded(&self) -> Result<Vec<u8>> {
+        use super::overflow_value::decode_value;
+
+        let encoded = self.value()?;
+        decode_value(self.storage, encoded)
     }
 
     pub fn advance(&mut self) -> Result<bool> {

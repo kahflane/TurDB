@@ -178,9 +178,10 @@ impl Database {
 
         while cursor.valid() {
             let key = cursor.key()?;
-            let value = cursor.value()?;
+            let encoded_value = cursor.value()?;
+            let decoded_value = cursor.value_decoded()?;
 
-            let values = decoder.decode(key, value)?;
+            let values = decoder.decode(key, &decoded_value)?;
             let mut row_values: Vec<OwnedValue> =
                 values.into_iter().map(OwnedValue::from).collect();
 
@@ -194,7 +195,8 @@ impl Database {
             };
 
             if should_update {
-                let old_value = value.to_vec();
+                // Store encoded value for undo log
+                let old_value = encoded_value.to_vec();
 
                 for (col_idx, value_expr) in &assignment_indices {
                     let new_value = Self::eval_literal(value_expr)?;
@@ -246,8 +248,8 @@ impl Database {
                     let existing_key = check_cursor.key()?;
 
                     if existing_key != update_key.as_slice() {
-                        let existing_value = check_cursor.value()?;
-                        let existing_values_raw = decoder.decode(existing_key, existing_value)?;
+                        let existing_value = check_cursor.value_decoded()?;
+                        let existing_values_raw = decoder.decode(existing_key, &existing_value)?;
                         let existing_values: Vec<OwnedValue> =
                             existing_values_raw.into_iter().map(OwnedValue::from).collect();
 
@@ -317,7 +319,7 @@ impl Database {
             for (key, _old_value, updated_values) in &rows_to_update {
                 btree_mut.delete(key)?;
                 let record_data = OwnedValue::build_record_from_values(updated_values, &schema)?;
-                btree_mut.insert(key, &record_data)?;
+                btree_mut.insert_with_overflow(key, &record_data)?;
             }
             Ok::<_, eyre::Report>(())
         });
@@ -432,8 +434,8 @@ impl Database {
 
             let mut table_rows: Vec<Vec<OwnedValue>> = Vec::new();
             while from_cursor.valid() {
-                let value = from_cursor.value()?;
-                let record = RecordView::new(value, &from_schemas[i])?;
+                let value = from_cursor.value_decoded()?;
+                let record = RecordView::new(&value, &from_schemas[i])?;
                 let row_values = OwnedValue::extract_row_from_record(&record, from_columns)?;
                 table_rows.push(row_values);
                 from_cursor.advance()?;
@@ -457,9 +459,10 @@ impl Database {
 
         while cursor.valid() {
             let key = cursor.key()?;
-            let value = cursor.value()?;
+            let encoded_value = cursor.value()?;
+            let decoded_value = cursor.value_decoded()?;
 
-            let values = decoder.decode(key, value)?;
+            let values = decoder.decode(key, &decoded_value)?;
             let target_row_values: Vec<OwnedValue> =
                 values.into_iter().map(OwnedValue::from).collect();
 
@@ -502,7 +505,8 @@ impl Database {
                 };
 
                 if should_update && !updated_keys.contains(&key.to_vec()) {
-                    let old_value = value.to_vec();
+                    // Store encoded value for undo log
+                    let old_value = encoded_value.to_vec();
                     let mut row_values = target_row_values.clone();
 
                     for (col_idx, value_expr) in &assignment_indices {
@@ -565,8 +569,8 @@ impl Database {
                     let existing_key = check_cursor.key()?;
 
                     if existing_key != update_key.as_slice() {
-                        let existing_value = check_cursor.value()?;
-                        let existing_record = RecordView::new(existing_value, schema)?;
+                        let existing_value = check_cursor.value_decoded()?;
+                        let existing_record = RecordView::new(&existing_value, schema)?;
                         let existing_values =
                             OwnedValue::extract_row_from_record(&existing_record, columns)?;
 
@@ -636,7 +640,7 @@ impl Database {
             for (key, _old_value, updated_values) in &rows_to_update {
                 btree_mut.delete(key)?;
                 let record_data = OwnedValue::build_record_from_values(updated_values, schema)?;
-                btree_mut.insert(key, &record_data)?;
+                btree_mut.insert_with_overflow(key, &record_data)?;
             }
             Ok::<_, eyre::Report>(())
         });

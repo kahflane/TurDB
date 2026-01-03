@@ -92,6 +92,7 @@
 
 mod interior;
 mod leaf;
+mod overflow_value;
 mod tree;
 
 pub use interior::{
@@ -103,3 +104,8 @@ pub use leaf::{
     LEAF_HEADER_SIZE, SLOT_SIZE,
 };
 pub use tree::{BTree, BTreeReader, Cursor, InsertResult, SearchHandle, MAX_TREE_DEPTH, get_fastpath_stats, reset_fastpath_stats, get_fastpath_fail_stats, get_slowpath_stats};
+pub use overflow_value::{
+    decode_value, encode_value, free_overflow_value, get_inline_value, get_value_size,
+    is_overflow_value, MAX_INLINE_VALUE, MIN_INLINE_PREFIX, OVERFLOW_POINTER_OVERHEAD,
+    VALUE_TYPE_INLINE, VALUE_TYPE_OVERFLOW,
+};
