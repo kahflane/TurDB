@@ -306,6 +306,7 @@ pub struct StreamingBTreeSource<'storage> {
     decoder: SimpleDecoder,
     started: bool,
     row_buffer: Vec<Value<'static>>,
+    end_key: Option<Vec<u8>>,
 }
 
 impl<'storage> StreamingBTreeSource<'storage> {
@@ -319,6 +320,22 @@ impl<'storage> StreamingBTreeSource<'storage> {
             decoder,
             started: false,
             row_buffer: Vec::with_capacity(column_count),
+            end_key: None,
+        }
+    }
+
+    pub fn with_end_key(
+        cursor: crate::btree::Cursor<'storage, crate::storage::MmapStorage>,
+        decoder: SimpleDecoder,
+        column_count: usize,
+        end_key: Option<Vec<u8>>,
+    ) -> Self {
+        Self {
+            cursor,
+            decoder,
+            started: false,
+            row_buffer: Vec::with_capacity(column_count),
+            end_key,
         }
     }
 
@@ -366,6 +383,57 @@ impl<'storage> StreamingBTreeSource<'storage> {
 
         Ok(Self::new(cursor, decoder, output_count))
     }
+
+    pub fn from_btree_range_scan(
+        storage: &'storage crate::storage::MmapStorage,
+        root_page: u32,
+        start_key: Option<&[u8]>,
+        end_key: Option<&[u8]>,
+        column_types: Vec<crate::records::types::DataType>,
+    ) -> Result<Self> {
+        Self::from_btree_range_scan_with_projections(
+            storage,
+            root_page,
+            start_key,
+            end_key,
+            column_types,
+            None,
+        )
+    }
+
+    pub fn from_btree_range_scan_with_projections(
+        storage: &'storage crate::storage::MmapStorage,
+        root_page: u32,
+        start_key: Option<&[u8]>,
+        end_key: Option<&[u8]>,
+        column_types: Vec<crate::records::types::DataType>,
+        projections: Option<Vec<usize>>,
+    ) -> Result<Self> {
+        use crate::btree::BTreeReader;
+
+        let reader = BTreeReader::new(storage, root_page)?;
+        let cursor = if let Some(start) = start_key {
+            reader.cursor_seek(start)?
+        } else {
+            reader.cursor_first()?
+        };
+
+        let output_count = projections
+            .as_ref()
+            .map(|p| p.len())
+            .unwrap_or(column_types.len());
+        let decoder = match projections {
+            Some(proj) => SimpleDecoder::with_projections(column_types, proj),
+            None => SimpleDecoder::new(column_types),
+        };
+
+        Ok(Self::with_end_key(
+            cursor,
+            decoder,
+            output_count,
+            end_key.map(|k| k.to_vec()),
+        ))
+    }
 }
 
 impl<'storage> RowSource for StreamingBTreeSource<'storage> {
@@ -385,6 +453,13 @@ impl<'storage> RowSource for StreamingBTreeSource<'storage> {
         }
 
         let key = self.cursor.key()?;
+
+        if let Some(ref end) = self.end_key {
+            if key >= end.as_slice() {
+                return Ok(None);
+            }
+        }
+
         let value = self.cursor.value()?;
         self.row_buffer.clear();
         self.decoder.decode_into(key, value, &mut self.row_buffer)?;

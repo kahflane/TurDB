@@ -325,8 +325,8 @@ impl<'a> WalStoragePerTable<'a> {
                 PAGE_SIZE
             );
 
-            wal.write_frame(page_no, db_size, page_data)
-                .wrap_err_with(|| format!("failed to write page {} to WAL", page_no))?;
+            wal.write_frame_with_file_id(page_no, db_size, page_data, table_id as u64)
+                .wrap_err_with(|| format!("failed to write page {} to WAL for table_id {}", page_no, table_id))?;
 
             frames_written += 1;
         }

@@ -2245,10 +2245,11 @@ impl<'a> Planner<'a> {
         _filter: &LogicalFilter<'a>,
     ) -> Option<&'a PhysicalOperator<'a>> {
         None
-        // TODO: Re-enable IndexScan optimization once executor supports it
-        // The executor doesn't currently support IndexScan properly - it needs
-        // explicit BTreeCursorAdapter setup via build_index_scan method.
-        // For now, fall back to TableScan + FilterExec which works correctly.
+        // NOTE: IndexScan optimization is disabled because the primary table BTree
+        // is keyed by internal row_id (u64 BE bytes), not by primary key column values.
+        // To enable this optimization, we would need a secondary index on the PK column
+        // that maps PK values -> row_ids. The encoding functions below are preserved
+        // for future use when proper index scan support is implemented.
     }
 
     fn try_optimize_sort_to_index_scan(

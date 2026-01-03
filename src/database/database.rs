@@ -13,7 +13,7 @@ use crate::sql::executor::{BTreeSource, Executor, ExecutorRow, MaterializedRowSo
 use crate::sql::planner::Planner;
 
 use crate::sql::Parser;
-use crate::storage::{FileManager, TableFileHeader, Wal, WalStoragePerTable};
+use crate::storage::{FileManager, TableFileHeader, Wal, WalStoragePerTable, DEFAULT_SCHEMA};
 use crate::types::{create_record_schema, DataType, OwnedValue, Value};
 use bumpalo::Bump;
 use eyre::{bail, ensure, Result, WrapErr};
@@ -113,6 +113,8 @@ impl Database {
             table_id_lookup: RwLock::new(hashbrown::HashMap::new()),
         };
 
+        db.ensure_catalog()?;
+
         let recovery_info = RecoveryInfo {
             frames_recovered,
             wal_size_bytes,
@@ -133,9 +135,9 @@ impl Database {
         std::fs::create_dir_all(&path)
             .wrap_err_with(|| format!("failed to create database directory at {:?}", path))?;
 
-        let root_dir = path.join("root");
+        let root_dir = path.join(DEFAULT_SCHEMA);
         std::fs::create_dir_all(&root_dir).wrap_err_with(|| {
-            format!("failed to create root schema directory at {:?}", root_dir)
+            format!("failed to create default schema directory at {:?}", root_dir)
         })?;
 
         let meta_path = path.join("turdb.meta");
@@ -1007,6 +1009,8 @@ impl Database {
                 rows
             }
             Some(PlanSource::IndexScan(scan)) => {
+                use crate::sql::planner::ScanRange;
+
                 let schema_name = scan.schema.unwrap_or("root");
                 let table_name = scan.table;
 
@@ -1029,13 +1033,42 @@ impl Database {
                     })?;
 
                 let root_page = 1u32;
-                let source = StreamingBTreeSource::from_btree_scan_with_projections(
+
+                let (start_key, end_key): (Option<&[u8]>, Option<&[u8]>) = match &scan.key_range {
+                    ScanRange::FullScan => (None, None),
+                    ScanRange::PrefixScan { prefix } => {
+                        let mut end = prefix.to_vec();
+                        let mut carry = true;
+                        for byte in end.iter_mut().rev() {
+                            if carry {
+                                if *byte == 0xFF {
+                                    *byte = 0x00;
+                                } else {
+                                    *byte += 1;
+                                    carry = false;
+                                    break;
+                                }
+                            }
+                        }
+                        if carry {
+                            (Some(*prefix), None)
+                        } else {
+                            let end_slice = arena.alloc_slice_copy(&end);
+                            (Some(*prefix), Some(end_slice as &[u8]))
+                        }
+                    }
+                    ScanRange::RangeScan { start, end } => (*start, *end),
+                };
+
+                let source = StreamingBTreeSource::from_btree_range_scan_with_projections(
                     storage,
                     root_page,
+                    start_key,
+                    end_key,
                     column_types,
                     None,
                 )
-                .wrap_err("failed to create table scan for index scan fallback")?;
+                .wrap_err("failed to create range scan for index scan")?;
 
                 let ctx = ExecutionContext::new(&arena);
                 let builder = ExecutorBuilder::new(&ctx);

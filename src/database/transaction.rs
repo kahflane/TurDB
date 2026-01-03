@@ -94,7 +94,7 @@
 
 use crate::mvcc::{TxnId, TxnState, WriteEntry};
 use crate::sql::ast::IsolationLevel;
-use crate::storage::WalStoragePerTable;
+use crate::storage::{WalStoragePerTable, DEFAULT_SCHEMA};
 use eyre::{bail, Result, WrapErr};
 use smallvec::SmallVec;
 
@@ -361,7 +361,7 @@ impl Database {
         }
 
         let table_def = table_def.unwrap();
-        let schema_name = "root";
+        let schema_name = DEFAULT_SCHEMA;
         let table_name = table_def.name();
 
         let table_storage = file_manager.table_data_mut(schema_name, table_name)?;

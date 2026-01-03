@@ -97,7 +97,7 @@ use crate::database::row::Row;
 use crate::database::{Database, ExecuteResult};
 use crate::mvcc::WriteEntry;
 use crate::schema::table::Constraint;
-use crate::storage::{TableFileHeader, WalStoragePerTable};
+use crate::storage::{TableFileHeader, WalStoragePerTable, DEFAULT_SCHEMA};
 use crate::types::{create_record_schema, OwnedValue};
 use bumpalo::Bump;
 use eyre::{bail, Result};
@@ -122,7 +122,7 @@ impl Database {
         let catalog_guard = self.catalog.read();
         let catalog = catalog_guard.as_ref().unwrap();
 
-        let schema_name = insert.table.schema.unwrap_or("root");
+        let schema_name = insert.table.schema.unwrap_or(DEFAULT_SCHEMA);
         let table_name = insert.table.name;
 
         let table_def = catalog.resolve_table(table_name)?;
@@ -782,6 +782,11 @@ impl Database {
         }
 
         self.flush_wal_if_autocommit(file_manager, schema_name, table_name, table_id as u32)?;
+
+        if has_toast {
+            let toast_table_name_owned = crate::storage::toast::toast_table_name(table_name);
+            self.flush_wal_if_autocommit(file_manager, schema_name, &toast_table_name_owned, toast_table_id)?;
+        }
 
         Ok(ExecuteResult::Insert {
             rows_affected: count,

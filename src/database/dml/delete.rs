@@ -100,7 +100,7 @@ use crate::mvcc::WriteEntry;
 use crate::records::RecordView;
 use crate::schema::table::Constraint;
 use crate::sql::predicate::CompiledPredicate;
-use crate::storage::TableFileHeader;
+use crate::storage::{TableFileHeader, DEFAULT_SCHEMA};
 use crate::types::{create_column_map, create_record_schema, owned_values_to_values, OwnedValue};
 use bumpalo::Bump;
 use eyre::{bail, Result};
@@ -117,7 +117,7 @@ impl Database {
         let catalog_guard = self.catalog.read();
         let catalog = catalog_guard.as_ref().unwrap();
 
-        let schema_name = delete.table.schema.unwrap_or("root");
+        let schema_name = delete.table.schema.unwrap_or(DEFAULT_SCHEMA);
         let table_name = delete.table.name;
 
         let table_def = catalog.resolve_table(table_name)?;

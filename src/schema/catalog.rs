@@ -4,6 +4,7 @@
 
 use super::table::{ColumnDef, TableDef};
 use super::{Schema, SchemaId, TableId};
+use crate::storage::DEFAULT_SCHEMA;
 use eyre::{bail, ensure, Result};
 use std::collections::HashMap;
 
@@ -19,14 +20,14 @@ impl Catalog {
     pub fn new() -> Self {
         let mut catalog = Self {
             schemas: HashMap::new(),
-            default_schema: "root".to_string(),
+            default_schema: DEFAULT_SCHEMA.to_string(),
             next_schema_id: 1,
             next_table_id: 1,
         };
 
         catalog
             .schemas
-            .insert("root".to_string(), Schema::new(0, "root"));
+            .insert(DEFAULT_SCHEMA.to_string(), Schema::new(0, DEFAULT_SCHEMA));
 
         catalog
             .schemas

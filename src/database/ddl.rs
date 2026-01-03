@@ -51,7 +51,7 @@
 
 use crate::database::{ExecuteResult, Database};
 use crate::schema::ColumnDef as SchemaColumnDef;
-use crate::storage::TableFileHeader;
+use crate::storage::{TableFileHeader, DEFAULT_SCHEMA};
 use crate::types::{create_record_schema, OwnedValue};
 use bumpalo::Bump;
 use eyre::{bail, Result, WrapErr};
@@ -69,7 +69,7 @@ impl Database {
         let mut catalog_guard = self.catalog.write();
         let catalog = catalog_guard.as_mut().unwrap();
 
-        let schema_name = create.schema.unwrap_or("root");
+        let schema_name = create.schema.unwrap_or(DEFAULT_SCHEMA);
         let table_name = create.name;
 
         if catalog
@@ -350,7 +350,7 @@ impl Database {
         self.ensure_catalog()?;
         self.ensure_file_manager()?;
 
-        let schema_name = create.table.schema.unwrap_or("root");
+        let schema_name = create.table.schema.unwrap_or(DEFAULT_SCHEMA);
         let table_name = create.table.name;
         let index_name = create.name;
 

@@ -93,6 +93,7 @@ use crate::schema::table::Constraint;
 use crate::sql::decoder::RecordDecoder;
 use crate::sql::executor::ExecutorRow;
 use crate::sql::predicate::CompiledPredicate;
+use crate::storage::DEFAULT_SCHEMA;
 use crate::types::{create_column_map, create_record_schema, owned_values_to_values, OwnedValue, Value};
 use bumpalo::Bump;
 use eyre::{bail, Result};
@@ -111,7 +112,7 @@ impl Database {
         let catalog_guard = self.catalog.read();
         let catalog = catalog_guard.as_ref().unwrap();
 
-        let schema_name = update.table.schema.unwrap_or("root");
+        let schema_name = update.table.schema.unwrap_or(DEFAULT_SCHEMA);
         let table_name = update.table.name;
         let table_alias = update.table.alias;
 

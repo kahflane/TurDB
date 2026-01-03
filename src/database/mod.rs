@@ -185,6 +185,7 @@ pub struct CheckpointInfo {
 mod tests {
     use super::*;
     use crate::database::database::Database;
+    use crate::storage::DEFAULT_SCHEMA;
     use crate::OwnedValue;
     use tempfile::tempdir;
 
@@ -1143,14 +1144,14 @@ mod tests {
         db.execute("CREATE TABLE users (id INT PRIMARY KEY, email TEXT UNIQUE, name TEXT)")
             .unwrap();
 
-        let pk_index_path = db_path.join("root").join("users_id_pkey.idx");
+        let pk_index_path = db_path.join(DEFAULT_SCHEMA).join("users_id_pkey.idx");
         assert!(
             pk_index_path.exists(),
             "PRIMARY KEY should auto-create index at {:?}",
             pk_index_path
         );
 
-        let unique_index_path = db_path.join("root").join("users_email_key.idx");
+        let unique_index_path = db_path.join(DEFAULT_SCHEMA).join("users_email_key.idx");
         assert!(
             unique_index_path.exists(),
             "UNIQUE constraint should auto-create index at {:?}",
