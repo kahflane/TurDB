@@ -1,13 +1,12 @@
 //! # DELETE Operation Module
 //!
 //! This module implements DELETE operations for TurDB, handling row deletion
-//! with constraint validation and TOAST cleanup.
+//! with constraint validation.
 //!
 //! ## Purpose
 //!
 //! DELETE operations remove rows from tables while:
 //! - Checking FOREIGN KEY constraints (prevent deleting referenced rows)
-//! - Cleaning up TOAST chunks for large values
 //! - Recording undo data for transaction rollback
 //! - Supporting RETURNING clause for deleted rows
 //!
@@ -44,27 +43,20 @@
 //! │       │                                                                 │
 //! │       ▼                                                                 │
 //! │   ┌─────────────────────────────────────────────────────────────────┐   │
-//! │   │ 4. Clean up TOAST chunks                                        │   │
-//! │   │    - For each toasted column value                              │   │
-//! │   │    - Delete all chunks from TOAST table                         │   │
-//! │   └─────────────────────────────────────────────────────────────────┘   │
-//! │       │                                                                 │
-//! │       ▼                                                                 │
-//! │   ┌─────────────────────────────────────────────────────────────────┐   │
-//! │   │ 5. Delete rows from BTree                                       │   │
+//! │   │ 4. Delete rows from BTree                                       │   │
 //! │   │    - Remove each row key                                        │   │
 //! │   │    - WAL tracking if enabled                                    │   │
 //! │   └─────────────────────────────────────────────────────────────────┘   │
 //! │       │                                                                 │
 //! │       ▼                                                                 │
 //! │   ┌─────────────────────────────────────────────────────────────────┐   │
-//! │   │ 6. Record transaction write entries with undo data              │   │
+//! │   │ 5. Record transaction write entries with undo data              │   │
 //! │   │    - Store old row value for potential reinsert                 │   │
 //! │   └─────────────────────────────────────────────────────────────────┘   │
 //! │       │                                                                 │
 //! │       ▼                                                                 │
 //! │   ┌─────────────────────────────────────────────────────────────────┐   │
-//! │   │ 7. Update table row count in header                             │   │
+//! │   │ 6. Update table row count in header                             │   │
 //! │   └─────────────────────────────────────────────────────────────────┘   │
 //! │                                                                         │
 //! └─────────────────────────────────────────────────────────────────────────┘
@@ -85,7 +77,6 @@
 //! - DELETE without WHERE: O(n) scan + O(n * log n) for n deletions
 //! - DELETE with WHERE: O(n) scan + O(m * log n) for m matching rows
 //! - FK check: O(n * k) where k is number of referencing tables
-//! - TOAST cleanup: O(chunks) per toasted value
 //!
 //! ## Thread Safety
 //!
@@ -123,7 +114,6 @@ impl Database {
         let table_def = catalog.resolve_table(table_name)?;
         let table_id = table_def.id();
         let columns = table_def.columns().to_vec();
-        let has_toast = table_def.has_toast();
 
         let mut fk_references: Vec<(String, String, String, usize)> = Vec::new();
         for (schema_key, schema_val) in catalog.schemas() {
@@ -294,26 +284,6 @@ impl Database {
         } else {
             None
         };
-
-        if has_toast {
-            use crate::storage::toast::ToastPointer;
-            for (_key, _old_value, row_values) in &rows_to_delete {
-                for val in row_values.iter() {
-                    if let OwnedValue::ToastPointer(ptr) = val {
-                        if let Ok(pointer) = ToastPointer::decode(ptr) {
-                            let _ = self.delete_toast_chunks(
-                                file_manager,
-                                schema_name,
-                                table_name,
-                                pointer.row_id(),
-                                pointer.column_index(),
-                                pointer.total_size,
-                            );
-                        }
-                    }
-                }
-            }
-        }
 
         let wal_enabled = self.wal_enabled.load(std::sync::atomic::Ordering::Acquire);
         if wal_enabled {

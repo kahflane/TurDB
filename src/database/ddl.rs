@@ -173,42 +173,6 @@ impl Database {
         storage.grow(2)?;
         crate::btree::BTree::create(storage, 1)?;
 
-        let needs_toast = {
-            let catalog_guard = self.catalog.read();
-            let catalog = catalog_guard.as_ref().unwrap();
-            catalog
-                .get_schema(schema_name)
-                .and_then(|s| s.get_table(table_name))
-                .map(|t| t.columns().iter().any(|c| c.data_type().is_toastable()))
-                .unwrap_or(false)
-        };
-
-        if needs_toast {
-            let toast_table_name = crate::storage::toast::toast_table_name(table_name);
-            let toast_id = self.allocate_table_id();
-            file_manager.create_table(schema_name, &toast_table_name, toast_id, 3)?;
-
-            let toast_storage = file_manager.table_data_mut(schema_name, &toast_table_name)?;
-            toast_storage.grow(2)?;
-            crate::btree::BTree::create(toast_storage, 1)?;
-
-            self.table_id_lookup.write().insert(
-                toast_id as u32,
-                (schema_name.to_string(), toast_table_name.clone()),
-            );
-
-            let mut catalog_guard = self.catalog.write();
-            let catalog = catalog_guard.as_mut().unwrap();
-            if let Some(schema) = catalog.get_schema_mut(schema_name) {
-                if let Some(table) = schema.get_table(table_name) {
-                    let mut table_clone = table.clone();
-                    table_clone.set_toast_id(Some(toast_id));
-                    schema.remove_table(table_name);
-                    schema.add_table(table_clone);
-                }
-            }
-        }
-
         for (col_name, is_primary_key) in &unique_columns {
             let index_name = if *is_primary_key {
                 format!("{}_pkey", col_name)

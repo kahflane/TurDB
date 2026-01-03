@@ -251,8 +251,8 @@ impl DataType {
         matches!(self, DataType::Inet4 | DataType::Inet6 | DataType::MacAddr)
     }
 
-    /// Returns true if this type can potentially store large values that may need TOAST.
-    pub fn is_toastable(&self) -> bool {
+    /// Returns true if this type can potentially store large values requiring overflow pages.
+    pub fn is_overflow_candidate(&self) -> bool {
         matches!(
             self,
             DataType::Text

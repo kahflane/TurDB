@@ -26,7 +26,6 @@
 //! ```
 
 use super::{DataType, Value};
-use crate::storage::toast::is_toast_pointer;
 use eyre::Result;
 use std::borrow::Cow;
 
@@ -55,7 +54,6 @@ pub enum OwnedValue {
     Jsonb(Vec<u8>),
     Decimal(i128, i16),
     Enum(u16, u16),
-    ToastPointer(Vec<u8>),
 }
 
 impl<'a> From<&Value<'a>> for OwnedValue {
@@ -86,7 +84,6 @@ impl<'a> From<&Value<'a>> for OwnedValue {
             Value::Circle { center, radius } => OwnedValue::Circle(*center, *radius),
             Value::Enum { type_id, ordinal } => OwnedValue::Enum(*type_id, *ordinal),
             Value::Decimal { digits, scale } => OwnedValue::Decimal(*digits, *scale),
-            Value::ToastPointer(b) => OwnedValue::ToastPointer(b.to_vec()),
         }
     }
 }
@@ -226,7 +223,6 @@ impl OwnedValue {
                 type_id: *type_id,
                 ordinal: *ordinal,
             },
-            OwnedValue::ToastPointer(b) => Value::ToastPointer(Cow::Borrowed(b.as_slice())),
         }
     }
 
@@ -255,7 +251,6 @@ impl OwnedValue {
             OwnedValue::Jsonb(_) => DataType::Jsonb,
             OwnedValue::Decimal(_, _) => DataType::Decimal,
             OwnedValue::Enum(_, _) => DataType::Enum,
-            OwnedValue::ToastPointer(_) => DataType::Blob,
         }
     }
 
@@ -318,7 +313,6 @@ impl OwnedValue {
             OwnedValue::Jsonb(data) => format!("<jsonb:{} bytes>", data.len()),
             OwnedValue::Decimal(digits, scale) => format_decimal(*digits, *scale),
             OwnedValue::Enum(type_id, ordinal) => format!("enum({}:{})", type_id, ordinal),
-            OwnedValue::ToastPointer(b) => format!("<toast:{} bytes>", b.len()),
         }
     }
 
@@ -350,23 +344,11 @@ impl OwnedValue {
                 .unwrap_or(OwnedValue::Null),
             DataType::Text | DataType::Varchar | DataType::Char => record
                 .get_blob_opt(col_idx)?
-                .map(|b| {
-                    if is_toast_pointer(b) {
-                        OwnedValue::ToastPointer(b.to_vec())
-                    } else {
-                        OwnedValue::Text(String::from_utf8_lossy(b).to_string())
-                    }
-                })
+                .map(|b| OwnedValue::Text(String::from_utf8_lossy(b).to_string()))
                 .unwrap_or(OwnedValue::Null),
             DataType::Blob => record
                 .get_blob_opt(col_idx)?
-                .map(|b| {
-                    if is_toast_pointer(b) {
-                        OwnedValue::ToastPointer(b.to_vec())
-                    } else {
-                        OwnedValue::Blob(b.to_vec())
-                    }
-                })
+                .map(|b| OwnedValue::Blob(b.to_vec()))
                 .unwrap_or(OwnedValue::Null),
             DataType::Bool => record
                 .get_bool_opt(col_idx)?
@@ -495,7 +477,6 @@ impl OwnedValue {
                 builder.set_decimal(idx, *digits, *scale, *digits < 0)?
             }
             OwnedValue::Enum(type_id, ordinal) => builder.set_enum(idx, *type_id, *ordinal)?,
-            OwnedValue::ToastPointer(data) => builder.set_blob(idx, data)?,
         }
         Ok(())
     }

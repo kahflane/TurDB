@@ -72,7 +72,6 @@ fn eval_typeof<'a>(args: &[Option<Value<'a>>]) -> Option<Value<'a>> {
         Value::Circle { .. } => "circle",
         Value::Enum { .. } => "enum",
         Value::Decimal { .. } => "decimal",
-        Value::ToastPointer(_) => "toast_pointer",
     };
     Some(Value::Text(Cow::Borrowed(type_name)))
 }

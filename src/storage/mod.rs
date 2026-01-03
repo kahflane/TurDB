@@ -89,8 +89,8 @@ mod file_manager;
 mod freelist;
 mod headers;
 mod mmap;
+pub mod overflow;
 mod page;
-pub mod toast;
 mod wal;
 mod wal_storage;
 
@@ -109,6 +109,13 @@ pub use mmap::MmapStorage;
 pub use page::{validate_page, PageHeader, PageType};
 pub use wal::{SyncMode, Wal, WalFrameHeader, WalSegment};
 pub use wal_storage::{WalStorage, WalStoragePerTable};
+pub use overflow::{
+    BlobHandle, BlobHandleMut, OverflowHeader, OverflowPointer,
+    free_overflow_chain, needs_overflow, overflow_pages_needed,
+    read_overflow, read_overflow_into, write_overflow,
+    MAX_INLINE_PAYLOAD, MIN_INLINE_PAYLOAD, OVERFLOW_DATA_OFFSET,
+    OVERFLOW_DATA_SIZE, OVERFLOW_HEADER_SIZE, OVERFLOW_POINTER_SIZE,
+};
 
 use eyre::{ensure, Result};
 use zerocopy::{FromBytes, Immutable, KnownLayout};

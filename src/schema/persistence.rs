@@ -180,13 +180,6 @@ impl CatalogPersistence {
             Self::serialize_index(index, buf)?;
         }
 
-        if let Some(toast_id) = table.toast_id() {
-            buf.push(1);
-            buf.extend(toast_id.to_le_bytes());
-        } else {
-            buf.push(0);
-        }
-
         Ok(())
     }
 
@@ -458,16 +451,6 @@ impl CatalogPersistence {
             let (index, new_pos) = Self::deserialize_index(bytes, pos)?;
             pos = new_pos;
             table = table.with_index(index);
-        }
-
-        if pos < bytes.len() {
-            let has_toast = bytes[pos] != 0;
-            pos += 1;
-            if has_toast && pos + 8 <= bytes.len() {
-                let toast_id = u64::from_le_bytes(bytes[pos..pos + 8].try_into().unwrap());
-                pos += 8;
-                table = table.with_toast_id(toast_id);
-            }
         }
 
         Ok((table, pos))

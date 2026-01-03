@@ -7,7 +7,6 @@
 //!
 //! UPDATE operations modify existing rows while:
 //! - Validating constraints on new values
-//! - Processing TOAST for large updated values
 //! - Supporting UPDATE...FROM for join-based updates
 //! - Recording undo data for transaction rollback
 //!
@@ -38,14 +37,7 @@
 //! │       │                                                                 │
 //! │       ▼                                                                 │
 //! │   ┌─────────────────────────────────────────────────────────────────┐   │
-//! │   │ 3. Handle TOAST                                                 │   │
-//! │   │    - Delete old TOAST chunks if column was toasted              │   │
-//! │   │    - Toast new value if exceeds threshold                       │   │
-//! │   └─────────────────────────────────────────────────────────────────┘   │
-//! │       │                                                                 │
-//! │       ▼                                                                 │
-//! │   ┌─────────────────────────────────────────────────────────────────┐   │
-//! │   │ 4. Apply updates to BTree                                       │   │
+//! │   │ 3. Apply updates to BTree                                       │   │
 //! │   │    - Delete old record                                          │   │
 //! │   │    - Insert updated record                                      │   │
 //! │   │    - WAL tracking if enabled                                    │   │
@@ -53,7 +45,7 @@
 //! │       │                                                                 │
 //! │       ▼                                                                 │
 //! │   ┌─────────────────────────────────────────────────────────────────┐   │
-//! │   │ 5. Record transaction write entries with undo data              │   │
+//! │   │ 4. Record transaction write entries with undo data              │   │
 //! │   └─────────────────────────────────────────────────────────────────┘   │
 //! │                                                                         │
 //! └─────────────────────────────────────────────────────────────────────────┘
@@ -76,7 +68,6 @@
 //! - Simple UPDATE: O(n) scan + O(m * log n) for m matching rows
 //! - UPDATE...FROM: O(n * k) for cartesian product, filtered by predicate
 //! - UNIQUE check: O(n) scan of existing rows (could be optimized)
-//! - TOAST cleanup: O(chunks) per toasted column
 //!
 //! ## Thread Safety
 //!
@@ -119,7 +110,6 @@ impl Database {
         let table_def = catalog.resolve_table(table_name)?.clone();
         let table_id = table_def.id();
         let columns = table_def.columns().to_vec();
-        let has_toast = table_def.has_toast();
 
         #[allow(clippy::type_complexity)]
         let from_tables_data: Option<Vec<(
@@ -184,7 +174,7 @@ impl Database {
         let mut cursor = btree.cursor_first()?;
 
         #[allow(clippy::type_complexity)]
-        let mut rows_to_update: Vec<(Vec<u8>, Vec<u8>, Vec<OwnedValue>, Vec<(usize, OwnedValue)>)> = Vec::new();
+        let mut rows_to_update: Vec<(Vec<u8>, Vec<u8>, Vec<OwnedValue>)> = Vec::new();
 
         while cursor.valid() {
             let key = cursor.key()?;
@@ -206,11 +196,7 @@ impl Database {
             if should_update {
                 let old_value = value.to_vec();
 
-                let mut old_toast_values: Vec<(usize, OwnedValue)> = Vec::new();
                 for (col_idx, value_expr) in &assignment_indices {
-                    if let OwnedValue::ToastPointer(_) = &row_values[*col_idx] {
-                        old_toast_values.push((*col_idx, row_values[*col_idx].clone()));
-                    }
                     let new_value = Self::eval_literal(value_expr)?;
                     row_values[*col_idx] = new_value;
                 }
@@ -234,7 +220,7 @@ impl Database {
                     }
                 }
 
-                rows_to_update.push((key.to_vec(), old_value, row_values, old_toast_values));
+                rows_to_update.push((key.to_vec(), old_value, row_values));
             }
 
             cursor.advance()?;
@@ -255,7 +241,7 @@ impl Database {
             let btree_for_check = BTree::new(storage_for_check, root_page)?;
             let mut check_cursor = btree_for_check.cursor_first()?;
 
-            for (update_key, _old_value, updated_values, _old_toast) in &rows_to_update {
+            for (update_key, _old_value, updated_values) in &rows_to_update {
                 while check_cursor.valid() {
                     let existing_key = check_cursor.key()?;
 
@@ -293,7 +279,7 @@ impl Database {
         let returned_rows: Option<Vec<Row>> = update.returning.map(|returning_cols| {
             rows_to_update
                 .iter()
-                .map(|(_key, _old_value, updated_values, _old_toast)| {
+                .map(|(_key, _old_value, updated_values)| {
                     let row_values: Vec<OwnedValue> = returning_cols
                         .iter()
                         .flat_map(|col| match col {
@@ -320,80 +306,15 @@ impl Database {
                 .collect()
         });
 
-        let mut processed_rows: Vec<(Vec<u8>, Vec<OwnedValue>)> = Vec::with_capacity(rows_to_update.len());
-
         let wal_enabled = self.wal_enabled.load(std::sync::atomic::Ordering::Acquire);
         if wal_enabled {
             self.ensure_wal()?;
         }
 
-        if has_toast {
-            use crate::storage::toast::ToastPointer;
-            for (key, _old_value, mut updated_values, old_toast_values) in rows_to_update.clone() {
-                for (_col_idx, old_val) in old_toast_values {
-                    if let OwnedValue::ToastPointer(ptr) = old_val {
-                        if let Ok(pointer) = ToastPointer::decode(&ptr) {
-                            let _ = self.delete_toast_chunks(
-                                file_manager,
-                                schema_name,
-                                table_name,
-                                pointer.row_id(),
-                                pointer.column_index(),
-                                pointer.total_size,
-                            );
-                        }
-                    }
-                }
-
-                let pk_value = if let Some(pk_idx) = columns.iter().position(|c| c.has_constraint(&Constraint::PrimaryKey)) {
-                    if let OwnedValue::Int(id) = &updated_values[pk_idx] {
-                        *id as u64
-                    } else {
-                        0
-                    }
-                } else {
-                    0
-                };
-
-                for (col_idx, val) in updated_values.iter_mut().enumerate() {
-                    if columns[col_idx].data_type().is_toastable() {
-                        let needs_toast = match val {
-                            OwnedValue::Text(s) => crate::storage::toast::needs_toast(s.as_bytes()),
-                            OwnedValue::Blob(b) => crate::storage::toast::needs_toast(b),
-                            _ => false,
-                        };
-                        if needs_toast {
-                            let data = match val {
-                                OwnedValue::Text(s) => s.as_bytes().to_vec(),
-                                OwnedValue::Blob(b) => b.clone(),
-                                _ => continue,
-                            };
-                            let (pointer, _) = self.toast_value(
-                                file_manager,
-                                schema_name,
-                                table_name,
-                                pk_value,
-                                col_idx as u16,
-                                &data,
-                                wal_enabled,
-                                None,
-                            )?;
-                            *val = OwnedValue::ToastPointer(pointer);
-                        }
-                    }
-                }
-                processed_rows.push((key, updated_values));
-            }
-        } else {
-            for (key, _old_value, updated_values, _old_toast) in rows_to_update.clone() {
-                processed_rows.push((key, updated_values));
-            }
-        }
-
         let storage = file_manager.table_data_mut(schema_name, table_name)?;
 
         with_btree_storage!(wal_enabled, storage, &self.dirty_tracker, table_id as u32, root_page, |btree_mut: &mut crate::btree::BTree<_>| {
-            for (key, updated_values) in &processed_rows {
+            for (key, _old_value, updated_values) in &rows_to_update {
                 btree_mut.delete(key)?;
                 let record_data = OwnedValue::build_record_from_values(updated_values, &schema)?;
                 btree_mut.insert(key, &record_data)?;
@@ -408,7 +329,7 @@ impl Database {
         {
             let mut active_txn = self.active_txn.lock();
             if let Some(ref mut txn) = *active_txn {
-                for (key, old_value, _updated_values, _old_toast) in rows_to_update {
+                for (key, old_value, _updated_values) in rows_to_update {
                     txn.add_write_entry_with_undo(
                         WriteEntry {
                             table_id: table_id as u32,

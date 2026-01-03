@@ -1,7 +1,5 @@
-use crate::storage::toast::{is_toast_pointer, Detoaster};
 use crate::types::Value;
 use std::borrow::Cow;
-use std::sync::Arc;
 
 pub trait RecordDecoder {
     fn decode(&self, key: &[u8], value: &[u8]) -> eyre::Result<Vec<Value<'static>>>;
@@ -12,7 +10,6 @@ pub struct SimpleDecoder {
     decode_columns: Vec<usize>,
     current_schema: crate::records::Schema,
     older_schemas: Vec<(u16, usize, usize, crate::records::Schema)>,
-    detoaster: Option<Arc<dyn Detoaster + Send + Sync>>,
 }
 
 impl SimpleDecoder {
@@ -25,7 +22,6 @@ impl SimpleDecoder {
             decode_columns,
             current_schema,
             older_schemas,
-            detoaster: None,
         }
     }
 
@@ -40,17 +36,7 @@ impl SimpleDecoder {
             decode_columns: projections,
             current_schema,
             older_schemas,
-            detoaster: None,
         }
-    }
-
-    pub fn with_detoaster(mut self, detoaster: Arc<dyn Detoaster + Send + Sync>) -> Self {
-        self.detoaster = Some(detoaster);
-        self
-    }
-
-    pub fn set_detoaster(&mut self, detoaster: Arc<dyn Detoaster + Send + Sync>) {
-        self.detoaster = Some(detoaster);
     }
 
     #[allow(clippy::type_complexity)]
@@ -198,31 +184,11 @@ impl SimpleDecoder {
                 DataType::Float8 => Value::Float(view.get_float8(idx)?),
                 DataType::Bool => Value::Int(if view.get_bool(idx)? { 1 } else { 0 }),
                 DataType::Text | DataType::Varchar | DataType::Char => {
-                    let raw = view.get_var_raw(idx)?;
-                    if is_toast_pointer(raw) {
-                        if let Some(ref detoaster) = self.detoaster {
-                            let detoasted = detoaster.detoast(raw)?;
-                            let text = String::from_utf8(detoasted)
-                                .map_err(|e| eyre::eyre!("invalid UTF-8 in detoasted text: {}", e))?;
-                            Value::Text(Cow::Owned(text))
-                        } else {
-                            Value::ToastPointer(Cow::Owned(raw.to_vec()))
-                        }
-                    } else {
-                        Value::Text(Cow::Owned(view.get_text(idx)?.to_string()))
-                    }
+                    Value::Text(Cow::Owned(view.get_text(idx)?.to_string()))
                 }
                 DataType::Blob => {
                     let raw = view.get_blob(idx)?;
-                    if is_toast_pointer(raw) {
-                        if let Some(ref detoaster) = self.detoaster {
-                            Value::Blob(Cow::Owned(detoaster.detoast(raw)?))
-                        } else {
-                            Value::ToastPointer(Cow::Owned(raw.to_vec()))
-                        }
-                    } else {
-                        Value::Blob(Cow::Owned(raw.to_vec()))
-                    }
+                    Value::Blob(Cow::Owned(raw.to_vec()))
                 }
                 DataType::Uuid => Value::Uuid(*view.get_uuid(idx)?),
                 DataType::Vector => Value::Vector(Cow::Owned(view.get_vector(idx)?.to_vec())),

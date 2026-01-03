@@ -42,30 +42,23 @@
 //! │       │                                                                 │
 //! │       ▼                                                                 │
 //! │   ┌─────────────────────────────────────────────────────────────────┐   │
-//! │   │ 3. TOAST large values                                           │   │
-//! │   │    - Split into chunks if exceeds threshold                     │   │
-//! │   │    - Store in TOAST table                                       │   │
-//! │   │    - Replace with TOAST pointer                                 │   │
-//! │   └─────────────────────────────────────────────────────────────────┘   │
-//! │       │                                                                 │
-//! │       ▼                                                                 │
-//! │   ┌─────────────────────────────────────────────────────────────────┐   │
-//! │   │ 4. Insert into BTree                                            │   │
+//! │   │ 3. Insert into BTree                                            │   │
 //! │   │    - Generate row key from row_id                               │   │
 //! │   │    - Build record from values                                   │   │
+//! │   │    - Handle overflow pages for large values                     │   │
 //! │   │    - Insert with WAL tracking if enabled                        │   │
 //! │   └─────────────────────────────────────────────────────────────────┘   │
 //! │       │                                                                 │
 //! │       ▼                                                                 │
 //! │   ┌─────────────────────────────────────────────────────────────────┐   │
-//! │   │ 5. Update indexes                                               │   │
+//! │   │ 4. Update indexes                                               │   │
 //! │   │    - Insert into UNIQUE indexes                                 │   │
 //! │   │    - Insert into secondary indexes                              │   │
 //! │   └─────────────────────────────────────────────────────────────────┘   │
 //! │       │                                                                 │
 //! │       ▼                                                                 │
 //! │   ┌─────────────────────────────────────────────────────────────────┐   │
-//! │   │ 6. Record transaction write entry                               │   │
+//! │   │ 5. Record transaction write entry                               │   │
 //! │   │    - Store key for potential rollback                           │   │
 //! │   └─────────────────────────────────────────────────────────────────┘   │
 //! │                                                                         │
@@ -97,7 +90,7 @@ use crate::database::row::Row;
 use crate::database::{Database, ExecuteResult};
 use crate::mvcc::WriteEntry;
 use crate::schema::table::Constraint;
-use crate::storage::{TableFileHeader, WalStoragePerTable, DEFAULT_SCHEMA};
+use crate::storage::{FileKey, TableFileHeader, WalStoragePerTable, DEFAULT_SCHEMA};
 use crate::types::{create_record_schema, OwnedValue};
 use bumpalo::Bump;
 use eyre::{bail, Result};
@@ -129,7 +122,6 @@ impl Database {
         let table_id = table_def.id();
         let columns = table_def.columns().to_vec();
         let table_def_for_validator = table_def.clone();
-        let has_toast = table_def.has_toast();
 
         let unique_columns: Vec<(usize, String, bool, bool)> = columns
             .iter()
@@ -277,41 +269,8 @@ impl Database {
             if hint > 0 { Some(hint) } else { None }
         };
 
-        let mut toast_rightmost_hints: SmallVec<[Option<u32>; 8]> = SmallVec::new();
-        let toastable_col_indices: SmallVec<[usize; 8]> = if has_toast {
-            toast_rightmost_hints.resize(columns.len(), None);
-            columns.iter()
-                .enumerate()
-                .filter(|(_, col)| col.data_type().is_toastable())
-                .map(|(idx, _)| idx)
-                .collect()
-        } else {
-            SmallVec::new()
-        };
-
         let table_file_key = crate::storage::FileManager::make_table_key(schema_name, table_name);
         let mut record_builder = crate::records::RecordBuilder::new(&schema);
-
-        use crate::storage::FileKey;
-        let toast_file_key: Option<FileKey>;
-        let mut toast_table_id: u32 = 0;
-        let mut toast_root_page: u32 = 1;
-        let mut toast_initial_root_page: u32 = 1;
-        let mut toast_rightmost_hint: Option<u32> = None;
-        if has_toast {
-            let toast_table_name_owned = crate::storage::toast::toast_table_name(table_name);
-            toast_file_key = Some(crate::storage::FileManager::make_table_key(schema_name, &toast_table_name_owned));
-            let toast_storage = file_manager.table_data_mut(schema_name, &toast_table_name_owned)?;
-            let page0 = toast_storage.page(0)?;
-            let header = crate::storage::TableFileHeader::from_bytes(page0)?;
-            toast_table_id = header.table_id() as u32;
-            toast_root_page = header.root_page();
-            toast_initial_root_page = toast_root_page;
-            let hint = header.rightmost_hint();
-            toast_rightmost_hint = if hint > 0 { Some(hint) } else { None };
-        } else {
-            toast_file_key = None;
-        }
 
         let unique_column_keys: Vec<(usize, FileKey, bool, bool)> = unique_columns
             .iter()
@@ -599,55 +558,6 @@ impl Database {
             let row_id = self.next_row_id.fetch_add(1, Ordering::Relaxed);
             let row_key = Self::generate_row_key(row_id);
 
-            if !toastable_col_indices.is_empty() {
-                use crate::storage::toast::{needs_toast, make_chunk_key, ToastPointer, TOAST_CHUNK_SIZE};
-
-                for &col_idx in &toastable_col_indices {
-                    let value = &values[col_idx];
-                    let data = match value {
-                        OwnedValue::Text(s) => Some(s.as_bytes()),
-                        OwnedValue::Blob(b) => Some(b.as_slice()),
-                        _ => None,
-                    };
-
-                    if let Some(data) = data {
-                        if needs_toast(data) {
-                            let toast_key = toast_file_key.as_ref().unwrap();
-                            let toast_storage = file_manager.table_data_mut_with_key(toast_key)
-                                .ok_or_else(|| eyre::eyre!("toast storage not found"))?;
-
-                            let pointer = ToastPointer::new(row_id, col_idx as u16, data.len() as u64);
-                            let chunk_id = pointer.chunk_id;
-
-                            let (new_hint, new_root) = if wal_enabled {
-                                let mut wal_storage =
-                                    WalStoragePerTable::new(toast_storage, &self.dirty_tracker, toast_table_id);
-                                let mut btree = BTree::with_rightmost_hint(&mut wal_storage, toast_root_page, toast_rightmost_hint)?;
-                                for (seq, chunk) in data.chunks(TOAST_CHUNK_SIZE).enumerate() {
-                                    let chunk_key = make_chunk_key(chunk_id, seq as u32);
-                                    btree.insert(&chunk_key, chunk)?;
-                                }
-                                (btree.rightmost_hint(), btree.root_page())
-                            } else {
-                                let mut btree = BTree::with_rightmost_hint(toast_storage, toast_root_page, toast_rightmost_hint)?;
-                                for (seq, chunk) in data.chunks(TOAST_CHUNK_SIZE).enumerate() {
-                                    let chunk_key = make_chunk_key(chunk_id, seq as u32);
-                                    btree.insert(&chunk_key, chunk)?;
-                                }
-                                (btree.rightmost_hint(), btree.root_page())
-                            };
-
-                            toast_rightmost_hint = new_hint;
-                            if new_root != toast_root_page {
-                                toast_root_page = new_root;
-                            }
-
-                            values[col_idx] = OwnedValue::Blob(pointer.encode().to_vec());
-                        }
-                    }
-                }
-            }
-
             let table_storage = file_manager.table_data_mut_with_key(&table_file_key)
                 .ok_or_else(|| eyre::eyre!("table storage not found in cache"))?;
 
@@ -773,20 +683,7 @@ impl Database {
             header.set_row_count(new_row_count);
         }
 
-        if has_toast && toast_root_page != toast_initial_root_page {
-            let toast_table_name_owned = crate::storage::toast::toast_table_name(table_name);
-            let toast_storage = file_manager.table_data_mut(schema_name, &toast_table_name_owned)?;
-            let page0 = toast_storage.page_mut(0)?;
-            let header = crate::storage::TableFileHeader::from_bytes_mut(page0)?;
-            header.set_root_page(toast_root_page);
-        }
-
         self.flush_wal_if_autocommit(file_manager, schema_name, table_name, table_id as u32)?;
-
-        if has_toast {
-            let toast_table_name_owned = crate::storage::toast::toast_table_name(table_name);
-            self.flush_wal_if_autocommit(file_manager, schema_name, &toast_table_name_owned, toast_table_id)?;
-        }
 
         Ok(ExecuteResult::Insert {
             rows_affected: count,

@@ -211,10 +211,6 @@ impl Database {
                     table_def.id() as u32,
                     (schema_name.to_string(), table_name.to_string()),
                 );
-                if let Some(toast_id) = table_def.toast_id() {
-                    let toast_table_name = crate::storage::toast::toast_table_name(table_name);
-                    lookup.insert(toast_id as u32, (schema_name.to_string(), toast_table_name));
-                }
             }
         }
     }
@@ -394,7 +390,6 @@ impl Database {
             OwnedValue::Enum(type_id, ordinal) => {
                 key::encode_enum(*type_id as u32, *ordinal as u32, buf);
             }
-            OwnedValue::ToastPointer(b) => key::encode_blob(b, buf),
         }
     }
 
@@ -908,14 +903,10 @@ impl Database {
             return Ok((column_names, vec![Row::new(vec![OwnedValue::Int(count)])]));
         }
 
-        let mut toast_table_info: Option<(String, String)> = None;
-
         let rows = match plan_source {
             Some(PlanSource::TableScan(scan)) => {
                 let schema_name = scan.schema.unwrap_or("root");
                 let table_name = scan.table;
-
-                toast_table_info = Some((schema_name.to_string(), table_name.to_string()));
 
                 let table_def = catalog
                     .resolve_table(table_name)
@@ -1014,8 +1005,6 @@ impl Database {
                 let schema_name = scan.schema.unwrap_or("root");
                 let table_name = scan.table;
 
-                toast_table_info = Some((schema_name.to_string(), table_name.to_string()));
-
                 let table_def = catalog
                     .resolve_table(table_name)
                     .wrap_err_with(|| format!("table '{}' not found", table_name))?;
@@ -1113,8 +1102,6 @@ impl Database {
                 let schema_name = scan.schema.unwrap_or("root");
                 let table_name = scan.table;
                 let index_name = scan.index_name;
-
-                toast_table_info = Some((schema_name.to_string(), table_name.to_string()));
 
                 let table_def = scan.table_def.ok_or_else(|| {
                     eyre::eyre!("SecondaryIndexScan missing table_def for {}", table_name)
@@ -1654,12 +1641,6 @@ impl Database {
             } else {
                 deduplicated
             }
-        } else {
-            rows
-        };
-
-        let rows = if let Some((schema_name, table_name)) = toast_table_info {
-            self.detoast_rows(file_manager, &schema_name, &table_name, rows)?
         } else {
             rows
         };

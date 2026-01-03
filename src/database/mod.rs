@@ -99,7 +99,6 @@ pub mod prepared;
 mod recovery;
 pub mod row;
 pub mod timing;
-mod toast;
 mod transaction;
 
 pub use database::Database;
