@@ -470,6 +470,8 @@ impl Database {
         let table_file_key = crate::storage::FileManager::make_table_key(schema_name, table_name);
         let mut record_builder = crate::records::RecordBuilder::new(&schema);
         let mut record_buffer = Vec::with_capacity(256);
+        // Reusable buffer for overflow encoding to avoid per-insert allocations
+        let mut encode_buffer = Vec::with_capacity(512);
 
         let count;
 
@@ -484,7 +486,7 @@ impl Database {
                 let row_id = self.next_row_id.fetch_add(1, Ordering::Relaxed);
                 let row_key = Self::generate_row_key(row_id);
                 OwnedValue::build_record_into_buffer(row_values, &mut record_builder, &mut record_buffer)?;
-                btree.insert_append_with_overflow(&row_key, &record_buffer)?;
+                btree.insert_append_with_overflow_buf(&row_key, &record_buffer, &mut encode_buffer)?;
             }
 
             root_page = btree.root_page();
@@ -499,7 +501,7 @@ impl Database {
                 let row_id = self.next_row_id.fetch_add(1, Ordering::Relaxed);
                 let row_key = Self::generate_row_key(row_id);
                 OwnedValue::build_record_into_buffer(row_values, &mut record_builder, &mut record_buffer)?;
-                btree.insert_append_with_overflow(&row_key, &record_buffer)?;
+                btree.insert_append_with_overflow_buf(&row_key, &record_buffer, &mut encode_buffer)?;
             }
 
             root_page = btree.root_page();

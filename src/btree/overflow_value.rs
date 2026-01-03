@@ -99,13 +99,15 @@ pub fn encode_value<S: Storage>(
 
 /// Decodes a value from B-tree cell storage.
 ///
-/// For inline values, returns the data directly.
-/// For overflow values, reads from overflow pages and reconstructs the full value.
+/// For raw/inline values (no prefix), returns the data directly.
+/// For overflow values (0x01 prefix), reads from overflow pages and reconstructs.
+/// For legacy encoded inline values (0x00 prefix), decodes and returns data.
 pub fn decode_value<S: Storage + ?Sized>(storage: &S, encoded: &[u8]) -> Result<Vec<u8>> {
     ensure!(!encoded.is_empty(), "empty encoded value");
 
     match encoded[0] {
         VALUE_TYPE_INLINE => {
+            // Legacy format: 0x00 prefix with varint length
             ensure!(encoded.len() > 1, "inline value too short");
             let (len, varint_size) = decode_varint(&encoded[1..])?;
             let data_start = 1 + varint_size;
@@ -116,6 +118,7 @@ pub fn decode_value<S: Storage + ?Sized>(storage: &S, encoded: &[u8]) -> Result<
             Ok(encoded[data_start..data_start + len as usize].to_vec())
         }
         VALUE_TYPE_OVERFLOW => {
+            // Overflow format: 0x01 prefix with overflow pointer
             ensure!(
                 encoded.len() >= OVERFLOW_POINTER_OVERHEAD,
                 "overflow pointer too short"
@@ -141,21 +144,24 @@ pub fn decode_value<S: Storage + ?Sized>(storage: &S, encoded: &[u8]) -> Result<
 
             Ok(result)
         }
-        other => {
-            eyre::bail!("unknown value type marker: 0x{:02x}", other);
+        _ => {
+            // Raw format: no prefix, value stored directly
+            // This is the fast path for inline values <= MAX_INLINE_VALUE
+            Ok(encoded.to_vec())
         }
     }
 }
 
 /// Returns a reference to inline value data without allocation.
 ///
-/// For inline values, returns Some with the data slice.
+/// For inline/raw values, returns Some with the data slice.
 /// For overflow values, returns None (caller must use decode_value).
 pub fn get_inline_value(encoded: &[u8]) -> Result<Option<&[u8]>> {
     ensure!(!encoded.is_empty(), "empty encoded value");
 
     match encoded[0] {
         VALUE_TYPE_INLINE => {
+            // Legacy format: 0x00 prefix with varint length
             ensure!(encoded.len() > 1, "inline value too short");
             let (len, varint_size) = decode_varint(&encoded[1..])?;
             let data_start = 1 + varint_size;
@@ -166,8 +172,9 @@ pub fn get_inline_value(encoded: &[u8]) -> Result<Option<&[u8]>> {
             Ok(Some(&encoded[data_start..data_start + len as usize]))
         }
         VALUE_TYPE_OVERFLOW => Ok(None),
-        other => {
-            eyre::bail!("unknown value type marker: 0x{:02x}", other);
+        _ => {
+            // Raw format: no prefix, value stored directly
+            Ok(Some(encoded))
         }
     }
 }
