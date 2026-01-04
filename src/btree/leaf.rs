@@ -654,4 +654,60 @@ impl<'a> LeafNodeMut<'a> {
     pub fn as_ref(&self) -> LeafNode<'_> {
         LeafNode { data: self.data }
     }
+
+    pub fn update_cell_value_in_place(&mut self, index: usize, new_value: &[u8]) -> Result<()> {
+        let slot = self.slot_at(index)?;
+        let cell_offset = slot.offset() as usize;
+        let key_len = slot.key_len() as usize;
+        let value_start = cell_offset + key_len;
+
+        let (old_value_len, varint_size) = decode_varint(&self.data[value_start..])?;
+
+        ensure!(
+            new_value.len() == old_value_len as usize,
+            "value size mismatch: expected {}, got {}",
+            old_value_len,
+            new_value.len()
+        );
+
+        let value_data_start = value_start + varint_size;
+        self.data[value_data_start..value_data_start + new_value.len()]
+            .copy_from_slice(new_value);
+
+        Ok(())
+    }
+
+    pub fn update_cell_value_shrink(&mut self, index: usize, new_value: &[u8]) -> Result<()> {
+        let slot = self.slot_at(index)?;
+        let cell_offset = slot.offset() as usize;
+        let key_len = slot.key_len() as usize;
+        let value_start = cell_offset + key_len;
+
+        let (old_value_len, old_varint_size) = decode_varint(&self.data[value_start..])?;
+
+        ensure!(
+            new_value.len() < old_value_len as usize,
+            "value not shrinking: old={}, new={}",
+            old_value_len,
+            new_value.len()
+        );
+
+        let new_varint_size = varint_len(new_value.len() as u64);
+
+        encode_varint(new_value.len() as u64, &mut self.data[value_start..]);
+
+        let value_data_start = value_start + new_varint_size;
+        self.data[value_data_start..value_data_start + new_value.len()]
+            .copy_from_slice(new_value);
+
+        let old_total_size = old_varint_size + old_value_len as usize;
+        let new_total_size = new_varint_size + new_value.len();
+        let freed = old_total_size - new_total_size;
+
+        let header = PageHeader::from_bytes_mut(self.data)?;
+        let new_frag = header.frag_bytes().saturating_add(freed as u8);
+        header.set_frag_bytes(new_frag);
+
+        Ok(())
+    }
 }

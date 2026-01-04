@@ -1,17 +1,33 @@
 use crate::parsing::{parse_json_path, JsonNavigator};
 use crate::records::jsonb::{JsonbValue, JsonbView};
 use crate::sql::executor::ExecutorRow;
-use crate::types::Value;
+use crate::types::{OwnedValue, Value};
 use std::borrow::Cow;
 
 pub struct CompiledPredicate<'a> {
     expr: &'a crate::sql::ast::Expr<'a>,
     column_map: Vec<(String, usize)>,
+    params: Option<Vec<OwnedValue>>,
+    set_param_count: usize,
 }
 
 impl<'a> CompiledPredicate<'a> {
     pub fn new(expr: &'a crate::sql::ast::Expr<'a>, column_map: Vec<(String, usize)>) -> Self {
-        Self { expr, column_map }
+        Self { expr, column_map, params: None, set_param_count: 0 }
+    }
+
+    pub fn with_params(
+        expr: &'a crate::sql::ast::Expr<'a>,
+        column_map: Vec<(String, usize)>,
+        params: &[OwnedValue],
+        set_param_count: usize,
+    ) -> Self {
+        Self {
+            expr,
+            column_map,
+            params: Some(params.to_vec()),
+            set_param_count,
+        }
     }
 
     pub fn evaluate(&self, row: &ExecutorRow<'a>) -> bool {
@@ -169,7 +185,47 @@ impl<'a> CompiledPredicate<'a> {
                 self.eval_array_subscript(&array_val, &index_val)
             }
             Expr::Function(func) => self.eval_function(func, row),
+            Expr::Parameter(param_ref) => {
+                if let Some(ref params) = self.params {
+                    let idx = match param_ref {
+                        crate::sql::ast::ParameterRef::Anonymous => self.set_param_count,
+                        crate::sql::ast::ParameterRef::Positional(n) => {
+                            if *n > 0 { (*n - 1) as usize } else { return None; }
+                        }
+                        crate::sql::ast::ParameterRef::Named(_) => self.set_param_count,
+                    };
+                    params.get(idx).map(|v| self.owned_value_to_value(v))
+                } else {
+                    None
+                }
+            }
             _ => None,
+        }
+    }
+
+    fn owned_value_to_value(&self, v: &OwnedValue) -> Value<'a> {
+        match v {
+            OwnedValue::Null => Value::Null,
+            OwnedValue::Bool(b) => Value::Int(if *b { 1 } else { 0 }),
+            OwnedValue::Int(i) => Value::Int(*i),
+            OwnedValue::Float(f) => Value::Float(*f),
+            OwnedValue::Text(s) => Value::Text(Cow::Owned(s.clone())),
+            OwnedValue::Blob(b) => Value::Blob(Cow::Owned(b.clone())),
+            OwnedValue::Vector(v) => Value::Vector(Cow::Owned(v.clone())),
+            OwnedValue::Uuid(u) => Value::Uuid(*u),
+            OwnedValue::MacAddr(m) => Value::MacAddr(*m),
+            OwnedValue::Inet4(a) => Value::Inet4(*a),
+            OwnedValue::Inet6(a) => Value::Inet6(*a),
+            OwnedValue::Jsonb(b) => Value::Jsonb(Cow::Owned(b.clone())),
+            OwnedValue::TimestampTz(micros, offset_secs) => Value::TimestampTz { micros: *micros, offset_secs: *offset_secs },
+            OwnedValue::Interval(micros, days, months) => Value::Interval { micros: *micros, days: *days, months: *months },
+            OwnedValue::Point(x, y) => Value::Point { x: *x, y: *y },
+            OwnedValue::Box(low, high) => Value::GeoBox { low: *low, high: *high },
+            OwnedValue::Circle(center, radius) => Value::Circle { center: *center, radius: *radius },
+            OwnedValue::Enum(type_id, ordinal) => Value::Enum { type_id: *type_id, ordinal: *ordinal },
+            OwnedValue::Decimal(digits, scale) => Value::Decimal { digits: *digits, scale: *scale },
+            OwnedValue::ToastPointer(b) => Value::ToastPointer(Cow::Owned(b.clone())),
+            OwnedValue::Date(_) | OwnedValue::Time(_) | OwnedValue::Timestamp(_) => Value::Null,
         }
     }
 

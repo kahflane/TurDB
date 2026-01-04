@@ -116,11 +116,34 @@ pub struct CachedInsertPlan {
     pub record_buffer: std::cell::RefCell<Vec<u8>>,
 }
 
+#[derive(Debug, Clone)]
+pub struct CachedUpdatePlan {
+    pub table_id: u64,
+    pub schema_name: String,
+    pub table_name: String,
+    pub column_count: usize,
+    pub column_types: Vec<crate::records::types::DataType>,
+    pub record_schema: crate::records::Schema,
+    pub assignment_indices: Vec<(usize, String)>,
+    pub where_clause_str: Option<String>,
+    pub unique_col_indices: Vec<usize>,
+    pub root_page: std::cell::Cell<u32>,
+    pub storage: std::cell::RefCell<Option<std::sync::Weak<RwLock<MmapStorage>>>>,
+    pub original_sql: String,
+    pub row_buffer: std::cell::RefCell<Vec<crate::types::OwnedValue>>,
+    pub key_buffer: std::cell::RefCell<Vec<u8>>,
+    pub record_buffer: std::cell::RefCell<Vec<u8>>,
+    pub is_simple_pk_update: bool,
+    pub pk_column_index: Option<usize>,
+    pub all_params: bool,
+}
+
 #[derive(Debug)]
 pub struct PreparedStatement {
     sql: String,
     param_count: u32,
     cached_insert_plan: RefCell<Option<CachedInsertPlan>>,
+    cached_update_plan: RefCell<Option<CachedUpdatePlan>>,
 }
 
 impl Clone for PreparedStatement {
@@ -129,16 +152,18 @@ impl Clone for PreparedStatement {
             sql: self.sql.clone(),
             param_count: self.param_count,
             cached_insert_plan: RefCell::new(self.cached_insert_plan.borrow().clone()),
+            cached_update_plan: RefCell::new(self.cached_update_plan.borrow().clone()),
         }
     }
 }
 
 impl PreparedStatement {
     pub(crate) fn new(sql: String, param_count: u32) -> Self {
-        Self { 
-            sql, 
+        Self {
+            sql,
             param_count,
             cached_insert_plan: RefCell::new(None),
+            cached_update_plan: RefCell::new(None),
         }
     }
     
@@ -158,6 +183,14 @@ impl PreparedStatement {
         *self.cached_insert_plan.borrow_mut() = Some(plan);
     }
 
+    pub fn cached_update_plan(&self) -> Option<CachedUpdatePlan> {
+        self.cached_update_plan.borrow().clone()
+    }
+
+    pub fn set_cached_update_plan(&self, plan: CachedUpdatePlan) {
+        *self.cached_update_plan.borrow_mut() = Some(plan);
+    }
+
     pub fn bind<V: Into<OwnedValue>>(&self, value: V) -> BoundStatement<'_> {
         let mut bound = BoundStatement::new(self);
         bound.params.push(value.into());
@@ -169,6 +202,13 @@ impl PreparedStatement {
         F: FnOnce(&CachedInsertPlan) -> R,
     {
         self.cached_insert_plan.borrow().as_ref().map(f)
+    }
+
+    pub(crate) fn with_cached_update_plan<F, R>(&self, f: F) -> Option<R>
+    where
+        F: FnOnce(&CachedUpdatePlan) -> R,
+    {
+        self.cached_update_plan.borrow().as_ref().map(f)
     }
 }
 

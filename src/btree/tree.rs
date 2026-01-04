@@ -1033,6 +1033,52 @@ impl<'a, S: Storage> BTree<'a, S> {
         }
     }
 
+    pub fn update(&mut self, key: &[u8], new_value: &[u8]) -> Result<bool> {
+        let handle = match self.search(key)? {
+            Some(h) => h,
+            None => return Ok(false), 
+        };
+
+        let page_no = handle.page_no;
+        let cell_index = handle.cell_index;
+
+        let old_value = {
+            let page_data = self.storage.page(page_no)?;
+            let leaf = LeafNode::from_page(page_data)?;
+            leaf.value_at(cell_index)?.to_vec()
+        };
+
+        if new_value.len() == old_value.len() {
+            let page_data = self.storage.page_mut(page_no)?;
+            let mut leaf = LeafNodeMut::from_page(page_data)?;
+            leaf.update_cell_value_in_place(cell_index, new_value)?;
+            return Ok(true);
+        } else if new_value.len() < old_value.len() {
+            let page_data = self.storage.page_mut(page_no)?;
+            let mut leaf = LeafNodeMut::from_page(page_data)?;
+            leaf.update_cell_value_shrink(cell_index, new_value)?;
+            return Ok(true);
+        } else {
+            let value_len_size = varint_len(new_value.len() as u64);
+            let old_value_len_size = varint_len(old_value.len() as u64);
+            let size_increase = (new_value.len() + value_len_size)
+                .saturating_sub(old_value.len() + old_value_len_size);
+
+            let page_data = self.storage.page(page_no)?;
+            let leaf = LeafNode::from_page(page_data)?;
+
+            if (leaf.free_space() as usize) >= size_increase {
+                let page_data = self.storage.page_mut(page_no)?;
+                let mut leaf = LeafNodeMut::from_page(page_data)?;
+                leaf.delete_cell(cell_index)?;
+                leaf.insert_cell(key, new_value)?;
+                return Ok(true);
+            } else {
+                return Ok(false);
+            }
+        }
+    }
+
     fn allocate_page(&mut self) -> Result<u32> {
         if let Some(ref mut freelist) = self.freelist {
             if let Some(page_no) = freelist.allocate(self.storage)? {
@@ -1195,6 +1241,7 @@ impl<'a, S: Storage + ?Sized> Cursor<'a, S> {
         }
 
         let next_page = leaf.next_leaf();
+        
         if next_page == 0 {
             self.exhausted = true;
             return Ok(false);

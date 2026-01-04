@@ -94,16 +94,28 @@ use crate::sql::decoder::RecordDecoder;
 use crate::sql::executor::ExecutorRow;
 use crate::sql::predicate::CompiledPredicate;
 use crate::storage::DEFAULT_SCHEMA;
-use crate::types::{create_column_map, create_record_schema, owned_values_to_values, OwnedValue, Value};
+use crate::types::{create_record_schema, owned_values_to_values, OwnedValue, Value};
 use bumpalo::Bump;
-use eyre::{bail, Result};
+use eyre::{bail, Result, WrapErr};
 use hashbrown::HashSet;
 use std::borrow::Cow;
+
+fn count_params_in_expr(expr: &crate::sql::ast::Expr) -> usize {
+    use crate::sql::ast::Expr;
+    match expr {
+        Expr::Parameter(_) => 1,
+        Expr::BinaryOp { left, right, .. } => count_params_in_expr(left) + count_params_in_expr(right),
+        Expr::UnaryOp { expr, .. } => count_params_in_expr(expr),
+        Expr::Cast { expr, .. } => count_params_in_expr(expr),
+        _ => 0,
+    }
+}
 
 impl Database {
     pub(crate) fn execute_update(
         &self,
         update: &crate::sql::ast::UpdateStmt<'_>,
+        params: &[OwnedValue],
         arena: &Bump,
     ) -> Result<ExecuteResult> {
         self.ensure_catalog()?;
@@ -154,12 +166,6 @@ impl Database {
             );
         }
 
-        let column_map = create_column_map(&columns);
-
-        let predicate = update
-            .where_clause
-            .map(|expr| CompiledPredicate::new(expr, column_map));
-
         let assignment_indices: Vec<(usize, &crate::sql::ast::Expr<'_>)> = update
             .assignments
             .iter()
@@ -182,111 +188,339 @@ impl Database {
 
         let root_page = 1u32;
         let btree = BTree::new(&mut *storage, root_page)?;
-        let mut cursor = btree.cursor_first()?;
 
-        #[allow(clippy::type_complexity)]
-        let mut rows_to_update: Vec<(Vec<u8>, Vec<u8>, Vec<OwnedValue>, Vec<(usize, OwnedValue)>)> = Vec::new();
+        let mut pk_lookup_info: Option<(Vec<u8>, OwnedValue)> = 'pk_analysis: {
+            if let Some(ref w) = update.where_clause {
+                if let crate::sql::ast::Expr::BinaryOp { left, op: crate::sql::ast::BinaryOperator::Eq, right } = w {
+                    if let Some(pk_idx) = columns.iter().position(|c| c.has_constraint(&Constraint::PrimaryKey)) {
+                        let pk_col_name = columns[pk_idx].name();
 
-        while cursor.valid() {
-            let key = cursor.key()?;
-            let value = cursor.value()?;
+                        let val_expr = match (&**left, &**right) {
+                            (crate::sql::ast::Expr::Column(c), val) if c.column.eq_ignore_ascii_case(pk_col_name) => Some(val),
+                            (val, crate::sql::ast::Expr::Column(c)) if c.column.eq_ignore_ascii_case(pk_col_name) => Some(val),
+                            _ => None,
+                        };
 
-            let values = decoder.decode(key, value)?;
-            let mut row_values: Vec<OwnedValue> =
-                values.into_iter().map(OwnedValue::from).collect();
+                        if let Some(expr) = val_expr {
+                            let val_opt = if let crate::sql::ast::Expr::Parameter(param_ref) = expr {
+                                 match param_ref {
+                                     crate::sql::ast::ParameterRef::Anonymous => {
+                                         let mut param_offset = 0;
+                                         for assign in update.assignments {
+                                             param_offset += count_params_in_expr(&assign.value);
+                                         }
+                                         params.get(param_offset).cloned()
+                                     },
+                                     crate::sql::ast::ParameterRef::Positional(idx) => if *idx > 0 { params.get((*idx - 1) as usize).cloned() } else { None },
+                                     _ => None,
+                                 }
+                            } else {
+                                Self::eval_literal(expr).ok()
+                            };
 
-            let should_update = if let Some(ref pred) = predicate {
-                let values = owned_values_to_values(&row_values);
-                let values_slice = arena.alloc_slice_fill_iter(values.into_iter());
-                let exec_row = ExecutorRow::new(values_slice);
-                pred.evaluate(&exec_row)
-            } else {
-                true
-            };
+                            if let Some(val) = val_opt {
+                                let pk_index_name = format!("{}_pkey", pk_col_name);
 
-            if should_update {
-                let old_value = value.to_vec();
+                                if file_manager.index_exists(schema_name, table_name, &pk_index_name) {
+                                    if let Ok(index_storage_arc) = file_manager.index_data_mut(schema_name, table_name, &pk_index_name) {
+                                        let mut index_storage = index_storage_arc.write();
 
-                let mut old_toast_values: Vec<(usize, OwnedValue)> = Vec::new();
-                for (col_idx, value_expr) in &assignment_indices {
-                    if let OwnedValue::ToastPointer(_) = &row_values[*col_idx] {
-                        old_toast_values.push((*col_idx, row_values[*col_idx].clone()));
-                    }
-                    let new_value = Self::eval_literal(value_expr)?;
-                    row_values[*col_idx] = new_value;
-                }
+                                        let index_root_page = {
+                                            use crate::storage::IndexFileHeader;
+                                            let page0 = index_storage.page(0)?;
+                                            let header = IndexFileHeader::from_bytes(page0)?;
+                                            header.root_page()
+                                        };
 
-                let validator = crate::constraints::ConstraintValidator::new(&table_def);
-                validator.validate_update(&row_values)?;
+                                        let index_btree = BTree::new(&mut *index_storage, index_root_page)?;
 
-                for (col_idx, col) in columns.iter().enumerate() {
-                    for constraint in col.constraints() {
-                        if let Constraint::Check(expr_str) = constraint {
-                            let col_value = row_values.get(col_idx);
-                            if !Self::evaluate_check_expression(expr_str, col.name(), col_value) {
-                                bail!(
-                                    "CHECK constraint violated on column '{}' in table '{}': {}",
-                                    col.name(),
-                                    table_name,
-                                    expr_str
-                                );
+                                        let mut index_key = Vec::new();
+                                        Self::encode_value_as_key(&val, &mut index_key);
+
+                                        if let Some(handle) = index_btree.search(&index_key)? {
+                                            let row_key = index_btree.get_value(&handle)?.to_vec();
+                                            break 'pk_analysis Some((row_key, val));
+                                        }
+                                    }
+                                }
+                                break 'pk_analysis None;
                             }
                         }
                     }
                 }
-
-                rows_to_update.push((key.to_vec(), old_value, row_values, old_toast_values));
             }
+            None
+        };
 
-            cursor.advance()?;
+        #[allow(clippy::type_complexity)]
+        let mut rows_to_update: Vec<(Vec<u8>, Vec<u8>, Vec<OwnedValue>, Vec<(usize, OwnedValue)>)> = Vec::new();
+
+        let mut precomputed_assignments: Vec<(usize, OwnedValue)> = Vec::new();
+        let set_param_count: usize;
+        {
+            let mut param_idx = 0;
+            for (col_idx, value_expr) in &assignment_indices {
+                let val = Self::eval_expr_with_params(value_expr, None, Some(params), &mut param_idx)?;
+                precomputed_assignments.push((*col_idx, val));
+            }
+            set_param_count = param_idx;
         }
+
+        let predicate: Option<crate::sql::predicate::CompiledPredicate> = if let Some(ref w) = update.where_clause {
+             let col_map = columns.iter().enumerate().map(|(i, c)| (c.name().to_string(), i)).collect();
+             Some(crate::sql::predicate::CompiledPredicate::with_params(w, col_map, params, set_param_count))
+        } else {
+             None
+        };
+
+        let modified_col_indices: HashSet<usize> = assignment_indices
+            .iter()
+            .map(|(idx, _)| *idx)
+            .collect();
 
         let unique_col_indices: Vec<usize> = columns
             .iter()
             .enumerate()
-            .filter(|(_, col)| {
-                col.has_constraint(&Constraint::Unique)
-                    || col.has_constraint(&Constraint::PrimaryKey)
+            .filter(|(idx, col)| {
+                (col.has_constraint(&Constraint::Unique) || col.has_constraint(&Constraint::PrimaryKey))
+                && modified_col_indices.contains(idx)
             })
             .map(|(idx, _)| idx)
             .collect();
 
-        if !unique_col_indices.is_empty() {
-            let storage_for_check_arc = file_manager.table_data_mut(schema_name, table_name)?;
-            let mut storage_for_check = storage_for_check_arc.write();
-            let btree_for_check = BTree::new(&mut *storage_for_check, root_page)?;
-            let mut check_cursor = btree_for_check.cursor_first()?;
+        let can_onepass = pk_lookup_info.is_some()
+            && unique_col_indices.is_empty()
+            && !has_toast;
 
-            for (update_key, _old_value, updated_values, _old_toast) in &rows_to_update {
-                while check_cursor.valid() {
-                    let existing_key = check_cursor.key()?;
+        if can_onepass {
+            if let Some((ref target_key, ref target_val)) = pk_lookup_info {
+                
+                let cursor = btree.cursor_seek(target_key)?;
 
-                    if existing_key != update_key.as_slice() {
-                        let existing_value = check_cursor.value()?;
-                        let existing_values_raw = decoder.decode(existing_key, existing_value)?;
-                        let existing_values: Vec<OwnedValue> =
-                            existing_values_raw.into_iter().map(OwnedValue::from).collect();
+                if cursor.valid() && cursor.key()? == target_key.as_slice() {
+                    let key = cursor.key()?;
+                    let value = cursor.value()?;
+                    let values = decoder.decode(key, value)?;
+                    let mut row_values: Vec<OwnedValue> = values.into_iter().map(OwnedValue::from).collect();
+                    let pk_idx = columns.iter()
+                        .position(|c| c.has_constraint(&Constraint::PrimaryKey))
+                        .unwrap();
 
-                        for &col_idx in &unique_col_indices {
-                            let new_val = updated_values.get(col_idx);
-                            let existing_val = existing_values.get(col_idx);
+                    if &row_values[pk_idx] == target_val {
+                        let old_value = value.to_vec();
 
-                            if let (Some(new_v), Some(existing_v)) = (new_val, existing_val) {
-                                if !new_v.is_null() && !existing_v.is_null() && new_v == existing_v
-                                {
-                                    let col_name = &columns[col_idx].name();
+                        for (col_idx, val) in &precomputed_assignments {
+                            row_values[*col_idx] = val.clone();
+                        }
+
+                        let validator = crate::constraints::ConstraintValidator::new(&table_def);
+                        validator.validate_update(&row_values)?;
+
+                        for (col_idx, col) in columns.iter().enumerate() {
+                            for constraint in col.constraints() {
+                                if let Constraint::Check(expr_str) = constraint {
+                                    let col_value = row_values.get(col_idx);
+                                    if !Self::evaluate_check_expression(expr_str, col.name(), col_value) {
+                                        bail!(
+                                            "CHECK constraint violated on column '{}' in table '{}': {}",
+                                            col.name(),
+                                            table_name,
+                                            expr_str
+                                        );
+                                    }
+                                }
+                            }
+                        }
+
+                        let record_data = OwnedValue::build_record_from_values(&row_values, &schema)?;
+
+                        drop(cursor);
+                        drop(btree);
+                        // Fix deadlock: Drop the outer storage write lock before re-acquiring it
+                        drop(storage);
+
+                        let wal_enabled = self.wal_enabled.load(std::sync::atomic::Ordering::Acquire);
+                        if wal_enabled {
+                            self.ensure_wal()?;
+                        }
+
+                        let storage_arc = file_manager.table_data_mut(schema_name, table_name)?;
+                        let mut storage_inner = storage_arc.write();
+
+                        with_btree_storage!(wal_enabled, &mut *storage_inner, &self.dirty_tracker, table_id as u32, root_page, |btree_mut: &mut crate::btree::BTree<_>| {
+                            if !btree_mut.update(target_key, &record_data)? {
+                                btree_mut.delete(target_key)?;
+                                btree_mut.insert(target_key, &record_data)?;
+                            }
+                            Ok::<_, eyre::Report>(())
+                        });
+                        drop(storage_inner);
+
+                        self.flush_wal_if_autocommit(file_manager, schema_name, table_name, table_id as u32)?;
+
+                        {
+                            let mut active_txn = self.active_txn.lock();
+                            if let Some(ref mut txn) = *active_txn {
+                                txn.add_write_entry_with_undo(
+                                    WriteEntry {
+                                        table_id: table_id as u32,
+                                        key: target_key.clone(),
+                                        page_id: 0,
+                                        offset: 0,
+                                        undo_page_id: None,
+                                        undo_offset: None,
+                                        is_insert: false,
+                                    },
+                                    old_value,
+                                );
+                            }
+                        }
+
+                        return Ok(ExecuteResult::Update {
+                            rows_affected: 1,
+                            returned: None,
+                        });
+                    }
+                }
+
+                // Key not found or didn't match - return 0 rows affected
+                return Ok(ExecuteResult::Update {
+                    rows_affected: 0,
+                    returned: None,
+                });
+            }
+        }
+
+        // MULTIPASS: Fallback for complex queries
+        loop {
+            let mut cursor = if let Some((ref key, _)) = pk_lookup_info {
+                 btree.cursor_seek(key)?
+            } else {
+                 btree.cursor_first()?
+            };
+
+            while cursor.valid() {
+                let key = cursor.key()?;
+
+                // Optimization: If doing Point Lookup, stop if we pass the key or don't match
+                if let Some((ref target_key, _)) = pk_lookup_info {
+                    if key != target_key.as_slice() {
+                        break;
+                    }
+                }
+
+                let value = cursor.value()?;
+                let values = decoder.decode(key, value)?;
+                let mut row_values: Vec<OwnedValue> = values.into_iter().map(OwnedValue::from).collect();
+
+                let should_update = if let Some((_, ref target_val)) = pk_lookup_info {
+                    if let Some(pk_idx) = columns.iter().position(|c| c.has_constraint(&Constraint::PrimaryKey)) {
+                        &row_values[pk_idx] == target_val
+                    } else {
+                        false
+                    }
+                } else if let Some(ref pred) = predicate {
+                    let values = owned_values_to_values(&row_values);
+                    let values_slice = arena.alloc_slice_fill_iter(values.into_iter());
+                    let exec_row = ExecutorRow::new(values_slice);
+                    pred.evaluate(&exec_row)
+                } else {
+                    true
+                };
+
+                if should_update {
+                    let old_value = value.to_vec();
+
+                    let mut old_toast_values: Vec<(usize, OwnedValue)> = Vec::new();
+
+                    for (col_idx, val) in &precomputed_assignments {
+                        if let OwnedValue::ToastPointer(_) = &row_values[*col_idx] {
+                            old_toast_values.push((*col_idx, row_values[*col_idx].clone()));
+                        }
+                        row_values[*col_idx] = val.clone();
+                    }
+
+                    let validator = crate::constraints::ConstraintValidator::new(&table_def);
+                    validator.validate_update(&row_values)?;
+
+                    for (col_idx, col) in columns.iter().enumerate() {
+                        for constraint in col.constraints() {
+                            if let Constraint::Check(expr_str) = constraint {
+                                let col_value = row_values.get(col_idx);
+                                if !Self::evaluate_check_expression(expr_str, col.name(), col_value) {
                                     bail!(
-                                        "UNIQUE constraint violated on column '{}' in table '{}': value already exists",
-                                        col_name,
-                                        table_name
+                                        "CHECK constraint violated on column '{}' in table '{}': {}",
+                                        col.name(),
+                                        table_name,
+                                        expr_str
                                     );
                                 }
                             }
                         }
                     }
-                    check_cursor.advance()?;
+
+                    rows_to_update.push((key.to_vec(), old_value, row_values, old_toast_values));
                 }
-                check_cursor = btree_for_check.cursor_first()?;
+
+                cursor.advance()?;
+            }
+
+            if pk_lookup_info.is_some() && rows_to_update.is_empty() {
+                pk_lookup_info = None;
+                continue;
+            }
+
+            break;
+        }
+        
+        drop(btree);
+        drop(storage);
+
+        if !unique_col_indices.is_empty() {
+            
+            for (update_key, _old_value, updated_values, _old_toast) in &rows_to_update {
+                for &col_idx in &unique_col_indices {
+                    let new_val = &updated_values[col_idx];
+                    if new_val.is_null() {
+                        continue;
+                    }
+
+                    let col_name = columns[col_idx].name();
+                    let index_name = if columns[col_idx].has_constraint(&Constraint::PrimaryKey) {
+                        format!("{}_pkey", col_name)
+                    } else {
+                        format!("{}_key", col_name)
+                    };
+
+                    if let Ok(index_storage_arc) =
+                        file_manager.index_data_mut(schema_name, table_name, &index_name)
+                    {
+                        let mut index_storage = index_storage_arc.write();
+                        let index_root_page = {
+                            use crate::storage::IndexFileHeader;
+                            let page0 = index_storage.page(0)?;
+                            let header = IndexFileHeader::from_bytes(page0)?;
+                            header.root_page()
+                        };
+                        let index_btree = BTree::new(&mut *index_storage, index_root_page)?;
+
+                        let mut key_buf = Vec::new();
+                        Self::encode_value_as_key(new_val, &mut key_buf);
+
+                        // O(log n) index lookup
+                        if let Some(handle) = index_btree.search(&key_buf)? {
+                            let existing_row_key = index_btree.get_value(&handle)?;
+                            if existing_row_key != update_key.as_slice() {
+                                // Different row has this value - UNIQUE violation
+                                bail!(
+                                    "UNIQUE constraint violated on column '{}' in table '{}': value already exists",
+                                    col_name,
+                                    table_name
+                                );
+                            }
+                        }
+                    }
+                }
             }
         }
 
@@ -331,10 +565,12 @@ impl Database {
 
         if has_toast {
             use crate::storage::toast::ToastPointer;
-            for (key, _old_value, mut updated_values, old_toast_values) in rows_to_update.clone() {
-                for (_col_idx, old_val) in old_toast_values {
+            for row_tuple in &mut rows_to_update {
+                let (_key, _old_value, updated_values, old_toast_values) = row_tuple;
+
+                for (_col_idx, old_val) in old_toast_values.iter() {
                     if let OwnedValue::ToastPointer(ptr) = old_val {
-                        if let Ok(pointer) = ToastPointer::decode(&ptr) {
+                        if let Ok(pointer) = ToastPointer::decode(ptr) {
                             let _ = self.delete_toast_chunks(
                                 file_manager,
                                 schema_name,
@@ -384,12 +620,11 @@ impl Database {
                         }
                     }
                 }
-                processed_rows.push((key, updated_values));
             }
-        } else {
-            for (key, _old_value, updated_values, _old_toast) in rows_to_update.clone() {
-                processed_rows.push((key, updated_values));
-            }
+        }
+
+        for (key, _old_value, updated_values, _old_toast) in &rows_to_update {
+            processed_rows.push((key.clone(), updated_values.clone()));
         }
 
         let storage_arc = file_manager.table_data_mut(schema_name, table_name)?;
@@ -397,12 +632,16 @@ impl Database {
 
         with_btree_storage!(wal_enabled, &mut *storage, &self.dirty_tracker, table_id as u32, root_page, |btree_mut: &mut crate::btree::BTree<_>| {
             for (key, updated_values) in &processed_rows {
-                btree_mut.delete(key)?;
                 let record_data = OwnedValue::build_record_from_values(updated_values, &schema)?;
-                btree_mut.insert(key, &record_data)?;
+
+                if !btree_mut.update(key, &record_data)? {
+                    btree_mut.delete(key)?;
+                    btree_mut.insert(key, &record_data)?;
+                }
             }
             Ok::<_, eyre::Report>(())
         });
+        drop(storage);
 
         self.flush_wal_if_autocommit(file_manager, schema_name, table_name, table_id as u32)?;
 
@@ -720,9 +959,12 @@ impl Database {
 
         with_btree_storage!(wal_enabled, &mut *storage, &self.dirty_tracker, table_id as u32, root_page, |btree_mut: &mut crate::btree::BTree<_>| {
             for (key, _old_value, updated_values) in &rows_to_update {
-                btree_mut.delete(key)?;
                 let record_data = OwnedValue::build_record_from_values(updated_values, schema)?;
-                btree_mut.insert(key, &record_data)?;
+
+                if !btree_mut.update(key, &record_data)? {
+                    btree_mut.delete(key)?;
+                    btree_mut.insert(key, &record_data)?;
+                }
             }
             Ok::<_, eyre::Report>(())
         });
@@ -730,7 +972,6 @@ impl Database {
         self.flush_wal_if_autocommit(file_manager, schema_name, table_name, table_id as u32)?;
 
         drop(file_manager_guard);
-
         {
             let mut active_txn = self.active_txn.lock();
             if let Some(ref mut txn) = *active_txn {
@@ -900,6 +1141,144 @@ impl Database {
             }
             _ => Self::eval_literal(expr),
         }
+    }
+
+    pub(crate) fn execute_update_cached(
+        &self,
+        cached: &crate::database::prepared::CachedUpdatePlan,
+        params: &[OwnedValue],
+    ) -> Result<ExecuteResult> {
+        self.ensure_file_manager()?;
+
+        let wal_enabled = self.wal_enabled.load(std::sync::atomic::Ordering::Acquire);
+        if wal_enabled {
+            self.ensure_wal()?;
+        }
+
+        if cached.is_simple_pk_update && cached.assignment_indices.len() + 1 == params.len() {
+            return self.execute_update_param_only(cached, params, wal_enabled);
+        }
+
+        let arena = bumpalo::Bump::new();
+        let mut parser = crate::sql::parser::Parser::new(&cached.original_sql, &arena);
+
+        let stmt = parser.parse_statement()
+            .wrap_err("failed to re-parse cached UPDATE statement")?;
+
+        if let crate::sql::ast::Statement::Update(update) = stmt {
+            self.execute_update(&update, params, &arena)
+        } else {
+            bail!("cached plan produced non-UPDATE statement")
+        }
+    }
+
+    fn execute_update_param_only(
+        &self,
+        cached: &crate::database::prepared::CachedUpdatePlan,
+        params: &[OwnedValue],
+        wal_enabled: bool,
+    ) -> Result<ExecuteResult> {
+        let storage_arc = {
+            let storage_weak = cached.storage.borrow();
+            storage_weak.as_ref()
+                .and_then(|weak| weak.upgrade())
+                .ok_or_else(|| eyre::eyre!("cached plan storage no longer valid"))?
+        };
+
+        let root_page = cached.root_page.get();
+        if root_page == 0 {
+            let storage = storage_arc.write();
+            let new_root = {
+                use crate::storage::TableFileHeader;
+                let page0 = storage.page(0)?;
+                let header = TableFileHeader::from_bytes(page0)?;
+                header.root_page()
+            };
+            drop(storage);
+            cached.root_page.set(new_root);
+        }
+        let root_page = cached.root_page.get();
+
+        let where_param_value = params.last().ok_or_else(|| eyre::eyre!("missing WHERE parameter"))?;
+
+        let pk_col_idx = cached.pk_column_index.ok_or_else(|| eyre::eyre!("PK column index not cached"))?;
+
+        self.ensure_catalog()?;
+        let catalog_guard = self.catalog.read();
+        let catalog = catalog_guard.as_ref().unwrap();
+        let table_def = catalog.resolve_table(&cached.table_name)?;
+        let pk_col_name = table_def.columns()[pk_col_idx].name();
+        let pk_index_name = format!("{}_pkey", pk_col_name);
+        drop(catalog_guard);
+
+        let mut file_manager_guard = self.file_manager.write();
+        let file_manager = file_manager_guard.as_mut().unwrap();
+
+        let target_key = if file_manager.index_exists(&cached.schema_name, &cached.table_name, &pk_index_name) {
+            if let Ok(index_storage_arc) = file_manager.index_data_mut(&cached.schema_name, &cached.table_name, &pk_index_name) {
+                let mut index_storage = index_storage_arc.write();
+                let index_root_page = {
+                    use crate::storage::IndexFileHeader;
+                    let page0 = index_storage.page(0)?;
+                    let header = IndexFileHeader::from_bytes(page0)?;
+                    header.root_page()
+                };
+                let index_btree = BTree::new(&mut *index_storage, index_root_page)?;
+                let mut index_key = Vec::new();
+                Self::encode_value_as_key(where_param_value, &mut index_key);
+                if let Some(handle) = index_btree.search(&index_key)? {
+                    index_btree.get_value(&handle)?.to_vec()
+                } else {
+                    return Ok(ExecuteResult::Update { rows_affected: 0, returned: None });
+                }
+            } else {
+                bail!("failed to get index storage")
+            }
+        } else {
+            bail!("PK index not found for fast path")
+        };
+
+        drop(file_manager_guard);
+
+        let mut storage = storage_arc.write();
+        let decoder = crate::sql::decoder::SimpleDecoder::new(cached.column_types.clone());
+        let btree = BTree::new(&mut *storage, root_page)?;
+
+        let cursor = btree.cursor_seek(&target_key)?;
+
+        if !cursor.valid() || cursor.key()? != target_key.as_slice() {
+            return Ok(ExecuteResult::Update { rows_affected: 0, returned: None });
+        }
+
+        let key = cursor.key()?;
+        let value = cursor.value()?;
+        let values = decoder.decode(key, value)?;
+        let mut row_values: Vec<OwnedValue> = values.iter().map(OwnedValue::from).collect();
+
+        for (i, (col_idx, _)) in cached.assignment_indices.iter().enumerate() {
+            row_values[*col_idx] = params[i].clone();
+        }
+
+        drop(cursor);
+        drop(btree);
+        drop(storage);
+
+        let mut storage = storage_arc.write();
+
+        with_btree_storage!(wal_enabled, &mut *storage, &self.dirty_tracker, cached.table_id as u32, root_page, |btree_mut: &mut crate::btree::BTree<_>| {
+            let record_data = OwnedValue::build_record_from_values(&row_values, &cached.record_schema)?;
+
+            if !btree_mut.update(&target_key, &record_data)? {
+                btree_mut.delete(&target_key)?;
+                btree_mut.insert(&target_key, &record_data)?;
+            }
+            Ok::<_, eyre::Report>(())
+        });
+
+        Ok(ExecuteResult::Update {
+            rows_affected: 1,
+            returned: None,
+        })
     }
 
     pub(crate) fn extract_tables_from_clause<'a>(

@@ -2177,6 +2177,12 @@ impl Database {
             return result;
         }
 
+        if let Some(result) = prepared.with_cached_update_plan(|plan| {
+            self.execute_update_cached(plan, params)
+        }) {
+            return result;
+        }
+
         let parse_start = std::time::Instant::now();
         let arena = Bump::new();
         let mut parser = Parser::new(prepared.sql(), &arena);
@@ -2223,6 +2229,100 @@ impl Database {
             drop(catalog_guard);
         }
 
+        if let crate::sql::ast::Statement::Update(update) = &stmt {
+            self.ensure_catalog()?;
+            self.ensure_file_manager()?;
+
+            let catalog_guard = self.catalog.read();
+            let catalog = catalog_guard.as_ref().unwrap();
+
+            let table_name = update.table.name;
+            let schema_name = update.table.schema.unwrap_or(crate::storage::DEFAULT_SCHEMA);
+
+            if let Ok(table_def) = catalog.resolve_table(table_name) {
+                let column_types: Vec<_> = table_def.columns().iter().map(|c| c.data_type()).collect();
+
+                if let Ok(storage_arc) = {
+                    let mut fm_guard = self.file_manager.write();
+                    let fm = fm_guard.as_mut().unwrap();
+                    fm.table_data(schema_name, table_name)
+                } {
+                    use crate::schema::Constraint;
+                    let unique_col_indices: Vec<usize> = table_def.columns().iter()
+                        .enumerate()
+                        .filter(|(_, col)| col.has_constraint(&Constraint::Unique))
+                        .map(|(idx, _)| idx)
+                        .collect();
+
+                    let assignment_indices: Vec<(usize, String)> = update.assignments.iter()
+                        .filter_map(|assignment| {
+                            table_def.columns().iter()
+                                .position(|col| col.name().eq_ignore_ascii_case(assignment.column.column))
+                                .map(|idx| (idx, format!("{:?}", assignment.value)))
+                        })
+                        .collect();
+
+                    let where_clause_str = update.where_clause.as_ref().map(|w| format!("{:?}", w));
+
+                    let all_params = update.assignments.iter().all(|a| {
+                        matches!(a.value, crate::sql::ast::Expr::Parameter(_))
+                    });
+
+                    let (is_simple_pk_update, pk_column_index) = if let Some(ref where_clause) = update.where_clause {
+                        use crate::sql::ast::{Expr, BinaryOperator};
+                        use crate::schema::Constraint;
+
+                        if let Expr::BinaryOp { left, op: BinaryOperator::Eq, right } = where_clause {
+                            let pk_idx = table_def.columns().iter()
+                                .position(|c| c.has_constraint(&Constraint::PrimaryKey));
+
+                            if let Some(pk_idx) = pk_idx {
+                                let pk_col_name = table_def.columns()[pk_idx].name();
+
+                                let is_pk_match = match (&**left, &**right) {
+                                    (Expr::Column(c), Expr::Parameter(_)) if c.column.eq_ignore_ascii_case(pk_col_name) => true,
+                                    (Expr::Parameter(_), Expr::Column(c)) if c.column.eq_ignore_ascii_case(pk_col_name) => true,
+                                    _ => false,
+                                };
+
+                                (is_pk_match && all_params, if is_pk_match { Some(pk_idx) } else { None })
+                            } else {
+                                (false, None)
+                            }
+                        } else {
+                            (false, None)
+                        }
+                    } else {
+                        (false, None)
+                    };
+
+                    let cached_plan = super::prepared::CachedUpdatePlan {
+                        table_id: table_def.id(),
+                        schema_name: schema_name.to_string(),
+                        table_name: table_name.to_string(),
+                        column_count: column_types.len(),
+                        column_types,
+                        record_schema: create_record_schema(table_def.columns()),
+                        assignment_indices,
+                        where_clause_str,
+                        unique_col_indices,
+                        root_page: std::cell::Cell::new(0),
+                        storage: std::cell::RefCell::new(Some(std::sync::Arc::downgrade(&storage_arc))),
+                        original_sql: prepared.sql().to_string(),
+                        row_buffer: std::cell::RefCell::new(Vec::new()),
+                        key_buffer: std::cell::RefCell::new(Vec::new()),
+                        record_buffer: std::cell::RefCell::new(Vec::new()),
+                        is_simple_pk_update,
+                        pk_column_index,
+                        all_params,
+                    };
+
+                    prepared.set_cached_update_plan(cached_plan);
+                }
+            }
+            drop(catalog_guard);
+        }
+
         self.execute_statement(&stmt, prepared.sql(), &arena, Some(params))
     }
 
@@ -2244,7 +2344,7 @@ impl Database {
                 INSERT_TIME_NS.fetch_add(insert_start.elapsed().as_nanos() as u64, AtomicOrdering::Relaxed);
                 result
             }
-            Statement::Update(update) => self.execute_update(update, arena),
+            Statement::Update(update) => self.execute_update(update, params.unwrap_or(&[]), &arena),
             Statement::Delete(delete) => self.execute_delete(delete, arena),
             Statement::Select(_) => {
                 let (columns, rows) = self.query_with_columns(sql)?;
