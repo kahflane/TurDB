@@ -108,6 +108,9 @@ use std::path::{Path, PathBuf};
 use eyre::{ensure, Result, WrapErr};
 
 use super::{MmapStorage, PAGE_SIZE};
+use parking_lot::RwLock;
+use std::sync::Arc;
+
 
 pub const DEFAULT_MAX_OPEN_FILES: usize = 64;
 pub const MIN_MAX_OPEN_FILES: usize = 8;
@@ -263,7 +266,7 @@ pub struct FileManager {
     base_path: PathBuf,
     max_open_files: usize,
     meta_storage: MmapStorage,
-    open_files: LruFileCache<FileKey, MmapStorage>,
+    open_files: LruFileCache<FileKey, Arc<RwLock<MmapStorage>>>,
 }
 
 impl FileManager {
@@ -359,8 +362,8 @@ impl FileManager {
     pub fn sync_all(&mut self) -> Result<()> {
         self.meta_storage.sync()?;
 
-        for storage in self.open_files.map.values() {
-            storage.sync()?;
+        for storage_lock in self.open_files.map.values() {
+            storage_lock.write().sync()?;
         }
 
         Ok(())
@@ -560,7 +563,7 @@ impl FileManager {
         index_path.exists()
     }
 
-    pub fn table_data(&mut self, schema: &str, table: &str) -> Result<&MmapStorage> {
+    pub fn table_data(&mut self, schema: &str, table: &str) -> Result<Arc<RwLock<MmapStorage>>> {
         ensure!(
             self.table_exists(schema, table),
             "table '{}.{}' does not exist",
@@ -576,15 +579,16 @@ impl FileManager {
         if self.open_files.get(&key).is_none() {
             let path = self.table_file_path(schema, table);
             let storage = MmapStorage::open(&path)?;
-            if let Some((_, storage)) = self.open_files.insert(key.clone(), storage) {
-                storage.sync()?;
+            let storage_arc = Arc::new(RwLock::new(storage));
+            if let Some((_, lock)) = self.open_files.insert(key.clone(), storage_arc) {
+                lock.write().sync()?;
             }
         }
 
-        Ok(self.open_files.get(&key).unwrap())
+        Ok(self.open_files.get(&key).unwrap().clone())
     }
 
-    pub fn table_data_mut(&mut self, schema: &str, table: &str) -> Result<&mut MmapStorage> {
+    pub fn table_data_mut(&mut self, schema: &str, table: &str) -> Result<Arc<RwLock<MmapStorage>>> {
         ensure!(
             self.table_exists(schema, table),
             "table '{}.{}' does not exist",
@@ -600,16 +604,17 @@ impl FileManager {
         if self.open_files.get(&key).is_none() {
             let path = self.table_file_path(schema, table);
             let storage = MmapStorage::open(&path)?;
-            if let Some((_, storage)) = self.open_files.insert(key.clone(), storage) {
-                storage.sync()?;
+            let storage_arc = Arc::new(RwLock::new(storage));
+            if let Some((_, lock)) = self.open_files.insert(key.clone(), storage_arc) {
+                lock.write().sync()?;
             }
         }
 
-        Ok(self.open_files.get_mut(&key).unwrap())
+        Ok(self.open_files.get(&key).unwrap().clone())
     }
 
-    pub fn table_data_mut_with_key(&mut self, key: &FileKey) -> Option<&mut MmapStorage> {
-        self.open_files.get_mut(key)
+    pub fn table_data_mut_with_key(&mut self, key: &FileKey) -> Option<Arc<RwLock<MmapStorage>>> {
+        self.open_files.get_mut(key).cloned()
     }
 
     pub fn make_table_key(schema: &str, table: &str) -> FileKey {
@@ -627,8 +632,8 @@ impl FileManager {
         }
     }
 
-    pub fn index_data_mut_with_key(&mut self, key: &FileKey) -> Option<&mut MmapStorage> {
-        self.open_files.get_mut(key)
+    pub fn index_data_mut_with_key(&mut self, key: &FileKey) -> Option<Arc<RwLock<MmapStorage>>> {
+        self.open_files.get_mut(key).cloned()
     }
 
     pub fn index_data(
@@ -636,7 +641,7 @@ impl FileManager {
         schema: &str,
         table: &str,
         index_name: &str,
-    ) -> Result<&MmapStorage> {
+    ) -> Result<Arc<RwLock<MmapStorage>>> {
         ensure!(
             self.index_exists(schema, table, index_name),
             "index '{}.{}.{}' does not exist",
@@ -654,12 +659,13 @@ impl FileManager {
         if self.open_files.get(&key).is_none() {
             let path = self.index_file_path(schema, table, index_name);
             let storage = MmapStorage::open(&path)?;
-            if let Some((_, storage)) = self.open_files.insert(key.clone(), storage) {
-                storage.sync()?;
+            let storage_arc = Arc::new(RwLock::new(storage));
+            if let Some((_, lock)) = self.open_files.insert(key.clone(), storage_arc) {
+                lock.write().sync()?;
             }
         }
 
-        Ok(self.open_files.get(&key).unwrap())
+        Ok(self.open_files.get(&key).unwrap().clone())
     }
 
     pub fn index_data_mut(
@@ -667,7 +673,7 @@ impl FileManager {
         schema: &str,
         table: &str,
         index_name: &str,
-    ) -> Result<&mut MmapStorage> {
+    ) -> Result<Arc<RwLock<MmapStorage>>> {
         ensure!(
             self.index_exists(schema, table, index_name),
             "index '{}.{}.{}' does not exist",
@@ -685,12 +691,13 @@ impl FileManager {
         if self.open_files.get(&key).is_none() {
             let path = self.index_file_path(schema, table, index_name);
             let storage = MmapStorage::open(&path)?;
-            if let Some((_, storage)) = self.open_files.insert(key.clone(), storage) {
-                storage.sync()?;
+            let storage_arc = Arc::new(RwLock::new(storage));
+            if let Some((_, lock)) = self.open_files.insert(key.clone(), storage_arc) {
+                lock.write().sync()?;
             }
         }
 
-        Ok(self.open_files.get_mut(&key).unwrap())
+        Ok(self.open_files.get_mut(&key).unwrap().clone())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -751,7 +758,7 @@ impl FileManager {
         schema: &str,
         table: &str,
         index_name: &str,
-    ) -> Result<&MmapStorage> {
+    ) -> Result<Arc<RwLock<MmapStorage>>> {
         ensure!(
             self.hnsw_exists(schema, table, index_name),
             "HNSW index '{}.{}.{}' does not exist",
@@ -769,12 +776,13 @@ impl FileManager {
         if self.open_files.get(&key).is_none() {
             let path = self.hnsw_file_path(schema, table, index_name);
             let storage = MmapStorage::open(&path)?;
-            if let Some((_, storage)) = self.open_files.insert(key.clone(), storage) {
-                storage.sync()?;
+            let storage_arc = Arc::new(RwLock::new(storage));
+            if let Some((_, lock)) = self.open_files.insert(key.clone(), storage_arc) {
+                lock.write().sync()?;
             }
         }
 
-        Ok(self.open_files.get(&key).unwrap())
+        Ok(self.open_files.get(&key).unwrap().clone())
     }
 
     pub fn hnsw_data_mut(
@@ -782,7 +790,7 @@ impl FileManager {
         schema: &str,
         table: &str,
         index_name: &str,
-    ) -> Result<&mut MmapStorage> {
+    ) -> Result<Arc<RwLock<MmapStorage>>> {
         ensure!(
             self.hnsw_exists(schema, table, index_name),
             "HNSW index '{}.{}.{}' does not exist",
@@ -800,12 +808,13 @@ impl FileManager {
         if self.open_files.get(&key).is_none() {
             let path = self.hnsw_file_path(schema, table, index_name);
             let storage = MmapStorage::open(&path)?;
-            if let Some((_, storage)) = self.open_files.insert(key.clone(), storage) {
-                storage.sync()?;
+            let storage_arc = Arc::new(RwLock::new(storage));
+            if let Some((_, lock)) = self.open_files.insert(key.clone(), storage_arc) {
+                lock.write().sync()?;
             }
         }
 
-        Ok(self.open_files.get_mut(&key).unwrap())
+        Ok(self.open_files.get_mut(&key).unwrap().clone())
     }
 
     fn hnsw_file_path(&self, schema: &str, table: &str, index_name: &str) -> PathBuf {

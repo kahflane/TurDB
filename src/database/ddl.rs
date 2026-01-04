@@ -169,9 +169,10 @@ impl Database {
         let file_manager = file_manager_guard.as_mut().unwrap();
         file_manager.create_table(schema_name, table_name, table_id, column_count)?;
 
-        let storage = file_manager.table_data_mut(schema_name, table_name)?;
+        let storage_arc = file_manager.table_data_mut(schema_name, table_name)?;
+        let mut storage = storage_arc.write();
         storage.grow(2)?;
-        crate::btree::BTree::create(storage, 1)?;
+        crate::btree::BTree::create(&mut *storage, 1)?;
 
         let needs_toast = {
             let catalog_guard = self.catalog.read();
@@ -188,9 +189,10 @@ impl Database {
             let toast_id = self.allocate_table_id();
             file_manager.create_table(schema_name, &toast_table_name, toast_id, 3)?;
 
-            let toast_storage = file_manager.table_data_mut(schema_name, &toast_table_name)?;
+            let toast_storage_arc = file_manager.table_data_mut(schema_name, &toast_table_name)?;
+            let mut toast_storage = toast_storage_arc.write();
             toast_storage.grow(2)?;
-            crate::btree::BTree::create(toast_storage, 1)?;
+            crate::btree::BTree::create(&mut *toast_storage, 1)?;
 
             self.table_id_lookup.write().insert(
                 toast_id as u32,
@@ -227,10 +229,11 @@ impl Database {
                 true,
             )?;
 
-            let index_storage =
+            let index_storage_arc =
                 file_manager.index_data_mut(schema_name, table_name, &index_name)?;
+            let mut index_storage = index_storage_arc.write();
             index_storage.grow(2)?;
-            crate::btree::BTree::create(index_storage, 1)?;
+            crate::btree::BTree::create(&mut *index_storage, 1)?;
 
             let index_def = crate::schema::table::IndexDef::new(
                 index_name.clone(),
@@ -426,16 +429,18 @@ impl Database {
             create.unique,
         )?;
 
-        let index_storage = file_manager.index_data_mut(schema_name, table_name, index_name)?;
+        let index_storage_arc = file_manager.index_data_mut(schema_name, table_name, index_name)?;
+        let mut index_storage = index_storage_arc.write();
         index_storage.grow(2)?;
-        BTree::create(index_storage, 1)?;
+        BTree::create(&mut *index_storage, 1)?;
 
         if can_populate {
             let root_page = 1u32;
 
             let index_entries: Vec<(SmallVec<[u8; 64]>, u64)> = {
-                let table_storage = file_manager.table_data_mut(schema_name, table_name)?;
-                let table_btree = BTree::new(table_storage, root_page)?;
+                let table_storage_arc = file_manager.table_data_mut(schema_name, table_name)?;
+                let mut table_storage = table_storage_arc.write();
+                let table_btree = BTree::new(&mut *table_storage, root_page)?;
                 let mut cursor = table_btree.cursor_first()?;
 
                 let mut entries = Vec::new();
@@ -487,9 +492,10 @@ impl Database {
                 if !create.unique {
                     key_buf.extend_from_slice(&row_id_bytes);
                 }
-                let index_storage =
+                let index_storage_arc =
                     file_manager.index_data_mut(schema_name, table_name, index_name)?;
-                let mut index_btree = BTree::new(index_storage, root_page)?;
+                let mut index_storage = index_storage_arc.write();
+                let mut index_btree = BTree::new(&mut *index_storage, root_page)?;
                 index_btree.insert(&key_buf, &row_id_bytes)?;
             }
         }
@@ -529,10 +535,11 @@ impl Database {
         for (schema_name, table_name) in &tables_info {
             let mut file_manager_guard = self.file_manager.write();
             let file_manager = file_manager_guard.as_mut().unwrap();
-            let storage = file_manager.table_data_mut(schema_name, table_name)?;
+            let storage_arc = file_manager.table_data_mut(schema_name, table_name)?;
+            let mut storage = storage_arc.write();
 
             let root_page = 1u32;
-            let btree = BTree::new(storage, root_page)?;
+            let btree = BTree::new(&mut *storage, root_page)?;
             let mut cursor = btree.cursor_first()?;
 
             let mut keys_to_delete: Vec<Vec<u8>> = Vec::new();
@@ -544,7 +551,7 @@ impl Database {
             let rows_affected = keys_to_delete.len();
             total_rows_affected += rows_affected;
 
-            let mut btree_mut = BTree::new(storage, root_page)?;
+            let mut btree_mut = BTree::new(&mut *storage, root_page)?;
             for key in &keys_to_delete {
                 btree_mut.delete(key)?;
             }
@@ -568,8 +575,9 @@ impl Database {
 
             for index_name in indexes {
                 if file_manager.index_exists(schema_name, table_name, &index_name) {
-                    let index_storage = file_manager.index_data_mut(schema_name, table_name, &index_name)?;
-                    let index_btree = BTree::new(index_storage, root_page)?;
+                    let index_storage_arc = file_manager.index_data_mut(schema_name, table_name, &index_name)?;
+                    let mut index_storage = index_storage_arc.write();
+                    let index_btree = BTree::new(&mut *index_storage, root_page)?;
                     let mut index_cursor = index_btree.cursor_first()?;
 
                     let mut index_keys_to_delete: Vec<Vec<u8>> = Vec::new();
@@ -578,7 +586,7 @@ impl Database {
                         index_cursor.advance()?;
                     }
 
-                    let mut index_btree_mut = BTree::new(index_storage, root_page)?;
+                    let mut index_btree_mut = BTree::new(&mut *index_storage, root_page)?;
                     for key in &index_keys_to_delete {
                         index_btree_mut.delete(key)?;
                     }
@@ -726,10 +734,11 @@ impl Database {
             let file_manager = file_manager_guard.as_mut().unwrap();
 
             if file_manager.index_exists(schema_name, table_name, index_name) {
-                let index_storage =
+                let index_storage_arc =
                     file_manager.index_data_mut(schema_name, table_name, index_name)?;
+                let mut index_storage = index_storage_arc.write();
                 let root_page = 1u32;
-                let index_btree = BTree::new(index_storage, root_page)?;
+                let index_btree = BTree::new(&mut *index_storage, root_page)?;
                 let mut index_cursor = index_btree.cursor_first()?;
 
                 let mut keys_to_delete: Vec<Vec<u8>> = Vec::new();
@@ -738,7 +747,7 @@ impl Database {
                     index_cursor.advance()?;
                 }
 
-                let mut index_btree_mut = BTree::new(index_storage, root_page)?;
+                let mut index_btree_mut = BTree::new(&mut *index_storage, root_page)?;
                 for key in &keys_to_delete {
                     index_btree_mut.delete(key)?;
                 }
@@ -757,11 +766,12 @@ impl Database {
         {
             let mut file_manager_guard = self.file_manager.write();
             let file_manager = file_manager_guard.as_mut().unwrap();
-            let storage = file_manager.table_data_mut(schema_name, table_name)?;
+            let storage_arc = file_manager.table_data_mut(schema_name, table_name)?;
+            let mut storage = storage_arc.write();
             let root_page = 1u32;
 
             let all_keys: Vec<Vec<u8>> = {
-                let btree = BTree::new(storage, root_page)?;
+                let btree = BTree::new(&mut *storage, root_page)?;
                 let mut cursor = btree.cursor_first()?;
                 let mut keys = Vec::new();
                 while cursor.valid() {
@@ -775,7 +785,7 @@ impl Database {
                 let mut batch: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(chunk.len());
 
                 {
-                    let btree = BTree::new(storage, root_page)?;
+                    let btree = BTree::new(&mut *storage, root_page)?;
                     for key in chunk {
                         if let Some(handle) = btree.search(key)? {
                             let value = btree.get_value(&handle)?;
@@ -791,7 +801,7 @@ impl Database {
                     }
                 }
 
-                let mut btree_mut = BTree::new(storage, root_page)?;
+                let mut btree_mut = BTree::new(&mut *storage, root_page)?;
                 for (key, _) in &batch {
                     btree_mut.delete(key)?;
                 }

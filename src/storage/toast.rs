@@ -199,14 +199,15 @@ impl Detoaster for TableDetoaster {
             .as_mut()
             .ok_or_else(|| eyre::eyre!("file manager not available"))?;
 
-        let toast_storage = file_manager.table_data_mut(&self.schema_name, &toast_table_name)?;
+        let toast_storage_arc = file_manager.table_data_mut(&self.schema_name, &toast_table_name)?;
+        let mut toast_storage = toast_storage_arc.write();
 
         let root_page = {
             let page0 = toast_storage.page(0)?;
             crate::storage::TableFileHeader::from_bytes(page0)?.root_page()
         };
 
-        let btree = BTree::new(toast_storage, root_page)?;
+        let btree = BTree::new(&mut *toast_storage, root_page)?;
 
         let mut result = Vec::with_capacity(total_size);
 

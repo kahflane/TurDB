@@ -106,10 +106,50 @@ use smallvec::SmallVec;
 use std::sync::atomic::Ordering;
 
 impl Database {
-    pub(crate) fn execute_insert(
+    pub(crate) fn execute_insert_cached(
+        &self,
+        cached: &crate::database::prepared::CachedInsertPlan,
+        params: &[OwnedValue],
+    ) -> Result<ExecuteResult> {
+        self.ensure_file_manager()?;
+
+        let wal_enabled = self.wal_enabled.load(Ordering::Acquire);
+        if wal_enabled {
+            self.ensure_wal()?;
+        }
+
+        // Build row from params based on cached column count
+        if params.len() != cached.column_count {
+            eyre::bail!(
+                "parameter count mismatch: expected {} but got {}",
+                cached.column_count,
+                params.len()
+            );
+        }
+
+        // Use optimized insert_cached path
+        let count = self.insert_cached(cached, params)?;
+
+        Ok(ExecuteResult::Insert {
+            rows_affected: count,
+            returned: None,
+        })
+    }
+
+    pub(crate) fn execute_insert_with_params(
         &self,
         insert: &crate::sql::ast::InsertStmt<'_>,
         _arena: &Bump,
+        params: Option<&[OwnedValue]>,
+    ) -> Result<ExecuteResult> {
+        self.execute_insert_internal(insert, _arena, params)
+    }
+
+    fn execute_insert_internal(
+        &self,
+        insert: &crate::sql::ast::InsertStmt<'_>,
+        _arena: &Bump,
+        params: Option<&[OwnedValue]>,
     ) -> Result<ExecuteResult> {
         self.ensure_catalog()?;
         self.ensure_file_manager()?;
@@ -210,6 +250,8 @@ impl Database {
             .iter()
             .position(|c| c.has_constraint(&Constraint::AutoIncrement));
 
+        let mut param_idx = 0usize;
+
         let rows_to_insert: Vec<Vec<OwnedValue>> = match &insert.source {
             crate::sql::ast::InsertSource::Values(values) => {
                 let mut result = Vec::with_capacity(values.len());
@@ -220,14 +262,14 @@ impl Database {
                         for (val_idx, &col_idx) in col_indices.iter().enumerate() {
                             if let Some(expr) = row_exprs.get(val_idx) {
                                 let data_type = column_types.get(col_idx);
-                                row[col_idx] = Database::eval_literal_with_type(expr, data_type)?;
+                                row[col_idx] = Self::eval_expr_with_params(expr, data_type, params, &mut param_idx)?;
                             }
                         }
                     } else {
                         for (idx, expr) in row_exprs.iter().enumerate() {
                             if idx < columns.len() {
                                 let data_type = column_types.get(idx);
-                                row[idx] = Database::eval_literal_with_type(expr, data_type)?;
+                                row[idx] = Self::eval_expr_with_params(expr, data_type, params, &mut param_idx)?;
                             }
                         }
                     }
@@ -260,7 +302,8 @@ impl Database {
         let mut returned_rows: Option<Vec<Row>> = insert.returning.map(|_| Vec::new());
 
         let mut auto_increment_current = if auto_increment_col_idx.is_some() {
-            let storage = file_manager.table_data_mut(schema_name, table_name)?;
+            let storage_arc = file_manager.table_data_mut(schema_name, table_name)?;
+            let storage = storage_arc.write();
             let page = storage.page(0)?;
             let header = TableFileHeader::from_bytes(page)?;
             header.auto_increment()
@@ -270,7 +313,8 @@ impl Database {
         let mut auto_increment_max = auto_increment_current;
 
         let mut rightmost_hint: Option<u32> = {
-            let storage = file_manager.table_data_mut(schema_name, table_name)?;
+            let storage_arc = file_manager.table_data_mut(schema_name, table_name)?;
+            let storage = storage_arc.write();
             let page = storage.page(0)?;
             let header = TableFileHeader::from_bytes(page)?;
             let hint = header.rightmost_hint();
@@ -301,7 +345,8 @@ impl Database {
         if has_toast {
             let toast_table_name_owned = crate::storage::toast::toast_table_name(table_name);
             toast_file_key = Some(crate::storage::FileManager::make_table_key(schema_name, &toast_table_name_owned));
-            let toast_storage = file_manager.table_data_mut(schema_name, &toast_table_name_owned)?;
+            let toast_storage_arc = file_manager.table_data_mut(schema_name, &toast_table_name_owned)?;
+            let toast_storage = toast_storage_arc.write();
             let page0 = toast_storage.page(0)?;
             let header = crate::storage::TableFileHeader::from_bytes(page0)?;
             toast_table_id = header.table_id() as u32;
@@ -396,8 +441,9 @@ impl Database {
                         }
 
                         let ref_schema_name = "root";
-                        let ref_storage = file_manager.table_data_mut(ref_schema_name, fk_table)?;
-                        let ref_btree = BTree::new(ref_storage, 1)?;
+                        let ref_storage_arc = file_manager.table_data_mut(ref_schema_name, fk_table)?;
+                        let mut ref_storage = ref_storage_arc.write();
+                        let ref_btree = BTree::new(&mut *ref_storage, 1)?;
                         let ref_schema = create_record_schema(ref_columns);
                         let mut ref_cursor = ref_btree.cursor_first()?;
 
@@ -440,9 +486,10 @@ impl Database {
                         continue;
                     }
 
-                    let index_storage = file_manager.index_data_mut_with_key(index_key)
+                    let index_storage_arc = file_manager.index_data_mut_with_key(index_key)
                         .ok_or_else(|| eyre::eyre!("index storage not found"))?;
-                    let index_btree = BTree::new(index_storage, root_page)?;
+                    let mut index_storage = index_storage_arc.write();
+                    let index_btree = BTree::new(&mut *index_storage, root_page)?;
 
                     key_buf.clear();
                     Self::encode_value_as_key(value, &mut key_buf);
@@ -475,9 +522,10 @@ impl Database {
                     if all_non_null
                         && file_manager.index_exists(schema_name, table_name, index_name)
                     {
-                        let index_storage =
+                        let index_storage_arc =
                             file_manager.index_data_mut(schema_name, table_name, index_name)?;
-                        let index_btree = BTree::new(index_storage, root_page)?;
+                        let mut index_storage = index_storage_arc.write();
+                        let index_btree = BTree::new(&mut *index_storage, root_page)?;
 
                         key_buf.clear();
                         for &col_idx in col_indices {
@@ -519,9 +567,10 @@ impl Database {
                         }
                         OnConflictAction::DoUpdate(assignments) => {
                             if let Some(existing_key) = conflicting_key {
-                                let table_storage =
+                                let table_storage_arc =
                                     file_manager.table_data_mut(schema_name, table_name)?;
-                                let btree = BTree::new(table_storage, root_page)?;
+                                let mut table_storage = table_storage_arc.write();
+                                let btree = BTree::new(&mut *table_storage, root_page)?;
 
                                 if let Some(handle) = btree.search(&existing_key)? {
                                     let existing_value = btree.get_value(&handle)?;
@@ -545,9 +594,10 @@ impl Database {
                                     let updated_record =
                                         OwnedValue::build_record_from_values(&existing_values, &schema)?;
 
-                                    let table_storage =
+                                    let table_storage_arc =
                                         file_manager.table_data_mut(schema_name, table_name)?;
-                                    let mut btree_mut = BTree::new(table_storage, root_page)?;
+                                    let mut table_storage = table_storage_arc.write();
+                                    let mut btree_mut = BTree::new(&mut *table_storage, root_page)?;
                                     btree_mut.delete(&existing_key)?;
                                     btree_mut.insert(&existing_key, &updated_record)?;
 
@@ -613,15 +663,16 @@ impl Database {
                     if let Some(data) = data {
                         if needs_toast(data) {
                             let toast_key = toast_file_key.as_ref().unwrap();
-                            let toast_storage = file_manager.table_data_mut_with_key(toast_key)
+                            let toast_storage_arc = file_manager.table_data_mut_with_key(toast_key)
                                 .ok_or_else(|| eyre::eyre!("toast storage not found"))?;
+                            let mut toast_storage = toast_storage_arc.write();
 
                             let pointer = ToastPointer::new(row_id, col_idx as u16, data.len() as u64);
                             let chunk_id = pointer.chunk_id;
 
                             let (new_hint, new_root) = if wal_enabled {
                                 let mut wal_storage =
-                                    WalStoragePerTable::new(toast_storage, &self.dirty_tracker, toast_table_id);
+                                    WalStoragePerTable::new(&mut *toast_storage, &self.dirty_tracker, toast_table_id);
                                 let mut btree = BTree::with_rightmost_hint(&mut wal_storage, toast_root_page, toast_rightmost_hint)?;
                                 for (seq, chunk) in data.chunks(TOAST_CHUNK_SIZE).enumerate() {
                                     let chunk_key = make_chunk_key(chunk_id, seq as u32);
@@ -629,7 +680,7 @@ impl Database {
                                 }
                                 (btree.rightmost_hint(), btree.root_page())
                             } else {
-                                let mut btree = BTree::with_rightmost_hint(toast_storage, toast_root_page, toast_rightmost_hint)?;
+                                let mut btree = BTree::with_rightmost_hint(&mut *toast_storage, toast_root_page, toast_rightmost_hint)?;
                                 for (seq, chunk) in data.chunks(TOAST_CHUNK_SIZE).enumerate() {
                                     let chunk_key = make_chunk_key(chunk_id, seq as u32);
                                     btree.insert(&chunk_key, chunk)?;
@@ -648,19 +699,20 @@ impl Database {
                 }
             }
 
-            let table_storage = file_manager.table_data_mut_with_key(&table_file_key)
+            let table_storage_arc = file_manager.table_data_mut_with_key(&table_file_key)
                 .ok_or_else(|| eyre::eyre!("table storage not found in cache"))?;
+            let mut table_storage = table_storage_arc.write();
 
             let record_data = OwnedValue::build_record_with_builder(&values, &mut record_builder)?;
 
             if wal_enabled {
                 let mut wal_storage =
-                    WalStoragePerTable::new(table_storage, &self.dirty_tracker, table_id as u32);
+                    WalStoragePerTable::new(&mut *table_storage, &self.dirty_tracker, table_id as u32);
                 let mut btree = BTree::with_rightmost_hint(&mut wal_storage, root_page, rightmost_hint)?;
                 btree.insert(&row_key, &record_data)?;
                 rightmost_hint = btree.rightmost_hint();
             } else {
-                let mut btree = BTree::with_rightmost_hint(table_storage, root_page, rightmost_hint)?;
+                let mut btree = BTree::with_rightmost_hint(&mut *table_storage, root_page, rightmost_hint)?;
                 btree.insert(&row_key, &record_data)?;
                 rightmost_hint = btree.rightmost_hint();
             }
@@ -686,15 +738,16 @@ impl Database {
                         continue;
                     }
 
-                    let index_storage = file_manager.index_data_mut_with_key(index_key)
+                    let index_storage_arc = file_manager.index_data_mut_with_key(index_key)
                         .ok_or_else(|| eyre::eyre!("index storage not found"))?;
+                    let mut index_storage = index_storage_arc.write();
 
                     key_buf.clear();
                     Self::encode_value_as_key(value, &mut key_buf);
 
                     let row_id_bytes = row_id.to_be_bytes();
 
-                    let mut index_btree = BTree::new(index_storage, root_page)?;
+                    let mut index_btree = BTree::new(&mut *index_storage, root_page)?;
                     index_btree.insert(&key_buf, &row_id_bytes)?;
                 }
             }
@@ -705,8 +758,9 @@ impl Database {
                     .all(|&idx| values.get(idx).map(|v| !v.is_null()).unwrap_or(false));
 
                 if all_non_null && file_manager.index_exists(schema_name, table_name, index_name) {
-                    let index_storage =
+                    let index_storage_arc =
                         file_manager.index_data_mut(schema_name, table_name, index_name)?;
+                    let mut index_storage = index_storage_arc.write();
 
                     key_buf.clear();
                     for &col_idx in col_indices {
@@ -717,7 +771,7 @@ impl Database {
 
                     let row_id_bytes = row_id.to_be_bytes();
 
-                    let mut index_btree = BTree::new(index_storage, root_page)?;
+                    let mut index_btree = BTree::new(&mut *index_storage, root_page)?;
                     index_btree.insert(&key_buf, &row_id_bytes)?;
                 }
             }
@@ -750,7 +804,8 @@ impl Database {
         }
 
         if auto_increment_col_idx.is_some() && auto_increment_max > 0 {
-            let storage = file_manager.table_data_mut(schema_name, table_name)?;
+            let storage_arc = file_manager.table_data_mut(schema_name, table_name)?;
+            let mut storage = storage_arc.write();
             let page = storage.page_mut(0)?;
             let header = TableFileHeader::from_bytes_mut(page)?;
             if auto_increment_max > header.auto_increment() {
@@ -759,14 +814,16 @@ impl Database {
         }
 
         if let Some(hint) = rightmost_hint {
-            let storage = file_manager.table_data_mut(schema_name, table_name)?;
+            let storage_arc = file_manager.table_data_mut(schema_name, table_name)?;
+            let mut storage = storage_arc.write();
             let page = storage.page_mut(0)?;
             let header = TableFileHeader::from_bytes_mut(page)?;
             header.set_rightmost_hint(hint);
         }
 
         if count > 0 {
-            let storage = file_manager.table_data_mut(schema_name, table_name)?;
+            let storage_arc = file_manager.table_data_mut(schema_name, table_name)?;
+            let mut storage = storage_arc.write();
             let page = storage.page_mut(0)?;
             let header = TableFileHeader::from_bytes_mut(page)?;
             let new_row_count = header.row_count().saturating_add(count as u64);
@@ -775,7 +832,8 @@ impl Database {
 
         if has_toast && toast_root_page != toast_initial_root_page {
             let toast_table_name_owned = crate::storage::toast::toast_table_name(table_name);
-            let toast_storage = file_manager.table_data_mut(schema_name, &toast_table_name_owned)?;
+            let toast_storage_arc = file_manager.table_data_mut(schema_name, &toast_table_name_owned)?;
+            let mut toast_storage = toast_storage_arc.write();
             let page0 = toast_storage.page_mut(0)?;
             let header = crate::storage::TableFileHeader::from_bytes_mut(page0)?;
 

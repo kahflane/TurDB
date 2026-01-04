@@ -115,7 +115,8 @@ impl Database {
         use crate::storage::toast::{make_chunk_key, ToastPointer, TOAST_CHUNK_SIZE};
 
         let toast_table_name = crate::storage::toast::toast_table_name(table_name);
-        let toast_storage = file_manager.table_data_mut(schema_name, &toast_table_name)?;
+        let toast_storage_arc = file_manager.table_data_mut(schema_name, &toast_table_name)?;
+        let mut toast_storage = toast_storage_arc.write();
 
         let (toast_table_id, root_page) = {
             let page0 = toast_storage.page(0)?;
@@ -128,7 +129,7 @@ impl Database {
 
         let (new_hint, new_root) = if wal_enabled {
             let mut wal_storage =
-                WalStoragePerTable::new(toast_storage, &self.dirty_tracker, toast_table_id);
+                WalStoragePerTable::new(&mut *toast_storage, &self.dirty_tracker, toast_table_id);
             let mut btree = BTree::with_rightmost_hint(&mut wal_storage, root_page, hint)?;
             for (seq, chunk) in data.chunks(TOAST_CHUNK_SIZE).enumerate() {
                 let chunk_key = make_chunk_key(chunk_id, seq as u32);
@@ -136,7 +137,7 @@ impl Database {
             }
             (btree.rightmost_hint(), btree.root_page())
         } else {
-            let mut btree = BTree::with_rightmost_hint(toast_storage, root_page, hint)?;
+            let mut btree = BTree::with_rightmost_hint(&mut *toast_storage, root_page, hint)?;
             for (seq, chunk) in data.chunks(TOAST_CHUNK_SIZE).enumerate() {
                 let chunk_key = make_chunk_key(chunk_id, seq as u32);
                 btree.insert(&chunk_key, chunk)?;
@@ -145,7 +146,7 @@ impl Database {
         };
 
         if new_root != root_page {
-            let toast_storage = file_manager.table_data_mut(schema_name, &toast_table_name)?;
+            // Already holding lock, reuse toast_storage
             let page0 = toast_storage.page_mut(0)?;
             let header = crate::storage::TableFileHeader::from_bytes_mut(page0)?;
             header.set_root_page(new_root);
@@ -170,7 +171,8 @@ impl Database {
         let num_chunks = chunk_count(total_size);
 
         let toast_table_name = crate::storage::toast::toast_table_name(table_name);
-        let toast_storage = file_manager.table_data_mut(schema_name, &toast_table_name)?;
+        let toast_storage_arc = file_manager.table_data_mut(schema_name, &toast_table_name)?;
+        let mut toast_storage = toast_storage_arc.write();
 
         let root_page = {
             let page0 = toast_storage.page(0)?;
@@ -178,7 +180,7 @@ impl Database {
         };
 
 
-        let btree = BTree::new(toast_storage, root_page)?;
+        let btree = BTree::new(&mut *toast_storage, root_page)?;
 
         let mut result = Vec::with_capacity(total_size);
 
@@ -241,14 +243,15 @@ impl Database {
         let num_chunks = chunk_count(total_size as usize);
 
         let toast_table_name = crate::storage::toast::toast_table_name(table_name);
-        let toast_storage = file_manager.table_data_mut(schema_name, &toast_table_name)?;
+        let toast_storage_arc = file_manager.table_data_mut(schema_name, &toast_table_name)?;
+        let mut toast_storage = toast_storage_arc.write();
 
         let root_page = {
             let page0 = toast_storage.page(0)?;
             crate::storage::TableFileHeader::from_bytes(page0)?.root_page()
         };
 
-        let mut btree = BTree::new(toast_storage, root_page)?;
+        let mut btree = BTree::new(&mut *toast_storage, root_page)?;
 
         for seq in 0..num_chunks {
             let chunk_key = make_chunk_key(chunk_id, seq as u32);

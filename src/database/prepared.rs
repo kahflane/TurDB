@@ -96,45 +96,82 @@
 
 use crate::types::OwnedValue;
 
-/// A prepared SQL statement that can be executed with different parameter values.
-///
-/// Prepared statements provide SQL injection defense by separating SQL structure
-/// from data values. The SQL is parsed once at prepare time, and can be executed
-/// multiple times with different bound parameters.
+use parking_lot::RwLock;
+
+use crate::storage::MmapStorage;
+use std::cell::RefCell;
+
 #[derive(Debug, Clone)]
+pub struct CachedInsertPlan {
+    pub table_id: u64,
+    pub schema_name: String,
+    pub table_name: String,
+    pub column_count: usize,
+    pub column_types: Vec<crate::records::types::DataType>,
+    pub record_schema: crate::records::Schema,
+    pub root_page: std::cell::Cell<u32>,
+    pub rightmost_hint: std::cell::Cell<Option<u32>>,
+    pub row_count: std::cell::Cell<Option<u64>>,
+    pub storage: std::cell::RefCell<Option<std::sync::Weak<RwLock<MmapStorage>>>>,
+    pub record_buffer: std::cell::RefCell<Vec<u8>>,
+}
+
+#[derive(Debug)]
 pub struct PreparedStatement {
     sql: String,
     param_count: u32,
+    cached_insert_plan: RefCell<Option<CachedInsertPlan>>,
+}
+
+impl Clone for PreparedStatement {
+    fn clone(&self) -> Self {
+        Self {
+            sql: self.sql.clone(),
+            param_count: self.param_count,
+            cached_insert_plan: RefCell::new(self.cached_insert_plan.borrow().clone()),
+        }
+    }
 }
 
 impl PreparedStatement {
-    /// Creates a new PreparedStatement from the given SQL.
     pub(crate) fn new(sql: String, param_count: u32) -> Self {
-        Self { sql, param_count }
+        Self { 
+            sql, 
+            param_count,
+            cached_insert_plan: RefCell::new(None),
+        }
     }
-
-    /// Returns the original SQL string.
+    
     pub fn sql(&self) -> &str {
         &self.sql
     }
 
-    /// Returns the number of parameters expected by this statement.
     pub fn param_count(&self) -> u32 {
         self.param_count
     }
 
-    /// Creates a bound statement builder for binding parameter values.
+    pub fn cached_insert_plan(&self) -> Option<CachedInsertPlan> {
+        self.cached_insert_plan.borrow().clone()
+    }
+
+    pub fn set_cached_insert_plan(&self, plan: CachedInsertPlan) {
+        *self.cached_insert_plan.borrow_mut() = Some(plan);
+    }
+
     pub fn bind<V: Into<OwnedValue>>(&self, value: V) -> BoundStatement<'_> {
         let mut bound = BoundStatement::new(self);
         bound.params.push(value.into());
         bound
     }
+
+    pub(crate) fn with_cached_plan<F, R>(&self, f: F) -> Option<R>
+    where
+        F: FnOnce(&CachedInsertPlan) -> R,
+    {
+        self.cached_insert_plan.borrow().as_ref().map(f)
+    }
 }
 
-/// A prepared statement with bound parameter values.
-///
-/// This is a builder that accumulates parameter values before execution.
-/// Call `query()` for SELECT statements or `execute()` for DML statements.
 #[derive(Debug)]
 pub struct BoundStatement<'a> {
     prepared: &'a PreparedStatement,
@@ -149,18 +186,15 @@ impl<'a> BoundStatement<'a> {
         }
     }
 
-    /// Returns a reference to the underlying prepared statement.
     pub fn prepared(&self) -> &PreparedStatement {
         self.prepared
     }
 
-    /// Binds an additional parameter value.
     pub fn bind<V: Into<OwnedValue>>(mut self, value: V) -> Self {
         self.params.push(value.into());
         self
     }
 
-    /// Executes this bound statement as a query, returning rows.
     pub fn query(self, db: &super::Database) -> eyre::Result<Vec<super::Row>> {
         use eyre::ensure;
 
@@ -177,7 +211,6 @@ impl<'a> BoundStatement<'a> {
         db.query(&sql)
     }
 
-    /// Executes this bound statement for side effects (INSERT, UPDATE, DELETE).
     pub fn execute(self, db: &super::Database) -> eyre::Result<super::ExecuteResult> {
         use eyre::ensure;
 
@@ -190,8 +223,7 @@ impl<'a> BoundStatement<'a> {
             actual
         );
 
-        let sql = substitute_parameters(self.prepared.sql(), &self.params)?;
-        db.execute(&sql)
+        db.execute_with_cached_plan(self.prepared, &self.params)
     }
 }
 
@@ -348,12 +380,6 @@ fn value_to_sql_literal(value: &OwnedValue) -> String {
     }
 }
 
-/// Counts the number of parameter placeholders in a SQL string.
-///
-/// This function scans the SQL for:
-/// - Anonymous parameters: `?`
-/// - Positional parameters: `$1`, `$2`, etc. (returns the max position)
-/// - Named parameters: `:name` (each unique name counts as one)
 pub fn count_parameters(sql: &str) -> u32 {
     use crate::sql::token::Parameter;
     use crate::sql::{Lexer, Token};

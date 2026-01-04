@@ -185,6 +185,33 @@ impl Storage for MmapStorage {
     }
 }
 
+impl<S: Storage> Storage for parking_lot::RwLockWriteGuard<'_, S> {
+    fn page(&self, page_no: u32) -> Result<&[u8]> {
+        (**self).page(page_no)
+    }
+
+    fn page_mut(&mut self, page_no: u32) -> Result<&mut [u8]> {
+        (**self).page_mut(page_no)
+    }
+
+    fn grow(&mut self, new_page_count: u32) -> Result<()> {
+        (**self).grow(new_page_count)
+    }
+
+    fn page_count(&self) -> u32 {
+        (**self).page_count()
+    }
+
+    fn sync(&self) -> Result<()> {
+        (**self).sync()
+    }
+
+    fn prefetch_pages(&self, start_page: u32, count: u32) {
+        (**self).prefetch_pages(start_page, count)
+    }
+}
+
+
 pub const PAGE_SIZE: usize = 16384;
 pub const PAGE_HEADER_SIZE: usize = 16;
 pub const PAGE_USABLE_SIZE: usize = PAGE_SIZE - PAGE_HEADER_SIZE;

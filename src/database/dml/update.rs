@@ -173,14 +173,15 @@ impl Database {
 
         let mut file_manager_guard = self.file_manager.write();
         let file_manager = file_manager_guard.as_mut().unwrap();
-        let storage = file_manager.table_data_mut(schema_name, table_name)?;
+        let storage_arc = file_manager.table_data_mut(schema_name, table_name)?;
+        let mut storage = storage_arc.write();
 
         let column_types: Vec<crate::records::types::DataType> =
             columns.iter().map(|c| c.data_type()).collect();
         let decoder = crate::sql::decoder::SimpleDecoder::new(column_types);
 
         let root_page = 1u32;
-        let btree = BTree::new(storage, root_page)?;
+        let btree = BTree::new(&mut *storage, root_page)?;
         let mut cursor = btree.cursor_first()?;
 
         #[allow(clippy::type_complexity)]
@@ -251,8 +252,9 @@ impl Database {
             .collect();
 
         if !unique_col_indices.is_empty() {
-            let storage_for_check = file_manager.table_data_mut(schema_name, table_name)?;
-            let btree_for_check = BTree::new(storage_for_check, root_page)?;
+            let storage_for_check_arc = file_manager.table_data_mut(schema_name, table_name)?;
+            let mut storage_for_check = storage_for_check_arc.write();
+            let btree_for_check = BTree::new(&mut *storage_for_check, root_page)?;
             let mut check_cursor = btree_for_check.cursor_first()?;
 
             for (update_key, _old_value, updated_values, _old_toast) in &rows_to_update {
@@ -390,9 +392,10 @@ impl Database {
             }
         }
 
-        let storage = file_manager.table_data_mut(schema_name, table_name)?;
+        let storage_arc = file_manager.table_data_mut(schema_name, table_name)?;
+        let mut storage = storage_arc.write();
 
-        with_btree_storage!(wal_enabled, storage, &self.dirty_tracker, table_id as u32, root_page, |btree_mut: &mut crate::btree::BTree<_>| {
+        with_btree_storage!(wal_enabled, &mut *storage, &self.dirty_tracker, table_id as u32, root_page, |btree_mut: &mut crate::btree::BTree<_>| {
             for (key, updated_values) in &processed_rows {
                 btree_mut.delete(key)?;
                 let record_data = OwnedValue::build_record_from_values(updated_values, &schema)?;
@@ -505,8 +508,9 @@ impl Database {
 
         let mut all_from_rows: Vec<Vec<Vec<OwnedValue>>> = Vec::new();
         for (i, (from_schema_name, from_table_name, _, from_columns)) in from_tables.iter().enumerate() {
-            let from_storage = file_manager.table_data_mut(from_schema_name, from_table_name)?;
-            let from_btree = BTree::new(from_storage, 1u32)?;
+            let from_storage_arc = file_manager.table_data_mut(from_schema_name, from_table_name)?;
+            let mut from_storage = from_storage_arc.write();
+            let from_btree = BTree::new(&mut *from_storage, 1u32)?;
             let mut from_cursor = from_btree.cursor_first()?;
 
             let mut table_rows: Vec<Vec<OwnedValue>> = Vec::new();
@@ -522,9 +526,10 @@ impl Database {
 
         let combined_from_rows = Self::cartesian_product(&all_from_rows);
 
-        let storage = file_manager.table_data_mut(schema_name, table_name)?;
+        let storage_arc = file_manager.table_data_mut(schema_name, table_name)?;
+        let mut storage = storage_arc.write();
         let root_page = 1u32;
-        let btree = BTree::new(storage, root_page)?;
+        let btree = BTree::new(&mut *storage, root_page)?;
         let mut cursor = btree.cursor_first()?;
 
         let column_types: Vec<crate::records::types::DataType> =
@@ -635,8 +640,9 @@ impl Database {
             .collect();
 
         if !unique_col_indices.is_empty() {
-            let storage_for_check = file_manager.table_data_mut(schema_name, table_name)?;
-            let btree_for_check = BTree::new(storage_for_check, root_page)?;
+            let storage_for_check_arc = file_manager.table_data_mut(schema_name, table_name)?;
+            let mut storage_for_check = storage_for_check_arc.write();
+            let btree_for_check = BTree::new(&mut *storage_for_check, root_page)?;
             let mut check_cursor = btree_for_check.cursor_first()?;
 
             for (update_key, _old_value, updated_values) in &rows_to_update {
@@ -709,9 +715,10 @@ impl Database {
             self.ensure_wal()?;
         }
 
-        let storage = file_manager.table_data_mut(schema_name, table_name)?;
+        let storage_arc = file_manager.table_data_mut(schema_name, table_name)?;
+        let mut storage = storage_arc.write();
 
-        with_btree_storage!(wal_enabled, storage, &self.dirty_tracker, table_id as u32, root_page, |btree_mut: &mut crate::btree::BTree<_>| {
+        with_btree_storage!(wal_enabled, &mut *storage, &self.dirty_tracker, table_id as u32, root_page, |btree_mut: &mut crate::btree::BTree<_>| {
             for (key, _old_value, updated_values) in &rows_to_update {
                 btree_mut.delete(key)?;
                 let record_data = OwnedValue::build_record_from_values(updated_values, schema)?;

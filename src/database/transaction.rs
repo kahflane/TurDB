@@ -260,7 +260,7 @@ impl Database {
                 .ok_or_else(|| eyre::eyre!("WAL not initialized but WAL mode is enabled"))?;
 
             for (table_id, schema_name, table_name) in table_infos {
-                let storage = file_manager
+                let storage_arc = file_manager
                     .table_data(&schema_name, &table_name)
                     .wrap_err_with(|| {
                         format!(
@@ -268,8 +268,9 @@ impl Database {
                             schema_name, table_name
                         )
                     })?;
+                let storage = storage_arc.read();
 
-                WalStoragePerTable::flush_wal_for_table(&self.dirty_tracker, storage, wal, table_id)
+                WalStoragePerTable::flush_wal_for_table(&self.dirty_tracker, &*storage, wal, table_id)
                     .wrap_err_with(|| {
                         format!(
                             "failed to flush WAL for table {}.{} on commit",
@@ -364,10 +365,11 @@ impl Database {
         let schema_name = DEFAULT_SCHEMA;
         let table_name = table_def.name();
 
-        let table_storage = file_manager.table_data_mut(schema_name, table_name)?;
+        let table_storage_arc = file_manager.table_data_mut(schema_name, table_name)?;
+        let mut table_storage = table_storage_arc.write();
 
         use crate::btree::BTree;
-        let mut btree = BTree::new(table_storage, 1)?;
+        let mut btree = BTree::new(&mut *table_storage, 1)?;
 
         if entry.is_insert {
             btree.delete(&entry.key)?;

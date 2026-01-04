@@ -295,6 +295,58 @@ impl Database {
         }
     }
 
+    /// Evaluates an expression to an OwnedValue, supporting parameter placeholders.
+    ///
+    /// When `params` is provided, `Expr::Parameter` nodes are resolved from it.
+    /// This enables true prepared statement execution without SQL string reconstruction.
+    ///
+    /// # Arguments
+    /// * `expr` - The expression to evaluate
+    /// * `target_type` - Optional target column type for type-aware parsing
+    /// * `params` - Optional slice of bound parameter values
+    /// * `param_idx` - Mutable index for tracking anonymous (`?`) parameters
+    pub(crate) fn eval_expr_with_params(
+        expr: &crate::sql::ast::Expr<'_>,
+        target_type: Option<&crate::records::types::DataType>,
+        params: Option<&[OwnedValue]>,
+        param_idx: &mut usize,
+    ) -> Result<OwnedValue> {
+        use crate::sql::ast::{Expr, ParameterRef};
+
+        if let Expr::Parameter(param_ref) = expr {
+            if let Some(params) = params {
+                let idx = match param_ref {
+                    ParameterRef::Anonymous => {
+                        let i = *param_idx;
+                        *param_idx += 1;
+                        i
+                    }
+                    ParameterRef::Positional(n) => (*n as usize).saturating_sub(1),
+                    ParameterRef::Named(_) => {
+                        // For named params, use positional order (same as substitute_parameters)
+                        let i = *param_idx;
+                        *param_idx += 1;
+                        i
+                    }
+                };
+
+                if idx >= params.len() {
+                    bail!(
+                        "parameter index {} out of range (only {} parameters bound)",
+                        idx + 1,
+                        params.len()
+                    );
+                }
+
+                return Ok(params[idx].clone());
+            } else {
+                bail!("parameter placeholder found but no parameters were bound");
+            }
+        }
+
+        Self::eval_literal_with_type(expr, target_type)
+    }
+
     pub(crate) fn parse_json_string(s: &str) -> Result<OwnedValue> {
         let value = Self::parse_json_to_value(s.trim())?;
         let bytes = Self::jsonb_value_to_bytes(&value);

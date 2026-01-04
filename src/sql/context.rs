@@ -31,7 +31,7 @@ impl<'a> ExecutionContext<'a> {
         &mut self,
         schema: &str,
         table: &str,
-    ) -> eyre::Result<&mut crate::storage::MmapStorage> {
+    ) -> eyre::Result<std::sync::Arc<parking_lot::RwLock<crate::storage::MmapStorage>>> {
         let fm = self
             .file_manager
             .as_mut()

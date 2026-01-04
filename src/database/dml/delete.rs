@@ -187,10 +187,11 @@ impl Database {
 
         let mut file_manager_guard = self.file_manager.write();
         let file_manager = file_manager_guard.as_mut().unwrap();
-        let storage = file_manager.table_data_mut(schema_name, table_name)?;
+        let storage_arc = file_manager.table_data_mut(schema_name, table_name)?;
+        let mut storage = storage_arc.write();
 
         let root_page = 1u32;
-        let btree = BTree::new(storage, root_page)?;
+        let btree = BTree::new(&mut *storage, root_page)?;
         let mut cursor = btree.cursor_first()?;
 
         let mut rows_to_delete: Vec<(Vec<u8>, Vec<u8>, Vec<OwnedValue>)> = Vec::new();
@@ -230,8 +231,9 @@ impl Database {
 
         if !values_to_check.is_empty() {
             for (child_schema, child_name, child_columns, fk_col_idx) in &child_table_schemas {
-                let child_storage = file_manager.table_data_mut(child_schema, child_name)?;
-                let child_btree = BTree::new(child_storage, root_page)?;
+                let child_storage_arc = file_manager.table_data_mut(child_schema, child_name)?;
+                let mut child_storage = child_storage_arc.write();
+                let child_btree = BTree::new(&mut *child_storage, root_page)?;
                 let mut child_cursor = child_btree.cursor_first()?;
                 let child_record_schema = create_record_schema(child_columns);
 
@@ -320,9 +322,10 @@ impl Database {
             self.ensure_wal()?;
         }
 
-        let storage = file_manager.table_data_mut(schema_name, table_name)?;
+        let storage_arc = file_manager.table_data_mut(schema_name, table_name)?;
+        let mut storage = storage_arc.write();
 
-        with_btree_storage!(wal_enabled, storage, &self.dirty_tracker, table_id as u32, root_page, |btree_mut: &mut crate::btree::BTree<_>| {
+        with_btree_storage!(wal_enabled, &mut *storage, &self.dirty_tracker, table_id as u32, root_page, |btree_mut: &mut crate::btree::BTree<_>| {
             for (key, _old_value, _row_values) in &rows_to_delete {
                 btree_mut.delete(key)?;
             }
@@ -356,7 +359,8 @@ impl Database {
         if rows_affected > 0 {
             let mut file_manager_guard = self.file_manager.write();
             let file_manager = file_manager_guard.as_mut().unwrap();
-            let storage = file_manager.table_data_mut(schema_name, table_name)?;
+            let storage_arc = file_manager.table_data_mut(schema_name, table_name)?;
+            let mut storage = storage_arc.write();
             let page = storage.page_mut(0)?;
             let header = TableFileHeader::from_bytes_mut(page)?;
             let new_row_count = header.row_count().saturating_sub(rows_affected as u64);

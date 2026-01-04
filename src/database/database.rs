@@ -177,6 +177,9 @@ impl Database {
     }
 
     pub(crate) fn ensure_file_manager(&self) -> Result<()> {
+        if self.file_manager.read().is_some() {
+            return Ok(());
+        }
         let mut guard = self.file_manager.write();
         if guard.is_none() {
             let fm = FileManager::open(&self.path, 64)
@@ -255,13 +258,14 @@ impl Database {
             return Ok(0);
         }
 
-        let table_storage = file_manager.table_data(schema_name, table_name)?;
+        let table_storage_arc = file_manager.table_data(schema_name, table_name)?;
+        let table_storage = table_storage_arc.read();
         let mut wal_guard = self.wal.lock();
         let wal = wal_guard.as_mut().ok_or_else(|| {
             eyre::eyre!("WAL is enabled but not initialized - this is a bug")
         })?;
         let frames_written =
-            WalStoragePerTable::flush_wal_for_table(&self.dirty_tracker, table_storage, wal, table_id)
+            WalStoragePerTable::flush_wal_for_table(&self.dirty_tracker, &table_storage, wal, table_id)
                 .wrap_err("failed to flush WAL")?;
         Ok(frames_written as usize)
     }
@@ -456,7 +460,8 @@ impl Database {
         let file_manager = file_manager_guard.as_mut().unwrap();
 
         let (mut root_page, mut rightmost_hint): (u32, Option<u32>) = {
-            let storage = file_manager.table_data_mut(schema_name, table_name)?;
+            let storage_arc = file_manager.table_data_mut(schema_name, table_name)?;
+            let storage = storage_arc.read();
             let page = storage.page(0)?;
             let header = TableFileHeader::from_bytes(page)?;
             let stored_root = header.root_page();
@@ -472,10 +477,11 @@ impl Database {
         let count;
 
         if wal_enabled {
-            let table_storage = file_manager.table_data_mut_with_key(&table_file_key)
+            let table_storage_arc = file_manager.table_data_mut_with_key(&table_file_key)
                 .ok_or_else(|| eyre::eyre!("table storage not found in cache"))?;
+            let mut table_storage = table_storage_arc.write();
             let mut wal_storage =
-                WalStoragePerTable::new(table_storage, &self.dirty_tracker, table_id as u32);
+                WalStoragePerTable::new(&mut *table_storage, &self.dirty_tracker, table_id as u32);
             let mut btree = BTree::with_rightmost_hint(&mut wal_storage, root_page, rightmost_hint)?;
 
             for row_values in rows {
@@ -489,9 +495,10 @@ impl Database {
             rightmost_hint = btree.rightmost_hint();
             count = rows.len();
         } else {
-            let table_storage = file_manager.table_data_mut_with_key(&table_file_key)
+            let table_storage_arc = file_manager.table_data_mut_with_key(&table_file_key)
                 .ok_or_else(|| eyre::eyre!("table storage not found in cache"))?;
-            let mut btree = BTree::with_rightmost_hint(table_storage, root_page, rightmost_hint)?;
+            let mut table_storage = table_storage_arc.write();
+            let mut btree = BTree::with_rightmost_hint(&mut *table_storage, root_page, rightmost_hint)?;
 
             for row_values in rows {
                 let row_id = self.next_row_id.fetch_add(1, Ordering::Relaxed);
@@ -506,7 +513,8 @@ impl Database {
         }
 
         {
-            let storage = file_manager.table_data_mut(schema_name, table_name)?;
+            let storage_arc = file_manager.table_data_mut(schema_name, table_name)?;
+            let mut storage = storage_arc.write();
             let page = storage.page_mut(0)?;
             let header = TableFileHeader::from_bytes_mut(page)?;
             header.set_root_page(root_page);
@@ -520,6 +528,109 @@ impl Database {
         self.flush_wal_if_autocommit(file_manager, schema_name, table_name, table_id as u32)?;
 
         Ok(count)
+    }
+
+    pub fn insert_cached(
+        &self,
+        plan: &crate::database::prepared::CachedInsertPlan,
+        params: &[OwnedValue],
+    ) -> Result<usize> {
+        use crate::btree::BTree;
+        use crate::storage::WalStoragePerTable;
+        use std::sync::atomic::Ordering;
+
+        self.ensure_file_manager()?;
+
+        let wal_enabled = self.wal_enabled.load(Ordering::Acquire);
+        if wal_enabled {
+            self.ensure_wal()?;
+        }
+
+        // Try to get storage from cache or acquire it
+        let storage_arc = if let Some(weak) = plan.storage.borrow().as_ref() {
+            weak.upgrade()
+        } else {
+            None
+        };
+
+        let storage_arc = if let Some(arc) = storage_arc {
+            arc
+        } else {
+            // Cold path: Lock FileManager and get/cache storage
+            let mut file_manager_guard = self.file_manager.write();
+            let file_manager = file_manager_guard.as_mut().unwrap();
+            let arc = file_manager.table_data_mut(&plan.schema_name, &plan.table_name)?;
+            
+            // Update weak cache
+            *plan.storage.borrow_mut() = Some(std::sync::Arc::downgrade(&arc));
+            arc
+        };
+
+        // Acquire lock on the specific table storage
+        let mut storage_guard = storage_arc.write();
+
+        // Read metadata from page 0 directly (fast, no FM lock)
+        let (mut root_page, mut rightmost_hint) = {
+            let page = storage_guard.page(0)?;
+            let header = TableFileHeader::from_bytes(page)?;
+            let stored_root = header.root_page();
+            let hint = header.rightmost_hint();
+            let root = if stored_root > 0 { stored_root } else { 1 };
+            (root, if hint > 0 { Some(hint) } else { Some(root) })
+        };
+
+        let mut record_builder = crate::records::RecordBuilder::new(&plan.record_schema);
+        
+        let mut buffer_guard = plan.record_buffer.borrow_mut();
+        buffer_guard.clear();
+        OwnedValue::build_record_into_buffer(params, &mut record_builder, &mut *buffer_guard)?;
+
+        let row_id = self.next_row_id.fetch_add(1, Ordering::Relaxed);
+        let row_key = Self::generate_row_key(row_id);
+
+        if wal_enabled {
+            let mut wal_storage =
+                WalStoragePerTable::new(&mut *storage_guard, &self.dirty_tracker, plan.table_id as u32);
+            let mut btree = BTree::with_rightmost_hint(&mut wal_storage, root_page, rightmost_hint)?;
+            btree.insert_append(&row_key, &buffer_guard)?;
+            root_page = btree.root_page();
+            rightmost_hint = btree.rightmost_hint();
+        } else {
+            let mut btree = BTree::with_rightmost_hint(&mut *storage_guard, root_page, rightmost_hint)?;
+            btree.insert_append(&row_key, &buffer_guard)?;
+            root_page = btree.root_page();
+            rightmost_hint = btree.rightmost_hint();
+        }
+
+        // Update header
+        {
+            let page = storage_guard.page_mut(0)?;
+            let header = TableFileHeader::from_bytes_mut(page)?;
+            header.set_root_page(root_page);
+            if let Some(hint) = rightmost_hint {
+                header.set_rightmost_hint(hint);
+            }
+            let new_row_count = header.row_count().saturating_add(1);
+            header.set_row_count(new_row_count);
+        }
+
+        // Handle WAL flush for autocommit without relocking FileManager
+        if wal_enabled {
+             let txn_active = self.active_txn.lock().is_some();
+             if !txn_active && self.dirty_tracker.has_dirty_pages(plan.table_id as u32) {
+                 let mut wal_guard = self.wal.lock();
+                 if let Some(wal) = wal_guard.as_mut() {
+                     WalStoragePerTable::flush_wal_for_table(
+                        &self.dirty_tracker, 
+                        &mut *storage_guard, 
+                        wal, 
+                        plan.table_id as u32
+                    )?;
+                 }
+             }
+        }
+
+        Ok(1)
     }
 
     pub fn query(&self, sql: &str) -> Result<Vec<Row>> {
@@ -768,7 +879,7 @@ impl Database {
                 let column_types: Vec<_> =
                     inner_table_def.columns().iter().map(|c| c.data_type()).collect();
 
-                let storage = file_manager
+                let storage_arc = file_manager
                     .table_data(schema_name, table_name)
                     .wrap_err_with(|| {
                         format!(
@@ -776,10 +887,11 @@ impl Database {
                             schema_name, table_name
                         )
                     })?;
+                let storage = storage_arc.read();
 
                 let root_page = 1u32;
                 let inner_source = StreamingBTreeSource::from_btree_scan_with_projections(
-                    storage,
+                    &storage,
                     root_page,
                     column_types,
                     None,
@@ -885,7 +997,7 @@ impl Database {
             let schema_name = scan.schema.unwrap_or("root");
             let table_name = scan.table;
 
-            let storage = file_manager
+            let storage_arc = file_manager
                 .table_data(schema_name, table_name)
                 .wrap_err_with(|| {
                     format!(
@@ -893,6 +1005,7 @@ impl Database {
                         schema_name, table_name
                     )
                 })?;
+            let storage = storage_arc.read();
 
             let page = storage.page(0)?;
             let header = TableFileHeader::from_bytes(page)?;
@@ -927,7 +1040,7 @@ impl Database {
                     find_projections(physical_plan.root, table_def)
                 };
 
-                let storage = file_manager
+                let storage_arc = file_manager
                     .table_data(schema_name, table_name)
                     .wrap_err_with(|| {
                         format!(
@@ -935,12 +1048,13 @@ impl Database {
                             schema_name, table_name
                         )
                     })?;
+                let storage = storage_arc.read();
 
                 let root_page = 1u32;
                 let source: BTreeSource = if scan.reverse {
                     BTreeSource::Reverse(
                         ReverseBTreeSource::from_btree_scan_reverse_with_projections(
-                            storage,
+                            &storage,
                             root_page,
                             column_types,
                             projections,
@@ -950,7 +1064,7 @@ impl Database {
                 } else {
                     BTreeSource::Forward(
                         StreamingBTreeSource::from_btree_scan_with_projections(
-                            storage,
+                            &storage,
                             root_page,
                             column_types,
                             projections,
@@ -1016,7 +1130,7 @@ impl Database {
                 let column_types: Vec<_> =
                     table_def.columns().iter().map(|c| c.data_type()).collect();
 
-                let storage = file_manager
+                let storage_arc = file_manager
                     .table_data(schema_name, table_name)
                     .wrap_err_with(|| {
                         format!(
@@ -1024,6 +1138,7 @@ impl Database {
                             schema_name, table_name
                         )
                     })?;
+                let storage = storage_arc.read();
 
                 let root_page = 1u32;
 
@@ -1054,7 +1169,7 @@ impl Database {
                 };
 
                 let source = StreamingBTreeSource::from_btree_range_scan_with_projections(
-                    storage,
+                    &storage,
                     root_page,
                     start_key,
                     end_key,
@@ -1119,7 +1234,7 @@ impl Database {
                 let row_id_suffix_len = if scan.is_unique_index { 0 } else { 8 };
 
                 let row_keys: Vec<[u8; 8]> = {
-                    let index_storage = file_manager
+                    let index_storage_arc = file_manager
                         .index_data(schema_name, table_name, index_name)
                         .wrap_err_with(|| {
                             format!(
@@ -1127,9 +1242,10 @@ impl Database {
                                 schema_name, table_name, index_name
                             )
                         })?;
+                    let index_storage = index_storage_arc.read();
 
                     let root_page = 1u32;
-                    let index_reader = BTreeReader::new(index_storage, root_page)?;
+                    let index_reader = BTreeReader::new(&index_storage, root_page)?;
 
                     let mut keys = Vec::new();
 
@@ -1182,7 +1298,7 @@ impl Database {
                 let mut materialized_rows: Vec<Vec<OwnedValue>> = Vec::with_capacity(row_keys.len());
 
                 {
-                    let table_storage = file_manager
+                    let table_storage_arc = file_manager
                         .table_data(schema_name, table_name)
                         .wrap_err_with(|| {
                             format!(
@@ -1190,9 +1306,10 @@ impl Database {
                                 schema_name, table_name
                             )
                         })?;
+                    let table_storage = table_storage_arc.read();
 
                     let root_page = 1u32;
-                    let table_reader = BTreeReader::new(table_storage, root_page)?;
+                    let table_reader = BTreeReader::new(&table_storage, root_page)?;
 
                     for row_key in &row_keys {
                         if let Some(row_data) = table_reader.get(row_key)? {
@@ -1362,9 +1479,10 @@ impl Database {
                     left_alias = alias;
                     let table_def = catalog.resolve_table(table_name)?;
                     let column_types: Vec<_> = table_def.columns().iter().map(|c| c.data_type()).collect();
-                    let storage = file_manager.table_data(schema_name, table_name)?;
+                    let storage_arc = file_manager.table_data(schema_name, table_name)?;
+                    let storage = storage_arc.read();
                     let source = StreamingBTreeSource::from_btree_scan_with_projections(
-                        storage, 1, column_types.clone(), None,
+                        &storage, 1, column_types.clone(), None,
                     )?;
                     let mut cursor = source;
                     while let Some(row) = cursor.next_row()? {
@@ -1385,9 +1503,10 @@ impl Database {
                     right_alias = alias;
                     let table_def = catalog.resolve_table(table_name)?;
                     let column_types: Vec<_> = table_def.columns().iter().map(|c| c.data_type()).collect();
-                    let storage = file_manager.table_data(schema_name, table_name)?;
+                    let storage_arc = file_manager.table_data(schema_name, table_name)?;
+                    let storage = storage_arc.read();
                     let source = StreamingBTreeSource::from_btree_scan_with_projections(
-                        storage, 1, column_types.clone(), None,
+                        &storage, 1, column_types.clone(), None,
                     )?;
                     let mut cursor = source;
                     while let Some(row) = cursor.next_row()? {
@@ -1815,7 +1934,7 @@ impl Database {
                     let column_types: Vec<_> =
                         table_def.columns().iter().map(|c| c.data_type()).collect();
 
-                    let storage = file_manager
+                    let storage_arc = file_manager
                         .table_data(schema_name, table_name)
                         .wrap_err_with(|| {
                             format!(
@@ -1823,10 +1942,11 @@ impl Database {
                                 schema_name, table_name
                             )
                         })?;
+                    let storage = storage_arc.read();
 
                     let root_page = 1u32;
                     let source = StreamingBTreeSource::from_btree_scan_with_projections(
-                        storage,
+                        &storage,
                         root_page,
                         column_types.clone(),
                         None,
@@ -1933,7 +2053,7 @@ impl Database {
 
             let column_types: Vec<_> = table_def.columns().iter().map(|c| c.data_type()).collect();
 
-            let storage = file_manager
+            let storage_arc = file_manager
                 .table_data(schema_name, table_name)
                 .wrap_err_with(|| {
                     format!(
@@ -1941,10 +2061,11 @@ impl Database {
                         schema_name, table_name
                     )
                 })?;
+            let storage = storage_arc.read();
 
             let root_page = 1u32;
             let source = StreamingBTreeSource::from_btree_scan_with_projections(
-                storage,
+                &storage,
                 root_page,
                 column_types,
                 None,
@@ -2027,19 +2148,104 @@ impl Database {
             .wrap_err("failed to parse SQL statement")?;
         PARSE_TIME_NS.fetch_add(parse_start.elapsed().as_nanos() as u64, AtomicOrdering::Relaxed);
 
+        self.execute_statement(&stmt, sql, &arena, None)
+    }
+
+    pub fn execute_with_params(&self, sql: &str, params: &[OwnedValue]) -> Result<ExecuteResult> {
+        let parse_start = std::time::Instant::now();
+        let arena = Bump::new();
+        let mut parser = Parser::new(sql, &arena);
+        let stmt = parser
+            .parse_statement()
+            .wrap_err("failed to parse SQL statement")?;
+        PARSE_TIME_NS.fetch_add(parse_start.elapsed().as_nanos() as u64, AtomicOrdering::Relaxed);
+
+        self.execute_statement(&stmt, sql, &arena, Some(params))
+    }
+
+    pub fn execute_with_cached_plan(
+        &self,
+        prepared: &super::PreparedStatement,
+        params: &[OwnedValue],
+    ) -> Result<ExecuteResult> {
+        if let Some(result) = prepared.with_cached_plan(|plan| {
+            let insert_start = std::time::Instant::now();
+            let result = self.execute_insert_cached(plan, params);
+            INSERT_TIME_NS.fetch_add(insert_start.elapsed().as_nanos() as u64, AtomicOrdering::Relaxed);
+            result
+        }) {
+            return result;
+        }
+
+        let parse_start = std::time::Instant::now();
+        let arena = Bump::new();
+        let mut parser = Parser::new(prepared.sql(), &arena);
+        let stmt = parser
+            .parse_statement()
+            .wrap_err("failed to parse SQL statement")?;
+        PARSE_TIME_NS.fetch_add(parse_start.elapsed().as_nanos() as u64, AtomicOrdering::Relaxed);
+
+        if let crate::sql::ast::Statement::Insert(insert) = &stmt {
+            self.ensure_catalog()?;
+            self.ensure_file_manager()?;
+            
+            let catalog_guard = self.catalog.read();
+            let catalog = catalog_guard.as_ref().unwrap();
+            
+            let table_name = insert.table.name;
+            let schema_name = insert.table.schema.unwrap_or(crate::storage::DEFAULT_SCHEMA);
+            
+            if let Ok(table_def) = catalog.resolve_table(table_name) {
+                let column_types: Vec<_> = table_def.columns().iter().map(|c| c.data_type()).collect();
+                
+                if let Ok(storage_arc) = {
+                    let mut fm_guard = self.file_manager.write();
+                    let fm = fm_guard.as_mut().unwrap();
+                    fm.table_data(schema_name, table_name)
+                } {
+                    let cached_plan = super::prepared::CachedInsertPlan {
+                        table_id: table_def.id(),
+                        schema_name: schema_name.to_string(),
+                        table_name: table_name.to_string(),
+                        column_count: column_types.len(),
+                        column_types,
+                        record_schema: create_record_schema(table_def.columns()),
+                        root_page: std::cell::Cell::new(0),
+                        rightmost_hint: std::cell::Cell::new(None),
+                        row_count: std::cell::Cell::new(None),
+                         storage: std::cell::RefCell::new(Some(std::sync::Arc::downgrade(&storage_arc))),
+                         record_buffer: std::cell::RefCell::new(Vec::with_capacity(256)),
+                    };
+                    
+                    prepared.set_cached_insert_plan(cached_plan);
+                }
+            }
+            drop(catalog_guard);
+        }
+
+        self.execute_statement(&stmt, prepared.sql(), &arena, Some(params))
+    }
+
+    fn execute_statement<'a>(
+        &self,
+        stmt: &crate::sql::ast::Statement<'a>,
+        sql: &str,
+        arena: &Bump,
+        params: Option<&[OwnedValue]>,
+    ) -> Result<ExecuteResult> {
         use crate::sql::ast::Statement;
         match stmt {
-            Statement::CreateTable(create) => self.execute_create_table(create, &arena),
+            Statement::CreateTable(create) => self.execute_create_table(create, arena),
             Statement::CreateSchema(create) => self.execute_create_schema(create),
-            Statement::CreateIndex(create) => self.execute_create_index(create, &arena),
+            Statement::CreateIndex(create) => self.execute_create_index(create, arena),
             Statement::Insert(insert) => {
                 let insert_start = std::time::Instant::now();
-                let result = self.execute_insert(insert, &arena);
+                let result = self.execute_insert_with_params(insert, arena, params);
                 INSERT_TIME_NS.fetch_add(insert_start.elapsed().as_nanos() as u64, AtomicOrdering::Relaxed);
                 result
             }
-            Statement::Update(update) => self.execute_update(update, &arena),
-            Statement::Delete(delete) => self.execute_delete(delete, &arena),
+            Statement::Update(update) => self.execute_update(update, arena),
+            Statement::Delete(delete) => self.execute_delete(delete, arena),
             Statement::Select(_) => {
                 let (columns, rows) = self.query_with_columns(sql)?;
                 Ok(ExecuteResult::Select { columns, rows })
@@ -2288,9 +2494,10 @@ impl Database {
 
         let mut total_frames = 0u32;
         for (table_id, schema_name, table_name) in &table_infos {
-            if let Ok(storage) = file_manager.table_data(schema_name, table_name) {
+            if let Ok(storage_arc) = file_manager.table_data(schema_name, table_name) {
+                let storage = storage_arc.read();
                 let frames =
-                    WalStoragePerTable::flush_wal_for_table(&self.dirty_tracker, storage, wal, *table_id)
+                    WalStoragePerTable::flush_wal_for_table(&self.dirty_tracker, &*storage, wal, *table_id)
                         .wrap_err_with(|| {
                             format!(
                                 "failed to flush dirty pages for table {}.{}",
