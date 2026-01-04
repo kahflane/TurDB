@@ -25,9 +25,6 @@ use std::sync::atomic::Ordering as AtomicOrdering;
 
 use crate::database::timing::{INSERT_TIME_NS, PARSE_TIME_NS};
 
-/// Default page cache size (number of 16KB pages)
-const DEFAULT_CACHE_SIZE: u32 = 256;
-
 pub struct Database {
     path: PathBuf,
     pub(crate) file_manager: RwLock<Option<FileManager>>,
@@ -44,8 +41,6 @@ pub struct Database {
     pub(crate) active_txn: Mutex<Option<ActiveTransaction>>,
     /// Session setting: whether foreign key constraints are checked (default: true)
     pub(crate) foreign_keys_enabled: std::sync::atomic::AtomicBool,
-    /// Session setting: page cache size in number of pages (default: 256 = 4MB)
-    cache_size: std::sync::atomic::AtomicU32,
     pub(crate) table_id_lookup: RwLock<hashbrown::HashMap<u32, (String, String)>>,
 }
 
@@ -109,7 +104,6 @@ impl Database {
             txn_manager: TransactionManager::new(),
             active_txn: Mutex::new(None),
             foreign_keys_enabled: AtomicBool::new(true),
-            cache_size: std::sync::atomic::AtomicU32::new(DEFAULT_CACHE_SIZE),
             table_id_lookup: RwLock::new(hashbrown::HashMap::new()),
         };
 
@@ -167,7 +161,6 @@ impl Database {
             txn_manager: TransactionManager::new(),
             active_txn: Mutex::new(None),
             foreign_keys_enabled: AtomicBool::new(true),
-            cache_size: std::sync::atomic::AtomicU32::new(DEFAULT_CACHE_SIZE),
             table_id_lookup: RwLock::new(hashbrown::HashMap::new()),
         })
     }
@@ -2098,23 +2091,6 @@ impl Database {
                 Ok(ExecuteResult::Set {
                     name: "foreign_keys".to_string(),
                     value: if enabled { "ON".to_string() } else { "OFF".to_string() },
-                })
-            }
-            "cache_size" => {
-                let size = match value {
-                    crate::sql::ast::Expr::Literal(crate::sql::ast::Literal::Integer(i)) => {
-                        let parsed: i64 = i.parse().wrap_err("cache_size must be a valid integer")?;
-                        if parsed <= 0 {
-                            bail!("cache_size must be a positive integer");
-                        }
-                        parsed as u32
-                    }
-                    _ => bail!("invalid value for cache_size: expected a positive integer"),
-                };
-                self.cache_size.store(size, Ordering::Release);
-                Ok(ExecuteResult::Set {
-                    name: "cache_size".to_string(),
-                    value: size.to_string(),
                 })
             }
             _ => bail!("unknown setting: {}", set.name),
