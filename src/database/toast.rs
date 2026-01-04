@@ -177,6 +177,7 @@ impl Database {
             crate::storage::TableFileHeader::from_bytes(page0)?.root_page()
         };
 
+
         let btree = BTree::new(toast_storage, root_page)?;
 
         let mut result = Vec::with_capacity(total_size);

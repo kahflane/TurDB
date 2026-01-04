@@ -620,13 +620,10 @@ impl<'a, S: Storage> BTree<'a, S> {
     }
 
     pub fn insert(&mut self, key: &[u8], value: &[u8]) -> Result<()> {
-        // PostgreSQL-style fastpath optimization: try the cached rightmost leaf first.
-        // This avoids tree traversal for monotonically increasing keys.
         if let Some(hint_page) = self.rightmost_hint {
             if let Ok(true) = self.try_fastpath_insert(hint_page, key, value) {
                 return Ok(());
             }
-            // Fastpath failed, fall back to normal insert
         }
 
         let mut path: PathStack = SmallVec::new();
@@ -651,7 +648,7 @@ impl<'a, S: Storage> BTree<'a, S> {
                 ),
             }
         }
-
+        
         let result = self.insert_into_leaf(current_page, key, value)?;
         self.update_rightmost_hint(current_page);
 
@@ -707,7 +704,6 @@ impl<'a, S: Storage> BTree<'a, S> {
         Ok(true)
     }
 
-    /// Updates the rightmost hint if the given page is the rightmost leaf.
     fn update_rightmost_hint(&mut self, page_no: u32) {
         if let Ok(page_data) = self.storage.page(page_no) {
             if let Ok(leaf) = LeafNode::from_page(page_data) {
@@ -718,7 +714,6 @@ impl<'a, S: Storage> BTree<'a, S> {
         }
     }
 
-    /// Returns the current rightmost hint for use in subsequent BTree instances.
     pub fn rightmost_hint(&self) -> Option<u32> {
         self.rightmost_hint
     }
@@ -771,7 +766,6 @@ impl<'a, S: Storage> BTree<'a, S> {
             old_next_leaf = leaf.next_leaf();
         }
 
-        // Calculate cell sizes for proper split point selection
         let cell_sizes: BumpVec<usize> = all_keys
             .iter()
             .zip(all_values.iter())
@@ -823,10 +817,12 @@ impl<'a, S: Storage> BTree<'a, S> {
             separator_key = all_keys[mid].to_vec();
         }
 
-        Ok(InsertResult::Split {
-            separator: separator_key,
+        let split_result = InsertResult::Split {
+            separator: separator_key.clone(),
             new_page: new_page_no,
-        })
+        };
+        
+        Ok(split_result)
     }
 
     fn propagate_split(
@@ -847,7 +843,7 @@ impl<'a, S: Storage> BTree<'a, S> {
                 current_left,
                 current_right,
             )?;
-
+            
             match result {
                 InsertResult::Ok => return Ok(()),
                 InsertResult::Split {
@@ -868,7 +864,7 @@ impl<'a, S: Storage> BTree<'a, S> {
         &mut self,
         page_no: u32,
         separator: &[u8],
-        _left_child: u32,
+        left_child: u32,
         right_child: u32,
     ) -> Result<InsertResult> {
         let page_data = self.storage.page_mut(page_no)?;
@@ -887,7 +883,22 @@ impl<'a, S: Storage> BTree<'a, S> {
                 interior.insert_separator(separator, old_right)?;
                 interior.set_right_child(right_child)?;
             } else {
-                interior.insert_separator(separator, right_child)?;
+                
+                interior.insert_separator(separator, left_child)?;
+                
+                let count = interior.cell_count() as usize;
+                let mut check_index = 0; 
+                for i in 0..count {
+                     let key_at_i = interior.key_at(i)?;
+                     if key_at_i == separator {
+                         check_index = i;
+                         break;
+                     }
+                }
+                
+                if check_index + 1 < count {
+                    interior.update_child(check_index + 1, right_child)?;
+                }
             }
             return Ok(InsertResult::Ok);
         }
@@ -1214,10 +1225,6 @@ impl<'a, S: Storage + ?Sized> Cursor<'a, S> {
         Ok(true)
     }
 
-    /// Moves the cursor to the previous key. Returns false if exhausted.
-    ///
-    /// **Performance:** O(1) within a page, O(log N) when crossing page boundaries
-    /// (requires tree re-traversal). Prefer forward iteration for large scans.
     pub fn prev(&mut self) -> Result<bool> {
         if self.exhausted {
             return Ok(false);

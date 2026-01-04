@@ -446,6 +446,22 @@ impl<'a> InteriorNodeMut<'a> {
         Ok(())
     }
 
+    pub fn update_child(&mut self, index: usize, child_page: u32) -> Result<()> {
+        ensure!(
+            index < self.cell_count() as usize,
+            "slot index {} out of bounds (cell_count={})",
+            index,
+            self.cell_count()
+        );
+
+        let offset = self.slot_offset(index);
+        // Update the child_page field (offset 4, 4 bytes)
+        // InteriorSlot structure: prefix(4) | child_page(4) | offset(2) | key_len(2)
+        let child_offset = offset + 4;
+        self.data[child_offset..child_offset + 4].copy_from_slice(&child_page.to_le_bytes());
+        Ok(())
+    }
+
     pub fn as_ref(&self) -> InteriorNode<'_> {
         InteriorNode { data: self.data }
     }

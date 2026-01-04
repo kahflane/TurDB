@@ -214,19 +214,23 @@ impl<K: Clone + Eq + std::hash::Hash, V> LruFileCache<K, V> {
         }
     }
 
-    pub fn insert(&mut self, key: K, value: V) {
+    pub fn insert(&mut self, key: K, value: V) -> Option<(K, V)> {
         if self.map.contains_key(&key) {
             self.touch(&key);
             self.map.insert(key, value);
-            return;
+            return None;
         }
 
-        if self.order.len() >= self.capacity {
-            self.pop_lru();
-        }
+        let evicted = if self.order.len() >= self.capacity {
+            self.pop_lru()
+        } else {
+            None
+        };
 
         self.order.push(key.clone());
         self.map.insert(key, value);
+        
+        evicted
     }
 
     pub fn pop_lru(&mut self) -> Option<(K, V)> {
@@ -572,7 +576,9 @@ impl FileManager {
         if self.open_files.get(&key).is_none() {
             let path = self.table_file_path(schema, table);
             let storage = MmapStorage::open(&path)?;
-            self.open_files.insert(key.clone(), storage);
+            if let Some((_, storage)) = self.open_files.insert(key.clone(), storage) {
+                storage.sync()?;
+            }
         }
 
         Ok(self.open_files.get(&key).unwrap())
@@ -594,7 +600,9 @@ impl FileManager {
         if self.open_files.get(&key).is_none() {
             let path = self.table_file_path(schema, table);
             let storage = MmapStorage::open(&path)?;
-            self.open_files.insert(key.clone(), storage);
+            if let Some((_, storage)) = self.open_files.insert(key.clone(), storage) {
+                storage.sync()?;
+            }
         }
 
         Ok(self.open_files.get_mut(&key).unwrap())
@@ -646,7 +654,9 @@ impl FileManager {
         if self.open_files.get(&key).is_none() {
             let path = self.index_file_path(schema, table, index_name);
             let storage = MmapStorage::open(&path)?;
-            self.open_files.insert(key.clone(), storage);
+            if let Some((_, storage)) = self.open_files.insert(key.clone(), storage) {
+                storage.sync()?;
+            }
         }
 
         Ok(self.open_files.get(&key).unwrap())
@@ -675,7 +685,9 @@ impl FileManager {
         if self.open_files.get(&key).is_none() {
             let path = self.index_file_path(schema, table, index_name);
             let storage = MmapStorage::open(&path)?;
-            self.open_files.insert(key.clone(), storage);
+            if let Some((_, storage)) = self.open_files.insert(key.clone(), storage) {
+                storage.sync()?;
+            }
         }
 
         Ok(self.open_files.get_mut(&key).unwrap())
@@ -757,7 +769,9 @@ impl FileManager {
         if self.open_files.get(&key).is_none() {
             let path = self.hnsw_file_path(schema, table, index_name);
             let storage = MmapStorage::open(&path)?;
-            self.open_files.insert(key.clone(), storage);
+            if let Some((_, storage)) = self.open_files.insert(key.clone(), storage) {
+                storage.sync()?;
+            }
         }
 
         Ok(self.open_files.get(&key).unwrap())
@@ -786,7 +800,9 @@ impl FileManager {
         if self.open_files.get(&key).is_none() {
             let path = self.hnsw_file_path(schema, table, index_name);
             let storage = MmapStorage::open(&path)?;
-            self.open_files.insert(key.clone(), storage);
+            if let Some((_, storage)) = self.open_files.insert(key.clone(), storage) {
+                storage.sync()?;
+            }
         }
 
         Ok(self.open_files.get_mut(&key).unwrap())

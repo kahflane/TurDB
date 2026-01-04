@@ -368,7 +368,16 @@ fn escape_sql_value(value: rusqlite::types::Value) -> String {
             }
         }
         Value::Text(s) => format!("'{}'", s.replace('\'', "''")),
-        Value::Blob(_) => "NULL".to_string(),
+        Value::Blob(b) => {
+            use std::fmt::Write;
+            let mut s = String::with_capacity(b.len() * 2 + 3);
+            s.push_str("X'");
+            for byte in b {
+                write!(s, "{:02X}", byte).unwrap();
+            }
+            s.push('\'');
+            s
+        }
     }
 }
 
@@ -660,6 +669,22 @@ fn import_small_tables() {
     
     aggregate.print_summary(overall_elapsed);
     assert!(aggregate.total_rows > 0, "Should have imported some rows");
+
+    // Verification: Try to read TOAST values from DatasetVersions
+    println!("\n=== Verifying TOAST Data (DatasetVersions) ===");
+    let verify_start = Instant::now();
+    let rows = db.query("SELECT Description FROM dataset_versions WHERE Description IS NOT NULL LIMIT 200").unwrap();
+    println!("Read {} rows for verification", rows.len());
+    let mut toast_count = 0;
+    for row in rows {
+        if let turdb::OwnedValue::Text(s) = row.get(0).unwrap() {
+            if s.len() > 1000 {
+                toast_count += 1;
+            }
+        }
+    }
+    println!("Verified {} large TOAST values in {:.2}s", toast_count, verify_start.elapsed().as_secs_f64());
+
 }
 
 #[test]

@@ -778,6 +778,7 @@ impl Database {
             let toast_storage = file_manager.table_data_mut(schema_name, &toast_table_name_owned)?;
             let page0 = toast_storage.page_mut(0)?;
             let header = crate::storage::TableFileHeader::from_bytes_mut(page0)?;
+
             header.set_root_page(toast_root_page);
         }
 
