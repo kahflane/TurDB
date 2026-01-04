@@ -24,3 +24,6 @@ CODE_REVIEW.md
 AGENTS.md
 .crush/
 book/*
+
+testdata/
+scripts/prepare_qdrant_comparison.py

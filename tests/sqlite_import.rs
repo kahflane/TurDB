@@ -854,35 +854,7 @@ fn benchmark_sqlite_vs_turdb() {
         println!("\nTurDB is {:.2}x SLOWER than SQLite (target: 2-3x faster)", 1.0/ratio);
     }
 
+
     let _ = std::fs::remove_file(SQLITE_TARGET);
     let _ = std::fs::remove_dir_all(TURDB_TARGET);
-}
-
-#[allow(dead_code)]
-fn write_sql_value(buf: &mut String, value: &rusqlite::types::Value) {
-    use rusqlite::types::Value;
-    use std::fmt::Write;
-    match value {
-        Value::Null => buf.push_str("NULL"),
-        Value::Integer(i) => { let _ = write!(buf, "{}", i); }
-        Value::Real(f) => {
-            if f.is_nan() || f.is_infinite() {
-                buf.push_str("NULL");
-            } else {
-                let _ = write!(buf, "{:.15e}", f);
-            }
-        }
-        Value::Text(s) => {
-            buf.push('\'');
-            for c in s.chars() {
-                if c == '\'' {
-                    buf.push_str("''");
-                } else {
-                    buf.push(c);
-                }
-            }
-            buf.push('\'');
-        }
-        Value::Blob(_) => buf.push_str("NULL"),
-    }
 }
