@@ -96,6 +96,7 @@ pub mod dirty_tracker;
 mod dml;
 pub mod group_commit;
 mod macros;
+pub mod page_locks;
 pub mod prepared;
 mod recovery;
 pub mod row;
