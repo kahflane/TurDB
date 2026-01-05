@@ -99,12 +99,13 @@ use crate::database::row::Row;
 use crate::database::{Database, ExecuteResult};
 use crate::mvcc::WriteEntry;
 use crate::records::RecordView;
-use crate::schema::table::Constraint;
+use crate::schema::table::{Constraint, IndexType};
 use crate::sql::predicate::CompiledPredicate;
-use crate::storage::{TableFileHeader, DEFAULT_SCHEMA};
+use crate::storage::{IndexFileHeader, TableFileHeader, DEFAULT_SCHEMA};
 use crate::types::{create_column_map, create_record_schema, owned_values_to_values, OwnedValue};
 use bumpalo::Bump;
 use eyre::{bail, Result};
+use smallvec::SmallVec;
 use std::sync::atomic::Ordering;
 
 impl Database {
@@ -127,6 +128,39 @@ impl Database {
         let table_id = table_def.id();
         let columns = table_def.columns().to_vec();
         let has_toast = table_def.has_toast();
+
+        let secondary_indexes: Vec<(String, Vec<usize>)> = table_def
+            .indexes()
+            .iter()
+            .filter(|idx| idx.index_type() == IndexType::BTree)
+            .map(|idx| {
+                let col_indices: Vec<usize> = idx
+                    .columns()
+                    .iter()
+                    .filter_map(|col_name| columns.iter().position(|c| c.name() == col_name))
+                    .collect();
+                (idx.name().to_string(), col_indices)
+            })
+            .collect();
+
+        let unique_columns: Vec<(usize, String, bool)> = columns
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, col)| {
+                let is_pk = col.has_constraint(&Constraint::PrimaryKey);
+                let is_unique = col.has_constraint(&Constraint::Unique);
+                if is_pk || is_unique {
+                    let index_name = if is_pk {
+                        format!("{}_pkey", col.name())
+                    } else {
+                        format!("{}_key", col.name())
+                    };
+                    Some((idx, index_name, is_pk))
+                } else {
+                    None
+                }
+            })
+            .collect();
 
         let mut fk_references: Vec<(String, String, String, usize)> = Vec::new();
         for (schema_key, schema_val) in catalog.schemas() {
@@ -401,6 +435,69 @@ impl Database {
                                 pointer.total_size,
                             );
                         }
+                    }
+                }
+            }
+        }
+
+        let mut key_buf: SmallVec<[u8; 64]> = SmallVec::new();
+
+        for (col_idx, index_name, _is_pk) in &unique_columns {
+            if file_manager.index_exists(schema_name, table_name, index_name) {
+                let index_storage_arc =
+                    file_manager.index_data_mut(schema_name, table_name, index_name)?;
+                let mut index_storage = index_storage_arc.write();
+
+                let index_root_page = {
+                    let page0 = index_storage.page(0)?;
+                    let header = IndexFileHeader::from_bytes(page0)?;
+                    header.root_page()
+                };
+
+                let mut index_btree = BTree::new(&mut *index_storage, index_root_page)?;
+
+                for (_row_key, _old_value, row_values) in &rows_to_delete {
+                    if let Some(value) = row_values.get(*col_idx) {
+                        if !value.is_null() {
+                            key_buf.clear();
+                            Self::encode_value_as_key(value, &mut key_buf);
+                            let _ = index_btree.delete(&key_buf);
+                        }
+                    }
+                }
+            }
+        }
+
+        for (index_name, col_indices) in &secondary_indexes {
+            if col_indices.is_empty() {
+                continue;
+            }
+            if file_manager.index_exists(schema_name, table_name, index_name) {
+                let index_storage_arc =
+                    file_manager.index_data_mut(schema_name, table_name, index_name)?;
+                let mut index_storage = index_storage_arc.write();
+
+                let index_root_page = {
+                    let page0 = index_storage.page(0)?;
+                    let header = IndexFileHeader::from_bytes(page0)?;
+                    header.root_page()
+                };
+
+                let mut index_btree = BTree::new(&mut *index_storage, index_root_page)?;
+
+                for (_row_key, _old_value, row_values) in &rows_to_delete {
+                    let all_non_null = col_indices
+                        .iter()
+                        .all(|&idx| row_values.get(idx).is_some_and(|v| !v.is_null()));
+
+                    if all_non_null {
+                        key_buf.clear();
+                        for &col_idx in col_indices {
+                            if let Some(value) = row_values.get(col_idx) {
+                                Self::encode_value_as_key(value, &mut key_buf);
+                            }
+                        }
+                        let _ = index_btree.delete(&key_buf);
                     }
                 }
             }

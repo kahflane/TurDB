@@ -93,8 +93,9 @@
 //! - WAL flush acquires file_manager and WAL locks atomically
 
 use crate::mvcc::{TxnId, TxnState, UndoRegistry, WriteEntry};
+use crate::schema::table::{Constraint, IndexType};
 use crate::sql::ast::IsolationLevel;
-use crate::storage::{WalStoragePerTable, DEFAULT_SCHEMA};
+use crate::storage::{IndexFileHeader, WalStoragePerTable, DEFAULT_SCHEMA};
 use eyre::{bail, Result, WrapErr};
 use smallvec::SmallVec;
 
@@ -343,7 +344,7 @@ impl Database {
         let schema_name = DEFAULT_SCHEMA;
         let table_name = table_def.name();
 
-        let table_storage_arc = file_manager.table_data_mut(schema_name, table_name)?;
+        let table_storage_arc = file_manager.table_data_mut(schema_name, &table_name)?;
         let mut table_storage = table_storage_arc.write();
 
         let btree = BTree::new(&mut *table_storage, 1)?;
@@ -414,7 +415,11 @@ impl Database {
     }
 
     fn undo_write_entry(&self, entry: &WriteEntry, undo_data: Option<&Vec<u8>>) -> Result<()> {
+        use crate::btree::BTree;
+        use crate::database::dml::mvcc_helpers::get_user_data;
+        use crate::records::RecordView;
         use crate::storage::TableFileHeader;
+        use crate::types::{create_record_schema, OwnedValue};
 
         self.ensure_file_manager()?;
 
@@ -433,26 +438,219 @@ impl Database {
 
         let table_def = table_def.unwrap();
         let schema_name = DEFAULT_SCHEMA;
-        let table_name = table_def.name();
+        let table_name = table_def.name().to_string();
+        let columns = table_def.columns().to_vec();
 
-        let table_storage_arc = file_manager.table_data_mut(schema_name, table_name)?;
+        let secondary_indexes: Vec<(String, Vec<usize>)> = table_def
+            .indexes()
+            .iter()
+            .filter(|idx| idx.index_type() == IndexType::BTree)
+            .map(|idx| {
+                let col_indices: Vec<usize> = idx
+                    .columns()
+                    .iter()
+                    .filter_map(|col_name| columns.iter().position(|c| c.name() == col_name))
+                    .collect();
+                (idx.name().to_string(), col_indices)
+            })
+            .collect();
+
+        let unique_columns: Vec<(usize, String, bool)> = columns
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, col)| {
+                let is_pk = col.has_constraint(&Constraint::PrimaryKey);
+                let is_unique = col.has_constraint(&Constraint::Unique);
+                if is_pk || is_unique {
+                    let index_name = if is_pk {
+                        format!("{}_pkey", col.name())
+                    } else {
+                        format!("{}_key", col.name())
+                    };
+                    Some((idx, index_name, is_pk))
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        drop(catalog_guard);
+
+        let schema = create_record_schema(&columns);
+
+        let table_storage_arc = file_manager.table_data_mut(schema_name, &table_name)?;
         let mut table_storage = table_storage_arc.write();
 
-        use crate::btree::BTree;
         let mut btree = BTree::new(&mut *table_storage, 1)?;
 
         if entry.is_insert {
+            let row_values: Option<Vec<OwnedValue>> = if let Some(raw_value) = btree.get(&entry.key)? {
+                let user_data = get_user_data(&raw_value);
+                if let Ok(record) = RecordView::new(user_data, &schema) {
+                    OwnedValue::extract_row_from_record(&record, &columns).ok()
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
             let deleted = btree.delete(&entry.key)?;
             drop(btree);
+
             if deleted {
                 let page = table_storage.page_mut(0)?;
                 let header = TableFileHeader::from_bytes_mut(page)?;
                 let new_count = header.row_count().saturating_sub(1);
                 header.set_row_count(new_count);
             }
+            drop(table_storage);
+
+            if let Some(row_values) = row_values {
+                let mut key_buf: SmallVec<[u8; 64]> = SmallVec::new();
+
+                for (col_idx, index_name, _is_pk) in &unique_columns {
+                    if file_manager.index_exists(schema_name, &table_name, index_name) {
+                        if let Some(value) = row_values.get(*col_idx) {
+                            if !value.is_null() {
+                                let index_storage_arc =
+                                    file_manager.index_data_mut(schema_name, &table_name, index_name)?;
+                                let mut index_storage = index_storage_arc.write();
+
+                                let index_root_page = {
+                                    let page0 = index_storage.page(0)?;
+                                    let header = IndexFileHeader::from_bytes(page0)?;
+                                    header.root_page()
+                                };
+
+                                let mut index_btree = BTree::new(&mut *index_storage, index_root_page)?;
+                                key_buf.clear();
+                                Self::encode_value_as_key(value, &mut key_buf);
+                                let _ = index_btree.delete(&key_buf);
+                            }
+                        }
+                    }
+                }
+
+                for (index_name, col_indices) in &secondary_indexes {
+                    if col_indices.is_empty() {
+                        continue;
+                    }
+                    if file_manager.index_exists(schema_name, &table_name, index_name) {
+                        let all_non_null = col_indices
+                            .iter()
+                            .all(|&idx| row_values.get(idx).is_some_and(|v| !v.is_null()));
+
+                        if all_non_null {
+                            let index_storage_arc =
+                                file_manager.index_data_mut(schema_name, &table_name, index_name)?;
+                            let mut index_storage = index_storage_arc.write();
+
+                            let index_root_page = {
+                                let page0 = index_storage.page(0)?;
+                                let header = IndexFileHeader::from_bytes(page0)?;
+                                header.root_page()
+                            };
+
+                            let mut index_btree = BTree::new(&mut *index_storage, index_root_page)?;
+                            key_buf.clear();
+                            for &col_idx in col_indices {
+                                if let Some(value) = row_values.get(col_idx) {
+                                    Self::encode_value_as_key(value, &mut key_buf);
+                                }
+                            }
+                            let _ = index_btree.delete(&key_buf);
+                        }
+                    }
+                }
+            }
         } else if let Some(old_value) = undo_data {
             btree.delete(&entry.key)?;
             btree.insert(&entry.key, old_value)?;
+            drop(btree);
+            drop(table_storage);
+
+            let old_row_values: Option<Vec<OwnedValue>> = {
+                let user_data = get_user_data(old_value);
+                if let Ok(record) = RecordView::new(user_data, &schema) {
+                    OwnedValue::extract_row_from_record(&record, &columns).ok()
+                } else {
+                    None
+                }
+            };
+
+            if let Some(row_values) = old_row_values {
+                let mut key_buf: SmallVec<[u8; 64]> = SmallVec::new();
+
+                for (col_idx, index_name, _is_pk) in &unique_columns {
+                    if file_manager.index_exists(schema_name, &table_name, index_name) {
+                        if let Some(value) = row_values.get(*col_idx) {
+                            if !value.is_null() {
+                                let index_storage_arc =
+                                    file_manager.index_data_mut(schema_name, &table_name, index_name)?;
+                                let mut index_storage = index_storage_arc.write();
+
+                                let index_root_page = {
+                                    let page0 = index_storage.page(0)?;
+                                    let header = IndexFileHeader::from_bytes(page0)?;
+                                    header.root_page()
+                                };
+
+                                let mut index_btree = BTree::new(&mut *index_storage, index_root_page)?;
+                                key_buf.clear();
+                                Self::encode_value_as_key(value, &mut key_buf);
+
+                                let pk_idx = columns.iter().position(|c| c.has_constraint(&Constraint::PrimaryKey));
+                                if let Some(pk_idx) = pk_idx {
+                                    if let Some(OwnedValue::Int(pk_val)) = row_values.get(pk_idx) {
+                                        let row_id_bytes = (*pk_val as u64).to_be_bytes();
+                                        let _ = index_btree.insert(&key_buf, &row_id_bytes);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                for (index_name, col_indices) in &secondary_indexes {
+                    if col_indices.is_empty() {
+                        continue;
+                    }
+                    if file_manager.index_exists(schema_name, &table_name, index_name) {
+                        let all_non_null = col_indices
+                            .iter()
+                            .all(|&idx| row_values.get(idx).is_some_and(|v| !v.is_null()));
+
+                        if all_non_null {
+                            let index_storage_arc =
+                                file_manager.index_data_mut(schema_name, &table_name, index_name)?;
+                            let mut index_storage = index_storage_arc.write();
+
+                            let index_root_page = {
+                                let page0 = index_storage.page(0)?;
+                                let header = IndexFileHeader::from_bytes(page0)?;
+                                header.root_page()
+                            };
+
+                            let mut index_btree = BTree::new(&mut *index_storage, index_root_page)?;
+                            key_buf.clear();
+                            for &col_idx in col_indices {
+                                if let Some(value) = row_values.get(col_idx) {
+                                    Self::encode_value_as_key(value, &mut key_buf);
+                                }
+                            }
+
+                            let pk_idx = columns.iter().position(|c| c.has_constraint(&Constraint::PrimaryKey));
+                            if let Some(pk_idx) = pk_idx {
+                                if let Some(OwnedValue::Int(pk_val)) = row_values.get(pk_idx) {
+                                    let row_id_bytes = (*pk_val as u64).to_be_bytes();
+                                    let _ = index_btree.insert(&key_buf, &row_id_bytes);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
         }
 
         Ok(())

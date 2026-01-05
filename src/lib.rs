@@ -12,10 +12,7 @@
 //! ```ignore
 //! use turdb::Database;
 //!
-//! let db = Database::builder()
-//!     .path("./mydb")
-//!     .page_cache_size(64)
-//!     .open()?;
+//! let db = Database::create(path).expect("Failed to create TurDB");
 //!
 //! db.execute("CREATE TABLE users (id INT PRIMARY KEY, name TEXT)")?;
 //! db.execute("INSERT INTO users VALUES (1, 'Alice')")?;
@@ -31,19 +28,19 @@
 //!
 //! ```text
 //! ┌─────────────────────────────────────┐
-//! │         Public API (Database)        │
+//! │         Public API (Database)       │
 //! ├─────────────────────────────────────┤
-//! │     SQL Layer (Parser/Executor)      │
+//! │     SQL Layer (Parser/Executor)     │
 //! ├─────────────────────────────────────┤
-//! │  Schema & Catalog │ MVCC Transactions│
+//! │  Schema & Catalog │ MVCC Transaction│
 //! ├───────────────────┼─────────────────┤
-//! │   B-Tree Index    │   HNSW Index     │
+//! │   B-Tree Index    │   HNSW Index    │
 //! ├─────────────────────────────────────┤
-//! │     Record Serialization Layer       │
+//! │     Record Serialization Layer      │
 //! ├─────────────────────────────────────┤
-//! │      Storage Layer (Pager/Cache)     │
+//! │      Storage Layer (Pager/Cache)    │
 //! ├─────────────────────────────────────┤
-//! │    Memory-Mapped File I/O + WAL      │
+//! │    Memory-Mapped File I/O + WAL     │
 //! └─────────────────────────────────────┘
 //! ```
 //!

@@ -270,12 +270,7 @@ impl Database {
         }
         Ok(())
     }
-
-    /// Flushes dirty pages to WAL if WAL is enabled and not in an explicit transaction.
-    /// In autocommit mode (no explicit transaction), this flushes immediately.
-    /// In explicit transaction mode, WAL flush is deferred to commit.
-    ///
-    /// Returns the number of frames written, or 0 if no flush was needed.
+    
     pub(crate) fn flush_wal_if_autocommit(
         &self,
         file_manager: &mut crate::storage::FileManager,
@@ -428,13 +423,6 @@ impl Database {
         }
     }
 
-    /// Prepares a SQL statement for execution with parameters.
-    ///
-    /// The SQL can contain parameter placeholders:
-    /// - `?` for anonymous parameters (bound in order)
-    /// - `$1`, `$2`, etc. for positional parameters
-    ///
-    /// Returns a `PreparedStatement` that can be bound with values and executed.
     pub fn prepare(&self, sql: &str) -> Result<super::PreparedStatement> {
         use super::prepared::count_parameters;
 

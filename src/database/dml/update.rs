@@ -90,15 +90,16 @@ use crate::database::row::Row;
 use crate::database::{Database, ExecuteResult};
 use crate::mvcc::WriteEntry;
 use crate::records::RecordView;
-use crate::schema::table::Constraint;
+use crate::schema::table::{Constraint, IndexType};
 use crate::sql::decoder::RecordDecoder;
 use crate::sql::executor::ExecutorRow;
 use crate::sql::predicate::CompiledPredicate;
-use crate::storage::DEFAULT_SCHEMA;
+use crate::storage::{IndexFileHeader, DEFAULT_SCHEMA};
 use crate::types::{create_record_schema, owned_values_to_values, OwnedValue, Value};
 use bumpalo::Bump;
 use eyre::{bail, Result, WrapErr};
 use hashbrown::HashSet;
+use smallvec::SmallVec;
 use std::borrow::Cow;
 use std::sync::atomic::Ordering;
 
@@ -134,6 +135,39 @@ impl Database {
         let table_id = table_def.id();
         let columns = table_def.columns().to_vec();
         let has_toast = table_def.has_toast();
+
+        let secondary_indexes: Vec<(String, Vec<usize>)> = table_def
+            .indexes()
+            .iter()
+            .filter(|idx| idx.index_type() == IndexType::BTree)
+            .map(|idx| {
+                let col_indices: Vec<usize> = idx
+                    .columns()
+                    .iter()
+                    .filter_map(|col_name| columns.iter().position(|c| c.name() == col_name))
+                    .collect();
+                (idx.name().to_string(), col_indices)
+            })
+            .collect();
+
+        let unique_columns: Vec<(usize, String, bool)> = columns
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, col)| {
+                let is_pk = col.has_constraint(&Constraint::PrimaryKey);
+                let is_unique = col.has_constraint(&Constraint::Unique);
+                if is_pk || is_unique {
+                    let index_name = if is_pk {
+                        format!("{}_pkey", col.name())
+                    } else {
+                        format!("{}_key", col.name())
+                    };
+                    Some((idx, index_name, is_pk))
+                } else {
+                    None
+                }
+            })
+            .collect();
 
         #[allow(clippy::type_complexity)]
         let from_tables_data: Option<Vec<(
@@ -255,7 +289,7 @@ impl Database {
         };
 
         #[allow(clippy::type_complexity)]
-        let mut rows_to_update: Vec<(Vec<u8>, Vec<u8>, Vec<OwnedValue>, Vec<(usize, OwnedValue)>)> = Vec::new();
+        let mut rows_to_update: Vec<(Vec<u8>, Vec<u8>, Vec<OwnedValue>, Vec<OwnedValue>, Vec<(usize, OwnedValue)>)> = Vec::new();
 
         let mut precomputed_assignments: Vec<(usize, OwnedValue)> = Vec::new();
         let set_param_count: usize;
@@ -442,6 +476,7 @@ impl Database {
 
                 if should_update {
                     let old_value = value.to_vec();
+                    let old_row_values = row_values.clone();
 
                     let mut old_toast_values: Vec<(usize, OwnedValue)> = Vec::new();
 
@@ -471,7 +506,7 @@ impl Database {
                         }
                     }
 
-                    rows_to_update.push((key.to_vec(), old_value, row_values, old_toast_values));
+                    rows_to_update.push((key.to_vec(), old_value, row_values, old_row_values, old_toast_values));
                 }
 
                 cursor.advance()?;
@@ -490,7 +525,7 @@ impl Database {
 
         if !unique_col_indices.is_empty() {
             
-            for (update_key, _old_value, updated_values, _old_toast) in &rows_to_update {
+            for (update_key, _old_value, updated_values, _old_row_values, _old_toast) in &rows_to_update {
                 for &col_idx in &unique_col_indices {
                     let new_val = &updated_values[col_idx];
                     if new_val.is_null() {
@@ -541,7 +576,7 @@ impl Database {
         let returned_rows: Option<Vec<Row>> = update.returning.map(|returning_cols| {
             rows_to_update
                 .iter()
-                .map(|(_key, _old_value, updated_values, _old_toast)| {
+                .map(|(_key, _old_value, updated_values, _old_row_values, _old_toast)| {
                     let row_values: Vec<OwnedValue> = returning_cols
                         .iter()
                         .flat_map(|col| match col {
@@ -578,7 +613,7 @@ impl Database {
         if has_toast {
             use crate::storage::toast::ToastPointer;
             for row_tuple in &mut rows_to_update {
-                let (_key, _old_value, updated_values, old_toast_values) = row_tuple;
+                let (_key, _old_value, updated_values, _old_row_values, old_toast_values) = row_tuple;
 
                 for (_col_idx, old_val) in old_toast_values.iter() {
                     if let OwnedValue::ToastPointer(ptr) = old_val {
@@ -635,7 +670,109 @@ impl Database {
             }
         }
 
-        for (key, _old_value, updated_values, _old_toast) in &rows_to_update {
+        let mut key_buf: SmallVec<[u8; 64]> = SmallVec::new();
+
+        for (col_idx, index_name, _is_pk) in &unique_columns {
+            if !modified_col_indices.contains(col_idx) {
+                continue;
+            }
+            if file_manager.index_exists(schema_name, table_name, index_name) {
+                let index_storage_arc =
+                    file_manager.index_data_mut(schema_name, table_name, index_name)?;
+                let mut index_storage = index_storage_arc.write();
+
+                let index_root_page = {
+                    let page0 = index_storage.page(0)?;
+                    let header = IndexFileHeader::from_bytes(page0)?;
+                    header.root_page()
+                };
+
+                let mut index_btree = BTree::new(&mut *index_storage, index_root_page)?;
+
+                for (_row_key, _old_value, new_row_values, old_row_values, _old_toast) in &rows_to_update {
+                    if let Some(old_value) = old_row_values.get(*col_idx) {
+                        if !old_value.is_null() {
+                            key_buf.clear();
+                            Self::encode_value_as_key(old_value, &mut key_buf);
+                            let _ = index_btree.delete(&key_buf);
+                        }
+                    }
+
+                    if let Some(new_value) = new_row_values.get(*col_idx) {
+                        if !new_value.is_null() {
+                            key_buf.clear();
+                            Self::encode_value_as_key(new_value, &mut key_buf);
+                            if let Some(pk_idx) = columns.iter().position(|c| c.has_constraint(&Constraint::PrimaryKey)) {
+                                if let Some(OwnedValue::Int(pk_val)) = new_row_values.get(pk_idx) {
+                                    let row_id_bytes = (*pk_val as u64).to_be_bytes();
+                                    let _ = index_btree.insert(&key_buf, &row_id_bytes);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        for (index_name, col_indices) in &secondary_indexes {
+            if col_indices.is_empty() {
+                continue;
+            }
+            let any_modified = col_indices.iter().any(|idx| modified_col_indices.contains(idx));
+            if !any_modified {
+                continue;
+            }
+            if file_manager.index_exists(schema_name, table_name, index_name) {
+                let index_storage_arc =
+                    file_manager.index_data_mut(schema_name, table_name, index_name)?;
+                let mut index_storage = index_storage_arc.write();
+
+                let index_root_page = {
+                    let page0 = index_storage.page(0)?;
+                    let header = IndexFileHeader::from_bytes(page0)?;
+                    header.root_page()
+                };
+
+                let mut index_btree = BTree::new(&mut *index_storage, index_root_page)?;
+
+                for (_row_key, _old_value, new_row_values, old_row_values, _old_toast) in &rows_to_update {
+                    let old_all_non_null = col_indices
+                        .iter()
+                        .all(|&idx| old_row_values.get(idx).is_some_and(|v| !v.is_null()));
+
+                    if old_all_non_null {
+                        key_buf.clear();
+                        for &col_idx in col_indices {
+                            if let Some(value) = old_row_values.get(col_idx) {
+                                Self::encode_value_as_key(value, &mut key_buf);
+                            }
+                        }
+                        let _ = index_btree.delete(&key_buf);
+                    }
+
+                    let new_all_non_null = col_indices
+                        .iter()
+                        .all(|&idx| new_row_values.get(idx).is_some_and(|v| !v.is_null()));
+
+                    if new_all_non_null {
+                        key_buf.clear();
+                        for &col_idx in col_indices {
+                            if let Some(value) = new_row_values.get(col_idx) {
+                                Self::encode_value_as_key(value, &mut key_buf);
+                            }
+                        }
+                        if let Some(pk_idx) = columns.iter().position(|c| c.has_constraint(&Constraint::PrimaryKey)) {
+                            if let Some(OwnedValue::Int(pk_val)) = new_row_values.get(pk_idx) {
+                                let row_id_bytes = (*pk_val as u64).to_be_bytes();
+                                let _ = index_btree.insert(&key_buf, &row_id_bytes);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        for (key, _old_value, updated_values, _old_row_values, _old_toast) in &rows_to_update {
             processed_rows.push((key.clone(), updated_values.clone()));
         }
 
@@ -672,7 +809,7 @@ impl Database {
         {
             let mut active_txn = self.active_txn.lock();
             if let Some(ref mut txn) = *active_txn {
-                for (key, old_value, _updated_values, _old_toast) in rows_to_update {
+                for (key, old_value, _updated_values, _old_row_values, _old_toast) in rows_to_update {
                     txn.add_write_entry_with_undo(
                         WriteEntry {
                             table_id: table_id as u32,
