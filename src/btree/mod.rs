@@ -92,6 +92,7 @@
 
 mod interior;
 mod leaf;
+pub mod simd_scan;
 mod tree;
 
 pub use interior::{
@@ -102,4 +103,5 @@ pub use leaf::{
     extract_prefix, LeafNode, LeafNodeMut, SearchResult, Slot, LEAF_CONTENT_START,
     LEAF_HEADER_SIZE, SLOT_SIZE,
 };
+pub use simd_scan::{find_key_simd, BatchSlotIterator, SlotBatch, prefetch_slots};
 pub use tree::{BTree, BTreeReader, Cursor, InsertResult, SearchHandle, MAX_TREE_DEPTH, get_fastpath_stats, reset_fastpath_stats, get_fastpath_fail_stats, get_slowpath_stats};

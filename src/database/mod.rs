@@ -94,6 +94,7 @@ mod convert;
 mod ddl;
 pub mod dirty_tracker;
 mod dml;
+pub mod group_commit;
 mod macros;
 pub mod prepared;
 mod recovery;

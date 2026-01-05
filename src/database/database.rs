@@ -40,6 +40,8 @@ pub(crate) struct SharedDatabase {
     pub(crate) dirty_tracker: ShardedDirtyTracker,
     pub(crate) txn_manager: TransactionManager,
     pub(crate) table_id_lookup: RwLock<hashbrown::HashMap<u32, (String, String)>>,
+    /// Group commit queue for batching WAL flushes across concurrent transactions
+    pub(crate) group_commit_queue: super::group_commit::GroupCommitQueue,
 }
 
 pub struct Database {
@@ -133,6 +135,7 @@ impl Database {
             dirty_tracker: ShardedDirtyTracker::new(),
             txn_manager: TransactionManager::new(),
             table_id_lookup: RwLock::new(hashbrown::HashMap::new()),
+            group_commit_queue: super::group_commit::GroupCommitQueue::with_default_config(),
         });
 
         let db = Self {
@@ -194,6 +197,7 @@ impl Database {
             dirty_tracker: ShardedDirtyTracker::new(),
             txn_manager: TransactionManager::new(),
             table_id_lookup: RwLock::new(hashbrown::HashMap::new()),
+            group_commit_queue: super::group_commit::GroupCommitQueue::with_default_config(),
         });
 
         Ok(Self {

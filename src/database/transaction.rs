@@ -263,6 +263,34 @@ impl Database {
                 return Ok(ExecuteResult::Commit);
             }
 
+            // Use group commit for better performance with concurrent transactions
+            if self.shared.group_commit_queue.is_enabled() {
+                // Convert to SmallVec for group commit
+                let dirty_ids: SmallVec<[u32; 8]> = dirty_table_ids.into_iter().collect();
+
+                // Submit to group commit queue and wait
+                match self.shared.group_commit_queue.submit_and_wait(dirty_ids) {
+                    Ok(_batch_id) => {
+                        // Check if we need to actually flush (we may be the leader)
+                        if let Some(pending_commits) = self.shared.group_commit_queue.take_pending() {
+                            // We're the flush leader - perform the batched WAL flush
+                            let result = self.execute_group_wal_flush(&pending_commits);
+                            match &result {
+                                Ok(()) => self.shared.group_commit_queue.complete_batch(&pending_commits),
+                                Err(e) => self.shared.group_commit_queue.fail_batch(&pending_commits, &e.to_string()),
+                            }
+                            result?;
+                        }
+                        return Ok(ExecuteResult::Commit);
+                    }
+                    Err(e) => {
+                        // Fall back to direct flush on group commit failure
+                        bail!("group commit failed: {}", e);
+                    }
+                }
+            }
+
+            // Direct flush path (when group commit is disabled)
             let table_infos: Vec<(u32, String, String)> = {
                 let lookup = self.shared.table_id_lookup.read();
                 dirty_table_ids
@@ -307,6 +335,68 @@ impl Database {
         }
 
         Ok(ExecuteResult::Commit)
+    }
+
+    /// Execute a batched WAL flush for multiple transactions (group commit)
+    fn execute_group_wal_flush(
+        &self,
+        pending_commits: &[std::sync::Arc<super::group_commit::PendingCommit>],
+    ) -> Result<()> {
+        use super::group_commit::collect_dirty_tables;
+
+        // Collect all unique dirty table IDs from the batch
+        let all_dirty_table_ids = collect_dirty_tables(pending_commits);
+
+        if all_dirty_table_ids.is_empty() {
+            return Ok(());
+        }
+
+        // Get table info for all dirty tables
+        let table_infos: Vec<(u32, String, String)> = {
+            let lookup = self.shared.table_id_lookup.read();
+            all_dirty_table_ids
+                .iter()
+                .filter_map(|&table_id| {
+                    lookup
+                        .get(&table_id)
+                        .map(|(s, t)| (table_id, s.clone(), t.clone()))
+                })
+                .collect()
+        };
+
+        // Acquire locks and perform batched flush
+        let mut file_manager_guard = self.shared.file_manager.write();
+        let file_manager = file_manager_guard
+            .as_mut()
+            .ok_or_else(|| eyre::eyre!("file manager not available for group WAL flush"))?;
+
+        let mut wal_guard = self.shared.wal.lock();
+        let wal = wal_guard
+            .as_mut()
+            .ok_or_else(|| eyre::eyre!("WAL not initialized but WAL mode is enabled"))?;
+
+        // Flush all dirty tables in a single batch
+        for (table_id, schema_name, table_name) in table_infos {
+            let storage_arc = file_manager
+                .table_data(&schema_name, &table_name)
+                .wrap_err_with(|| {
+                    format!(
+                        "failed to get storage for table {}.{} during group WAL flush",
+                        schema_name, table_name
+                    )
+                })?;
+            let storage = storage_arc.read();
+
+            WalStoragePerTable::flush_wal_for_table(&self.shared.dirty_tracker, &storage, wal, table_id)
+                .wrap_err_with(|| {
+                    format!(
+                        "failed to flush WAL for table {}.{} during group commit",
+                        schema_name, table_name
+                    )
+                })?;
+        }
+
+        Ok(())
     }
 
     fn finalize_transaction_commit(&self, mut txn: ActiveTransaction) -> Result<()> {

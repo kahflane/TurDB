@@ -328,6 +328,31 @@ impl<'a> LeafNode<'a> {
         let header = PageHeader::from_bytes(self.data).unwrap(); // INVARIANT: page validated in from_page constructor
         header.next_leaf()
     }
+
+    /// SIMD-accelerated key search
+    ///
+    /// Uses SIMD instructions (AVX2 on x86_64, NEON on aarch64) to compare
+    /// multiple prefixes in parallel, reducing search iterations.
+    ///
+    /// Falls back to scalar binary search on unsupported architectures.
+    pub fn find_key_simd(&self, key: &[u8]) -> SearchResult {
+        super::simd_scan::find_key_simd(self.data, key, self.cell_count() as usize)
+    }
+
+    /// Get raw page data for SIMD operations
+    pub fn page_data(&self) -> &'a [u8] {
+        self.data
+    }
+
+    /// Create a batch iterator for efficient range scans
+    pub fn batch_iterator(&self) -> super::simd_scan::BatchSlotIterator<'a> {
+        super::simd_scan::BatchSlotIterator::new(self.data, self.cell_count() as usize)
+    }
+
+    /// Create a batch iterator starting at a specific index
+    pub fn batch_iterator_from(&self, start_index: usize) -> super::simd_scan::BatchSlotIterator<'a> {
+        super::simd_scan::BatchSlotIterator::from_index(self.data, self.cell_count() as usize, start_index)
+    }
 }
 
 impl<'a> LeafNodeMut<'a> {
