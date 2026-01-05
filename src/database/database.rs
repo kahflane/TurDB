@@ -440,7 +440,7 @@ impl Database {
         let (schema_name, table_name) = if let Some(dot_pos) = table.find('.') {
             (&table[..dot_pos], &table[dot_pos + 1..])
         } else {
-            ("root", table)
+            (DEFAULT_SCHEMA, table)
         };
         self.insert_batch_into_schema(schema_name, table_name, rows)
     }
@@ -951,7 +951,7 @@ impl Database {
             let inner_table_scan = find_table_scan(subq.child_plan);
 
             if let Some(inner_scan) = inner_table_scan {
-                let schema_name = inner_scan.schema.unwrap_or("root");
+                let schema_name = inner_scan.schema.unwrap_or(DEFAULT_SCHEMA);
                 let table_name = inner_scan.table;
 
                 let inner_table_def = catalog
@@ -1076,7 +1076,7 @@ impl Database {
         }
 
         if let Some(scan) = is_simple_count_star(physical_plan.root) {
-            let schema_name = scan.schema.unwrap_or("root");
+            let schema_name = scan.schema.unwrap_or(DEFAULT_SCHEMA);
             let table_name = scan.table;
 
             let storage_arc = file_manager
@@ -1100,7 +1100,7 @@ impl Database {
 
         let rows = match plan_source {
             Some(PlanSource::TableScan(scan)) => {
-                let schema_name = scan.schema.unwrap_or("root");
+                let schema_name = scan.schema.unwrap_or(DEFAULT_SCHEMA);
                 let table_name = scan.table;
 
                 toast_table_info = Some((schema_name.to_string(), table_name.to_string()));
@@ -1200,7 +1200,7 @@ impl Database {
             Some(PlanSource::IndexScan(scan)) => {
                 use crate::sql::planner::ScanRange;
 
-                let schema_name = scan.schema.unwrap_or("root");
+                let schema_name = scan.schema.unwrap_or(DEFAULT_SCHEMA);
                 let table_name = scan.table;
 
                 toast_table_info = Some((schema_name.to_string(), table_name.to_string()));
@@ -1300,7 +1300,7 @@ impl Database {
                 use crate::btree::BTreeReader;
                 use crate::records::RecordView;
 
-                let schema_name = scan.schema.unwrap_or("root");
+                let schema_name = scan.schema.unwrap_or(DEFAULT_SCHEMA);
                 let table_name = scan.table;
                 let index_name = scan.index_name;
 
@@ -1554,9 +1554,9 @@ impl Database {
                     left_rows = execute_subquery_recursive(subq, catalog, file_manager)?;
                 } else if let Some(scan_info) = &left_scan {
                     let (schema_name, table_name, alias) = match scan_info {
-                        JoinScanInfo::TableScan(scan) => (scan.schema.unwrap_or("root"), scan.table, scan.alias),
-                        JoinScanInfo::IndexScan(scan) => (scan.schema.unwrap_or("root"), scan.table, None),
-                        JoinScanInfo::SecondaryIndexScan(scan) => (scan.schema.unwrap_or("root"), scan.table, None),
+                        JoinScanInfo::TableScan(scan) => (scan.schema.unwrap_or(DEFAULT_SCHEMA), scan.table, scan.alias),
+                        JoinScanInfo::IndexScan(scan) => (scan.schema.unwrap_or(DEFAULT_SCHEMA), scan.table, None),
+                        JoinScanInfo::SecondaryIndexScan(scan) => (scan.schema.unwrap_or(DEFAULT_SCHEMA), scan.table, None),
                     };
                     left_table_name = Some(table_name);
                     left_alias = alias;
@@ -1578,9 +1578,9 @@ impl Database {
                     right_col_count = subq.output_schema.columns.len();
                 } else if let Some(scan_info) = &right_scan {
                     let (schema_name, table_name, alias) = match scan_info {
-                        JoinScanInfo::TableScan(scan) => (scan.schema.unwrap_or("root"), scan.table, scan.alias),
-                        JoinScanInfo::IndexScan(scan) => (scan.schema.unwrap_or("root"), scan.table, None),
-                        JoinScanInfo::SecondaryIndexScan(scan) => (scan.schema.unwrap_or("root"), scan.table, None),
+                        JoinScanInfo::TableScan(scan) => (scan.schema.unwrap_or(DEFAULT_SCHEMA), scan.table, scan.alias),
+                        JoinScanInfo::IndexScan(scan) => (scan.schema.unwrap_or(DEFAULT_SCHEMA), scan.table, None),
+                        JoinScanInfo::SecondaryIndexScan(scan) => (scan.schema.unwrap_or(DEFAULT_SCHEMA), scan.table, None),
                     };
                     right_table_name = Some(table_name);
                     right_alias = alias;
@@ -2007,7 +2007,7 @@ impl Database {
                     let scan = find_table_scan_for_set(op)
                         .ok_or_else(|| eyre::eyre!("set operation branch must have a table scan"))?;
 
-                    let schema_name = scan.schema.unwrap_or("root");
+                    let schema_name = scan.schema.unwrap_or(DEFAULT_SCHEMA);
                     let table_name = scan.table;
 
                     let table_def = catalog
@@ -2127,7 +2127,7 @@ impl Database {
         let table_scan = find_table_scan(physical_plan.root);
 
         let rows = if let Some(scan) = table_scan {
-            let schema_name = scan.schema.unwrap_or("root");
+            let schema_name = scan.schema.unwrap_or(DEFAULT_SCHEMA);
             let table_name = scan.table;
 
             let table_def = catalog

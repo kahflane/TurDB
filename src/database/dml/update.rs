@@ -1471,7 +1471,7 @@ impl Database {
 
         match from_clause {
             FromClause::Table(table_ref) => {
-                let schema = table_ref.schema.unwrap_or("root");
+                let schema = table_ref.schema.unwrap_or(DEFAULT_SCHEMA);
                 let table_name = table_ref.name;
                 let alias = table_ref.alias;
                 let table_def = catalog.resolve_table(table_name)?;

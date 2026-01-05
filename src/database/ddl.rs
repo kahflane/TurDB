@@ -524,7 +524,7 @@ impl Database {
 
             let mut info = Vec::new();
             for table_ref in truncate.tables {
-                let schema_name = table_ref.schema.unwrap_or("root");
+                let schema_name = table_ref.schema.unwrap_or(DEFAULT_SCHEMA);
                 let table_name = table_ref.name;
 
                 catalog.resolve_table(table_name)?;
@@ -613,7 +613,7 @@ impl Database {
         self.ensure_catalog()?;
         self.ensure_file_manager()?;
 
-        let schema_name = alter.table.schema.unwrap_or("root");
+        let schema_name = alter.table.schema.unwrap_or(DEFAULT_SCHEMA);
         let table_name = alter.table.name;
 
         let action_desc = match &alter.action {
@@ -880,7 +880,7 @@ impl Database {
         let mut actually_dropped = false;
 
         for table_ref in drop_stmt.names.iter() {
-            let schema_name = table_ref.schema.unwrap_or("root");
+            let schema_name = table_ref.schema.unwrap_or(DEFAULT_SCHEMA);
             let table_name = table_ref.name;
 
             if let Some(schema) = catalog.get_schema_mut(schema_name) {

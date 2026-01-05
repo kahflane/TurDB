@@ -441,8 +441,7 @@ impl Database {
                             );
                         }
 
-                        let ref_schema_name = "root";
-                        let ref_storage_arc = file_manager.table_data_mut(ref_schema_name, fk_table)?;
+                        let ref_storage_arc = file_manager.table_data_mut(schema_name, fk_table)?;
                         let mut ref_storage = ref_storage_arc.write();
                         let ref_btree = BTree::new(&mut *ref_storage, 1)?;
                         let ref_schema = create_record_schema(ref_columns);
