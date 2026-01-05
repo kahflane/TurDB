@@ -39,7 +39,9 @@
       "Skill(superpowers:systematic-debugging)",
       "WebSearch",
       "Bash(timeout 120 cargo test:*)",
-      "Bash(echo:*)"
+      "Bash(echo:*)",
+      "Bash(timeout 30 cargo test:*)",
+      "Bash(timeout 20 cargo test:*)"
     ]
   }
 }

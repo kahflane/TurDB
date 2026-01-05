@@ -85,7 +85,7 @@ Use Ctrl+D or .quit to exit."#
 }
 
 fn list_tables(db: &Database) -> CommandResult {
-    let catalog = db.catalog.read();
+    let catalog = db.shared.catalog.read();
     let catalog = match catalog.as_ref() {
         Some(c) => c,
         None => return CommandResult::Error("Database not initialized".to_string()),
@@ -107,7 +107,7 @@ fn list_tables(db: &Database) -> CommandResult {
 }
 
 fn show_schema(db: &Database, args: &[&str]) -> CommandResult {
-    let catalog = db.catalog.read();
+    let catalog = db.shared.catalog.read();
     let catalog = match catalog.as_ref() {
         Some(c) => c,
         None => return CommandResult::Error("Database not initialized".to_string()),
@@ -213,7 +213,7 @@ fn format_data_type(data_type: DataType, max_length: Option<u32>) -> String {
 }
 
 fn list_indexes(db: &Database, args: &[&str]) -> CommandResult {
-    let catalog = db.catalog.read();
+    let catalog = db.shared.catalog.read();
     let catalog = match catalog.as_ref() {
         Some(c) => c,
         None => return CommandResult::Error("Database not initialized".to_string()),

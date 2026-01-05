@@ -137,7 +137,7 @@ impl Database {
         })
     }
 
-    pub(crate) fn execute_insert_with_params(
+    pub(crate) fn execute_insert(
         &self,
         insert: &crate::sql::ast::InsertStmt<'_>,
         _arena: &Bump,
@@ -606,7 +606,6 @@ impl Database {
                                     };
                                     let updated_record = wrap_record_for_insert(txn_id, &user_record, in_transaction);
 
-                                    drop(btree);
                                     let mut btree_mut = BTree::new(&mut *table_storage, root_page)?;
                                     btree_mut.delete(&existing_key)?;
                                     btree_mut.insert(&existing_key, &updated_record)?;
@@ -682,7 +681,7 @@ impl Database {
 
                             let (new_hint, new_root) = if wal_enabled {
                                 let mut wal_storage =
-                                    WalStoragePerTable::new(&mut *toast_storage, &self.shared.dirty_tracker, toast_table_id);
+                                    WalStoragePerTable::new(&mut toast_storage, &self.shared.dirty_tracker, toast_table_id);
                                 let mut btree = BTree::with_rightmost_hint(&mut wal_storage, toast_root_page, toast_rightmost_hint)?;
                                 for (seq, chunk) in data.chunks(TOAST_CHUNK_SIZE).enumerate() {
                                     let chunk_key = make_chunk_key(chunk_id, seq as u32);
@@ -727,7 +726,7 @@ impl Database {
 
             if wal_enabled {
                 let mut wal_storage =
-                    WalStoragePerTable::new(&mut *table_storage, &self.shared.dirty_tracker, table_id as u32);
+                    WalStoragePerTable::new(&mut table_storage, &self.shared.dirty_tracker, table_id as u32);
                 let mut btree = BTree::with_rightmost_hint(&mut wal_storage, root_page, rightmost_hint)?;
                 btree.insert(&row_key, &record_data)?;
                 rightmost_hint = btree.rightmost_hint();

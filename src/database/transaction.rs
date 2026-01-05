@@ -296,7 +296,7 @@ impl Database {
                     })?;
                 let storage = storage_arc.read();
 
-                WalStoragePerTable::flush_wal_for_table(&self.shared.dirty_tracker, &*storage, wal, table_id)
+                WalStoragePerTable::flush_wal_for_table(&self.shared.dirty_tracker, &storage, wal, table_id)
                     .wrap_err_with(|| {
                         format!(
                             "failed to flush WAL for table {}.{} on commit",
@@ -344,20 +344,19 @@ impl Database {
         let schema_name = DEFAULT_SCHEMA;
         let table_name = table_def.name();
 
-        let table_storage_arc = file_manager.table_data_mut(schema_name, &table_name)?;
+        let table_storage_arc = file_manager.table_data_mut(schema_name, table_name)?;
         let mut table_storage = table_storage_arc.write();
 
         let btree = BTree::new(&mut *table_storage, 1)?;
         if let Some(raw_value) = btree.get(&entry.key)? {
             if raw_value.len() >= RecordHeader::SIZE {
-                let mut header = RecordHeader::from_bytes(&raw_value);
+                let mut header = RecordHeader::from_bytes(raw_value);
                 header.set_locked(false);
                 header.txn_id = commit_ts;
 
                 let mut new_value = raw_value.to_vec();
                 header.write_to(&mut new_value[..RecordHeader::SIZE]);
 
-                drop(btree);
                 let mut btree_mut = BTree::new(&mut *table_storage, 1)?;
                 btree_mut.update(&entry.key, &new_value)?;
             }
@@ -485,7 +484,7 @@ impl Database {
 
         if entry.is_insert {
             let row_values: Option<Vec<OwnedValue>> = if let Some(raw_value) = btree.get(&entry.key)? {
-                let user_data = get_user_data(&raw_value);
+                let user_data = get_user_data(raw_value);
                 if let Ok(record) = RecordView::new(user_data, &schema) {
                     OwnedValue::extract_row_from_record(&record, &columns).ok()
                 } else {
@@ -496,7 +495,6 @@ impl Database {
             };
 
             let deleted = btree.delete(&entry.key)?;
-            drop(btree);
 
             if deleted {
                 let page = table_storage.page_mut(0)?;
@@ -567,7 +565,6 @@ impl Database {
         } else if let Some(old_value) = undo_data {
             btree.delete(&entry.key)?;
             btree.insert(&entry.key, old_value)?;
-            drop(btree);
             drop(table_storage);
 
             let old_row_values: Option<Vec<OwnedValue>> = {

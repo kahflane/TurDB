@@ -648,11 +648,11 @@ fn stress_test_transaction_slots() {
                                 thread_id,
                                 seq
                             );
-                            if db_conn.execute(&insert_sql).is_ok() {
-                                if db_conn.execute("COMMIT").is_ok() {
-                                    success.fetch_add(1, Ordering::Relaxed);
-                                    continue;
-                                }
+                            if db_conn.execute(&insert_sql).is_ok()
+                                && db_conn.execute("COMMIT").is_ok()
+                            {
+                                success.fetch_add(1, Ordering::Relaxed);
+                                continue;
                             }
                             let _ = db_conn.execute("ROLLBACK");
                             failure.fetch_add(1, Ordering::Relaxed);

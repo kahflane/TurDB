@@ -207,7 +207,7 @@ impl UndoRegistry {
     pub fn get_or_create(&mut self, table_id: TableId) -> &mut UndoPageManager {
         self.managers
             .entry(table_id)
-            .or_insert_with(UndoPageManager::new)
+            .or_default()
     }
 
     pub fn get(&self, table_id: TableId) -> Option<&UndoPageManager> {

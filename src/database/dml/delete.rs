@@ -231,55 +231,53 @@ impl Database {
         let btree = BTree::new(&mut *storage, root_page)?;
 
         let mut pk_lookup_info: Option<(Vec<u8>, OwnedValue)> = 'pk_analysis: {
-            if let Some(ref w) = delete.where_clause {
-                if let crate::sql::ast::Expr::BinaryOp { left, op: crate::sql::ast::BinaryOperator::Eq, right } = w {
-                    if let Some(pk_idx) = columns.iter().position(|c| c.has_constraint(&Constraint::PrimaryKey)) {
-                        let pk_col_name = columns[pk_idx].name();
+            if let Some(crate::sql::ast::Expr::BinaryOp { left, op: crate::sql::ast::BinaryOperator::Eq, right }) = delete.where_clause.as_ref() {
+                if let Some(pk_idx) = columns.iter().position(|c| c.has_constraint(&Constraint::PrimaryKey)) {
+                    let pk_col_name = columns[pk_idx].name();
 
-                        let val_expr = match (&**left, &**right) {
-                            (crate::sql::ast::Expr::Column(c), val) if c.column.eq_ignore_ascii_case(pk_col_name) => Some(val),
-                            (val, crate::sql::ast::Expr::Column(c)) if c.column.eq_ignore_ascii_case(pk_col_name) => Some(val),
-                            _ => None,
+                    let val_expr = match (&**left, &**right) {
+                        (crate::sql::ast::Expr::Column(c), val) if c.column.eq_ignore_ascii_case(pk_col_name) => Some(val),
+                        (val, crate::sql::ast::Expr::Column(c)) if c.column.eq_ignore_ascii_case(pk_col_name) => Some(val),
+                        _ => None,
+                    };
+
+                    if let Some(expr) = val_expr {
+                        let val_opt = if let crate::sql::ast::Expr::Parameter(param_ref) = expr {
+                             match param_ref {
+                                 crate::sql::ast::ParameterRef::Anonymous => params.first().cloned(),
+                                 crate::sql::ast::ParameterRef::Positional(idx) => if *idx > 0 { params.get((*idx - 1) as usize).cloned() } else { None },
+                                 _ => None,
+                             }
+                        } else {
+                            Self::eval_literal(expr).ok()
                         };
 
-                        if let Some(expr) = val_expr {
-                            let val_opt = if let crate::sql::ast::Expr::Parameter(param_ref) = expr {
-                                 match param_ref {
-                                     crate::sql::ast::ParameterRef::Anonymous => params.get(0).cloned(),
-                                     crate::sql::ast::ParameterRef::Positional(idx) => if *idx > 0 { params.get((*idx - 1) as usize).cloned() } else { None },
-                                     _ => None,
-                                 }
-                            } else {
-                                Self::eval_literal(expr).ok()
-                            };
+                        if let Some(val) = val_opt {
+                            let pk_index_name = format!("{}_pkey", pk_col_name);
+                            
+                            if file_manager.index_exists(schema_name, table_name, &pk_index_name) {
+                                if let Ok(index_storage_arc) = file_manager.index_data_mut(schema_name, table_name, &pk_index_name) {
+                                    let mut index_storage = index_storage_arc.write();
 
-                            if let Some(val) = val_opt {
-                                let pk_index_name = format!("{}_pkey", pk_col_name);
-                                
-                                if file_manager.index_exists(schema_name, table_name, &pk_index_name) {
-                                    if let Ok(index_storage_arc) = file_manager.index_data_mut(schema_name, table_name, &pk_index_name) {
-                                        let mut index_storage = index_storage_arc.write();
+                                    let index_root_page = {
+                                        use crate::storage::IndexFileHeader;
+                                        let page0 = index_storage.page(0)?;
+                                        let header = IndexFileHeader::from_bytes(page0)?;
+                                        header.root_page()
+                                    };
 
-                                        let index_root_page = {
-                                            use crate::storage::IndexFileHeader;
-                                            let page0 = index_storage.page(0)?;
-                                            let header = IndexFileHeader::from_bytes(page0)?;
-                                            header.root_page()
-                                        };
+                                    let index_btree = BTree::new(&mut *index_storage, index_root_page)?;
 
-                                        let index_btree = BTree::new(&mut *index_storage, index_root_page)?;
+                                    let mut index_key = Vec::new();
+                                    Self::encode_value_as_key(&val, &mut index_key);
 
-                                        let mut index_key = Vec::new();
-                                        Self::encode_value_as_key(&val, &mut index_key);
-
-                                        if let Some(handle) = index_btree.search(&index_key)? {
-                                            let row_key = index_btree.get_value(&handle)?.to_vec();
-                                            break 'pk_analysis Some((row_key, val));
-                                        }
+                                    if let Some(handle) = index_btree.search(&index_key)? {
+                                        let row_key = index_btree.get_value(&handle)?.to_vec();
+                                        break 'pk_analysis Some((row_key, val));
                                     }
                                 }
-                                break 'pk_analysis None;
                             }
+                            break 'pk_analysis None;
                         }
                     }
                 }
@@ -504,7 +502,6 @@ impl Database {
         }
 
 
-        drop(btree);
         drop(storage);
 
         let wal_enabled = self.shared.wal_enabled.load(Ordering::Acquire);

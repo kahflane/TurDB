@@ -1052,12 +1052,12 @@ impl<'a, S: Storage> BTree<'a, S> {
             let page_data = self.storage.page_mut(page_no)?;
             let mut leaf = LeafNodeMut::from_page(page_data)?;
             leaf.update_cell_value_in_place(cell_index, new_value)?;
-            return Ok(true);
+            Ok(true)
         } else if new_value.len() < old_value.len() {
             let page_data = self.storage.page_mut(page_no)?;
             let mut leaf = LeafNodeMut::from_page(page_data)?;
             leaf.update_cell_value_shrink(cell_index, new_value)?;
-            return Ok(true);
+            Ok(true)
         } else {
             let value_len_size = varint_len(new_value.len() as u64);
             let old_value_len_size = varint_len(old_value.len() as u64);
@@ -1072,9 +1072,9 @@ impl<'a, S: Storage> BTree<'a, S> {
                 let mut leaf = LeafNodeMut::from_page(page_data)?;
                 leaf.delete_cell(cell_index)?;
                 leaf.insert_cell(key, new_value)?;
-                return Ok(true);
+                Ok(true)
             } else {
-                return Ok(false);
+                Ok(false)
             }
         }
     }

@@ -98,8 +98,8 @@
 #[macro_export]
 macro_rules! with_btree_storage {
     ($wal_enabled:expr, $storage:expr, $dirty_tracker:expr, $table_id:expr, $root_page:expr, $btree_ops:expr) => {{
-        use crate::btree::BTree;
-        use crate::storage::WalStoragePerTable;
+        use $crate::btree::BTree;
+        use $crate::storage::WalStoragePerTable;
         if $wal_enabled {
             let mut wal_storage = WalStoragePerTable::new($storage, $dirty_tracker, $table_id);
             let mut btree_mut = BTree::new(&mut wal_storage, $root_page)?;

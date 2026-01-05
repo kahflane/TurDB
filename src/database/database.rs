@@ -270,7 +270,7 @@ impl Database {
         }
         Ok(())
     }
-    
+
     pub(crate) fn flush_wal_if_autocommit(
         &self,
         file_manager: &mut crate::storage::FileManager,
@@ -502,7 +502,7 @@ impl Database {
                 .ok_or_else(|| eyre::eyre!("table storage not found in cache"))?;
             let mut table_storage = table_storage_arc.write();
             let mut wal_storage =
-                WalStoragePerTable::new(&mut *table_storage, &self.shared.dirty_tracker, table_id as u32);
+                WalStoragePerTable::new(&mut table_storage, &self.shared.dirty_tracker, table_id as u32);
             let mut btree = BTree::with_rightmost_hint(&mut wal_storage, root_page, rightmost_hint)?;
 
             for row_values in rows {
@@ -605,7 +605,7 @@ impl Database {
         
         let mut buffer_guard = plan.record_buffer.borrow_mut();
         buffer_guard.clear();
-        OwnedValue::build_record_into_buffer(params, &mut record_builder, &mut *buffer_guard)?;
+        OwnedValue::build_record_into_buffer(params, &mut record_builder, &mut buffer_guard)?;
 
         let (txn_id, in_transaction) = {
             let active_txn = self.active_txn.lock();
@@ -622,13 +622,13 @@ impl Database {
 
         if wal_enabled {
             let mut wal_storage =
-                WalStoragePerTable::new(&mut *storage_guard, &self.shared.dirty_tracker, plan.table_id as u32);
+                WalStoragePerTable::new(&mut storage_guard, &self.shared.dirty_tracker, plan.table_id as u32);
             let mut btree = BTree::with_rightmost_hint(&mut wal_storage, root_page, rightmost_hint)?;
             btree.insert_append(&row_key, &mvcc_record)?;
             root_page = btree.root_page();
             rightmost_hint = btree.rightmost_hint();
         } else {
-            let mut btree = BTree::with_rightmost_hint(&mut *storage_guard, root_page, rightmost_hint)?;
+            let mut btree = BTree::with_rightmost_hint(&mut storage_guard, root_page, rightmost_hint)?;
             btree.insert_append(&row_key, &mvcc_record)?;
             root_page = btree.root_page();
             rightmost_hint = btree.rightmost_hint();
@@ -704,7 +704,7 @@ impl Database {
                  if let Some(wal) = wal_guard.as_mut() {
                      WalStoragePerTable::flush_wal_for_table(
                         &self.shared.dirty_tracker, 
-                        &mut *storage_guard, 
+                        &storage_guard,
                         wal, 
                         plan.table_id as u32
                     )?;
@@ -1505,20 +1505,20 @@ impl Database {
                     }
                 }
 
-                enum JoinScanInfo<'a> {
-                    TableScan(&'a crate::sql::planner::PhysicalTableScan<'a>),
-                    IndexScan(&'a crate::sql::planner::PhysicalIndexScan<'a>),
-                    SecondaryIndexScan(&'a crate::sql::planner::PhysicalSecondaryIndexScan<'a>),
+                enum JoinScan<'a> {
+                    Table(&'a crate::sql::planner::PhysicalTableScan<'a>),
+                    Index(&'a crate::sql::planner::PhysicalIndexScan<'a>),
+                    SecondaryIndex(&'a crate::sql::planner::PhysicalSecondaryIndexScan<'a>),
                 }
 
                 fn find_scan_in_join<'a>(
                     op: &'a crate::sql::planner::PhysicalOperator<'a>,
-                ) -> Option<JoinScanInfo<'a>> {
+                ) -> Option<JoinScan<'a>> {
                     use crate::sql::planner::PhysicalOperator;
                     match op {
-                        PhysicalOperator::TableScan(scan) => Some(JoinScanInfo::TableScan(scan)),
-                        PhysicalOperator::IndexScan(scan) => Some(JoinScanInfo::IndexScan(scan)),
-                        PhysicalOperator::SecondaryIndexScan(scan) => Some(JoinScanInfo::SecondaryIndexScan(scan)),
+                        PhysicalOperator::TableScan(scan) => Some(JoinScan::Table(scan)),
+                        PhysicalOperator::IndexScan(scan) => Some(JoinScan::Index(scan)),
+                        PhysicalOperator::SecondaryIndexScan(scan) => Some(JoinScan::SecondaryIndex(scan)),
                         PhysicalOperator::FilterExec(f) => find_scan_in_join(f.input),
                         PhysicalOperator::ProjectExec(p) => find_scan_in_join(p.input),
                         PhysicalOperator::HashAggregate(agg) => find_scan_in_join(agg.input),
@@ -1554,9 +1554,9 @@ impl Database {
                     left_rows = execute_subquery_recursive(subq, catalog, file_manager)?;
                 } else if let Some(scan_info) = &left_scan {
                     let (schema_name, table_name, alias) = match scan_info {
-                        JoinScanInfo::TableScan(scan) => (scan.schema.unwrap_or(DEFAULT_SCHEMA), scan.table, scan.alias),
-                        JoinScanInfo::IndexScan(scan) => (scan.schema.unwrap_or(DEFAULT_SCHEMA), scan.table, None),
-                        JoinScanInfo::SecondaryIndexScan(scan) => (scan.schema.unwrap_or(DEFAULT_SCHEMA), scan.table, None),
+                        JoinScan::Table(scan) => (scan.schema.unwrap_or(DEFAULT_SCHEMA), scan.table, scan.alias),
+                        JoinScan::Index(scan) => (scan.schema.unwrap_or(DEFAULT_SCHEMA), scan.table, None),
+                        JoinScan::SecondaryIndex(scan) => (scan.schema.unwrap_or(DEFAULT_SCHEMA), scan.table, None),
                     };
                     left_table_name = Some(table_name);
                     left_alias = alias;
@@ -1578,9 +1578,9 @@ impl Database {
                     right_col_count = subq.output_schema.columns.len();
                 } else if let Some(scan_info) = &right_scan {
                     let (schema_name, table_name, alias) = match scan_info {
-                        JoinScanInfo::TableScan(scan) => (scan.schema.unwrap_or(DEFAULT_SCHEMA), scan.table, scan.alias),
-                        JoinScanInfo::IndexScan(scan) => (scan.schema.unwrap_or(DEFAULT_SCHEMA), scan.table, None),
-                        JoinScanInfo::SecondaryIndexScan(scan) => (scan.schema.unwrap_or(DEFAULT_SCHEMA), scan.table, None),
+                        JoinScan::Table(scan) => (scan.schema.unwrap_or(DEFAULT_SCHEMA), scan.table, scan.alias),
+                        JoinScan::Index(scan) => (scan.schema.unwrap_or(DEFAULT_SCHEMA), scan.table, None),
+                        JoinScan::SecondaryIndex(scan) => (scan.schema.unwrap_or(DEFAULT_SCHEMA), scan.table, None),
                     };
                     right_table_name = Some(table_name);
                     right_alias = alias;
@@ -2467,13 +2467,8 @@ impl Database {
             Statement::CreateTable(create) => self.execute_create_table(create, arena),
             Statement::CreateSchema(create) => self.execute_create_schema(create),
             Statement::CreateIndex(create) => self.execute_create_index(create, arena),
-            Statement::Insert(insert) => {
-                let insert_start = std::time::Instant::now();
-                let result = self.execute_insert_with_params(insert, arena, params);
-                INSERT_TIME_NS.fetch_add(insert_start.elapsed().as_nanos() as u64, AtomicOrdering::Relaxed);
-                result
-            }
-            Statement::Update(update) => self.execute_update(update, params.unwrap_or(&[]), &arena),
+            Statement::Insert(insert) => self.execute_insert(insert, arena, params),
+            Statement::Update(update) => self.execute_update(update, params.unwrap_or(&[]), arena),
             Statement::Delete(delete) => self.execute_delete(delete, params.unwrap_or(&[]), arena),
             Statement::Select(_) => {
                 let (columns, rows) = self.query_with_columns(sql)?;
@@ -2726,7 +2721,7 @@ impl Database {
             if let Ok(storage_arc) = file_manager.table_data(schema_name, table_name) {
                 let storage = storage_arc.read();
                 let frames =
-                    WalStoragePerTable::flush_wal_for_table(&self.shared.dirty_tracker, &*storage, wal, *table_id)
+                    WalStoragePerTable::flush_wal_for_table(&self.shared.dirty_tracker, &storage, wal, *table_id)
                         .wrap_err_with(|| {
                             format!(
                                 "failed to flush dirty pages for table {}.{}",

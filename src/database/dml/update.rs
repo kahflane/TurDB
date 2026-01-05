@@ -226,61 +226,59 @@ impl Database {
         let btree = BTree::new(&mut *storage, root_page)?;
 
         let mut pk_lookup_info: Option<(Vec<u8>, OwnedValue)> = 'pk_analysis: {
-            if let Some(ref w) = update.where_clause {
-                if let crate::sql::ast::Expr::BinaryOp { left, op: crate::sql::ast::BinaryOperator::Eq, right } = w {
-                    if let Some(pk_idx) = columns.iter().position(|c| c.has_constraint(&Constraint::PrimaryKey)) {
-                        let pk_col_name = columns[pk_idx].name();
+            if let Some(crate::sql::ast::Expr::BinaryOp { left, op: crate::sql::ast::BinaryOperator::Eq, right }) = update.where_clause.as_ref() {
+                if let Some(pk_idx) = columns.iter().position(|c| c.has_constraint(&Constraint::PrimaryKey)) {
+                    let pk_col_name = columns[pk_idx].name();
 
-                        let val_expr = match (&**left, &**right) {
-                            (crate::sql::ast::Expr::Column(c), val) if c.column.eq_ignore_ascii_case(pk_col_name) => Some(val),
-                            (val, crate::sql::ast::Expr::Column(c)) if c.column.eq_ignore_ascii_case(pk_col_name) => Some(val),
-                            _ => None,
+                    let val_expr = match (&**left, &**right) {
+                        (crate::sql::ast::Expr::Column(c), val) if c.column.eq_ignore_ascii_case(pk_col_name) => Some(val),
+                        (val, crate::sql::ast::Expr::Column(c)) if c.column.eq_ignore_ascii_case(pk_col_name) => Some(val),
+                        _ => None,
+                    };
+
+                    if let Some(expr) = val_expr {
+                        let val_opt = if let crate::sql::ast::Expr::Parameter(param_ref) = expr {
+                             match param_ref {
+                                 crate::sql::ast::ParameterRef::Anonymous => {
+                                     let mut param_offset = 0;
+                                     for assign in update.assignments {
+                                         param_offset += count_params_in_expr(assign.value);
+                                     }
+                                     params.get(param_offset).cloned()
+                                 },
+                                 crate::sql::ast::ParameterRef::Positional(idx) => if *idx > 0 { params.get((*idx - 1) as usize).cloned() } else { None },
+                                 _ => None,
+                             }
+                        } else {
+                            Self::eval_literal(expr).ok()
                         };
 
-                        if let Some(expr) = val_expr {
-                            let val_opt = if let crate::sql::ast::Expr::Parameter(param_ref) = expr {
-                                 match param_ref {
-                                     crate::sql::ast::ParameterRef::Anonymous => {
-                                         let mut param_offset = 0;
-                                         for assign in update.assignments {
-                                             param_offset += count_params_in_expr(&assign.value);
-                                         }
-                                         params.get(param_offset).cloned()
-                                     },
-                                     crate::sql::ast::ParameterRef::Positional(idx) => if *idx > 0 { params.get((*idx - 1) as usize).cloned() } else { None },
-                                     _ => None,
-                                 }
-                            } else {
-                                Self::eval_literal(expr).ok()
-                            };
+                        if let Some(val) = val_opt {
+                            let pk_index_name = format!("{}_pkey", pk_col_name);
 
-                            if let Some(val) = val_opt {
-                                let pk_index_name = format!("{}_pkey", pk_col_name);
+                            if file_manager.index_exists(schema_name, table_name, &pk_index_name) {
+                                if let Ok(index_storage_arc) = file_manager.index_data_mut(schema_name, table_name, &pk_index_name) {
+                                    let mut index_storage = index_storage_arc.write();
 
-                                if file_manager.index_exists(schema_name, table_name, &pk_index_name) {
-                                    if let Ok(index_storage_arc) = file_manager.index_data_mut(schema_name, table_name, &pk_index_name) {
-                                        let mut index_storage = index_storage_arc.write();
+                                    let index_root_page = {
+                                        use crate::storage::IndexFileHeader;
+                                        let page0 = index_storage.page(0)?;
+                                        let header = IndexFileHeader::from_bytes(page0)?;
+                                        header.root_page()
+                                    };
 
-                                        let index_root_page = {
-                                            use crate::storage::IndexFileHeader;
-                                            let page0 = index_storage.page(0)?;
-                                            let header = IndexFileHeader::from_bytes(page0)?;
-                                            header.root_page()
-                                        };
+                                    let index_btree = BTree::new(&mut *index_storage, index_root_page)?;
 
-                                        let index_btree = BTree::new(&mut *index_storage, index_root_page)?;
+                                    let mut index_key = Vec::new();
+                                    Self::encode_value_as_key(&val, &mut index_key);
 
-                                        let mut index_key = Vec::new();
-                                        Self::encode_value_as_key(&val, &mut index_key);
-
-                                        if let Some(handle) = index_btree.search(&index_key)? {
-                                            let row_key = index_btree.get_value(&handle)?.to_vec();
-                                            break 'pk_analysis Some((row_key, val));
-                                        }
+                                    if let Some(handle) = index_btree.search(&index_key)? {
+                                        let row_key = index_btree.get_value(&handle)?.to_vec();
+                                        break 'pk_analysis Some((row_key, val));
                                     }
                                 }
-                                break 'pk_analysis None;
                             }
+                            break 'pk_analysis None;
                         }
                     }
                 }
@@ -302,7 +300,7 @@ impl Database {
             set_param_count = param_idx;
         }
 
-        let predicate: Option<crate::sql::predicate::CompiledPredicate> = if let Some(ref w) = update.where_clause {
+        let predicate: Option<crate::sql::predicate::CompiledPredicate> = if let Some(w) = update.where_clause {
              let col_map = columns.iter().enumerate().map(|(i, c)| (c.name().to_string(), i)).collect();
              Some(crate::sql::predicate::CompiledPredicate::with_params(w, col_map, params, set_param_count))
         } else {
@@ -381,8 +379,6 @@ impl Database {
                         };
                         let record_data = wrap_record_for_update(txn_id, &user_record, 0, 0, in_transaction);
 
-                        drop(cursor);
-                        drop(btree);
                         drop(storage);
 
                         let wal_enabled = self.shared.wal_enabled.load(Ordering::Acquire);
@@ -520,7 +516,6 @@ impl Database {
             break;
         }
         
-        drop(btree);
         drop(storage);
 
         if !unique_col_indices.is_empty() {
@@ -1029,8 +1024,6 @@ impl Database {
             cursor.advance()?;
         }
 
-        drop(cursor);
-        drop(btree);
         drop(storage);
 
         let unique_col_indices: Vec<usize> = columns
@@ -1342,7 +1335,7 @@ impl Database {
             .wrap_err("failed to re-parse cached UPDATE statement")?;
 
         if let crate::sql::ast::Statement::Update(update) = stmt {
-            self.execute_update(&update, params, &arena)
+            self.execute_update(update, params, &arena)
         } else {
             bail!("cached plan produced non-UPDATE statement")
         }
@@ -1435,8 +1428,6 @@ impl Database {
             row_values[*col_idx] = params[i].clone();
         }
 
-        drop(cursor);
-        drop(btree);
         drop(storage);
 
         let mut storage = storage_arc.write();
