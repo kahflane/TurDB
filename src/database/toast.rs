@@ -129,7 +129,7 @@ impl Database {
 
         let (new_hint, new_root) = if wal_enabled {
             let mut wal_storage =
-                WalStoragePerTable::new(&mut *toast_storage, &self.dirty_tracker, toast_table_id);
+                WalStoragePerTable::new(&mut *toast_storage, &self.shared.dirty_tracker, toast_table_id);
             let mut btree = BTree::with_rightmost_hint(&mut wal_storage, root_page, hint)?;
             for (seq, chunk) in data.chunks(TOAST_CHUNK_SIZE).enumerate() {
                 let chunk_key = make_chunk_key(chunk_id, seq as u32);

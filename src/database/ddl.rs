@@ -66,7 +66,7 @@ impl Database {
         self.ensure_catalog()?;
         self.ensure_file_manager()?;
 
-        let mut catalog_guard = self.catalog.write();
+        let mut catalog_guard = self.shared.catalog.write();
         let catalog = catalog_guard.as_mut().unwrap();
 
         let schema_name = create.schema.unwrap_or(DEFAULT_SCHEMA);
@@ -160,12 +160,12 @@ impl Database {
 
         drop(catalog_guard);
 
-        self.table_id_lookup.write().insert(
+        self.shared.table_id_lookup.write().insert(
             table_id as u32,
             (schema_name.to_string(), table_name.to_string()),
         );
 
-        let mut file_manager_guard = self.file_manager.write();
+        let mut file_manager_guard = self.shared.file_manager.write();
         let file_manager = file_manager_guard.as_mut().unwrap();
         file_manager.create_table(schema_name, table_name, table_id, column_count)?;
 
@@ -175,7 +175,7 @@ impl Database {
         crate::btree::BTree::create(&mut *storage, 1)?;
 
         let needs_toast = {
-            let catalog_guard = self.catalog.read();
+            let catalog_guard = self.shared.catalog.read();
             let catalog = catalog_guard.as_ref().unwrap();
             catalog
                 .get_schema(schema_name)
@@ -194,12 +194,12 @@ impl Database {
             toast_storage.grow(2)?;
             crate::btree::BTree::create(&mut *toast_storage, 1)?;
 
-            self.table_id_lookup.write().insert(
+            self.shared.table_id_lookup.write().insert(
                 toast_id as u32,
                 (schema_name.to_string(), toast_table_name.clone()),
             );
 
-            let mut catalog_guard = self.catalog.write();
+            let mut catalog_guard = self.shared.catalog.write();
             let catalog = catalog_guard.as_mut().unwrap();
             if let Some(schema) = catalog.get_schema_mut(schema_name) {
                 if let Some(table) = schema.get_table(table_name) {
@@ -242,7 +242,7 @@ impl Database {
                 crate::schema::table::IndexType::BTree,
             );
 
-            let mut catalog_guard = self.catalog.write();
+            let mut catalog_guard = self.shared.catalog.write();
             let catalog = catalog_guard.as_mut().unwrap();
             if let Some(schema) = catalog.get_schema_mut(schema_name) {
                 if let Some(table) = schema.get_table(table_name) {
@@ -265,7 +265,7 @@ impl Database {
     ) -> Result<ExecuteResult> {
         self.ensure_catalog()?;
 
-        let mut catalog_guard = self.catalog.write();
+        let mut catalog_guard = self.shared.catalog.write();
         let catalog = catalog_guard.as_mut().unwrap();
 
         if catalog.schema_exists(create.name) {
@@ -383,7 +383,7 @@ impl Database {
             index_def = index_def.with_where_clause(Self::format_expr(where_clause));
         }
 
-        let mut catalog_guard = self.catalog.write();
+        let mut catalog_guard = self.shared.catalog.write();
         let catalog = catalog_guard.as_mut().unwrap();
 
         let table_def = catalog.resolve_table(table_name)?;
@@ -417,7 +417,7 @@ impl Database {
 
         let index_id = self.allocate_index_id();
 
-        let mut file_manager_guard = self.file_manager.write();
+        let mut file_manager_guard = self.shared.file_manager.write();
         let file_manager = file_manager_guard.as_mut().unwrap();
         file_manager.create_index(
             schema_name,
@@ -429,10 +429,12 @@ impl Database {
             create.unique,
         )?;
 
-        let index_storage_arc = file_manager.index_data_mut(schema_name, table_name, index_name)?;
-        let mut index_storage = index_storage_arc.write();
-        index_storage.grow(2)?;
-        BTree::create(&mut *index_storage, 1)?;
+        {
+            let index_storage_arc = file_manager.index_data_mut(schema_name, table_name, index_name)?;
+            let mut index_storage = index_storage_arc.write();
+            index_storage.grow(2)?;
+            BTree::create(&mut *index_storage, 1)?;
+        }
 
         if can_populate {
             let root_page = 1u32;
@@ -450,6 +452,7 @@ impl Database {
                     loop {
                         let row_key = cursor.key()?;
                         let row_data = cursor.value()?;
+                        let user_data = crate::database::dml::mvcc_helpers::get_user_data(row_data);
 
                         let row_id = u64::from_be_bytes(
                             row_key
@@ -457,7 +460,7 @@ impl Database {
                                 .wrap_err("Invalid row key length in table")?,
                         );
 
-                        let record = RecordView::new(row_data, &schema)?;
+                        let record = RecordView::new(user_data, &schema)?;
 
                         key_buf.clear();
                         let mut all_non_null = true;
@@ -516,7 +519,7 @@ impl Database {
         self.ensure_file_manager()?;
 
         let tables_info: Vec<(String, String)> = {
-            let catalog_guard = self.catalog.read();
+            let catalog_guard = self.shared.catalog.read();
             let catalog = catalog_guard.as_ref().unwrap();
 
             let mut info = Vec::new();
@@ -533,7 +536,7 @@ impl Database {
         let mut total_rows_affected: usize = 0;
 
         for (schema_name, table_name) in &tables_info {
-            let mut file_manager_guard = self.file_manager.write();
+            let mut file_manager_guard = self.shared.file_manager.write();
             let file_manager = file_manager_guard.as_mut().unwrap();
             let storage_arc = file_manager.table_data_mut(schema_name, table_name)?;
             let mut storage = storage_arc.write();
@@ -567,7 +570,7 @@ impl Database {
 
             storage.sync()?;
 
-            let catalog_guard = self.catalog.read();
+            let catalog_guard = self.shared.catalog.read();
             let catalog = catalog_guard.as_ref().unwrap();
             let table_def = catalog.resolve_table(table_name)?;
             let indexes: Vec<String> = table_def.indexes().iter().map(|i| i.name().to_string()).collect();
@@ -616,13 +619,13 @@ impl Database {
         let action_desc = match &alter.action {
             AlterTableAction::RenameTable(new_name) => {
                 {
-                    let mut file_manager_guard = self.file_manager.write();
+                    let mut file_manager_guard = self.shared.file_manager.write();
                     let file_manager = file_manager_guard.as_mut().unwrap();
                     file_manager.rename_table(schema_name, table_name, new_name)?;
                 }
 
                 {
-                    let mut catalog_guard = self.catalog.write();
+                    let mut catalog_guard = self.shared.catalog.write();
                     let catalog = catalog_guard.as_mut().unwrap();
                     let schema = catalog
                         .get_schema_mut(schema_name)
@@ -636,7 +639,7 @@ impl Database {
                 format!("renamed table to '{}'", new_name)
             }
             AlterTableAction::RenameColumn { old_name, new_name } => {
-                let mut catalog_guard = self.catalog.write();
+                let mut catalog_guard = self.shared.catalog.write();
                 let catalog = catalog_guard.as_mut().unwrap();
                 let schema = catalog
                     .get_schema_mut(schema_name)
@@ -651,7 +654,7 @@ impl Database {
                 format!("renamed column '{}' to '{}'", old_name, new_name)
             }
             AlterTableAction::AddColumn(col_def) => {
-                let mut catalog_guard = self.catalog.write();
+                let mut catalog_guard = self.shared.catalog.write();
                 let catalog = catalog_guard.as_mut().unwrap();
                 let schema = catalog
                     .get_schema_mut(schema_name)
@@ -689,7 +692,7 @@ impl Database {
         const BATCH_SIZE: usize = 10_000;
 
         let (old_columns, drop_idx, indexes_to_drop) = {
-            let catalog_guard = self.catalog.read();
+            let catalog_guard = self.shared.catalog.read();
             let catalog = catalog_guard.as_ref().unwrap();
             let schema = catalog
                 .get_schema(schema_name)
@@ -730,7 +733,7 @@ impl Database {
         };
 
         for index_name in &indexes_to_drop {
-            let mut file_manager_guard = self.file_manager.write();
+            let mut file_manager_guard = self.shared.file_manager.write();
             let file_manager = file_manager_guard.as_mut().unwrap();
 
             if file_manager.index_exists(schema_name, table_name, index_name) {
@@ -764,7 +767,7 @@ impl Database {
         let new_schema = create_record_schema(&new_columns);
 
         {
-            let mut file_manager_guard = self.file_manager.write();
+            let mut file_manager_guard = self.shared.file_manager.write();
             let file_manager = file_manager_guard.as_mut().unwrap();
             let storage_arc = file_manager.table_data_mut(schema_name, table_name)?;
             let mut storage = storage_arc.write();
@@ -814,7 +817,7 @@ impl Database {
         }
 
         {
-            let mut catalog_guard = self.catalog.write();
+            let mut catalog_guard = self.shared.catalog.write();
             let catalog = catalog_guard.as_mut().unwrap();
             let schema = catalog.get_schema_mut(schema_name).unwrap();
             let table = schema.get_table_mut(table_name).unwrap();
@@ -871,7 +874,7 @@ impl Database {
         self.ensure_catalog()?;
         self.ensure_file_manager()?;
 
-        let mut catalog_guard = self.catalog.write();
+        let mut catalog_guard = self.shared.catalog.write();
         let catalog = catalog_guard.as_mut().unwrap();
 
         let mut actually_dropped = false;
@@ -884,7 +887,7 @@ impl Database {
                 if let Some(table_def) = schema.get_table(table_name) {
                     let table_id = table_def.id() as u32;
                     schema.remove_table(table_name);
-                    self.table_id_lookup.write().remove(&table_id);
+                    self.shared.table_id_lookup.write().remove(&table_id);
                     actually_dropped = true;
                 } else if !drop_stmt.if_exists {
                     bail!(
@@ -898,7 +901,7 @@ impl Database {
             }
 
             if actually_dropped {
-                let mut file_manager_guard = self.file_manager.write();
+                let mut file_manager_guard = self.shared.file_manager.write();
                 let file_manager = file_manager_guard.as_mut().unwrap();
                 let _ = file_manager.drop_table(schema_name, table_name);
             }
@@ -920,7 +923,7 @@ impl Database {
     ) -> Result<ExecuteResult> {
         self.ensure_catalog()?;
 
-        let mut catalog_guard = self.catalog.write();
+        let mut catalog_guard = self.shared.catalog.write();
         let catalog = catalog_guard.as_mut().unwrap();
 
         for index_ref in drop_stmt.names.iter() {
@@ -946,7 +949,7 @@ impl Database {
         self.ensure_catalog()?;
         self.ensure_file_manager()?;
 
-        let mut catalog_guard = self.catalog.write();
+        let mut catalog_guard = self.shared.catalog.write();
         let catalog = catalog_guard.as_mut().unwrap();
 
         for schema_ref in drop_stmt.names.iter() {

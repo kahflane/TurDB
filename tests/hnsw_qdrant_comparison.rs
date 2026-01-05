@@ -1,13 +1,13 @@
 //! # HNSW Comparison Tests: TurDB vs Qdrant
 //!
-//! These tests validate TurDB's HNSW vector search implementation by comparing
+//! These tests validate TurDB's vector search implementation by comparing
 //! results against Qdrant, a production-grade vector database.
 //!
 //! ## Requirements Verified
 //!
-//! R1: TurDB HNSW returns top-k results with >= 90% recall vs Qdrant
-//! R2: Euclidean distances are computed correctly
-//! R3: HNSW graph construction maintains search quality
+//! R1: TurDB returns top-k results with >= 80% recall vs Qdrant
+//! R2: L2 distances are computed correctly
+//! R3: SQL interface for vector operations works correctly
 //!
 //! ## Setup
 //!
@@ -26,7 +26,8 @@ use std::collections::HashSet;
 use std::path::Path;
 use tempfile::tempdir;
 
-use turdb::hnsw::{self, DistanceFunction, PersistentHnswIndex, QuantizationType};
+use turdb::database::Database;
+use turdb::types::OwnedValue;
 
 const QDRANT_HOST: &str = "103.209.156.107";
 const QDRANT_PORT: u16 = 6333;
@@ -39,10 +40,13 @@ const MIN_RECALL: f32 = 0.80;
 
 #[derive(Debug, Deserialize)]
 struct EmbeddingsFile {
+    #[allow(dead_code)]
     version: u32,
     dimension: usize,
     count: usize,
+    #[allow(dead_code)]
     query_count: usize,
+    #[allow(dead_code)]
     distance_metric: String,
     #[allow(dead_code)]
     source: String,
@@ -52,17 +56,6 @@ struct EmbeddingsFile {
     texts: Vec<String>,
     vectors: Vec<Vec<f64>>,
     query_indices: Vec<usize>,
-}
-
-#[derive(Debug, Deserialize)]
-struct QdrantSearchResponse {
-    result: Vec<QdrantScoredPoint>,
-}
-
-#[derive(Debug, Deserialize)]
-struct QdrantScoredPoint {
-    id: u64,
-    score: f32,
 }
 
 struct QdrantClient {
@@ -124,7 +117,6 @@ fn load_embeddings(path: &Path) -> eyre::Result<EmbeddingsFile> {
     let reader = std::io::BufReader::new(file);
     let data: EmbeddingsFile = serde_json::from_reader(reader)?;
 
-    eyre::ensure!(data.version == 1, "Unsupported embeddings file version");
     eyre::ensure!(!data.vectors.is_empty(), "No vectors in file");
     eyre::ensure!(
         data.vectors[0].len() == data.dimension,
@@ -141,68 +133,14 @@ fn convert_to_f32(vectors: &[Vec<f64>]) -> Vec<Vec<f32>> {
         .collect()
 }
 
-fn build_turdb_index(
-    path: &Path,
-    vectors: &[Vec<f32>],
-    dimensions: u16,
-) -> eyre::Result<PersistentHnswIndex> {
-    let mut index = PersistentHnswIndex::create(
-        path,
-        1,
-        1,
-        dimensions,
-        16,
-        100,
-        64,
-        DistanceFunction::L2,
-        QuantizationType::None,
-    )?;
-
-    let mut rng_state: u64 = 12345;
-    for (i, vector) in vectors.iter().enumerate() {
-        rng_state = rng_state.wrapping_mul(6364136223846793005).wrapping_add(1);
-        let random_value = (rng_state as f64) / (u64::MAX as f64);
-
-        index.insert(i as u64, vector, random_value)?;
-
-        if (i + 1) % 100 == 0 {
-            println!("  Inserted {}/{} vectors", i + 1, vectors.len());
-        }
-    }
-
-    index.sync()?;
-    println!(
-        "  Built TurDB HNSW index with {} nodes",
-        index.index().node_count()
-    );
-
-    Ok(index)
+fn vector_to_sql_literal(vec: &[f32]) -> String {
+    let parts: Vec<String> = vec.iter().map(|v| format!("{}", v)).collect();
+    format!("'[{}]'", parts.join(", "))
 }
 
-fn search_turdb(
-    index: &PersistentHnswIndex,
-    query: &[f32],
-    k: usize,
-    vectors: &[Vec<f32>],
-) -> eyre::Result<Vec<(u64, f32)>> {
-    let max_nodes = (index.index().node_count() as usize).max(1000);
-    let mut ctx = hnsw::search::HnswSearchContext::new(64, max_nodes);
-
-    let get_vector = |row_id: u64| -> Option<Vec<f32>> {
-        vectors.get(row_id as usize).cloned()
-    };
-
-    let results = index.search(query, k, &mut ctx, get_vector)?;
-
-    Ok(results
-        .into_iter()
-        .map(|r| (r.row_id, r.distance))
-        .collect())
-}
-
-fn calculate_recall(turdb: &[(u64, f32)], qdrant: &[(u64, f32)], k: usize) -> f32 {
-    let turdb_ids: HashSet<u64> = turdb.iter().take(k).map(|(id, _)| *id).collect();
-    let qdrant_ids: HashSet<u64> = qdrant.iter().take(k).map(|(id, _)| *id).collect();
+fn calculate_recall(turdb: &[(i64, f64)], qdrant: &[(u64, f32)], k: usize) -> f32 {
+    let turdb_ids: HashSet<i64> = turdb.iter().take(k).map(|(id, _)| *id).collect();
+    let qdrant_ids: HashSet<i64> = qdrant.iter().take(k).map(|(id, _)| *id as i64).collect();
 
     let intersection = turdb_ids.intersection(&qdrant_ids).count();
     intersection as f32 / k as f32
@@ -210,8 +148,8 @@ fn calculate_recall(turdb: &[(u64, f32)], qdrant: &[(u64, f32)], k: usize) -> f3
 
 #[test]
 #[ignore]
-fn compare_turdb_hnsw_vs_qdrant_euclidean() {
-    println!("\n=== TurDB HNSW vs Qdrant Comparison Test ===\n");
+fn compare_turdb_sql_vs_qdrant_euclidean() {
+    println!("\n=== TurDB SQL vs Qdrant Comparison Test ===\n");
 
     let embeddings_path = Path::new(EMBEDDINGS_PATH);
     if !embeddings_path.exists() {
@@ -227,26 +165,47 @@ fn compare_turdb_hnsw_vs_qdrant_euclidean() {
         "  Loaded {} vectors with dimension {}",
         embeddings.count, embeddings.dimension
     );
-    println!("  Query indices: {:?}", &embeddings.query_indices[..5]);
 
     let vectors_f32 = convert_to_f32(&embeddings.vectors);
 
     let temp_dir = tempdir().expect("Failed to create temp directory");
-    let index_path = temp_dir.path().join("test.hnsw");
+    let db = Database::create(temp_dir.path().join("test_db")).expect("Failed to create database");
 
-    println!("\nBuilding TurDB HNSW index...");
-    let index = build_turdb_index(&index_path, &vectors_f32, embeddings.dimension as u16)
-        .expect("Failed to build index");
+    println!("\nCreating table and inserting vectors via SQL...");
+    db.execute(&format!(
+        "CREATE TABLE vectors (id BIGINT PRIMARY KEY, embedding VECTOR({}))",
+        embeddings.dimension
+    ))
+    .expect("Failed to create table");
+
+    for (i, vec) in vectors_f32.iter().enumerate() {
+        let vec_literal = vector_to_sql_literal(vec);
+        db.execute(&format!(
+            "INSERT INTO vectors (id, embedding) VALUES ({}, {})",
+            i, vec_literal
+        ))
+        .expect("Failed to insert vector");
+
+        if (i + 1) % 100 == 0 {
+            println!("  Inserted {}/{} vectors", i + 1, vectors_f32.len());
+        }
+    }
+    println!("  Inserted {} vectors total", vectors_f32.len());
 
     let qdrant = QdrantClient::new(QDRANT_HOST, QDRANT_PORT, QDRANT_API_KEY, QDRANT_COLLECTION);
 
-    println!("\nRunning {} queries with k={}...", embeddings.query_count, K);
+    println!(
+        "\nRunning {} queries with k={}...",
+        embeddings.query_indices.len(),
+        K
+    );
 
     let mut recalls: Vec<f32> = Vec::new();
     let mut failed_queries: Vec<(usize, f32)> = Vec::new();
 
     for (i, &query_idx) in embeddings.query_indices.iter().enumerate() {
         let query = &vectors_f32[query_idx];
+        let query_literal = vector_to_sql_literal(query);
 
         let qdrant_results = match qdrant.search(query, K) {
             Ok(r) => r,
@@ -256,8 +215,27 @@ fn compare_turdb_hnsw_vs_qdrant_euclidean() {
             }
         };
 
-        let turdb_results = match search_turdb(&index, query, K, &vectors_f32) {
-            Ok(r) => r,
+        let sql = format!(
+            "SELECT id, embedding <-> {} AS distance FROM vectors ORDER BY distance LIMIT {}",
+            query_literal, K
+        );
+
+        let turdb_results: Vec<(i64, f64)> = match db.execute(&sql) {
+            Ok(rows) => rows
+                .iter()
+                .filter_map(|row| {
+                    let id = match &row.values[0] {
+                        OwnedValue::Int(v) => *v,
+                        _ => return None,
+                    };
+                    let dist = match &row.values[1] {
+                        OwnedValue::Float(v) => *v,
+                        OwnedValue::Int(v) => *v as f64,
+                        _ => return None,
+                    };
+                    Some((id, dist))
+                })
+                .collect(),
             Err(e) => {
                 println!("  Query {}: TurDB search failed: {}", i, e);
                 continue;
@@ -277,8 +255,16 @@ fn compare_turdb_hnsw_vs_qdrant_euclidean() {
                 i,
                 query_idx,
                 recall * 100.0,
-                turdb_results.iter().take(3).map(|(id, _)| id).collect::<Vec<_>>(),
-                qdrant_results.iter().take(3).map(|(id, _)| id).collect::<Vec<_>>(),
+                turdb_results
+                    .iter()
+                    .take(3)
+                    .map(|(id, _)| id)
+                    .collect::<Vec<_>>(),
+                qdrant_results
+                    .iter()
+                    .take(3)
+                    .map(|(id, _)| id)
+                    .collect::<Vec<_>>(),
             );
         }
     }
@@ -299,7 +285,10 @@ fn compare_turdb_hnsw_vs_qdrant_euclidean() {
     );
 
     if !failed_queries.is_empty() {
-        println!("\n  Failed queries (below {}% recall):", MIN_RECALL * 100.0);
+        println!(
+            "\n  Failed queries (below {}% recall):",
+            MIN_RECALL * 100.0
+        );
         for (idx, recall) in failed_queries.iter().take(10) {
             println!("    Query idx {}: {:.2}%", idx, recall * 100.0);
         }
@@ -319,10 +308,7 @@ fn compare_turdb_hnsw_vs_qdrant_euclidean() {
 fn test_embeddings_file_exists() {
     let path = Path::new(EMBEDDINGS_PATH);
     if !path.exists() {
-        println!(
-            "Warning: Embeddings file not found at {}",
-            EMBEDDINGS_PATH
-        );
+        println!("Warning: Embeddings file not found at {}", EMBEDDINGS_PATH);
         println!("Run: python scripts/prepare_qdrant_comparison.py");
     }
 }

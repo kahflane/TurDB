@@ -119,6 +119,7 @@ pub const TABLE_FILE_EXTENSION: &str = "tbd";
 pub const INDEX_FILE_EXTENSION: &str = "idx";
 pub const HNSW_FILE_EXTENSION: &str = "hnsw";
 pub const META_FILE_NAME: &str = "turdb.meta";
+pub const CATALOG_FILE_NAME: &str = "turdb.catalog";
 
 pub const HNSW_MAGIC: &[u8; 16] = b"TurDB HNSW\x00\x00\x00\x00\x00\x00";
 

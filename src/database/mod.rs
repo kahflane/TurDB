@@ -1739,7 +1739,7 @@ mod tests {
             "CREATE INDEX with expression should succeed"
         );
 
-        let catalog = db.catalog.read();
+        let catalog = db.shared.catalog.read();
         let catalog = catalog.as_ref().unwrap();
         let table = catalog.resolve_table("users").unwrap();
 
@@ -1781,7 +1781,7 @@ mod tests {
             "CREATE INDEX with mixed columns/expressions should succeed"
         );
 
-        let catalog = db.catalog.read();
+        let catalog = db.shared.catalog.read();
         let catalog = catalog.as_ref().unwrap();
         let table = catalog.resolve_table("users").unwrap();
 
@@ -1817,7 +1817,7 @@ mod tests {
             db.execute("CREATE INDEX idx_active_users ON users (email) WHERE status = 'active'");
         assert!(result.is_ok(), "CREATE INDEX with WHERE should succeed");
 
-        let catalog = db.catalog.read();
+        let catalog = db.shared.catalog.read();
         let catalog = catalog.as_ref().unwrap();
         let table = catalog.resolve_table("users").unwrap();
 
@@ -1860,7 +1860,7 @@ mod tests {
             "CREATE UNIQUE INDEX with WHERE should succeed"
         );
 
-        let catalog = db.catalog.read();
+        let catalog = db.shared.catalog.read();
         let catalog = catalog.as_ref().unwrap();
         let table = catalog.resolve_table("users").unwrap();
 

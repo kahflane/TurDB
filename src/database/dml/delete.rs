@@ -116,7 +116,7 @@ impl Database {
         self.ensure_catalog()?;
         self.ensure_file_manager()?;
 
-        let catalog_guard = self.catalog.read();
+        let catalog_guard = self.shared.catalog.read();
         let catalog = catalog_guard.as_ref().unwrap();
 
         let schema_name = delete.table.schema.unwrap_or(DEFAULT_SCHEMA);
@@ -187,7 +187,7 @@ impl Database {
             .where_clause
             .map(|expr| CompiledPredicate::new(expr, column_map));
 
-        let mut file_manager_guard = self.file_manager.write();
+        let mut file_manager_guard = self.shared.file_manager.write();
         let file_manager = file_manager_guard.as_mut().unwrap();
         let storage_arc = file_manager.table_data_mut(schema_name, table_name)?;
         let mut storage = storage_arc.write();
@@ -325,7 +325,7 @@ impl Database {
         drop(btree);
         drop(storage);
 
-        let wal_enabled = self.wal_enabled.load(Ordering::Acquire);
+        let wal_enabled = self.shared.wal_enabled.load(Ordering::Acquire);
         if wal_enabled {
             self.ensure_wal()?;
         }
@@ -335,14 +335,14 @@ impl Database {
             if let Some(ref txn) = *active_txn {
                 (txn.txn_id, true)
             } else {
-                (self.txn_manager.global_ts.fetch_add(1, Ordering::SeqCst), false)
+                (self.shared.txn_manager.global_ts.fetch_add(1, Ordering::SeqCst), false)
             }
         };
 
         let storage_arc = file_manager.table_data_mut(schema_name, table_name)?;
         let mut storage = storage_arc.write();
 
-        with_btree_storage!(wal_enabled, &mut *storage, &self.dirty_tracker, table_id as u32, root_page, |btree_mut: &mut crate::btree::BTree<_>| {
+        with_btree_storage!(wal_enabled, &mut *storage, &self.shared.dirty_tracker, table_id as u32, root_page, |btree_mut: &mut crate::btree::BTree<_>| {
             for (key, old_value, _row_values) in &rows_to_delete {
                 let tombstone = wrap_record_for_delete(txn_id, old_value, in_transaction)?;
                 if !btree_mut.update(key, &tombstone)? {
@@ -380,7 +380,7 @@ impl Database {
         }
 
         if rows_affected > 0 {
-            let mut file_manager_guard = self.file_manager.write();
+            let mut file_manager_guard = self.shared.file_manager.write();
             let file_manager = file_manager_guard.as_mut().unwrap();
             let storage_arc = file_manager.table_data_mut(schema_name, table_name)?;
             let mut storage = storage_arc.write();

@@ -27,23 +27,7 @@
 use rusqlite::Connection;
 use std::path::Path;
 use std::time::Instant;
-use turdb::{Database, OwnedValue};
-
-fn rusqlite_to_owned(val: &rusqlite::types::Value) -> OwnedValue {
-    match val {
-        rusqlite::types::Value::Null => OwnedValue::Null,
-        rusqlite::types::Value::Integer(i) => OwnedValue::Int(*i),
-        rusqlite::types::Value::Real(f) => {
-            if f.is_nan() || f.is_infinite() {
-                OwnedValue::Null
-            } else {
-                OwnedValue::Float(*f)
-            }
-        }
-        rusqlite::types::Value::Text(s) => OwnedValue::Text(s.clone()),
-        rusqlite::types::Value::Blob(b) => OwnedValue::Blob(b.clone()),
-    }
-}
+use turdb::{Database};
 
 const SQLITE_DB_PATH: &str = "/Users/julfikar/Downloads/_meta-kaggle.db";
 const TURDB_PATH: &str = "/Users/julfikar/Documents/PassionFruit.nosync/turdb/turdb-core/.worktrees/bismillah";

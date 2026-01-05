@@ -114,7 +114,7 @@ impl Database {
     ) -> Result<ExecuteResult> {
         self.ensure_file_manager()?;
 
-        let wal_enabled = self.wal_enabled.load(Ordering::Acquire);
+        let wal_enabled = self.shared.wal_enabled.load(Ordering::Acquire);
         if wal_enabled {
             self.ensure_wal()?;
         }
@@ -155,12 +155,12 @@ impl Database {
         self.ensure_catalog()?;
         self.ensure_file_manager()?;
 
-        let wal_enabled = self.wal_enabled.load(Ordering::Acquire);
+        let wal_enabled = self.shared.wal_enabled.load(Ordering::Acquire);
         if wal_enabled {
             self.ensure_wal()?;
         }
 
-        let catalog_guard = self.catalog.read();
+        let catalog_guard = self.shared.catalog.read();
         let catalog = catalog_guard.as_ref().unwrap();
 
         let schema_name = insert.table.schema.unwrap_or(DEFAULT_SCHEMA);
@@ -289,13 +289,13 @@ impl Database {
             }
         };
 
-        let catalog_guard = self.catalog.read();
+        let catalog_guard = self.shared.catalog.read();
         let root_page = 1u32;
         let validator = ConstraintValidator::new(&table_def_for_validator);
 
         drop(catalog_guard);
 
-        let mut file_manager_guard = self.file_manager.write();
+        let mut file_manager_guard = self.shared.file_manager.write();
         let file_manager = file_manager_guard.as_mut().unwrap();
 
         let mut count = 0;
@@ -418,7 +418,7 @@ impl Database {
 
             let fk_enabled = self.foreign_keys_enabled.load(Ordering::Acquire);
             if fk_enabled && !fk_constraints.is_empty() {
-                let catalog_guard = self.catalog.read();
+                let catalog_guard = self.shared.catalog.read();
                 let catalog = catalog_guard.as_ref().unwrap();
 
                 for (col_idx, fk_table, fk_column) in &fk_constraints {
@@ -602,14 +602,12 @@ impl Database {
                                         if let Some(ref txn) = *active_txn {
                                             (txn.txn_id, true)
                                         } else {
-                                            (self.txn_manager.global_ts.fetch_add(1, Ordering::SeqCst), false)
+                                            (self.shared.txn_manager.global_ts.fetch_add(1, Ordering::SeqCst), false)
                                         }
                                     };
                                     let updated_record = wrap_record_for_insert(txn_id, &user_record, in_transaction);
 
-                                    let table_storage_arc =
-                                        file_manager.table_data_mut(schema_name, table_name)?;
-                                    let mut table_storage = table_storage_arc.write();
+                                    drop(btree);
                                     let mut btree_mut = BTree::new(&mut *table_storage, root_page)?;
                                     btree_mut.delete(&existing_key)?;
                                     btree_mut.insert(&existing_key, &updated_record)?;
@@ -659,7 +657,7 @@ impl Database {
                 }
             }
 
-            let row_id = self.next_row_id.fetch_add(1, Ordering::Relaxed);
+            let row_id = self.shared.next_row_id.fetch_add(1, Ordering::Relaxed);
             let row_key = Self::generate_row_key(row_id);
 
             if !toastable_col_indices.is_empty() {
@@ -685,7 +683,7 @@ impl Database {
 
                             let (new_hint, new_root) = if wal_enabled {
                                 let mut wal_storage =
-                                    WalStoragePerTable::new(&mut *toast_storage, &self.dirty_tracker, toast_table_id);
+                                    WalStoragePerTable::new(&mut *toast_storage, &self.shared.dirty_tracker, toast_table_id);
                                 let mut btree = BTree::with_rightmost_hint(&mut wal_storage, toast_root_page, toast_rightmost_hint)?;
                                 for (seq, chunk) in data.chunks(TOAST_CHUNK_SIZE).enumerate() {
                                     let chunk_key = make_chunk_key(chunk_id, seq as u32);
@@ -723,14 +721,14 @@ impl Database {
                 if let Some(ref txn) = *active_txn {
                     (txn.txn_id, true)
                 } else {
-                    (self.txn_manager.global_ts.fetch_add(1, Ordering::SeqCst), false)
+                    (self.shared.txn_manager.global_ts.fetch_add(1, Ordering::SeqCst), false)
                 }
             };
             let record_data = wrap_record_for_insert(txn_id, &user_record, in_transaction);
 
             if wal_enabled {
                 let mut wal_storage =
-                    WalStoragePerTable::new(&mut *table_storage, &self.dirty_tracker, table_id as u32);
+                    WalStoragePerTable::new(&mut *table_storage, &self.shared.dirty_tracker, table_id as u32);
                 let mut btree = BTree::with_rightmost_hint(&mut wal_storage, root_page, rightmost_hint)?;
                 btree.insert(&row_key, &record_data)?;
                 rightmost_hint = btree.rightmost_hint();

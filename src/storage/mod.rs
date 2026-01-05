@@ -98,7 +98,7 @@ pub use cache::{PageCache, PageKey, PageRef};
 pub use file_manager::{
     FileKey, FileManager, LruFileCache, TableFiles, DEFAULT_MAX_OPEN_FILES, DEFAULT_SCHEMA,
     HNSW_FILE_EXTENSION, HNSW_MAGIC, INDEX_FILE_EXTENSION, MIN_MAX_OPEN_FILES,
-    TABLE_FILE_EXTENSION,
+    TABLE_FILE_EXTENSION, CATALOG_FILE_NAME
 };
 pub use freelist::{Freelist, TrunkHeader, TRUNK_HEADER_SIZE, TRUNK_MAX_ENTRIES};
 pub use headers::{

@@ -220,7 +220,7 @@ impl Database {
         }
 
         let mvcc_txn = self
-            .txn_manager
+            .shared.txn_manager
             .begin_txn()
             .wrap_err("failed to begin MVCC transaction")?;
 
@@ -239,7 +239,7 @@ impl Database {
 
     pub(crate) fn execute_commit(&self) -> Result<ExecuteResult> {
         let wal_enabled = self
-            .wal_enabled
+            .shared.wal_enabled
             .load(std::sync::atomic::Ordering::Acquire);
 
         {
@@ -257,13 +257,13 @@ impl Database {
         self.finalize_transaction_commit(txn)?;
 
         if wal_enabled {
-            let dirty_table_ids = self.dirty_tracker.all_dirty_table_ids();
+            let dirty_table_ids = self.shared.dirty_tracker.all_dirty_table_ids();
             if dirty_table_ids.is_empty() {
                 return Ok(ExecuteResult::Commit);
             }
 
             let table_infos: Vec<(u32, String, String)> = {
-                let lookup = self.table_id_lookup.read();
+                let lookup = self.shared.table_id_lookup.read();
                 dirty_table_ids
                     .iter()
                     .filter_map(|&table_id| {
@@ -274,12 +274,12 @@ impl Database {
                     .collect()
             };
 
-            let mut file_manager_guard = self.file_manager.write();
+            let mut file_manager_guard = self.shared.file_manager.write();
             let file_manager = file_manager_guard
                 .as_mut()
                 .ok_or_else(|| eyre::eyre!("file manager not available for WAL flush"))?;
 
-            let mut wal_guard = self.wal.lock();
+            let mut wal_guard = self.shared.wal.lock();
             let wal = wal_guard
                 .as_mut()
                 .ok_or_else(|| eyre::eyre!("WAL not initialized but WAL mode is enabled"))?;
@@ -295,7 +295,7 @@ impl Database {
                     })?;
                 let storage = storage_arc.read();
 
-                WalStoragePerTable::flush_wal_for_table(&self.dirty_tracker, &*storage, wal, table_id)
+                WalStoragePerTable::flush_wal_for_table(&self.shared.dirty_tracker, &*storage, wal, table_id)
                     .wrap_err_with(|| {
                         format!(
                             "failed to flush WAL for table {}.{} on commit",
@@ -309,7 +309,7 @@ impl Database {
     }
 
     fn finalize_transaction_commit(&self, mut txn: ActiveTransaction) -> Result<()> {
-        let commit_ts = self.txn_manager.commit_txn(txn.slot_idx);
+        let commit_ts = self.shared.txn_manager.commit_txn(txn.slot_idx);
         let (write_entries, _undo_data) = txn.take_write_entries();
 
         for entry in write_entries.iter() {
@@ -326,10 +326,10 @@ impl Database {
 
         self.ensure_file_manager()?;
 
-        let mut file_manager_guard = self.file_manager.write();
+        let mut file_manager_guard = self.shared.file_manager.write();
         let file_manager = file_manager_guard.as_mut().unwrap();
 
-        let catalog_guard = self.catalog.read();
+        let catalog_guard = self.shared.catalog.read();
         let catalog = catalog_guard.as_ref().unwrap();
 
         let table_id = entry.table_id;
@@ -418,10 +418,10 @@ impl Database {
 
         self.ensure_file_manager()?;
 
-        let mut file_manager_guard = self.file_manager.write();
+        let mut file_manager_guard = self.shared.file_manager.write();
         let file_manager = file_manager_guard.as_mut().unwrap();
 
-        let catalog_guard = self.catalog.read();
+        let catalog_guard = self.shared.catalog.read();
         let catalog = catalog_guard.as_ref().unwrap();
 
         let table_id = entry.table_id;
@@ -489,5 +489,19 @@ impl Database {
         Ok(ExecuteResult::Release {
             name: release.name.to_string(),
         })
+    }
+
+    pub(crate) fn abort_active_transaction(&self) {
+        let txn = {
+            let mut active_txn = self.active_txn.lock();
+            active_txn.take()
+        };
+
+        if let Some(txn) = txn {
+            let write_entries: Vec<WriteEntry> = txn.write_entries.iter().cloned().collect();
+            let undo_data: Vec<Option<Vec<u8>>> = txn.undo_data.iter().cloned().collect();
+
+            let _ = self.undo_write_entries(&write_entries, &undo_data);
+        }
     }
 }

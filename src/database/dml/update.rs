@@ -123,7 +123,7 @@ impl Database {
         self.ensure_catalog()?;
         self.ensure_file_manager()?;
 
-        let catalog_guard = self.catalog.read();
+        let catalog_guard = self.shared.catalog.read();
         let catalog = catalog_guard.as_ref().unwrap();
 
         let schema_name = update.table.schema.unwrap_or(DEFAULT_SCHEMA);
@@ -179,7 +179,7 @@ impl Database {
             })
             .collect();
 
-        let mut file_manager_guard = self.file_manager.write();
+        let mut file_manager_guard = self.shared.file_manager.write();
         let file_manager = file_manager_guard.as_mut().unwrap();
         let storage_arc = file_manager.table_data_mut(schema_name, table_name)?;
         let mut storage = storage_arc.write();
@@ -342,7 +342,7 @@ impl Database {
                             if let Some(ref txn) = *active_txn {
                                 (txn.txn_id, true)
                             } else {
-                                (self.txn_manager.global_ts.fetch_add(1, Ordering::SeqCst), false)
+                                (self.shared.txn_manager.global_ts.fetch_add(1, Ordering::SeqCst), false)
                             }
                         };
                         let record_data = wrap_record_for_update(txn_id, &user_record, 0, 0, in_transaction);
@@ -351,7 +351,7 @@ impl Database {
                         drop(btree);
                         drop(storage);
 
-                        let wal_enabled = self.wal_enabled.load(Ordering::Acquire);
+                        let wal_enabled = self.shared.wal_enabled.load(Ordering::Acquire);
                         if wal_enabled {
                             self.ensure_wal()?;
                         }
@@ -359,7 +359,7 @@ impl Database {
                         let storage_arc = file_manager.table_data_mut(schema_name, table_name)?;
                         let mut storage_inner = storage_arc.write();
 
-                        with_btree_storage!(wal_enabled, &mut *storage_inner, &self.dirty_tracker, table_id as u32, root_page, |btree_mut: &mut crate::btree::BTree<_>| {
+                        with_btree_storage!(wal_enabled, &mut *storage_inner, &self.shared.dirty_tracker, table_id as u32, root_page, |btree_mut: &mut crate::btree::BTree<_>| {
                             if !btree_mut.update(target_key, &record_data)? {
                                 btree_mut.delete(target_key)?;
                                 btree_mut.insert(target_key, &record_data)?;
@@ -570,7 +570,7 @@ impl Database {
 
         let mut processed_rows: Vec<(Vec<u8>, Vec<OwnedValue>)> = Vec::with_capacity(rows_to_update.len());
 
-        let wal_enabled = self.wal_enabled.load(std::sync::atomic::Ordering::Acquire);
+        let wal_enabled = self.shared.wal_enabled.load(std::sync::atomic::Ordering::Acquire);
         if wal_enabled {
             self.ensure_wal()?;
         }
@@ -644,14 +644,14 @@ impl Database {
             if let Some(ref txn) = *active_txn {
                 (txn.txn_id, true)
             } else {
-                (self.txn_manager.global_ts.fetch_add(1, Ordering::SeqCst), false)
+                (self.shared.txn_manager.global_ts.fetch_add(1, Ordering::SeqCst), false)
             }
         };
 
         let storage_arc = file_manager.table_data_mut(schema_name, table_name)?;
         let mut storage = storage_arc.write();
 
-        with_btree_storage!(wal_enabled, &mut *storage, &self.dirty_tracker, table_id as u32, root_page, |btree_mut: &mut crate::btree::BTree<_>| {
+        with_btree_storage!(wal_enabled, &mut *storage, &self.shared.dirty_tracker, table_id as u32, root_page, |btree_mut: &mut crate::btree::BTree<_>| {
             for (key, updated_values) in &processed_rows {
                 let user_record = OwnedValue::build_record_from_values(updated_values, &schema)?;
                 let record_data = wrap_record_for_update(txn_id, &user_record, 0, 0, in_transaction);
@@ -764,7 +764,7 @@ impl Database {
             })
             .collect();
 
-        let mut file_manager_guard = self.file_manager.write();
+        let mut file_manager_guard = self.shared.file_manager.write();
         let file_manager = file_manager_guard.as_mut().unwrap();
 
         let mut all_from_rows: Vec<Vec<Vec<OwnedValue>>> = Vec::new();
@@ -892,6 +892,10 @@ impl Database {
             cursor.advance()?;
         }
 
+        drop(cursor);
+        drop(btree);
+        drop(storage);
+
         let unique_col_indices: Vec<usize> = columns
             .iter()
             .enumerate()
@@ -974,7 +978,7 @@ impl Database {
                 .collect()
         });
 
-        let wal_enabled = self.wal_enabled.load(Ordering::Acquire);
+        let wal_enabled = self.shared.wal_enabled.load(Ordering::Acquire);
         if wal_enabled {
             self.ensure_wal()?;
         }
@@ -984,14 +988,14 @@ impl Database {
             if let Some(ref txn) = *active_txn {
                 (txn.txn_id, true)
             } else {
-                (self.txn_manager.global_ts.fetch_add(1, Ordering::SeqCst), false)
+                (self.shared.txn_manager.global_ts.fetch_add(1, Ordering::SeqCst), false)
             }
         };
 
         let storage_arc = file_manager.table_data_mut(schema_name, table_name)?;
         let mut storage = storage_arc.write();
 
-        with_btree_storage!(wal_enabled, &mut *storage, &self.dirty_tracker, table_id as u32, root_page, |btree_mut: &mut crate::btree::BTree<_>| {
+        with_btree_storage!(wal_enabled, &mut *storage, &self.shared.dirty_tracker, table_id as u32, root_page, |btree_mut: &mut crate::btree::BTree<_>| {
             for (key, _old_value, updated_values) in &rows_to_update {
                 let user_record = OwnedValue::build_record_from_values(updated_values, schema)?;
                 let record_data = wrap_record_for_update(txn_id, &user_record, 0, 0, in_transaction);
@@ -1185,7 +1189,7 @@ impl Database {
     ) -> Result<ExecuteResult> {
         self.ensure_file_manager()?;
 
-        let wal_enabled = self.wal_enabled.load(std::sync::atomic::Ordering::Acquire);
+        let wal_enabled = self.shared.wal_enabled.load(std::sync::atomic::Ordering::Acquire);
         if wal_enabled {
             self.ensure_wal()?;
         }
@@ -1239,14 +1243,14 @@ impl Database {
         let pk_col_idx = cached.pk_column_index.ok_or_else(|| eyre::eyre!("PK column index not cached"))?;
 
         self.ensure_catalog()?;
-        let catalog_guard = self.catalog.read();
+        let catalog_guard = self.shared.catalog.read();
         let catalog = catalog_guard.as_ref().unwrap();
         let table_def = catalog.resolve_table(&cached.table_name)?;
         let pk_col_name = table_def.columns()[pk_col_idx].name();
         let pk_index_name = format!("{}_pkey", pk_col_name);
         drop(catalog_guard);
 
-        let mut file_manager_guard = self.file_manager.write();
+        let mut file_manager_guard = self.shared.file_manager.write();
         let file_manager = file_manager_guard.as_mut().unwrap();
 
         let target_key = if file_manager.index_exists(&cached.schema_name, &cached.table_name, &pk_index_name) {
@@ -1300,7 +1304,7 @@ impl Database {
 
         let mut storage = storage_arc.write();
 
-        with_btree_storage!(wal_enabled, &mut *storage, &self.dirty_tracker, cached.table_id as u32, root_page, |btree_mut: &mut crate::btree::BTree<_>| {
+        with_btree_storage!(wal_enabled, &mut *storage, &self.shared.dirty_tracker, cached.table_id as u32, root_page, |btree_mut: &mut crate::btree::BTree<_>| {
             let record_data = OwnedValue::build_record_from_values(&row_values, &cached.record_schema)?;
 
             if !btree_mut.update(&target_key, &record_data)? {
