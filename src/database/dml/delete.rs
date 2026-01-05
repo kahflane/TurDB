@@ -93,6 +93,7 @@
 //! include undo data (old row value) for rollback support.
 
 use crate::btree::BTree;
+use crate::database::dml::mvcc_helpers::{get_user_data, wrap_record_for_delete};
 use crate::database::macros::with_btree_storage;
 use crate::database::row::Row;
 use crate::database::{Database, ExecuteResult};
@@ -104,6 +105,7 @@ use crate::storage::{TableFileHeader, DEFAULT_SCHEMA};
 use crate::types::{create_column_map, create_record_schema, owned_values_to_values, OwnedValue};
 use bumpalo::Bump;
 use eyre::{bail, Result};
+use std::sync::atomic::Ordering;
 
 impl Database {
     pub(crate) fn execute_delete(
@@ -201,7 +203,8 @@ impl Database {
             let key = cursor.key()?;
             let value = cursor.value()?;
 
-            let record = RecordView::new(value, &schema)?;
+            let user_data = get_user_data(value);
+            let record = RecordView::new(user_data, &schema)?;
             let row_values = OwnedValue::extract_row_from_record(&record, &columns)?;
 
             let should_delete = if let Some(ref pred) = predicate {
@@ -239,7 +242,8 @@ impl Database {
 
                 while child_cursor.valid() {
                     let child_value = child_cursor.value()?;
-                    let child_record = RecordView::new(child_value, &child_record_schema)?;
+                    let child_user_data = get_user_data(child_value);
+                    let child_record = RecordView::new(child_user_data, &child_record_schema)?;
                     let child_row =
                         OwnedValue::extract_row_from_record(&child_record, child_columns)?;
 
@@ -317,20 +321,39 @@ impl Database {
             }
         }
 
-        let wal_enabled = self.wal_enabled.load(std::sync::atomic::Ordering::Acquire);
+        drop(cursor);
+        drop(btree);
+        drop(storage);
+
+        let wal_enabled = self.wal_enabled.load(Ordering::Acquire);
         if wal_enabled {
             self.ensure_wal()?;
         }
+
+        let (txn_id, in_transaction) = {
+            let active_txn = self.active_txn.lock();
+            if let Some(ref txn) = *active_txn {
+                (txn.txn_id, true)
+            } else {
+                (self.txn_manager.global_ts.fetch_add(1, Ordering::SeqCst), false)
+            }
+        };
 
         let storage_arc = file_manager.table_data_mut(schema_name, table_name)?;
         let mut storage = storage_arc.write();
 
         with_btree_storage!(wal_enabled, &mut *storage, &self.dirty_tracker, table_id as u32, root_page, |btree_mut: &mut crate::btree::BTree<_>| {
-            for (key, _old_value, _row_values) in &rows_to_delete {
-                btree_mut.delete(key)?;
+            for (key, old_value, _row_values) in &rows_to_delete {
+                let tombstone = wrap_record_for_delete(txn_id, old_value, in_transaction)?;
+                if !btree_mut.update(key, &tombstone)? {
+                    btree_mut.delete(key)?;
+                    btree_mut.insert(key, &tombstone)?;
+                }
             }
             Ok::<_, eyre::Report>(())
         });
+
+        drop(storage);
 
         self.flush_wal_if_autocommit(file_manager, schema_name, table_name, table_id as u32)?;
 

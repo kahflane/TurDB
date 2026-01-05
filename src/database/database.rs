@@ -536,6 +536,7 @@ impl Database {
         params: &[OwnedValue],
     ) -> Result<usize> {
         use crate::btree::BTree;
+        use crate::database::dml::mvcc_helpers::wrap_record_for_insert;
         use crate::storage::WalStoragePerTable;
         use std::sync::atomic::Ordering;
 
@@ -585,6 +586,16 @@ impl Database {
         buffer_guard.clear();
         OwnedValue::build_record_into_buffer(params, &mut record_builder, &mut *buffer_guard)?;
 
+        let (txn_id, in_transaction) = {
+            let active_txn = self.active_txn.lock();
+            if let Some(ref txn) = *active_txn {
+                (txn.txn_id, true)
+            } else {
+                (self.txn_manager.global_ts.fetch_add(1, Ordering::SeqCst), false)
+            }
+        };
+        let mvcc_record = wrap_record_for_insert(txn_id, &buffer_guard, in_transaction);
+
         let row_id = self.next_row_id.fetch_add(1, Ordering::Relaxed);
         let row_key = Self::generate_row_key(row_id);
 
@@ -592,12 +603,12 @@ impl Database {
             let mut wal_storage =
                 WalStoragePerTable::new(&mut *storage_guard, &self.dirty_tracker, plan.table_id as u32);
             let mut btree = BTree::with_rightmost_hint(&mut wal_storage, root_page, rightmost_hint)?;
-            btree.insert_append(&row_key, &buffer_guard)?;
+            btree.insert_append(&row_key, &mvcc_record)?;
             root_page = btree.root_page();
             rightmost_hint = btree.rightmost_hint();
         } else {
             let mut btree = BTree::with_rightmost_hint(&mut *storage_guard, root_page, rightmost_hint)?;
-            btree.insert_append(&row_key, &buffer_guard)?;
+            btree.insert_append(&row_key, &mvcc_record)?;
             root_page = btree.root_page();
             rightmost_hint = btree.rightmost_hint();
         }

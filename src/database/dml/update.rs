@@ -84,6 +84,7 @@
 //! include undo data (old row value) for rollback support.
 
 use crate::btree::BTree;
+use crate::database::dml::mvcc_helpers::{get_user_data, wrap_record_for_update};
 use crate::database::macros::with_btree_storage;
 use crate::database::row::Row;
 use crate::database::{Database, ExecuteResult};
@@ -99,6 +100,7 @@ use bumpalo::Bump;
 use eyre::{bail, Result, WrapErr};
 use hashbrown::HashSet;
 use std::borrow::Cow;
+use std::sync::atomic::Ordering;
 
 fn count_params_in_expr(expr: &crate::sql::ast::Expr) -> usize {
     use crate::sql::ast::Expr;
@@ -300,7 +302,8 @@ impl Database {
                 if cursor.valid() && cursor.key()? == target_key.as_slice() {
                     let key = cursor.key()?;
                     let value = cursor.value()?;
-                    let values = decoder.decode(key, value)?;
+                    let user_data = get_user_data(value);
+                    let values = decoder.decode(key, user_data)?;
                     let mut row_values: Vec<OwnedValue> = values.into_iter().map(OwnedValue::from).collect();
                     let pk_idx = columns.iter()
                         .position(|c| c.has_constraint(&Constraint::PrimaryKey))
@@ -332,14 +335,23 @@ impl Database {
                             }
                         }
 
-                        let record_data = OwnedValue::build_record_from_values(&row_values, &schema)?;
+                        let user_record = OwnedValue::build_record_from_values(&row_values, &schema)?;
+                        
+                        let (txn_id, in_transaction) = {
+                            let active_txn = self.active_txn.lock();
+                            if let Some(ref txn) = *active_txn {
+                                (txn.txn_id, true)
+                            } else {
+                                (self.txn_manager.global_ts.fetch_add(1, Ordering::SeqCst), false)
+                            }
+                        };
+                        let record_data = wrap_record_for_update(txn_id, &user_record, 0, 0, in_transaction);
 
                         drop(cursor);
                         drop(btree);
-                        // Fix deadlock: Drop the outer storage write lock before re-acquiring it
                         drop(storage);
 
-                        let wal_enabled = self.wal_enabled.load(std::sync::atomic::Ordering::Acquire);
+                        let wal_enabled = self.wal_enabled.load(Ordering::Acquire);
                         if wal_enabled {
                             self.ensure_wal()?;
                         }
@@ -402,7 +414,6 @@ impl Database {
             while cursor.valid() {
                 let key = cursor.key()?;
 
-                // Optimization: If doing Point Lookup, stop if we pass the key or don't match
                 if let Some((ref target_key, _)) = pk_lookup_info {
                     if key != target_key.as_slice() {
                         break;
@@ -410,7 +421,8 @@ impl Database {
                 }
 
                 let value = cursor.value()?;
-                let values = decoder.decode(key, value)?;
+                let user_data = get_user_data(value);
+                let values = decoder.decode(key, user_data)?;
                 let mut row_values: Vec<OwnedValue> = values.into_iter().map(OwnedValue::from).collect();
 
                 let should_update = if let Some((_, ref target_val)) = pk_lookup_info {
@@ -627,12 +639,22 @@ impl Database {
             processed_rows.push((key.clone(), updated_values.clone()));
         }
 
+        let (txn_id, in_transaction) = {
+            let active_txn = self.active_txn.lock();
+            if let Some(ref txn) = *active_txn {
+                (txn.txn_id, true)
+            } else {
+                (self.txn_manager.global_ts.fetch_add(1, Ordering::SeqCst), false)
+            }
+        };
+
         let storage_arc = file_manager.table_data_mut(schema_name, table_name)?;
         let mut storage = storage_arc.write();
 
         with_btree_storage!(wal_enabled, &mut *storage, &self.dirty_tracker, table_id as u32, root_page, |btree_mut: &mut crate::btree::BTree<_>| {
             for (key, updated_values) in &processed_rows {
-                let record_data = OwnedValue::build_record_from_values(updated_values, &schema)?;
+                let user_record = OwnedValue::build_record_from_values(updated_values, &schema)?;
+                let record_data = wrap_record_for_update(txn_id, &user_record, 0, 0, in_transaction);
 
                 if !btree_mut.update(key, &record_data)? {
                     btree_mut.delete(key)?;
@@ -755,7 +777,8 @@ impl Database {
             let mut table_rows: Vec<Vec<OwnedValue>> = Vec::new();
             while from_cursor.valid() {
                 let value = from_cursor.value()?;
-                let record = RecordView::new(value, &from_schemas[i])?;
+                let user_data = get_user_data(value);
+                let record = RecordView::new(user_data, &from_schemas[i])?;
                 let row_values = OwnedValue::extract_row_from_record(&record, from_columns)?;
                 table_rows.push(row_values);
                 from_cursor.advance()?;
@@ -782,7 +805,8 @@ impl Database {
             let key = cursor.key()?;
             let value = cursor.value()?;
 
-            let values = decoder.decode(key, value)?;
+            let user_data = get_user_data(value);
+            let values = decoder.decode(key, user_data)?;
             let target_row_values: Vec<OwnedValue> =
                 values.into_iter().map(OwnedValue::from).collect();
 
@@ -890,7 +914,8 @@ impl Database {
 
                     if existing_key != update_key.as_slice() {
                         let existing_value = check_cursor.value()?;
-                        let existing_record = RecordView::new(existing_value, schema)?;
+                        let existing_user_data = get_user_data(existing_value);
+                        let existing_record = RecordView::new(existing_user_data, schema)?;
                         let existing_values =
                             OwnedValue::extract_row_from_record(&existing_record, columns)?;
 
@@ -949,17 +974,27 @@ impl Database {
                 .collect()
         });
 
-        let wal_enabled = self.wal_enabled.load(std::sync::atomic::Ordering::Acquire);
+        let wal_enabled = self.wal_enabled.load(Ordering::Acquire);
         if wal_enabled {
             self.ensure_wal()?;
         }
+
+        let (txn_id, in_transaction) = {
+            let active_txn = self.active_txn.lock();
+            if let Some(ref txn) = *active_txn {
+                (txn.txn_id, true)
+            } else {
+                (self.txn_manager.global_ts.fetch_add(1, Ordering::SeqCst), false)
+            }
+        };
 
         let storage_arc = file_manager.table_data_mut(schema_name, table_name)?;
         let mut storage = storage_arc.write();
 
         with_btree_storage!(wal_enabled, &mut *storage, &self.dirty_tracker, table_id as u32, root_page, |btree_mut: &mut crate::btree::BTree<_>| {
             for (key, _old_value, updated_values) in &rows_to_update {
-                let record_data = OwnedValue::build_record_from_values(updated_values, schema)?;
+                let user_record = OwnedValue::build_record_from_values(updated_values, schema)?;
+                let record_data = wrap_record_for_update(txn_id, &user_record, 0, 0, in_transaction);
 
                 if !btree_mut.update(key, &record_data)? {
                     btree_mut.delete(key)?;

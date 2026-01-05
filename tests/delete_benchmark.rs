@@ -2,7 +2,7 @@ use std::time::Instant;
 use rusqlite::Connection;
 use turdb::{Database, OwnedValue};
 
-const ROW_COUNT: usize = 100_000;
+const ROW_COUNT: usize = 1000;
 const SQLITE_TARGET: &str = "/Users/julfikar/Documents/PassionFruit.nosync/turdb/turdb-core/.worktrees/delete_bench_sqlite.db";
 const TURDB_TARGET: &str = "/Users/julfikar/Documents/PassionFruit.nosync/turdb/turdb-core/.worktrees/delete_bench_turdb";
 
@@ -89,7 +89,7 @@ fn setup_turdb_with_data(path: &str, data: &[Vec<OwnedValue>]) -> Database {
     db.execute("PRAGMA synchronous = OFF;").expect("Failed to SET Synchronous");
     db.execute("
         CREATE TABLE dataset_versions (
-          id BIGINT,
+          id BIGINT PRIMARY KEY,
           dataset_id BIGINT,
           datasource_version_id BIGINT,
           creator_user_id BIGINT,

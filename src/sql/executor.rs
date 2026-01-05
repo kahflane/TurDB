@@ -70,6 +70,7 @@
 //! - Point lookup: < 1µs (cached)
 //! - Join performance: Depends on algorithm selection
 
+use crate::mvcc::RecordHeader;
 use crate::sql::adapter::BTreeCursorAdapter;
 use crate::sql::ast::JoinType;
 use crate::sql::decoder::SimpleDecoder;
@@ -443,27 +444,43 @@ impl<'storage> RowSource for StreamingBTreeSource<'storage> {
     }
 
     fn next_row(&mut self) -> Result<Option<Vec<Value<'static>>>> {
-        if !self.started {
-            self.started = true;
-            if !self.cursor.valid() {
+        loop {
+            if !self.started {
+                self.started = true;
+                if !self.cursor.valid() {
+                    return Ok(None);
+                }
+            } else if !self.cursor.advance()? {
                 return Ok(None);
             }
-        } else if !self.cursor.advance()? {
-            return Ok(None);
-        }
 
-        let key = self.cursor.key()?;
+            let key = self.cursor.key()?;
 
-        if let Some(ref end) = self.end_key {
-            if key >= end.as_slice() {
-                return Ok(None);
+            if let Some(ref end) = self.end_key {
+                if key >= end.as_slice() {
+                    return Ok(None);
+                }
             }
-        }
 
-        let value = self.cursor.value()?;
-        self.row_buffer.clear();
-        self.decoder.decode_into(key, value, &mut self.row_buffer)?;
-        Ok(Some(std::mem::take(&mut self.row_buffer)))
+            let raw_value = self.cursor.value()?;
+
+            if raw_value.len() >= RecordHeader::SIZE {
+                let header = RecordHeader::from_bytes(raw_value);
+                if header.is_deleted() {
+                    continue;
+                }
+            }
+
+            let user_data = if raw_value.len() > RecordHeader::SIZE {
+                &raw_value[RecordHeader::SIZE..]
+            } else {
+                raw_value
+            };
+
+            self.row_buffer.clear();
+            self.decoder.decode_into(key, user_data, &mut self.row_buffer)?;
+            return Ok(Some(std::mem::take(&mut self.row_buffer)));
+        }
     }
 }
 
@@ -527,20 +544,36 @@ impl<'storage> RowSource for ReverseBTreeSource<'storage> {
     }
 
     fn next_row(&mut self) -> Result<Option<Vec<Value<'static>>>> {
-        if !self.started {
-            self.started = true;
-            if !self.cursor.valid() {
+        loop {
+            if !self.started {
+                self.started = true;
+                if !self.cursor.valid() {
+                    return Ok(None);
+                }
+            } else if !self.cursor.prev()? {
                 return Ok(None);
             }
-        } else if !self.cursor.prev()? {
-            return Ok(None);
-        }
 
-        let key = self.cursor.key()?;
-        let value = self.cursor.value()?;
-        self.row_buffer.clear();
-        self.decoder.decode_into(key, value, &mut self.row_buffer)?;
-        Ok(Some(std::mem::take(&mut self.row_buffer)))
+            let key = self.cursor.key()?;
+            let raw_value = self.cursor.value()?;
+
+            if raw_value.len() >= RecordHeader::SIZE {
+                let header = RecordHeader::from_bytes(raw_value);
+                if header.is_deleted() {
+                    continue;
+                }
+            }
+
+            let user_data = if raw_value.len() > RecordHeader::SIZE {
+                &raw_value[RecordHeader::SIZE..]
+            } else {
+                raw_value
+            };
+
+            self.row_buffer.clear();
+            self.decoder.decode_into(key, user_data, &mut self.row_buffer)?;
+            return Ok(Some(std::mem::take(&mut self.row_buffer)));
+        }
     }
 }
 

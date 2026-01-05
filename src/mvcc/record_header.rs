@@ -107,9 +107,9 @@ impl RecordHeader {
     #[inline(always)]
     pub fn write_to(&self, slice: &mut [u8]) {
         debug_assert!(slice.len() >= Self::SIZE);
-        slice[0] = self.flags;
         slice[1..9].copy_from_slice(&self.txn_id.to_be_bytes());
         slice[9..17].copy_from_slice(&self.prev_version.to_be_bytes());
+        slice[0] = self.flags;
     }
 
     pub fn encode_ptr(page_id: u64, offset: u16) -> u64 {

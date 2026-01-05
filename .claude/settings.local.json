@@ -37,7 +37,9 @@
       "Bash(./target/release/turdb:*)",
       "Bash(sqlite3:*)",
       "Skill(superpowers:systematic-debugging)",
-      "WebSearch"
+      "WebSearch",
+      "Bash(timeout 120 cargo test:*)",
+      "Bash(echo:*)"
     ]
   }
 }

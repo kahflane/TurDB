@@ -31,6 +31,14 @@
 //! │             │                                                           │
 //! │             ▼                                                           │
 //! │   ┌─────────────────────┐                                               │
+//! │   │ MVCC Processing     │                                               │
+//! │   │ - Visibility check  │                                               │
+//! │   │ - Undo logging      │                                               │
+//! │   │ - Header wrapping   │                                               │
+//! │   └─────────┬───────────┘                                               │
+//! │             │                                                           │
+//! │             ▼                                                           │
+//! │   ┌─────────────────────┐                                               │
 //! │   │ TOAST Processing    │                                               │
 //! │   │ - Large values      │                                               │
 //! │   │ - Chunk storage     │                                               │
@@ -65,6 +73,7 @@
 //! - `insert`: INSERT operations including ON CONFLICT handling
 //! - `update`: UPDATE operations including UPDATE...FROM syntax
 //! - `delete`: DELETE operations with FK constraint checking
+//! - `mvcc_helpers`: MVCC integration helpers for wrapping/unwrapping records
 //!
 //! ## Constraint Handling
 //!
@@ -91,6 +100,15 @@
 //! - UPDATE: Records old value for rollback restore
 //! - DELETE: Records old value for rollback reinsert
 //!
+//! ## MVCC Support
+//!
+//! MVCC is always enabled. All operations use versioned records:
+//! - INSERT: Prepends RecordHeader with LOCK_BIT and txn_id
+//! - UPDATE: Writes old version to undo log, updates with prev_version pointer
+//! - DELETE: Sets DELETE_BIT instead of physical delete
+//! - COMMIT: Clears LOCK_BIT and updates to commit_ts
+//! - ROLLBACK: Restores old versions from undo log
+//!
 //! ## Performance Characteristics
 //!
 //! - INSERT: O(log n) per row for BTree insert + index updates
@@ -100,4 +118,5 @@
 
 mod delete;
 mod insert;
+pub mod mvcc_helpers;
 mod update;

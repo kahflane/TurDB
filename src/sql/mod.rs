@@ -54,6 +54,7 @@ pub mod executor;
 pub mod expr;
 pub mod functions;
 pub mod lexer;
+pub mod mvcc_scan;
 pub mod parser;
 pub mod planner;
 pub mod predicate;
@@ -63,5 +64,6 @@ pub mod util;
 
 pub use ast::*;
 pub use lexer::Lexer;
+pub use mvcc_scan::{check_row_visibility, strip_mvcc_header, MvccStreamingSource};
 pub use parser::{ParseError, Parser};
 pub use token::{Keyword, Parameter, Span, Token};

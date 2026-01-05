@@ -93,6 +93,7 @@
 
 use crate::btree::BTree;
 use crate::constraints::ConstraintValidator;
+use crate::database::dml::mvcc_helpers::wrap_record_for_insert;
 use crate::database::row::Row;
 use crate::database::{Database, ExecuteResult};
 use crate::mvcc::WriteEntry;
@@ -450,8 +451,9 @@ impl Database {
                         let mut found = false;
                         while ref_cursor.valid() {
                             let existing_value = ref_cursor.value()?;
+                            let user_data = crate::database::dml::mvcc_helpers::get_user_data(existing_value);
                             let existing_record =
-                                crate::records::RecordView::new(existing_value, &ref_schema)?;
+                                crate::records::RecordView::new(user_data, &ref_schema)?;
                             let existing_values =
                                 OwnedValue::extract_row_from_record(&existing_record, ref_columns)?;
 
@@ -574,7 +576,8 @@ impl Database {
 
                                 if let Some(handle) = btree.search(&existing_key)? {
                                     let existing_value = btree.get_value(&handle)?;
-                                    let record = crate::records::RecordView::new(existing_value, &schema)?;
+                                    let user_data = crate::database::dml::mvcc_helpers::get_user_data(existing_value);
+                                    let record = crate::records::RecordView::new(user_data, &schema)?;
                                     let mut existing_values =
                                         OwnedValue::extract_row_from_record(&record, &columns)?;
 
@@ -591,8 +594,18 @@ impl Database {
                                         }
                                     }
 
-                                    let updated_record =
+                                    let user_record =
                                         OwnedValue::build_record_from_values(&existing_values, &schema)?;
+                                    
+                                    let (txn_id, in_transaction) = {
+                                        let active_txn = self.active_txn.lock();
+                                        if let Some(ref txn) = *active_txn {
+                                            (txn.txn_id, true)
+                                        } else {
+                                            (self.txn_manager.global_ts.fetch_add(1, Ordering::SeqCst), false)
+                                        }
+                                    };
+                                    let updated_record = wrap_record_for_insert(txn_id, &user_record, in_transaction);
 
                                     let table_storage_arc =
                                         file_manager.table_data_mut(schema_name, table_name)?;
@@ -703,7 +716,17 @@ impl Database {
                 .ok_or_else(|| eyre::eyre!("table storage not found in cache"))?;
             let mut table_storage = table_storage_arc.write();
 
-            let record_data = OwnedValue::build_record_with_builder(&values, &mut record_builder)?;
+            let user_record = OwnedValue::build_record_with_builder(&values, &mut record_builder)?;
+
+            let (txn_id, in_transaction) = {
+                let active_txn = self.active_txn.lock();
+                if let Some(ref txn) = *active_txn {
+                    (txn.txn_id, true)
+                } else {
+                    (self.txn_manager.global_ts.fetch_add(1, Ordering::SeqCst), false)
+                }
+            };
+            let record_data = wrap_record_for_insert(txn_id, &user_record, in_transaction);
 
             if wal_enabled {
                 let mut wal_storage =

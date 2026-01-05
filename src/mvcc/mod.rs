@@ -87,6 +87,7 @@
 pub mod record_header;
 pub mod table;
 pub mod transaction;
+pub mod undo_manager;
 pub mod undo_page;
 pub mod version;
 
@@ -96,6 +97,7 @@ pub use transaction::{
     PageId, TableId, Transaction, TransactionManager, TxnId, TxnState, WriteEntry, WriteKey,
     MAX_CONCURRENT_TXNS,
 };
+pub use undo_manager::{UndoPageManager, UndoRegistry};
 pub use undo_page::{UndoHeader, UndoPageReader, UndoPageWriter, UndoRecord};
 pub use version::{
     VersionChainReader, VersionChainWriter, VisibilityResult, VisibleVersion, WriteCheckResult,
