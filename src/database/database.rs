@@ -646,6 +646,56 @@ impl Database {
             rightmost_hint = btree.rightmost_hint();
         }
 
+        // Update indexes
+        let row_id_bytes = row_id.to_be_bytes();
+        for index_plan in &plan.indexes {
+            let index_storage_arc = if let Some(weak) = index_plan.storage.borrow().as_ref() {
+                weak.upgrade()
+            } else {
+                None
+            };
+
+            let index_storage_arc = if let Some(arc) = index_storage_arc {
+                arc
+            } else {
+                 let mut file_manager_guard = self.shared.file_manager.write();
+                 let file_manager = file_manager_guard.as_mut().unwrap();
+                 if let Ok(arc) = file_manager.index_data_mut(&plan.schema_name, &plan.table_name, &index_plan.name) {
+                     *index_plan.storage.borrow_mut() = Some(std::sync::Arc::downgrade(&arc));
+                     arc
+                 } else {
+                     continue;
+                 }
+            };
+
+            let mut index_storage_guard = index_storage_arc.write();
+
+            let (index_root, _) = {
+                 use crate::storage::IndexFileHeader;
+                 let page = index_storage_guard.page(0)?;
+                 let header = IndexFileHeader::from_bytes(page)?;
+                 (header.root_page(), ())
+            };
+
+            let mut key_buf = Vec::new();
+            for &col_idx in &index_plan.col_indices {
+               if let Some(val) = params.get(col_idx) {
+                   Self::encode_value_as_key(val, &mut key_buf);
+               }
+            }
+
+            let mut index_btree = BTree::new(&mut *index_storage_guard, index_root)?;
+            index_btree.insert(&key_buf, &row_id_bytes)?;
+
+            let new_root = index_btree.root_page();
+            if new_root != index_root {
+                 use crate::storage::IndexFileHeader;
+                 let page = index_storage_guard.page_mut(0)?;
+                 let header = IndexFileHeader::from_bytes_mut(page)?;
+                 header.set_root_page(new_root);
+            }
+        }
+
         // Update header
         {
             let page = storage_guard.page_mut(0)?;
@@ -2254,6 +2304,51 @@ impl Database {
                     let fm = fm_guard.as_mut().unwrap();
                     fm.table_data(schema_name, table_name)
                 } {
+                    use crate::schema::Constraint;
+                    use std::collections::HashSet;
+                    
+                    let mut indexes = Vec::new();
+                    let mut seen_names = HashSet::new();
+                    
+                    for (idx, col) in table_def.columns().iter().enumerate() {
+                        let is_pk = col.has_constraint(&Constraint::PrimaryKey);
+                        let is_unique = col.has_constraint(&Constraint::Unique);
+                        if is_pk || is_unique {
+                             let name = if is_pk { format!("{}_pkey", col.name()) } else { format!("{}_key", col.name()) };
+                             if seen_names.insert(name.clone()) {
+                                 indexes.push(super::prepared::CachedIndexPlan {
+                                     name,
+                                     is_pk,
+                                     is_unique: true,
+                                     col_indices: vec![idx],
+                                     storage: std::cell::RefCell::new(None)
+                                 });
+                             }
+                        }
+                    }
+
+                    for idx_def in table_def.indexes() {
+                         let name = idx_def.name().to_string();
+                         if seen_names.contains(&name) {
+                             continue;
+                         }
+
+                         let col_indices: Vec<usize> = idx_def.columns().iter().filter_map(|cname| {
+                             table_def.columns().iter().position(|c| c.name().eq_ignore_ascii_case(cname))
+                         }).collect();
+                         
+                         if !col_indices.is_empty() {
+                             seen_names.insert(name.clone());
+                             indexes.push(super::prepared::CachedIndexPlan {
+                                 name,
+                                 is_pk: false, 
+                                 is_unique: idx_def.is_unique(),
+                                 col_indices,
+                                 storage: std::cell::RefCell::new(None)
+                             });
+                         }
+                    }
+
                     let cached_plan = super::prepared::CachedInsertPlan {
                         table_id: table_def.id(),
                         schema_name: schema_name.to_string(),
@@ -2266,6 +2361,7 @@ impl Database {
                         row_count: std::cell::Cell::new(None),
                          storage: std::cell::RefCell::new(Some(std::sync::Arc::downgrade(&storage_arc))),
                          record_buffer: std::cell::RefCell::new(Vec::with_capacity(256)),
+                         indexes,
                     };
                     
                     prepared.set_cached_insert_plan(cached_plan);
@@ -2390,7 +2486,7 @@ impl Database {
                 result
             }
             Statement::Update(update) => self.execute_update(update, params.unwrap_or(&[]), &arena),
-            Statement::Delete(delete) => self.execute_delete(delete, arena),
+            Statement::Delete(delete) => self.execute_delete(delete, params.unwrap_or(&[]), arena),
             Statement::Select(_) => {
                 let (columns, rows) = self.query_with_columns(sql)?;
                 Ok(ExecuteResult::Select { columns, rows })

@@ -111,6 +111,7 @@ impl Database {
     pub(crate) fn execute_delete(
         &self,
         delete: &crate::sql::ast::DeleteStmt<'_>,
+        params: &[OwnedValue],
         arena: &Bump,
     ) -> Result<ExecuteResult> {
         self.ensure_catalog()?;
@@ -194,20 +195,96 @@ impl Database {
 
         let root_page = 1u32;
         let btree = BTree::new(&mut *storage, root_page)?;
-        let mut cursor = btree.cursor_first()?;
+
+        let mut pk_lookup_info: Option<(Vec<u8>, OwnedValue)> = 'pk_analysis: {
+            if let Some(ref w) = delete.where_clause {
+                if let crate::sql::ast::Expr::BinaryOp { left, op: crate::sql::ast::BinaryOperator::Eq, right } = w {
+                    if let Some(pk_idx) = columns.iter().position(|c| c.has_constraint(&Constraint::PrimaryKey)) {
+                        let pk_col_name = columns[pk_idx].name();
+
+                        let val_expr = match (&**left, &**right) {
+                            (crate::sql::ast::Expr::Column(c), val) if c.column.eq_ignore_ascii_case(pk_col_name) => Some(val),
+                            (val, crate::sql::ast::Expr::Column(c)) if c.column.eq_ignore_ascii_case(pk_col_name) => Some(val),
+                            _ => None,
+                        };
+
+                        if let Some(expr) = val_expr {
+                            let val_opt = if let crate::sql::ast::Expr::Parameter(param_ref) = expr {
+                                 match param_ref {
+                                     crate::sql::ast::ParameterRef::Anonymous => params.get(0).cloned(),
+                                     crate::sql::ast::ParameterRef::Positional(idx) => if *idx > 0 { params.get((*idx - 1) as usize).cloned() } else { None },
+                                     _ => None,
+                                 }
+                            } else {
+                                Self::eval_literal(expr).ok()
+                            };
+
+                            if let Some(val) = val_opt {
+                                let pk_index_name = format!("{}_pkey", pk_col_name);
+                                
+                                if file_manager.index_exists(schema_name, table_name, &pk_index_name) {
+                                    if let Ok(index_storage_arc) = file_manager.index_data_mut(schema_name, table_name, &pk_index_name) {
+                                        let mut index_storage = index_storage_arc.write();
+
+                                        let index_root_page = {
+                                            use crate::storage::IndexFileHeader;
+                                            let page0 = index_storage.page(0)?;
+                                            let header = IndexFileHeader::from_bytes(page0)?;
+                                            header.root_page()
+                                        };
+
+                                        let index_btree = BTree::new(&mut *index_storage, index_root_page)?;
+
+                                        let mut index_key = Vec::new();
+                                        Self::encode_value_as_key(&val, &mut index_key);
+
+                                        if let Some(handle) = index_btree.search(&index_key)? {
+                                            let row_key = index_btree.get_value(&handle)?.to_vec();
+                                            break 'pk_analysis Some((row_key, val));
+                                        }
+                                    }
+                                }
+                                break 'pk_analysis None;
+                            }
+                        }
+                    }
+                }
+            }
+            None
+        };
 
         let mut rows_to_delete: Vec<(Vec<u8>, Vec<u8>, Vec<OwnedValue>)> = Vec::new();
         let mut values_to_check: Vec<(usize, OwnedValue)> = Vec::new();
 
+        loop {
+            let mut cursor = if let Some((ref key, _)) = pk_lookup_info {
+                 btree.cursor_seek(key)?
+            } else {
+                 btree.cursor_first()?
+            };
+
         while cursor.valid() {
             let key = cursor.key()?;
+
+            if let Some((ref target_key, _)) = pk_lookup_info {
+                if key != target_key.as_slice() {
+                    break;
+                }
+            }
+
             let value = cursor.value()?;
 
             let user_data = get_user_data(value);
             let record = RecordView::new(user_data, &schema)?;
             let row_values = OwnedValue::extract_row_from_record(&record, &columns)?;
 
-            let should_delete = if let Some(ref pred) = predicate {
+            let should_delete = if let Some((_, ref target_val)) = pk_lookup_info {
+                if let Some(pk_idx) = columns.iter().position(|c| c.has_constraint(&Constraint::PrimaryKey)) {
+                    &row_values[pk_idx] == target_val
+                } else {
+                    false
+                }
+            } else if let Some(ref pred) = predicate {
                 use crate::sql::executor::ExecutorRow;
 
                 let values = owned_values_to_values(&row_values);
@@ -230,6 +307,14 @@ impl Database {
             }
 
             cursor.advance()?;
+        }
+
+        if pk_lookup_info.is_some() && rows_to_delete.is_empty() {
+            pk_lookup_info = None;
+            continue;
+        }
+
+        break;
         }
 
         if !values_to_check.is_empty() {
@@ -321,7 +406,7 @@ impl Database {
             }
         }
 
-        drop(cursor);
+
         drop(btree);
         drop(storage);
 

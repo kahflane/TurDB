@@ -114,6 +114,16 @@ pub struct CachedInsertPlan {
     pub row_count: std::cell::Cell<Option<u64>>,
     pub storage: std::cell::RefCell<Option<std::sync::Weak<RwLock<MmapStorage>>>>,
     pub record_buffer: std::cell::RefCell<Vec<u8>>,
+    pub indexes: Vec<CachedIndexPlan>,
+}
+
+#[derive(Debug, Clone)]
+pub struct CachedIndexPlan {
+    pub name: String,
+    pub is_pk: bool,
+    pub is_unique: bool,
+    pub col_indices: Vec<usize>,
+    pub storage: std::cell::RefCell<Option<std::sync::Weak<RwLock<MmapStorage>>>>,
 }
 
 #[derive(Debug, Clone)]

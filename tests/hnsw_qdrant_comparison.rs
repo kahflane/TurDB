@@ -220,12 +220,12 @@ fn compare_turdb_sql_vs_qdrant_euclidean() {
             query_literal, K
         );
 
-        let turdb_results: Vec<(i64, f64)> = match db.execute(&sql) {
+        let turdb_results: Vec<(i64, f64)> = match db.query(&sql) {
             Ok(rows) => rows
                 .iter()
                 .filter_map(|row| {
                     let id = match &row.values[0] {
-                        OwnedValue::Int(v) => *v,
+                        OwnedValue::Int(v) => v,
                         _ => return None,
                     };
                     let dist = match &row.values[1] {
@@ -233,7 +233,7 @@ fn compare_turdb_sql_vs_qdrant_euclidean() {
                         OwnedValue::Int(v) => *v as f64,
                         _ => return None,
                     };
-                    Some((id, dist))
+                    Some((*id, dist))
                 })
                 .collect(),
             Err(e) => {
