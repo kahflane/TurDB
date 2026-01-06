@@ -40,6 +40,34 @@
 //! - Lock acquisition: O(1) hash lookup + lock contention
 //! - Memory: ~64 bytes per locked page (cleaned up on unlock)
 //! - Shards: 64 for table locks, reduces lock manager contention
+//!
+//! ## Implementation Details
+//!
+//! ### Guard Safety
+//!
+//! PageReadGuard and PageWriteGuard hold raw pointers to PageLockShard. This is
+//! safe because the PageLockManager is stored in Arc<SharedDatabase> which ensures
+//! the manager outlives all guards. The entry Arc keeps the lock data alive.
+//!
+//! ### Lock Acquisition Pattern
+//!
+//! The page_read and page_write methods use a pattern where the parking_lot guard
+//! is acquired and then forgotten via std::mem::forget. This prevents automatic
+//! unlock when the guard goes out of scope. Instead, the Drop implementations on
+//! PageReadGuard/PageWriteGuard manually call force_unlock_read/force_unlock_write.
+//! This allows storing the lock state without complex lifetime management.
+//!
+//! ### Reference Counting and Cleanup
+//!
+//! Each PageLockEntry maintains a reference count. When try_cleanup is called,
+//! it decrements the count and if zero, double-checks under the shard lock before
+//! removing the entry from the map. This prevents race conditions during cleanup.
+//!
+//! ### Table Lock State Cleanup
+//!
+//! When releasing table intent locks, if all lock counts reach zero (intent_shared,
+//! intent_exclusive, and exclusive all false/zero), the table entry is removed
+//! from the map to prevent unbounded memory growth.
 
 use parking_lot::{Mutex, RwLock};
 use std::collections::HashMap;
@@ -49,7 +77,6 @@ use std::sync::Arc;
 const TABLE_SHARD_COUNT: usize = 64;
 const PAGE_SHARD_COUNT: usize = 256;
 
-/// Statistics for monitoring lock performance
 #[derive(Debug, Default)]
 pub struct LockStats {
     pub page_locks_acquired: AtomicU64,
@@ -70,7 +97,6 @@ impl LockStats {
     }
 }
 
-/// A unique identifier for a page within a table
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct PageId {
     pub table_id: u32,
@@ -90,7 +116,6 @@ impl PageId {
     }
 }
 
-/// Per-page lock entry with reference counting for cleanup
 struct PageLockEntry {
     lock: RwLock<()>,
     ref_count: AtomicU64,
@@ -113,7 +138,6 @@ impl PageLockEntry {
     }
 }
 
-/// A shard of page locks
 struct PageLockShard {
     locks: Mutex<HashMap<PageId, Arc<PageLockEntry>>>,
 }
@@ -139,7 +163,6 @@ impl PageLockShard {
     fn try_cleanup(&self, page_id: PageId, entry: &PageLockEntry) {
         if entry.release() {
             let mut map = self.locks.lock();
-            // Double-check ref_count is still 0 under lock
             if entry.ref_count.load(Ordering::Acquire) == 0 {
                 map.remove(&page_id);
             }
@@ -147,7 +170,6 @@ impl PageLockShard {
     }
 }
 
-/// Table-level intent lock
 struct TableLockShard {
     locks: RwLock<HashMap<u32, TableLockState>>,
 }
@@ -167,56 +189,38 @@ impl TableLockShard {
     }
 }
 
-/// Guard for a page read lock - uses RAII to release lock on drop
 pub struct PageReadGuard {
     shard: *const PageLockShard,
     page_id: PageId,
     entry: Arc<PageLockEntry>,
 }
 
-// SAFETY: PageReadGuard only holds a pointer to PageLockShard which is part of PageLockManager.
-// The PageLockManager is always stored in Arc<SharedDatabase> which ensures it outlives all guards.
-// The entry Arc keeps the lock data alive.
 unsafe impl Send for PageReadGuard {}
 unsafe impl Sync for PageReadGuard {}
 
 impl Drop for PageReadGuard {
     fn drop(&mut self) {
-        // Release the read lock
-        // SAFETY: We acquired a read lock in page_read, so we must have a read lock to release.
-        // parking_lot RwLock allows force_unlock which releases the lock held by this thread.
         unsafe { self.entry.lock.force_unlock_read() };
-
-        // Try to clean up the entry if we're the last reference
-        // SAFETY: shard pointer is valid for the lifetime of PageLockManager which outlives this guard
         unsafe { (*self.shard).try_cleanup(self.page_id, &self.entry) };
     }
 }
 
-/// Guard for a page write lock - uses RAII to release lock on drop
 pub struct PageWriteGuard {
     shard: *const PageLockShard,
     page_id: PageId,
     entry: Arc<PageLockEntry>,
 }
 
-// SAFETY: Same reasoning as PageReadGuard
 unsafe impl Send for PageWriteGuard {}
 unsafe impl Sync for PageWriteGuard {}
 
 impl Drop for PageWriteGuard {
     fn drop(&mut self) {
-        // Release the write lock
-        // SAFETY: We acquired a write lock in page_write, so we must have a write lock to release.
         unsafe { self.entry.lock.force_unlock_write() };
-
-        // Try to clean up the entry if we're the last reference
-        // SAFETY: shard pointer is valid for the lifetime of PageLockManager which outlives this guard
         unsafe { (*self.shard).try_cleanup(self.page_id, &self.entry) };
     }
 }
 
-/// Guard for table intent-shared lock
 pub struct TableIntentSharedGuard<'a> {
     lock_manager: &'a PageLockManager,
     table_id: u32,
@@ -228,7 +232,6 @@ impl Drop for TableIntentSharedGuard<'_> {
     }
 }
 
-/// Guard for table intent-exclusive lock
 pub struct TableIntentExclusiveGuard<'a> {
     lock_manager: &'a PageLockManager,
     table_id: u32,
@@ -240,7 +243,6 @@ impl Drop for TableIntentExclusiveGuard<'_> {
     }
 }
 
-/// The main page lock manager
 pub struct PageLockManager {
     page_shards: Vec<PageLockShard>,
     table_shards: Vec<TableLockShard>,
@@ -273,7 +275,6 @@ impl PageLockManager {
         table_id as usize % TABLE_SHARD_COUNT
     }
 
-    /// Acquire an intent-shared lock on a table (for reading pages)
     pub fn table_intent_shared(&self, table_id: u32) -> TableIntentSharedGuard<'_> {
         let shard_idx = self.table_shard_index(table_id);
         let shard = &self.table_shards[shard_idx];
@@ -296,7 +297,6 @@ impl PageLockManager {
         }
     }
 
-    /// Acquire an intent-exclusive lock on a table (for writing pages)
     pub fn table_intent_exclusive(&self, table_id: u32) -> TableIntentExclusiveGuard<'_> {
         let shard_idx = self.table_shard_index(table_id);
         let shard = &self.table_shards[shard_idx];
@@ -327,7 +327,6 @@ impl PageLockManager {
         if let Some(state) = map.get_mut(&table_id) {
             state.intent_shared = state.intent_shared.saturating_sub(1);
 
-            // Clean up if no locks held
             if state.intent_shared == 0 && state.intent_exclusive == 0 && !state.exclusive {
                 map.remove(&table_id);
             }
@@ -342,27 +341,20 @@ impl PageLockManager {
         if let Some(state) = map.get_mut(&table_id) {
             state.intent_exclusive = state.intent_exclusive.saturating_sub(1);
 
-            // Clean up if no locks held
             if state.intent_shared == 0 && state.intent_exclusive == 0 && !state.exclusive {
                 map.remove(&table_id);
             }
         }
     }
 
-    /// Acquire a read lock on a page (blocking)
-    ///
-    /// Should be called while holding a table intent-shared lock.
     pub fn page_read(&self, table_id: u32, page_no: u32) -> PageReadGuard {
         let page_id = PageId::new(table_id, page_no);
         let shard = &self.page_shards[page_id.shard_index()];
         let entry = shard.get_or_create(page_id);
 
-        // Check if lock was contended
         let contended = entry.lock.try_read().is_none();
 
-        // Acquire the read lock (blocking)
         let guard = entry.lock.read();
-        // Forget the guard to prevent automatic unlock - we'll manually unlock in Drop
         std::mem::forget(guard);
 
         self.stats.record_page_lock(contended);
@@ -374,20 +366,14 @@ impl PageLockManager {
         }
     }
 
-    /// Acquire a write lock on a page (blocking)
-    ///
-    /// Should be called while holding a table intent-exclusive lock.
     pub fn page_write(&self, table_id: u32, page_no: u32) -> PageWriteGuard {
         let page_id = PageId::new(table_id, page_no);
         let shard = &self.page_shards[page_id.shard_index()];
         let entry = shard.get_or_create(page_id);
 
-        // Check if lock was contended
         let contended = entry.lock.try_write().is_none();
 
-        // Acquire the write lock (blocking)
         let guard = entry.lock.write();
-        // Forget the guard to prevent automatic unlock - we'll manually unlock in Drop
         std::mem::forget(guard);
 
         self.stats.record_page_lock(contended);
@@ -399,10 +385,6 @@ impl PageLockManager {
         }
     }
 
-    /// Acquire multiple page write locks in order (deadlock-safe)
-    ///
-    /// Pages are sorted by (table_id, page_no) before locking to ensure
-    /// consistent ordering across all transactions.
     pub fn page_write_multi(&self, pages: &[(u32, u32)]) -> Vec<PageWriteGuard> {
         let mut sorted: Vec<_> = pages.to_vec();
         sorted.sort();
@@ -412,7 +394,6 @@ impl PageLockManager {
             .collect()
     }
 
-    /// Get current lock statistics
     pub fn stats(&self) -> &LockStats {
         &self.stats
     }
@@ -465,7 +446,6 @@ mod tests {
         let guard1 = manager.page_write(1, 100);
 
         let handle = thread::spawn(move || {
-            // Different page should succeed immediately
             manager2.page_write(1, 200)
         });
 
@@ -492,7 +472,6 @@ mod tests {
     fn test_multi_page_lock_ordering() {
         let manager = PageLockManager::new();
 
-        // Acquire in reverse order - should still work
         let guards = manager.page_write_multi(&[(1, 300), (1, 100), (1, 200)]);
         assert_eq!(guards.len(), 3);
     }
@@ -505,7 +484,6 @@ mod tests {
             let _guard = manager.page_write(1, 100);
         }
 
-        // Lock should be cleaned up
         let shard = &manager.page_shards[PageId::new(1, 100).shard_index()];
         let map = shard.locks.lock();
         assert!(map.is_empty());
