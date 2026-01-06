@@ -314,6 +314,12 @@ impl Database {
                 .ok_or_else(|| eyre::eyre!("WAL not initialized but WAL mode is enabled"))?;
 
             for (table_id, schema_name, table_name) in table_infos {
+                let _table_lock = self.shared.page_locks.table_intent_exclusive(table_id);
+
+                let dirty_pages = self.shared.dirty_tracker.dirty_pages_for_table(table_id);
+                let page_tuples: Vec<(u32, u32)> = dirty_pages.iter().map(|&p| (table_id, p)).collect();
+                let _page_locks = self.shared.page_locks.page_write_multi(&page_tuples);
+
                 let storage_arc = file_manager
                     .table_data(&schema_name, &table_name)
                     .wrap_err_with(|| {
@@ -364,7 +370,6 @@ impl Database {
                 .collect()
         };
 
-        // Acquire locks and perform batched flush
         let mut file_manager_guard = self.shared.file_manager.write();
         let file_manager = file_manager_guard
             .as_mut()
@@ -375,8 +380,13 @@ impl Database {
             .as_mut()
             .ok_or_else(|| eyre::eyre!("WAL not initialized but WAL mode is enabled"))?;
 
-        // Flush all dirty tables in a single batch
         for (table_id, schema_name, table_name) in table_infos {
+            let _table_lock = self.shared.page_locks.table_intent_exclusive(table_id);
+
+            let dirty_pages = self.shared.dirty_tracker.dirty_pages_for_table(table_id);
+            let page_tuples: Vec<(u32, u32)> = dirty_pages.iter().map(|&p| (table_id, p)).collect();
+            let _page_locks = self.shared.page_locks.page_write_multi(&page_tuples);
+
             let storage_arc = file_manager
                 .table_data(&schema_name, &table_name)
                 .wrap_err_with(|| {

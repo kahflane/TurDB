@@ -154,6 +154,14 @@ impl ShardedDirtyTracker {
         }
         table_ids
     }
+
+    pub fn dirty_pages_for_table(&self, table_id: u32) -> Vec<u32> {
+        let shard = self.shard_for(table_id).lock();
+        shard
+            .get(&table_id)
+            .map(|bm| bm.iter().collect())
+            .unwrap_or_default()
+    }
 }
 
 impl Default for ShardedDirtyTracker {
