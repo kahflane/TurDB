@@ -253,6 +253,8 @@ impl Database {
 
         let mut param_idx = 0usize;
 
+        drop(catalog_guard);
+
         let rows_to_insert: Vec<Vec<OwnedValue>> = match &insert.source {
             crate::sql::ast::InsertSource::Values(values) => {
                 let mut result = Vec::with_capacity(values.len());
@@ -280,7 +282,6 @@ impl Database {
                 result
             }
             crate::sql::ast::InsertSource::Select(select_stmt) => {
-                drop(catalog_guard);
                 let select_rows = self.execute_select_internal(select_stmt)?;
                 select_rows.into_iter().map(|row| row.values).collect()
             }
@@ -289,11 +290,8 @@ impl Database {
             }
         };
 
-        let catalog_guard = self.shared.catalog.read();
         let root_page = 1u32;
         let validator = ConstraintValidator::new(&table_def_for_validator);
-
-        drop(catalog_guard);
 
         let mut file_manager_guard = self.shared.file_manager.write();
         let file_manager = file_manager_guard.as_mut().unwrap();

@@ -66,11 +66,14 @@ impl Database {
         self.ensure_catalog()?;
         self.ensure_file_manager()?;
 
-        let mut catalog_guard = self.shared.catalog.write();
-        let catalog = catalog_guard.as_mut().unwrap();
-
         let schema_name = create.schema.unwrap_or(DEFAULT_SCHEMA);
         let table_name = create.name;
+
+        let mut file_manager_guard = self.shared.file_manager.write();
+        let file_manager = file_manager_guard.as_mut().unwrap();
+
+        let mut catalog_guard = self.shared.catalog.write();
+        let catalog = catalog_guard.as_mut().unwrap();
 
         if catalog
             .get_schema(schema_name)
@@ -158,15 +161,11 @@ impl Database {
         let table_id = self.allocate_table_id();
         catalog.create_table_with_id(schema_name, table_name, columns, table_id)?;
 
-        drop(catalog_guard);
-
         self.shared.table_id_lookup.write().insert(
             table_id as u32,
             (schema_name.to_string(), table_name.to_string()),
         );
 
-        let mut file_manager_guard = self.shared.file_manager.write();
-        let file_manager = file_manager_guard.as_mut().unwrap();
         file_manager.create_table(schema_name, table_name, table_id, column_count)?;
 
         let storage_arc = file_manager.table_data_mut(schema_name, table_name)?;
@@ -174,15 +173,11 @@ impl Database {
         storage.grow(2)?;
         crate::btree::BTree::create(&mut *storage, 1)?;
 
-        let needs_toast = {
-            let catalog_guard = self.shared.catalog.read();
-            let catalog = catalog_guard.as_ref().unwrap();
-            catalog
-                .get_schema(schema_name)
-                .and_then(|s| s.get_table(table_name))
-                .map(|t| t.columns().iter().any(|c| c.data_type().is_toastable()))
-                .unwrap_or(false)
-        };
+        let needs_toast = catalog
+            .get_schema(schema_name)
+            .and_then(|s| s.get_table(table_name))
+            .map(|t| t.columns().iter().any(|c| c.data_type().is_toastable()))
+            .unwrap_or(false);
 
         if needs_toast {
             let toast_table_name = crate::storage::toast::toast_table_name(table_name);
@@ -199,8 +194,6 @@ impl Database {
                 (schema_name.to_string(), toast_table_name.clone()),
             );
 
-            let mut catalog_guard = self.shared.catalog.write();
-            let catalog = catalog_guard.as_mut().unwrap();
             if let Some(schema) = catalog.get_schema_mut(schema_name) {
                 if let Some(table) = schema.get_table(table_name) {
                     let mut table_clone = table.clone();
@@ -242,8 +235,6 @@ impl Database {
                 crate::schema::table::IndexType::BTree,
             );
 
-            let mut catalog_guard = self.shared.catalog.write();
-            let catalog = catalog_guard.as_mut().unwrap();
             if let Some(schema) = catalog.get_schema_mut(schema_name) {
                 if let Some(table) = schema.get_table(table_name) {
                     let table_with_index = table.clone().with_index(index_def);
@@ -252,6 +243,9 @@ impl Database {
                 }
             }
         }
+
+        drop(catalog_guard);
+        drop(file_manager_guard);
 
         self.save_catalog()?;
         self.save_meta()?;
