@@ -40,6 +40,12 @@
 //!
 //! All functions are pure and operate on borrowed data, making them safe
 //! for concurrent use across threads.
+//!
+//! ## Platform Notes
+//!
+//! - **x86_64**: Full AVX2 SIMD support with prefetch hints
+//! - **aarch64**: NEON SIMD support; prefetch disabled (requires nightly Rust)
+//! - **Other**: Scalar fallback implementation
 
 use super::leaf::{extract_prefix, SearchResult, LEAF_CONTENT_START, SLOT_SIZE};
 use crate::storage::PAGE_SIZE;
@@ -515,22 +521,12 @@ pub fn prefetch_slots(page_data: &[u8], start_index: usize, _cell_count: usize) 
 
 #[cfg(target_arch = "aarch64")]
 #[inline]
-pub fn prefetch_slots(page_data: &[u8], start_index: usize, _cell_count: usize) {
-    use std::arch::aarch64::*;
-
-    let slot_offset = LEAF_CONTENT_START + start_index * SLOT_SIZE;
-    if slot_offset + 64 <= PAGE_SIZE {
-        // SAFETY: The pointer is valid (within page bounds)
-        unsafe {
-            _prefetch(page_data.as_ptr().add(slot_offset) as *const i8, _PREFETCH_READ, _PREFETCH_LOCALITY3);
-        }
-    }
+pub fn prefetch_slots(_page_data: &[u8], _start_index: usize, _cell_count: usize) {
 }
 
 #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
 #[inline]
 pub fn prefetch_slots(_page_data: &[u8], _start_index: usize, _cell_count: usize) {
-    // No-op on unsupported architectures
 }
 
 #[cfg(test)]
