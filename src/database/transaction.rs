@@ -86,11 +86,29 @@
 //! 2. Changes are flushed to WAL before commit returns
 //! 3. This ensures durability even on crash after commit
 //!
+//! ## Group Commit
+//!
+//! When group_commit_queue is enabled, multiple concurrent transactions batch
+//! their WAL flushes together for better throughput:
+//! 1. Transaction submits dirty table IDs to the queue and waits
+//! 2. One transaction becomes the flush leader and performs the batched flush
+//! 3. All waiting transactions are notified on completion or failure
+//!
+//! ## Page-Level Locking
+//!
+//! During WAL flush, fine-grained page locks are acquired to enable concurrent
+//! writes to different pages:
+//! 1. Acquire table intent-exclusive lock for each dirty table
+//! 2. Acquire page-write locks for all dirty pages (sorted order for deadlock prevention)
+//! 3. Perform the WAL flush while holding locks
+//! 4. Release locks (RAII via guard drop)
+//!
 //! ## Thread Safety
 //!
 //! - `active_txn` is protected by a Mutex (one transaction per connection)
 //! - Write entries are owned by the transaction (no sharing)
 //! - WAL flush acquires file_manager and WAL locks atomically
+//! - Page locks use 256-shard design to minimize contention
 
 use crate::mvcc::{TxnId, TxnState, UndoRegistry, WriteEntry};
 use crate::schema::table::{Constraint, IndexType};
@@ -263,17 +281,12 @@ impl Database {
                 return Ok(ExecuteResult::Commit);
             }
 
-            // Use group commit for better performance with concurrent transactions
             if self.shared.group_commit_queue.is_enabled() {
-                // Convert to SmallVec for group commit
                 let dirty_ids: SmallVec<[u32; 8]> = dirty_table_ids.into_iter().collect();
 
-                // Submit to group commit queue and wait
                 match self.shared.group_commit_queue.submit_and_wait(dirty_ids) {
                     Ok(_batch_id) => {
-                        // Check if we need to actually flush (we may be the leader)
                         if let Some(pending_commits) = self.shared.group_commit_queue.take_pending() {
-                            // We're the flush leader - perform the batched WAL flush
                             let result = self.execute_group_wal_flush(&pending_commits);
                             match &result {
                                 Ok(()) => self.shared.group_commit_queue.complete_batch(&pending_commits),
@@ -284,13 +297,11 @@ impl Database {
                         return Ok(ExecuteResult::Commit);
                     }
                     Err(e) => {
-                        // Fall back to direct flush on group commit failure
                         bail!("group commit failed: {}", e);
                     }
                 }
             }
 
-            // Direct flush path (when group commit is disabled)
             let table_infos: Vec<(u32, String, String)> = {
                 let lookup = self.shared.table_id_lookup.read();
                 dirty_table_ids
@@ -343,21 +354,18 @@ impl Database {
         Ok(ExecuteResult::Commit)
     }
 
-    /// Execute a batched WAL flush for multiple transactions (group commit)
     fn execute_group_wal_flush(
         &self,
         pending_commits: &[std::sync::Arc<super::group_commit::PendingCommit>],
     ) -> Result<()> {
         use super::group_commit::collect_dirty_tables;
 
-        // Collect all unique dirty table IDs from the batch
         let all_dirty_table_ids = collect_dirty_tables(pending_commits);
 
         if all_dirty_table_ids.is_empty() {
             return Ok(());
         }
 
-        // Get table info for all dirty tables
         let table_infos: Vec<(u32, String, String)> = {
             let lookup = self.shared.table_id_lookup.read();
             all_dirty_table_ids
