@@ -1073,7 +1073,6 @@ fn test_1() { }  // Meaningless
 - Full CRUD cycles with real files (not mocks)
 - Crash recovery scenarios (kill process mid-operation)
 - Concurrent access patterns (multiple threads/processes)
-- Memory-constrained operation (1MB limit enforcement)
 
 ### Fuzz Testing
 

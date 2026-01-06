@@ -129,7 +129,12 @@ impl SlotBatch {
 /// * `cell_count` - Number of cells in the page
 ///
 /// # Returns
-/// * `(left_bound, exact_matches)` - The narrowed search range and a bitmask of exact prefix matches
+/// * `(left_bound, right_bound, exact_match_mask)` - The narrowed search range and a bitmask of exact prefix matches
+///
+/// # Safety
+/// Caller must verify AVX2 support via `is_x86_feature_detected!("avx2")`.
+/// The caller must ensure page_data is valid and cell_count does not exceed
+/// the actual number of slots in the page.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 pub unsafe fn simd_prefix_search_avx2(
@@ -146,21 +151,18 @@ pub unsafe fn simd_prefix_search_avx2(
     let mut left = 0usize;
     let mut right = cell_count;
 
-    // Broadcast target prefix to all lanes
-    let target = _mm256_set1_epi32(target_prefix as i32);
+    let sign_bit = _mm256_set1_epi32(0x80000000u32 as i32);
+    let target_unsigned = _mm256_xor_si256(_mm256_set1_epi32(target_prefix as i32), sign_bit);
 
-    // Process 8 slots at a time when range is large enough
     while right - left >= AVX2_BATCH_SIZE {
         let mid_start = left + (right - left) / 2;
-        // Align to batch boundary
         let batch_start = mid_start.saturating_sub(AVX2_BATCH_SIZE / 2);
         let batch_start = batch_start.min(right.saturating_sub(AVX2_BATCH_SIZE));
 
         if batch_start + AVX2_BATCH_SIZE > cell_count {
-            break; // Fall back to scalar for remainder
+            break;
         }
 
-        // Load 8 prefixes (need to gather from non-contiguous memory due to slot layout)
         let mut prefixes = [0i32; 8];
         for i in 0..8 {
             let slot_offset = LEAF_CONTENT_START + (batch_start + i) * SLOT_SIZE;
@@ -171,45 +173,48 @@ pub unsafe fn simd_prefix_search_avx2(
         }
 
         let batch = _mm256_loadu_si256(prefixes.as_ptr() as *const __m256i);
+        let batch_unsigned = _mm256_xor_si256(batch, sign_bit);
 
-        // Compare: find positions where prefix < target (we want the first >= target)
-        let cmp_lt = _mm256_cmpgt_epi32(target, batch); // target > batch means batch < target
+        let cmp_lt = _mm256_cmpgt_epi32(target_unsigned, batch_unsigned);
         let lt_mask = _mm256_movemask_epi8(cmp_lt) as u32;
 
-        // Find first slot where prefix >= target using trailing zeros
-        // Each comparison produces 4 bytes in the mask
-        let first_ge_idx = if lt_mask == 0xFFFFFFFF {
-            // All prefixes < target, search in right half
+        let cmp_eq = _mm256_cmpeq_epi32(_mm256_set1_epi32(target_prefix as i32), batch);
+        let eq_mask = _mm256_movemask_epi8(cmp_eq) as u32;
+
+        if lt_mask == 0xFFFFFFFF {
+            if eq_mask != 0 {
+                let eq_idx = (eq_mask.trailing_zeros() / 4) as usize;
+                return (batch_start + eq_idx, batch_start + eq_idx + 1, eq_mask);
+            }
             left = batch_start + AVX2_BATCH_SIZE;
             continue;
         } else if lt_mask == 0 {
-            // All prefixes >= target, search in left half
+            if eq_mask != 0 {
+                let eq_idx = (eq_mask.trailing_zeros() / 4) as usize;
+                return (batch_start + eq_idx, batch_start + eq_idx + 1, eq_mask);
+            }
             right = batch_start;
             continue;
-        } else {
-            // Mixed: find transition point
-            // Each i32 produces 4 bytes in mask, so divide by 4
-            (lt_mask.trailing_ones() / 4) as usize
-        };
+        }
 
-        // Narrow the range
+        let first_ge_idx = (lt_mask.trailing_ones() / 4) as usize;
+
         if first_ge_idx > 0 {
             left = batch_start + first_ge_idx - 1;
         }
         right = batch_start + first_ge_idx.min(7) + 1;
 
-        // Check for exact matches in narrowed range
-        let cmp_eq = _mm256_cmpeq_epi32(target, batch);
-        let eq_mask = _mm256_movemask_epi8(cmp_eq) as u32;
-
         return (left, right, eq_mask);
     }
 
-    // Fall back to scalar for small ranges
     (left, right, 0)
 }
 
 /// SIMD-accelerated binary search for a prefix in the slot array (NEON version)
+///
+/// # Safety
+/// NEON is guaranteed on aarch64. The caller must ensure page_data is valid
+/// and cell_count does not exceed the actual number of slots in the page.
 #[cfg(target_arch = "aarch64")]
 pub unsafe fn simd_prefix_search_neon(
     page_data: &[u8],
@@ -225,10 +230,8 @@ pub unsafe fn simd_prefix_search_neon(
     let mut left = 0usize;
     let mut right = cell_count;
 
-    // Broadcast target prefix to all lanes
     let target = vdupq_n_u32(target_prefix);
 
-    // Process 4 slots at a time when range is large enough
     while right - left >= NEON_BATCH_SIZE {
         let mid_start = left + (right - left) / 2;
         let batch_start = mid_start.saturating_sub(NEON_BATCH_SIZE / 2);
@@ -238,44 +241,46 @@ pub unsafe fn simd_prefix_search_neon(
             break;
         }
 
-        // Load 4 prefixes
         let mut prefixes = [0u32; 4];
-        for i in 0..4 {
+        for (i, prefix) in prefixes.iter_mut().enumerate() {
             let slot_offset = LEAF_CONTENT_START + (batch_start + i) * SLOT_SIZE;
             let prefix_bytes: [u8; 4] = page_data[slot_offset..slot_offset + 4]
                 .try_into()
                 .unwrap_or([0; 4]);
-            prefixes[i] = u32::from_be_bytes(prefix_bytes);
+            *prefix = u32::from_be_bytes(prefix_bytes);
         }
 
         let batch = vld1q_u32(prefixes.as_ptr());
-
-        // Compare for less-than (batch < target)
         let cmp_lt = vcltq_u32(batch, target);
-
-        // Convert comparison result to mask
         let cmp_narrow = vmovn_u32(cmp_lt);
         let mask_val = vget_lane_u64(vreinterpret_u64_u16(cmp_narrow), 0);
 
-        let first_ge_idx = if mask_val == 0xFFFFFFFFFFFFFFFF {
+        let cmp_eq = vceqq_u32(batch, target);
+        let eq_narrow = vmovn_u32(cmp_eq);
+        let eq_mask = vget_lane_u64(vreinterpret_u64_u16(eq_narrow), 0) as u32;
+
+        if mask_val == 0xFFFFFFFFFFFFFFFF {
+            if eq_mask != 0 {
+                let eq_idx = (eq_mask.trailing_zeros() / 16) as usize;
+                return (batch_start + eq_idx, batch_start + eq_idx + 1, eq_mask);
+            }
             left = batch_start + NEON_BATCH_SIZE;
             continue;
         } else if mask_val == 0 {
+            if eq_mask != 0 {
+                let eq_idx = (eq_mask.trailing_zeros() / 16) as usize;
+                return (batch_start + eq_idx, batch_start + eq_idx + 1, eq_mask);
+            }
             right = batch_start;
             continue;
-        } else {
-            (mask_val.trailing_ones() / 16) as usize
-        };
+        }
+
+        let first_ge_idx = (mask_val.trailing_ones() / 16) as usize;
 
         if first_ge_idx > 0 {
             left = batch_start + first_ge_idx - 1;
         }
         right = batch_start + first_ge_idx.min(3) + 1;
-
-        // Check for exact matches
-        let cmp_eq = vceqq_u32(batch, target);
-        let eq_narrow = vmovn_u32(cmp_eq);
-        let eq_mask = vget_lane_u64(vreinterpret_u64_u16(eq_narrow), 0) as u32;
 
         return (left, right, eq_mask);
     }
@@ -579,7 +584,6 @@ mod tests {
 
     #[test]
     fn test_prefix_comparison_order() {
-        // Test that big-endian comparison gives correct lexicographic order
         let key_a = b"aaaa";
         let key_b = b"aaab";
         let key_c = b"aaba";
@@ -590,5 +594,237 @@ mod tests {
 
         assert!(prefix_a < prefix_b);
         assert!(prefix_b < prefix_c);
+    }
+
+    fn create_test_page_with_keys(keys: &[&[u8]]) -> Vec<u8> {
+        use crate::storage::{PageHeader, PageType};
+
+        let mut page = vec![0u8; PAGE_SIZE];
+
+        let header = PageHeader::from_bytes_mut(&mut page).unwrap();
+        header.set_page_type(PageType::BTreeLeaf);
+        header.set_cell_count(keys.len() as u16);
+        header.set_free_start((LEAF_CONTENT_START + keys.len() * SLOT_SIZE) as u16);
+
+        let mut cell_end = PAGE_SIZE;
+        for (i, key) in keys.iter().enumerate() {
+            let cell_size = key.len() + 2;
+            cell_end -= cell_size;
+
+            page[cell_end..cell_end + key.len()].copy_from_slice(key);
+            page[cell_end + key.len()] = 0;
+            page[cell_end + key.len() + 1] = 0;
+
+            let slot_offset = LEAF_CONTENT_START + i * SLOT_SIZE;
+            let prefix = extract_prefix(key);
+            page[slot_offset..slot_offset + 4].copy_from_slice(&prefix);
+            page[slot_offset + 4..slot_offset + 6]
+                .copy_from_slice(&(cell_end as u16).to_le_bytes());
+            page[slot_offset + 6..slot_offset + 8]
+                .copy_from_slice(&(key.len() as u16).to_le_bytes());
+        }
+
+        let header = PageHeader::from_bytes_mut(&mut page).unwrap();
+        header.set_free_end(cell_end as u16);
+
+        page
+    }
+
+    #[test]
+    fn test_high_byte_prefix_ordering() {
+        let key_low = b"aaa";
+        let key_high = b"\x80\x00\x00";
+
+        let prefix_low = u32::from_be_bytes(extract_prefix(key_low));
+        let prefix_high = u32::from_be_bytes(extract_prefix(key_high));
+
+        assert!(
+            prefix_low < prefix_high,
+            "0x{:08X} should be < 0x{:08X} for correct lexicographic order",
+            prefix_low,
+            prefix_high
+        );
+    }
+
+    #[test]
+    fn test_find_key_simd_with_high_byte_keys() {
+        let keys: Vec<&[u8]> = vec![
+            b"aaa",
+            b"bbb",
+            b"ccc",
+            b"\x80\x00\x00",
+            b"\x90\x00\x00",
+            b"\xff\x00\x00",
+        ];
+
+        let page = create_test_page_with_keys(&keys);
+
+        for (expected_idx, key) in keys.iter().enumerate() {
+            let result = find_key_simd(&page, key, keys.len());
+            assert_eq!(
+                result,
+                SearchResult::Found(expected_idx),
+                "Failed to find key {:?} (expected at index {})",
+                key,
+                expected_idx
+            );
+        }
+    }
+
+    #[test]
+    fn test_find_key_simd_not_found_high_byte() {
+        let keys: Vec<&[u8]> = vec![
+            b"aaa",
+            b"ccc",
+            b"\x80\x00\x00",
+            b"\xff\x00\x00",
+        ];
+
+        let page = create_test_page_with_keys(&keys);
+
+        let result = find_key_simd(&page, b"bbb", keys.len());
+        assert_eq!(
+            result,
+            SearchResult::NotFound(1),
+            "bbb should be inserted at index 1"
+        );
+
+        let result = find_key_simd(&page, b"\x85\x00\x00", keys.len());
+        assert_eq!(
+            result,
+            SearchResult::NotFound(3),
+            "0x85... should be inserted at index 3"
+        );
+    }
+
+    #[test]
+    fn test_find_key_simd_matches_scalar_for_many_keys() {
+        let mut keys: Vec<Vec<u8>> = Vec::new();
+        for i in 0u8..64 {
+            keys.push(vec![i, 0, 0, 0]);
+        }
+        for i in 0x80u8..0xC0 {
+            keys.push(vec![i, 0, 0, 0]);
+        }
+
+        keys.sort();
+        let key_refs: Vec<&[u8]> = keys.iter().map(|k| k.as_slice()).collect();
+        let page = create_test_page_with_keys(&key_refs);
+
+        for (expected_idx, key) in key_refs.iter().enumerate() {
+            let simd_result = find_key_simd(&page, key, key_refs.len());
+            assert_eq!(
+                simd_result,
+                SearchResult::Found(expected_idx),
+                "SIMD failed to find key {:02X?} at index {}",
+                key,
+                expected_idx
+            );
+        }
+
+        let not_found_key = vec![0x50u8, 0, 0, 0];
+        let simd_result = find_key_simd(&page, &not_found_key, key_refs.len());
+        if let SearchResult::NotFound(idx) = simd_result {
+            assert!(
+                idx <= key_refs.len(),
+                "Insertion point {} should be <= {}",
+                idx,
+                key_refs.len()
+            );
+            if idx > 0 {
+                assert!(
+                    key_refs[idx - 1] < not_found_key.as_slice(),
+                    "Key at idx-1 should be less than search key"
+                );
+            }
+            if idx < key_refs.len() {
+                assert!(
+                    key_refs[idx] > not_found_key.as_slice(),
+                    "Key at idx should be greater than search key"
+                );
+            }
+        } else {
+            panic!("Key 0x50... should not be found");
+        }
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn test_avx2_unsigned_comparison() {
+        if !is_x86_feature_detected!("avx2") {
+            return;
+        }
+
+        let keys: Vec<&[u8]> = vec![
+            b"\x00\x00\x00\x00",
+            b"\x40\x00\x00\x00",
+            b"\x7f\xff\xff\xff",
+            b"\x80\x00\x00\x00",
+            b"\xc0\x00\x00\x00",
+            b"\xff\xff\xff\xff",
+        ];
+
+        let page = create_test_page_with_keys(&keys);
+
+        let target_prefix_mid = 0x80000000u32;
+        let (left, right, _) = unsafe {
+            simd_prefix_search_avx2(&page, target_prefix_mid, keys.len())
+        };
+
+        assert!(
+            left <= 3 && right >= 4,
+            "Range [{}, {}) should include index 3 (where 0x80... is)",
+            left,
+            right
+        );
+    }
+
+    #[test]
+    #[cfg(target_arch = "aarch64")]
+    fn test_neon_prefix_search() {
+        let keys: Vec<&[u8]> = vec![
+            b"\x00\x00\x00\x00",
+            b"\x40\x00\x00\x00",
+            b"\x80\x00\x00\x00",
+            b"\xc0\x00\x00\x00",
+        ];
+
+        let page = create_test_page_with_keys(&keys);
+
+        let target_prefix = 0x80000000u32;
+        let (left, right, _) = unsafe {
+            simd_prefix_search_neon(&page, target_prefix, keys.len())
+        };
+
+        assert!(
+            left <= 2 && right >= 3,
+            "Range [{}, {}) should include index 2 (where 0x80... is)",
+            left,
+            right
+        );
+    }
+
+    #[test]
+    fn test_scalar_handles_signed_boundary() {
+        let keys: Vec<&[u8]> = vec![
+            b"\x7f\xff\xff\xff",
+            b"\x80\x00\x00\x00",
+        ];
+
+        let page = create_test_page_with_keys(&keys);
+
+        let result = find_key_simd(&page, b"\x80\x00\x00\x00", keys.len());
+        assert_eq!(
+            result,
+            SearchResult::Found(1),
+            "0x80000000 should be found at index 1"
+        );
+
+        let result = find_key_simd(&page, b"\x7f\xff\xff\xff", keys.len());
+        assert_eq!(
+            result,
+            SearchResult::Found(0),
+            "0x7FFFFFFF should be found at index 0"
+        );
     }
 }

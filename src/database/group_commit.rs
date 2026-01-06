@@ -20,6 +20,31 @@
 //! 3. All pending commits are flushed to WAL in a single I/O operation
 //! 4. All waiting threads are notified of completion
 //!
+//! ## Leader Election Protocol
+//!
+//! When multiple threads call `submit_and_wait()` concurrently, one thread
+//! becomes the "leader" responsible for performing the actual WAL flush:
+//!
+//! ```text
+//! Thread A (Leader):                Thread B (Waiter):
+//! ─────────────────                 ─────────────────
+//! submit_and_wait()                 submit_and_wait()
+//!   └─► adds pending                  └─► adds pending
+//!   └─► should_flush? YES             └─► should_flush? NO (in progress)
+//!   └─► sets flush_in_progress        └─► waits on flush_complete
+//!   └─► returns IMMEDIATELY
+//! take_pending()
+//! execute_group_wal_flush()
+//! complete_batch()
+//!   └─► notifies flush_complete ──────► wakes up, returns
+//! ```
+//!
+//! The leader is the first thread to set `flush_in_progress = true`. That
+//! thread returns from `wait_for_completion()` immediately (without waiting
+//! for completion) so it can proceed to call `take_pending()` and execute
+//! the WAL flush. Other threads block on `flush_complete` until the leader
+//! calls `complete_batch()`.
+//!
 //! ## Performance Benefits
 //!
 //! - Reduces fsync() calls from N to 1 for N concurrent commits
@@ -51,9 +76,9 @@ pub struct GroupCommitConfig {
 impl Default for GroupCommitConfig {
     fn default() -> Self {
         Self {
-            max_batch_size: 64,      // Match transaction slot limit
-            max_wait_us: 1000,       // 1ms max latency
-            min_batch_size: 1,       // Flush immediately if at least 1 commit
+            max_batch_size: 64,
+            max_wait_us: 1000,
+            min_batch_size: 1,
         }
     }
 }
@@ -63,7 +88,7 @@ impl GroupCommitConfig {
     pub fn high_throughput() -> Self {
         Self {
             max_batch_size: 128,
-            max_wait_us: 5000,   // 5ms
+            max_wait_us: 5000,
             min_batch_size: 4,
         }
     }
@@ -72,7 +97,7 @@ impl GroupCommitConfig {
     pub fn low_latency() -> Self {
         Self {
             max_batch_size: 16,
-            max_wait_us: 100,   // 100us
+            max_wait_us: 100,
             min_batch_size: 1,
         }
     }
@@ -232,7 +257,6 @@ impl GroupCommitQueue {
     /// Returns the batch ID this commit was part of, or an error message
     pub fn submit_and_wait(&self, dirty_table_ids: SmallVec<[u32; 8]>) -> Result<u64, String> {
         if !self.is_enabled() || dirty_table_ids.is_empty() {
-            // Bypass batching if disabled or no dirty pages
             return Ok(0);
         }
 
@@ -248,18 +272,14 @@ impl GroupCommitQueue {
             let pending = std::sync::Arc::new(PendingCommit::new(batch_id, dirty_table_ids));
             state.pending.push_back(std::sync::Arc::clone(&pending));
 
-            // Check if we should trigger a flush
             let should_flush = state.pending.len() >= self.config.max_batch_size;
-
             if should_flush && !state.flush_in_progress {
-                // Signal that a flush should happen
                 self.commit_ready.notify_one();
             }
 
             pending
         };
 
-        // Wait for completion
         self.wait_for_completion(&pending)?;
 
         Ok(pending.batch_id)
@@ -278,7 +298,6 @@ impl GroupCommitQueue {
         let pending = std::sync::Arc::new(PendingCommit::new(batch_id, dirty_table_ids));
         state.pending.push_back(std::sync::Arc::clone(&pending));
 
-        // Check if we should trigger a flush
         if state.pending.len() >= self.config.max_batch_size && !state.flush_in_progress {
             self.commit_ready.notify_one();
         }
@@ -287,27 +306,23 @@ impl GroupCommitQueue {
     }
 
     fn wait_for_completion(&self, pending: &PendingCommit) -> Result<(), String> {
-        let timeout = Duration::from_micros(self.config.max_wait_us * 10); // 10x max wait as absolute timeout
+        let timeout = Duration::from_micros(self.config.max_wait_us * 10);
         let start = Instant::now();
 
         while !pending.is_completed() {
             let mut state = self.state.lock();
 
-            // Double-check completion with lock held
             if pending.is_completed() {
                 break;
             }
 
-            // Check if we should initiate a flush
             let should_flush = !state.flush_in_progress && self.should_flush(&state);
 
             if should_flush {
                 state.flush_in_progress = true;
                 drop(state);
-                // Signal that flush should happen (handled by flush_pending)
-                self.commit_ready.notify_all();
+                return Ok(());
             } else {
-                // Wait for flush to complete
                 let remaining = timeout.saturating_sub(start.elapsed());
                 if remaining.is_zero() {
                     return Err("group commit timeout".to_string());
@@ -328,19 +343,16 @@ impl GroupCommitQueue {
             return false;
         }
 
-        // Flush if batch size reached
         if state.pending.len() >= self.config.max_batch_size {
             return true;
         }
 
-        // Flush if timeout reached
         if let Some(batch_start) = state.batch_start {
             if batch_start.elapsed() >= Duration::from_micros(self.config.max_wait_us) {
                 return true;
             }
         }
 
-        // Flush if we have minimum batch size
         state.pending.len() >= self.config.min_batch_size
     }
 
@@ -353,9 +365,7 @@ impl GroupCommitQueue {
             return None;
         }
 
-        // Mark flush as in progress
         state.flush_in_progress = true;
-
         let pending: Vec<_> = state.pending.drain(..).collect();
         state.batch_start = None;
 
@@ -370,10 +380,8 @@ impl GroupCommitQueue {
             commit.mark_completed();
         }
 
-        // Update stats
         self.stats.record_flush(batch_size);
 
-        // Clear flush_in_progress and notify waiters
         {
             let mut state = self.state.lock();
             state.flush_in_progress = false;
@@ -387,7 +395,6 @@ impl GroupCommitQueue {
             commit.mark_failed(error.to_string());
         }
 
-        // Clear flush_in_progress and notify waiters
         {
             let mut state = self.state.lock();
             state.flush_in_progress = false;
@@ -536,7 +543,7 @@ mod tests {
         ];
 
         let dirty = collect_dirty_tables(&commits);
-        assert_eq!(dirty.len(), 4); // 1, 2, 3, 4 (deduplicated)
+        assert_eq!(dirty.len(), 4);
     }
 
     #[test]
@@ -546,7 +553,7 @@ mod tests {
 
         let result = queue.submit_and_wait(SmallVec::from_slice(&[1]));
         assert!(result.is_ok());
-        assert_eq!(result.unwrap(), 0); // Bypassed
+        assert_eq!(result.unwrap(), 0);
         assert_eq!(queue.pending_count(), 0);
     }
 
@@ -556,6 +563,6 @@ mod tests {
 
         let result = queue.submit_and_wait(SmallVec::new());
         assert!(result.is_ok());
-        assert_eq!(result.unwrap(), 0); // Bypassed
+        assert_eq!(result.unwrap(), 0);
     }
 }
