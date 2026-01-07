@@ -478,7 +478,8 @@ impl<'storage> RowSource for StreamingBTreeSource<'storage> {
             };
 
             self.row_buffer.clear();
-            self.decoder.decode_into(key, user_data, &mut self.row_buffer)?;
+            self.decoder
+                .decode_into(key, user_data, &mut self.row_buffer)?;
             return Ok(Some(std::mem::take(&mut self.row_buffer)));
         }
     }
@@ -571,7 +572,8 @@ impl<'storage> RowSource for ReverseBTreeSource<'storage> {
             };
 
             self.row_buffer.clear();
-            self.decoder.decode_into(key, user_data, &mut self.row_buffer)?;
+            self.decoder
+                .decode_into(key, user_data, &mut self.row_buffer)?;
             return Ok(Some(std::mem::take(&mut self.row_buffer)));
         }
     }

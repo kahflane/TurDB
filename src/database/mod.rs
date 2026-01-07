@@ -88,9 +88,9 @@
 //! - Insert: > 100K rows/sec
 //! - Query planning: < 100µs for simple queries
 
+mod convert;
 #[allow(clippy::module_inception)]
 mod database;
-mod convert;
 mod ddl;
 pub mod dirty_tracker;
 mod dml;
@@ -105,10 +105,10 @@ mod toast;
 mod transaction;
 
 pub use database::Database;
-pub use timing::{get_batch_timing_stats, get_timing_stats, reset_timing_stats};
-pub use transaction::{ActiveTransaction, Savepoint};
 pub use prepared::{BoundStatement, PreparedStatement};
 pub use row::Row;
+pub use timing::{get_batch_timing_stats, get_timing_stats, reset_timing_stats};
+pub use transaction::{ActiveTransaction, Savepoint};
 
 #[derive(Debug)]
 pub enum ExecuteResult {
@@ -968,7 +968,10 @@ mod tests {
             "Complex JOIN query should succeed now that executor supports joins"
         );
         let rows = result.unwrap();
-        println!("Complex JOIN with filter and LIMIT returned {} rows", rows.len());
+        println!(
+            "Complex JOIN with filter and LIMIT returned {} rows",
+            rows.len()
+        );
 
         db.close().unwrap();
 
@@ -1958,8 +1961,10 @@ mod tests {
 
         let db = Database::create(&db_path).unwrap();
 
-        db.execute("CREATE TABLE orders (id INT PRIMARY KEY, customer_id INT, status TEXT, amount INT)")
-            .unwrap();
+        db.execute(
+            "CREATE TABLE orders (id INT PRIMARY KEY, customer_id INT, status TEXT, amount INT)",
+        )
+        .unwrap();
 
         db.execute("INSERT INTO orders VALUES (1, 100, 'pending', 50)")
             .unwrap();
@@ -1974,10 +1979,16 @@ mod tests {
             .unwrap();
 
         let rows = db
-            .query("SELECT id FROM orders WHERE customer_id = 100 AND status = 'pending' ORDER BY id")
+            .query(
+                "SELECT id FROM orders WHERE customer_id = 100 AND status = 'pending' ORDER BY id",
+            )
             .unwrap();
 
-        assert_eq!(rows.len(), 2, "Should find 2 pending orders for customer 100");
+        assert_eq!(
+            rows.len(),
+            2,
+            "Should find 2 pending orders for customer 100"
+        );
         let ids: Vec<i64> = rows
             .iter()
             .filter_map(|r| match &r.values[0] {
@@ -2101,10 +2112,7 @@ mod tests {
             }
         }
 
-        let categories: Vec<&str> = rows
-            .iter()
-            .filter_map(|r| get_text(&r.values[1]))
-            .collect();
+        let categories: Vec<&str> = rows.iter().filter_map(|r| get_text(&r.values[1])).collect();
         assert_eq!(
             categories,
             vec!["appliances", "books", "clothing", "electronics"]
@@ -2138,7 +2146,11 @@ mod tests {
             .query("SELECT o.id, c.name FROM orders o JOIN customers c ON o.customer_id = c.id LIMIT 2")
             .unwrap();
 
-        assert_eq!(rows.len(), 2, "JOIN with LIMIT 2 should return exactly 2 rows");
+        assert_eq!(
+            rows.len(),
+            2,
+            "JOIN with LIMIT 2 should return exactly 2 rows"
+        );
     }
 
     #[test]
@@ -2565,7 +2577,8 @@ mod tests {
         let db_path = dir.path().join("test_db");
 
         let db = Database::create(&db_path).unwrap();
-        db.execute("CREATE TABLE users (id INT, name TEXT)").unwrap();
+        db.execute("CREATE TABLE users (id INT, name TEXT)")
+            .unwrap();
         db.execute("INSERT INTO users VALUES (1, 'Alice')").unwrap();
 
         let (columns, rows) = db.query_with_columns("SELECT * FROM users").unwrap();
@@ -2579,7 +2592,8 @@ mod tests {
         let db_path = dir.path().join("test_db");
 
         let db = Database::create(&db_path).unwrap();
-        db.execute("CREATE TABLE users (id INT, name TEXT)").unwrap();
+        db.execute("CREATE TABLE users (id INT, name TEXT)")
+            .unwrap();
         db.execute("INSERT INTO users VALUES (1, 'Alice')").unwrap();
 
         let result = db.execute("SELECT * FROM users").unwrap();

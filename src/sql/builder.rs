@@ -56,9 +56,10 @@ impl<'a> ExecutorBuilder<'a> {
             PhysicalOperator::TableScan(_) => Ok(DynamicExecutor::TableScan(
                 TableScanExecutor::new(source, self.ctx.arena),
             )),
-            PhysicalOperator::DualScan => Ok(DynamicExecutor::TableScan(
-                TableScanExecutor::new(source, self.ctx.arena),
-            )),
+            PhysicalOperator::DualScan => Ok(DynamicExecutor::TableScan(TableScanExecutor::new(
+                source,
+                self.ctx.arena,
+            ))),
             PhysicalOperator::FilterExec(filter) => {
                 let child = self.build_operator(filter.input, source, column_map)?;
                 let predicate = CompiledPredicate::new(filter.predicate, column_map.to_vec());
@@ -76,21 +77,16 @@ impl<'a> ExecutorBuilder<'a> {
 
                 let child = self.build_operator(project.input, source, column_map)?;
 
-                let has_complex_expressions = project.expressions.iter().any(|expr| {
-                    match expr {
-                        Expr::Column(_) => false,
-                        Expr::Function(func) => {
-                            if func.over.is_some() {
-                                return false;
-                            }
-                            let name = func.name.name.to_uppercase();
-                            !matches!(
-                                name.as_str(),
-                                "COUNT" | "SUM" | "AVG" | "MIN" | "MAX"
-                            )
+                let has_complex_expressions = project.expressions.iter().any(|expr| match expr {
+                    Expr::Column(_) => false,
+                    Expr::Function(func) => {
+                        if func.over.is_some() {
+                            return false;
                         }
-                        _ => true,
+                        let name = func.name.name.to_uppercase();
+                        !matches!(name.as_str(), "COUNT" | "SUM" | "AVG" | "MIN" | "MAX")
                     }
+                    _ => true,
                 });
 
                 if has_complex_expressions && !project.expressions.is_empty() {
@@ -124,7 +120,10 @@ impl<'a> ExecutorBuilder<'a> {
                                     if let Expr::Column(col_ref) = expr {
                                         for (idx, group_expr) in group_by.iter().enumerate() {
                                             if let Expr::Column(group_col) = group_expr {
-                                                if group_col.column.eq_ignore_ascii_case(col_ref.column) {
+                                                if group_col
+                                                    .column
+                                                    .eq_ignore_ascii_case(col_ref.column)
+                                                {
                                                     return idx;
                                                 }
                                             }
@@ -152,13 +151,18 @@ impl<'a> ExecutorBuilder<'a> {
                                             if matches_func {
                                                 use crate::sql::ast::FunctionArgs;
                                                 let first_arg = match args {
-                                                    FunctionArgs::Args(arg_list) => arg_list.first().map(|a| a.value),
+                                                    FunctionArgs::Args(arg_list) => {
+                                                        arg_list.first().map(|a| a.value)
+                                                    }
                                                     _ => None,
                                                 };
                                                 let args_match = match (agg.argument, first_arg) {
-                                                    (Some(Expr::Column(agg_col)), Some(Expr::Column(arg_col))) => {
-                                                        agg_col.column.eq_ignore_ascii_case(arg_col.column)
-                                                    }
+                                                    (
+                                                        Some(Expr::Column(agg_col)),
+                                                        Some(Expr::Column(arg_col)),
+                                                    ) => agg_col
+                                                        .column
+                                                        .eq_ignore_ascii_case(arg_col.column),
                                                     (None, _) | (Some(Expr::Literal(_)), _) => true,
                                                     _ => false,
                                                 };
@@ -394,9 +398,7 @@ impl<'a> ExecutorBuilder<'a> {
                 )))
             }
             PhysicalOperator::SetOpExec(_) => {
-                eyre::bail!(
-                    "SetOpExec requires special handling - use Database::query instead"
-                )
+                eyre::bail!("SetOpExec requires special handling - use Database::query instead")
             }
         }
     }
@@ -609,7 +611,9 @@ impl<'a> ExecutorBuilder<'a> {
         for (idx, agg) in aggregates.iter().enumerate() {
             if let Some(Expr::Column(col)) = agg.argument {
                 let agg_name = match agg.function {
-                    crate::sql::planner::AggregateFunction::Count => format!("count_{}", col.column),
+                    crate::sql::planner::AggregateFunction::Count => {
+                        format!("count_{}", col.column)
+                    }
                     crate::sql::planner::AggregateFunction::Sum => format!("sum_{}", col.column),
                     crate::sql::planner::AggregateFunction::Avg => format!("avg_{}", col.column),
                     crate::sql::planner::AggregateFunction::Min => format!("min_{}", col.column),
@@ -653,9 +657,7 @@ impl<'a> ExecutorBuilder<'a> {
                 }
             }
             PhysicalOperator::DualScan => Vec::new(),
-            PhysicalOperator::IndexScan(_) => {
-                Vec::new()
-            }
+            PhysicalOperator::IndexScan(_) => Vec::new(),
             PhysicalOperator::FilterExec(filter) => self.compute_input_column_map(filter.input),
             PhysicalOperator::SortExec(sort) => self.compute_input_column_map(sort.input),
             PhysicalOperator::LimitExec(limit) => self.compute_input_column_map(limit.input),

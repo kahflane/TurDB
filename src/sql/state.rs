@@ -347,7 +347,9 @@ impl<'a, S: RowSource> WindowState<'a, S> {
                         } else {
                             partition_indices
                                 .iter()
-                                .filter(|&&row_idx| self.get_arg_value(row_idx, window_func).is_some())
+                                .filter(|&&row_idx| {
+                                    self.get_arg_value(row_idx, window_func).is_some()
+                                })
                                 .count() as f64
                         };
                         for &row_idx in &partition_indices {

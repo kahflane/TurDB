@@ -211,7 +211,10 @@ impl Repl {
                     );
                 }
             }
-            ExecuteResult::Insert { rows_affected, returned } => {
+            ExecuteResult::Insert {
+                rows_affected,
+                returned,
+            } => {
                 if let Some(rows) = returned {
                     if !rows.is_empty() {
                         let headers = self.generate_headers(&rows);
@@ -226,7 +229,10 @@ impl Repl {
                     format_duration(elapsed)
                 );
             }
-            ExecuteResult::Update { rows_affected, returned } => {
+            ExecuteResult::Update {
+                rows_affected,
+                returned,
+            } => {
                 if let Some(rows) = returned {
                     if !rows.is_empty() {
                         let headers = self.generate_headers(&rows);
@@ -241,7 +247,10 @@ impl Repl {
                     format_duration(elapsed)
                 );
             }
-            ExecuteResult::Delete { rows_affected, returned } => {
+            ExecuteResult::Delete {
+                rows_affected,
+                returned,
+            } => {
                 if let Some(rows) = returned {
                     if !rows.is_empty() {
                         let headers = self.generate_headers(&rows);
@@ -323,10 +332,18 @@ impl Repl {
                 println!("Transaction rolled back ({})", format_duration(elapsed));
             }
             ExecuteResult::Savepoint { name } => {
-                println!("Savepoint '{}' created ({})", name, format_duration(elapsed));
+                println!(
+                    "Savepoint '{}' created ({})",
+                    name,
+                    format_duration(elapsed)
+                );
             }
             ExecuteResult::Release { name } => {
-                println!("Savepoint '{}' released ({})", name, format_duration(elapsed));
+                println!(
+                    "Savepoint '{}' released ({})",
+                    name,
+                    format_duration(elapsed)
+                );
             }
             ExecuteResult::AlterTable { action } => {
                 println!("Table altered: {} ({})", action, format_duration(elapsed));

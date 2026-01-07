@@ -45,9 +45,10 @@
 //!
 //! ### Guard Safety
 //!
-//! PageReadGuard and PageWriteGuard hold raw pointers to PageLockShard. This is
-//! safe because the PageLockManager is stored in Arc<SharedDatabase> which ensures
-//! the manager outlives all guards. The entry Arc keeps the lock data alive.
+//! PageReadGuard and PageWriteGuard use Rust's lifetime system to ensure the
+//! guard cannot outlive the PageLockManager. The guard holds a reference to the
+//! shard (`&'a PageLockShard`), which the borrow checker enforces at compile time.
+//! The entry Arc keeps the lock data alive until after unlock.
 //!
 //! ### Lock Acquisition Pattern
 //!
@@ -55,7 +56,8 @@
 //! is acquired and then forgotten via std::mem::forget. This prevents automatic
 //! unlock when the guard goes out of scope. Instead, the Drop implementations on
 //! PageReadGuard/PageWriteGuard manually call force_unlock_read/force_unlock_write.
-//! This allows storing the lock state without complex lifetime management.
+//! The unsafe blocks are justified because we own the lock (via mem::forget) and
+//! are responsible for releasing it exactly once.
 //!
 //! ### Reference Counting and Cleanup
 //!
@@ -189,35 +191,37 @@ impl TableLockShard {
     }
 }
 
-pub struct PageReadGuard {
-    shard: *const PageLockShard,
+pub struct PageReadGuard<'a> {
+    shard: &'a PageLockShard,
     page_id: PageId,
     entry: Arc<PageLockEntry>,
 }
 
-unsafe impl Send for PageReadGuard {}
-unsafe impl Sync for PageReadGuard {}
-
-impl Drop for PageReadGuard {
+impl Drop for PageReadGuard<'_> {
     fn drop(&mut self) {
+        // SAFETY: The read lock was acquired via entry.lock.read() and then
+        // std::mem::forget was called to prevent automatic unlock. We are the
+        // sole owner of this read lock and must manually release it here.
+        // The entry Arc keeps the lock data alive until after this unlock.
         unsafe { self.entry.lock.force_unlock_read() };
-        unsafe { (*self.shard).try_cleanup(self.page_id, &self.entry) };
+        self.shard.try_cleanup(self.page_id, &self.entry);
     }
 }
 
-pub struct PageWriteGuard {
-    shard: *const PageLockShard,
+pub struct PageWriteGuard<'a> {
+    shard: &'a PageLockShard,
     page_id: PageId,
     entry: Arc<PageLockEntry>,
 }
 
-unsafe impl Send for PageWriteGuard {}
-unsafe impl Sync for PageWriteGuard {}
-
-impl Drop for PageWriteGuard {
+impl Drop for PageWriteGuard<'_> {
     fn drop(&mut self) {
+        // SAFETY: The write lock was acquired via entry.lock.write() and then
+        // std::mem::forget was called to prevent automatic unlock. We are the
+        // sole owner of this write lock and must manually release it here.
+        // The entry Arc keeps the lock data alive until after this unlock.
         unsafe { self.entry.lock.force_unlock_write() };
-        unsafe { (*self.shard).try_cleanup(self.page_id, &self.entry) };
+        self.shard.try_cleanup(self.page_id, &self.entry);
     }
 }
 
@@ -239,7 +243,8 @@ pub struct TableIntentExclusiveGuard<'a> {
 
 impl Drop for TableIntentExclusiveGuard<'_> {
     fn drop(&mut self) {
-        self.lock_manager.release_table_intent_exclusive(self.table_id);
+        self.lock_manager
+            .release_table_intent_exclusive(self.table_id);
     }
 }
 
@@ -347,7 +352,7 @@ impl PageLockManager {
         }
     }
 
-    pub fn page_read(&self, table_id: u32, page_no: u32) -> PageReadGuard {
+    pub fn page_read(&self, table_id: u32, page_no: u32) -> PageReadGuard<'_> {
         let page_id = PageId::new(table_id, page_no);
         let shard = &self.page_shards[page_id.shard_index()];
         let entry = shard.get_or_create(page_id);
@@ -360,13 +365,13 @@ impl PageLockManager {
         self.stats.record_page_lock(contended);
 
         PageReadGuard {
-            shard: shard as *const PageLockShard,
+            shard,
             page_id,
             entry,
         }
     }
 
-    pub fn page_write(&self, table_id: u32, page_no: u32) -> PageWriteGuard {
+    pub fn page_write(&self, table_id: u32, page_no: u32) -> PageWriteGuard<'_> {
         let page_id = PageId::new(table_id, page_no);
         let shard = &self.page_shards[page_id.shard_index()];
         let entry = shard.get_or_create(page_id);
@@ -379,17 +384,18 @@ impl PageLockManager {
         self.stats.record_page_lock(contended);
 
         PageWriteGuard {
-            shard: shard as *const PageLockShard,
+            shard,
             page_id,
             entry,
         }
     }
 
-    pub fn page_write_multi(&self, pages: &[(u32, u32)]) -> Vec<PageWriteGuard> {
+    pub fn page_write_multi(&self, pages: &[(u32, u32)]) -> Vec<PageWriteGuard<'_>> {
         let mut sorted: Vec<_> = pages.to_vec();
         sorted.sort();
 
-        sorted.into_iter()
+        sorted
+            .into_iter()
             .map(|(table_id, page_no)| self.page_write(table_id, page_no))
             .collect()
     }
@@ -446,13 +452,12 @@ mod tests {
         let guard1 = manager.page_write(1, 100);
 
         let handle = thread::spawn(move || {
-            manager2.page_write(1, 200)
+            let guard = manager2.page_write(1, 200);
+            drop(guard);
         });
 
-        let guard2 = handle.join().unwrap();
-
+        handle.join().unwrap();
         drop(guard1);
-        drop(guard2);
 
         assert_eq!(manager.stats.page_locks_acquired.load(Ordering::Relaxed), 2);
     }
@@ -487,5 +492,118 @@ mod tests {
         let shard = &manager.page_shards[PageId::new(1, 100).shard_index()];
         let map = shard.locks.lock();
         assert!(map.is_empty());
+    }
+
+    #[test]
+    fn test_concurrent_stress_same_page() {
+        use std::sync::atomic::AtomicU64;
+        use std::sync::Barrier;
+
+        let manager = Arc::new(PageLockManager::new());
+        let counter = Arc::new(AtomicU64::new(0));
+        let barrier = Arc::new(Barrier::new(10));
+        let iterations = 1000;
+
+        let handles: Vec<_> = (0..10)
+            .map(|_| {
+                let manager = Arc::clone(&manager);
+                let counter = Arc::clone(&counter);
+                let barrier = Arc::clone(&barrier);
+
+                thread::spawn(move || {
+                    barrier.wait();
+
+                    for _ in 0..iterations {
+                        let guard = manager.page_write(1, 100);
+                        let old = counter.fetch_add(1, Ordering::SeqCst);
+                        assert_eq!(
+                            counter.load(Ordering::SeqCst),
+                            old + 1,
+                            "Race condition detected: counter was modified while holding exclusive lock"
+                        );
+                        drop(guard);
+                    }
+                })
+            })
+            .collect();
+
+        for handle in handles {
+            handle.join().expect("Thread panicked");
+        }
+
+        assert_eq!(counter.load(Ordering::SeqCst), 10 * iterations);
+
+        let shard = &manager.page_shards[PageId::new(1, 100).shard_index()];
+        let map = shard.locks.lock();
+        assert!(map.is_empty(), "Lock entry should be cleaned up after all locks released");
+    }
+
+    #[test]
+    fn test_concurrent_read_write_same_page() {
+        use std::sync::Barrier;
+
+        let manager = Arc::new(PageLockManager::new());
+        let barrier = Arc::new(Barrier::new(20));
+        let iterations = 500;
+
+        let handles: Vec<_> = (0..20)
+            .map(|i| {
+                let manager = Arc::clone(&manager);
+                let barrier = Arc::clone(&barrier);
+
+                thread::spawn(move || {
+                    barrier.wait();
+
+                    for _ in 0..iterations {
+                        if i % 2 == 0 {
+                            let _guard = manager.page_read(1, 100);
+                            std::thread::yield_now();
+                        } else {
+                            let _guard = manager.page_write(1, 100);
+                            std::thread::yield_now();
+                        }
+                    }
+                })
+            })
+            .collect();
+
+        for handle in handles {
+            handle.join().expect("Thread panicked");
+        }
+
+        let shard = &manager.page_shards[PageId::new(1, 100).shard_index()];
+        let map = shard.locks.lock();
+        assert!(map.is_empty(), "Lock entry should be cleaned up after all locks released");
+    }
+
+    #[test]
+    fn test_cleanup_race_condition() {
+        use std::sync::Barrier;
+
+        let manager = Arc::new(PageLockManager::new());
+        let barrier = Arc::new(Barrier::new(10));
+
+        let handles: Vec<_> = (0..10)
+            .map(|_| {
+                let manager = Arc::clone(&manager);
+                let barrier = Arc::clone(&barrier);
+
+                thread::spawn(move || {
+                    for _ in 0..100 {
+                        barrier.wait();
+                        let guard = manager.page_write(1, 42);
+                        drop(guard);
+                    }
+                })
+            })
+            .collect();
+
+        for handle in handles {
+            handle.join().expect("Thread panicked - possible race in cleanup");
+        }
+
+        let shard = &manager.page_shards[PageId::new(1, 42).shard_index()];
+        let map = shard.locks.lock();
+        assert!(map.is_empty(), "All lock entries should be cleaned up");
     }
 }

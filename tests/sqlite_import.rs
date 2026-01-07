@@ -27,10 +27,11 @@
 use rusqlite::Connection;
 use std::path::Path;
 use std::time::Instant;
-use turdb::{Database};
+use turdb::Database;
 
 const SQLITE_DB_PATH: &str = "/Users/julfikar/Downloads/_meta-kaggle.db";
-const TURDB_PATH: &str = "/Users/julfikar/Documents/PassionFruit.nosync/turdb/turdb-core/.worktrees/bismillah";
+const TURDB_PATH: &str =
+    "/Users/julfikar/Documents/PassionFruit.nosync/turdb/turdb-core/.worktrees/bismillah";
 const BATCH_SIZE: i64 = 55000;
 const INSERT_BATCH_SIZE: usize = 55000;
 
@@ -319,23 +320,49 @@ impl ImportStats {
         let build_secs = self.sql_build_nanos as f64 / 1_000_000_000.0;
         let insert_secs = self.turdb_insert_nanos as f64 / 1_000_000_000.0;
         let total_secs = overall_elapsed.as_secs_f64();
-        
+
         println!("\n=== Detailed Timing Breakdown ===");
-        println!("SQLite read time:    {:>8.2}s ({:>5.1}%)", sqlite_secs, sqlite_secs / total_secs * 100.0);
-        println!("SQL string build:    {:>8.2}s ({:>5.1}%)", build_secs, build_secs / total_secs * 100.0);
-        println!("TurDB insert time:   {:>8.2}s ({:>5.1}%)", insert_secs, insert_secs / total_secs * 100.0);
-        println!("Other overhead:      {:>8.2}s ({:>5.1}%)", 
+        println!(
+            "SQLite read time:    {:>8.2}s ({:>5.1}%)",
+            sqlite_secs,
+            sqlite_secs / total_secs * 100.0
+        );
+        println!(
+            "SQL string build:    {:>8.2}s ({:>5.1}%)",
+            build_secs,
+            build_secs / total_secs * 100.0
+        );
+        println!(
+            "TurDB insert time:   {:>8.2}s ({:>5.1}%)",
+            insert_secs,
+            insert_secs / total_secs * 100.0
+        );
+        println!(
+            "Other overhead:      {:>8.2}s ({:>5.1}%)",
             total_secs - sqlite_secs - build_secs - insert_secs,
-            (total_secs - sqlite_secs - build_secs - insert_secs) / total_secs * 100.0);
+            (total_secs - sqlite_secs - build_secs - insert_secs) / total_secs * 100.0
+        );
         println!("─────────────────────────────────");
         println!("Total wall time:     {:>8.2}s", total_secs);
-        
+
         println!("\n=== Performance Metrics ===");
-        println!("SQLite read rate:    {:>8.0} rows/sec", self.total_rows as f64 / sqlite_secs);
-        println!("TurDB insert rate:   {:>8.0} rows/sec", self.total_rows as f64 / insert_secs);
-        println!("Overall rate:        {:>8.0} rows/sec", self.total_rows as f64 / total_secs);
+        println!(
+            "SQLite read rate:    {:>8.0} rows/sec",
+            self.total_rows as f64 / sqlite_secs
+        );
+        println!(
+            "TurDB insert rate:   {:>8.0} rows/sec",
+            self.total_rows as f64 / insert_secs
+        );
+        println!(
+            "Overall rate:        {:>8.0} rows/sec",
+            self.total_rows as f64 / total_secs
+        );
         println!("Batches executed:    {:>8}", self.insert_count);
-        println!("Avg batch size:      {:>8.0} rows", self.total_rows as f64 / self.insert_count as f64);
+        println!(
+            "Avg batch size:      {:>8.0} rows",
+            self.total_rows as f64 / self.insert_count as f64
+        );
     }
 }
 
@@ -379,16 +406,28 @@ impl TableImportStats {
         let build_secs = self.sql_build_nanos as f64 / 1_000_000_000.0;
         let insert_secs = self.turdb_insert_nanos as f64 / 1_000_000_000.0;
         let total_secs = sqlite_secs + build_secs + insert_secs;
-        
-        println!("  {} - {} rows in {:.2}s", table_name, self.rows, total_secs);
-        println!("    SQLite read: {:.2}s ({:.1}%) @ {:.0} rows/sec", 
-            sqlite_secs, sqlite_secs / total_secs * 100.0, 
-            self.rows as f64 / sqlite_secs);
-        println!("    SQL build:   {:.2}s ({:.1}%)", 
-            build_secs, build_secs / total_secs * 100.0);
-        println!("    TurDB insert: {:.2}s ({:.1}%) @ {:.0} rows/sec", 
-            insert_secs, insert_secs / total_secs * 100.0,
-            self.rows as f64 / insert_secs);
+
+        println!(
+            "  {} - {} rows in {:.2}s",
+            table_name, self.rows, total_secs
+        );
+        println!(
+            "    SQLite read: {:.2}s ({:.1}%) @ {:.0} rows/sec",
+            sqlite_secs,
+            sqlite_secs / total_secs * 100.0,
+            self.rows as f64 / sqlite_secs
+        );
+        println!(
+            "    SQL build:   {:.2}s ({:.1}%)",
+            build_secs,
+            build_secs / total_secs * 100.0
+        );
+        println!(
+            "    TurDB insert: {:.2}s ({:.1}%) @ {:.0} rows/sec",
+            insert_secs,
+            insert_secs / total_secs * 100.0,
+            self.rows as f64 / insert_secs
+        );
     }
 }
 
@@ -400,11 +439,10 @@ fn import_table(
     println!("\n[{}] Creating table...", table.name);
     turdb.execute(table.turdb_ddl)?;
 
-    let count: i64 = sqlite_conn.query_row(
-        &format!("SELECT COUNT(*) FROM {}", table.name),
-        [],
-        |row| row.get(0),
-    )?;
+    let count: i64 =
+        sqlite_conn.query_row(&format!("SELECT COUNT(*) FROM {}", table.name), [], |row| {
+            row.get(0)
+        })?;
     println!("[{}] Found {} rows in SQLite", table.name, count);
 
     if count == 0 {
@@ -427,8 +465,10 @@ fn import_table(
     let mut total_insert_nanos: u64 = 0;
     let mut batch_count: u64 = 0;
 
-    println!("[{}] Starting import ({} columns, batch size: {})...", 
-             table.name, col_count, INSERT_BATCH_SIZE);
+    println!(
+        "[{}] Starting import ({} columns, batch size: {})...",
+        table.name, col_count, INSERT_BATCH_SIZE
+    );
 
     turdb.execute("BEGIN")?;
 
@@ -448,9 +488,10 @@ fn import_table(
         let mut batch_build_nanos: u64 = 0;
 
         while let Some(row) = rows.next()? {
-            let row_read_elapsed = sqlite_start.elapsed().as_nanos() as u64 - batch_sqlite_nanos - batch_build_nanos;
+            let row_read_elapsed =
+                sqlite_start.elapsed().as_nanos() as u64 - batch_sqlite_nanos - batch_build_nanos;
             batch_sqlite_nanos += row_read_elapsed;
-            
+
             let build_start = Instant::now();
             let mut values = Vec::with_capacity(col_count);
             for i in 0..col_count {
@@ -459,14 +500,14 @@ fn import_table(
             }
             value_batches.push(format!("({})", values.join(", ")));
             batch_build_nanos += build_start.elapsed().as_nanos() as u64;
-            
+
             loop_batch_count += 1;
             total_inserted += 1;
 
             if value_batches.len() >= INSERT_BATCH_SIZE {
                 total_sqlite_nanos += batch_sqlite_nanos;
                 let read_ms = batch_sqlite_nanos as f64 / 1_000_000.0;
-                
+
                 let join_start = Instant::now();
                 let insert_sql = format!(
                     "INSERT INTO {} VALUES {}",
@@ -476,17 +517,17 @@ fn import_table(
                 batch_build_nanos += join_start.elapsed().as_nanos() as u64;
                 total_build_nanos += batch_build_nanos;
                 let build_ms = batch_build_nanos as f64 / 1_000_000.0;
-                
+
                 let insert_start = Instant::now();
                 turdb.execute(&insert_sql)?;
                 let insert_elapsed = insert_start.elapsed().as_nanos() as u64;
                 total_insert_nanos += insert_elapsed;
                 let insert_ms = insert_elapsed as f64 / 1_000_000.0;
-                
+
                 batch_count += 1;
                 println!("[{}] Batch {}: read {} rows ({:.1}ms) | sql built ({:.1}ms) | inserted ({:.1}ms) | total: {}/{}", 
                          table.name, batch_count, INSERT_BATCH_SIZE, read_ms, build_ms, insert_ms, total_inserted, count);
-                
+
                 batch_sqlite_nanos = 0;
                 batch_build_nanos = 0;
                 value_batches.clear();
@@ -497,7 +538,7 @@ fn import_table(
             let remaining = value_batches.len();
             total_sqlite_nanos += batch_sqlite_nanos;
             let read_ms = batch_sqlite_nanos as f64 / 1_000_000.0;
-            
+
             let join_start = Instant::now();
             let insert_sql = format!(
                 "INSERT INTO {} VALUES {}",
@@ -505,14 +546,15 @@ fn import_table(
                 value_batches.join(", ")
             );
             total_build_nanos += batch_build_nanos + join_start.elapsed().as_nanos() as u64;
-            let build_ms = (batch_build_nanos + join_start.elapsed().as_nanos() as u64) as f64 / 1_000_000.0;
-            
+            let build_ms =
+                (batch_build_nanos + join_start.elapsed().as_nanos() as u64) as f64 / 1_000_000.0;
+
             let insert_start = Instant::now();
             turdb.execute(&insert_sql)?;
             let insert_elapsed = insert_start.elapsed().as_nanos() as u64;
             total_insert_nanos += insert_elapsed;
             let insert_ms = insert_elapsed as f64 / 1_000_000.0;
-            
+
             batch_count += 1;
             println!("[{}] Batch {} (final): read {} rows ({:.1}ms) | sql built ({:.1}ms) | inserted ({:.1}ms) | total: {}/{}", 
                      table.name, batch_count, remaining, read_ms, build_ms, insert_ms, total_inserted, count);
@@ -539,7 +581,7 @@ fn import_table(
         turdb_insert_nanos: total_insert_nanos,
         batch_count,
     };
-    
+
     println!("[{}] Import complete!", table.name);
     stats.print(table.name);
 
@@ -549,7 +591,10 @@ fn import_table(
 #[test]
 fn import_all_tables() {
     if !sqlite_db_exists() {
-        eprintln!("Skipping test: SQLite database not found at {}", SQLITE_DB_PATH);
+        eprintln!(
+            "Skipping test: SQLite database not found at {}",
+            SQLITE_DB_PATH
+        );
         return;
     }
 
@@ -560,11 +605,14 @@ fn import_all_tables() {
 
     let sqlite_conn = Connection::open(SQLITE_DB_PATH).expect("Failed to open SQLite DB");
     let db = Database::create(TURDB_PATH).unwrap();
-    
+
     db.execute("PRAGMA WAL=ON").expect("Failed to enable WAL");
-    db.execute("PRAGMA synchronous=NORMAL").expect("Failed to set synchronous mode");
-    db.execute("SET foreign_keys = OFF").expect("Failed to set foreign keys");
-    db.execute("SET cache_size = 1024").expect("Failed to set cache size");
+    db.execute("PRAGMA synchronous=NORMAL")
+        .expect("Failed to set synchronous mode");
+    db.execute("SET foreign_keys = OFF")
+        .expect("Failed to set foreign keys");
+    db.execute("SET cache_size = 1024")
+        .expect("Failed to set cache size");
 
     println!("\n=== Starting SQLite to TurDB Import (All Tables) ===\n");
 
@@ -586,23 +634,32 @@ fn import_all_tables() {
             }
         }
     }
-    
-    db.execute("PRAGMA synchronous=FULL").expect("Failed to restore synchronous mode");
-    db.execute("SET foreign_keys = ON").expect("Failed to set foreign keys");
-    
+
+    db.execute("PRAGMA synchronous=FULL")
+        .expect("Failed to restore synchronous mode");
+    db.execute("SET foreign_keys = ON")
+        .expect("Failed to set foreign keys");
+
     let overall_elapsed = overall_start.elapsed();
 
     println!("\n=== Import Complete ===");
-    println!("Tables imported: {}/{}", aggregate.tables_done, TABLES.len());
+    println!(
+        "Tables imported: {}/{}",
+        aggregate.tables_done,
+        TABLES.len()
+    );
     println!("Total rows: {}", aggregate.total_rows);
-    
+
     aggregate.print_summary(overall_elapsed);
 }
 
 #[test]
 fn import_small_tables() {
     if !sqlite_db_exists() {
-        eprintln!("Skipping test: SQLite database not found at {}", SQLITE_DB_PATH);
+        eprintln!(
+            "Skipping test: SQLite database not found at {}",
+            SQLITE_DB_PATH
+        );
         return;
     }
 
@@ -612,15 +669,24 @@ fn import_small_tables() {
     }
 
     let small_tables = [
-        "Tags", "KernelLanguages", "Organizations", "CompetitionTags",
-        "Competitions", "DatasetTasks", "DatasetTaskSubmissions", "UserOrganizations",
-        "DatasetVersions", "ForumMessages", "ForumMessageVotes"
+        "Tags",
+        "KernelLanguages",
+        "Organizations",
+        "CompetitionTags",
+        "Competitions",
+        "DatasetTasks",
+        "DatasetTaskSubmissions",
+        "UserOrganizations",
+        "DatasetVersions",
+        "ForumMessages",
+        "ForumMessageVotes",
     ];
 
     let sqlite_conn = Connection::open(SQLITE_DB_PATH).expect("Failed to open SQLite DB");
     let db = Database::create(TURDB_PATH).unwrap();
     db.execute("PRAGMA WAL=ON").expect("Failed to enable WAL");
-    db.execute("PRAGMA synchronous=NORMAL").expect("Failed to set synchronous mode");
+    db.execute("PRAGMA synchronous=NORMAL")
+        .expect("Failed to set synchronous mode");
 
     println!("\n=== Importing Small Tables Only ===\n");
 
@@ -643,21 +709,24 @@ fn import_small_tables() {
         }
     }
 
-    db.execute("PRAGMA synchronous=FULL").expect("Failed to restore synchronous mode");
+    db.execute("PRAGMA synchronous=FULL")
+        .expect("Failed to restore synchronous mode");
 
     let overall_elapsed = overall_start.elapsed();
 
     println!("\n=== Import Complete ===");
     println!("Tables imported: {}", aggregate.tables_done);
     println!("Total rows: {}", aggregate.total_rows);
-    
+
     aggregate.print_summary(overall_elapsed);
     assert!(aggregate.total_rows > 0, "Should have imported some rows");
 
     // Verification: Try to read TOAST values from DatasetVersions
     println!("\n=== Verifying TOAST Data (DatasetVersions) ===");
     let verify_start = Instant::now();
-    let rows = db.query("SELECT Description FROM dataset_versions WHERE Description IS NOT NULL LIMIT 200").unwrap();
+    let rows = db
+        .query("SELECT Description FROM dataset_versions WHERE Description IS NOT NULL LIMIT 200")
+        .unwrap();
     println!("Read {} rows for verification", rows.len());
     let mut toast_count = 0;
     for row in rows {
@@ -667,6 +736,9 @@ fn import_small_tables() {
             }
         }
     }
-    println!("Verified {} large TOAST values in {:.2}s", toast_count, verify_start.elapsed().as_secs_f64());
-
+    println!(
+        "Verified {} large TOAST values in {:.2}s",
+        toast_count,
+        verify_start.elapsed().as_secs_f64()
+    );
 }

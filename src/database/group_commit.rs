@@ -129,10 +129,12 @@ pub struct GroupCommitStats {
 
 impl GroupCommitStats {
     pub fn record_flush(&self, batch_size: usize) {
-        self.total_commits.fetch_add(batch_size as u64, Ordering::Relaxed);
+        self.total_commits
+            .fetch_add(batch_size as u64, Ordering::Relaxed);
         self.total_flushes.fetch_add(1, Ordering::Relaxed);
         if batch_size > 1 {
-            self.batched_commits.fetch_add(batch_size as u64 - 1, Ordering::Relaxed);
+            self.batched_commits
+                .fetch_add(batch_size as u64 - 1, Ordering::Relaxed);
         }
 
         let mut current_max = self.max_batch_size.load(Ordering::Relaxed);
@@ -225,7 +227,10 @@ impl GroupCommitQueue {
     /// Submit a commit request and wait for it to complete
     ///
     /// Returns the batch ID this commit was part of, or an error message
-    pub fn submit_and_wait(&self, payload: SmallVec<[(u32, u32, Vec<u8>, u32); 4]>) -> Result<u64, String> {
+    pub fn submit_and_wait(
+        &self,
+        payload: SmallVec<[(u32, u32, Vec<u8>, u32); 4]>,
+    ) -> Result<u64, String> {
         if !self.is_enabled() || payload.is_empty() {
             return Ok(0);
         }
@@ -256,7 +261,10 @@ impl GroupCommitQueue {
     }
 
     /// Submit a commit request without waiting (for async usage)
-    pub fn submit_async(&self, payload: SmallVec<[(u32, u32, Vec<u8>, u32); 4]>) -> std::sync::Arc<PendingCommit> {
+    pub fn submit_async(
+        &self,
+        payload: SmallVec<[(u32, u32, Vec<u8>, u32); 4]>,
+    ) -> std::sync::Arc<PendingCommit> {
         let mut state = self.state.lock();
         let batch_id = state.next_batch_id;
         state.next_batch_id += 1;

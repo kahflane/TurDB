@@ -199,6 +199,13 @@ impl ActiveTransaction {
         self.undo_data.push(None);
     }
 
+    pub fn add_write_entries_batch(&mut self, entries: impl IntoIterator<Item = WriteEntry>) {
+        for entry in entries {
+            self.write_entries.push(entry);
+            self.undo_data.push(None);
+        }
+    }
+
     pub fn add_write_entry_with_undo(&mut self, entry: WriteEntry, undo: Vec<u8>) {
         self.write_entries.push(entry);
         self.undo_data.push(Some(undo));
@@ -239,7 +246,8 @@ impl Database {
         }
 
         let mvcc_txn = self
-            .shared.txn_manager
+            .shared
+            .txn_manager
             .begin_txn()
             .wrap_err("failed to begin MVCC transaction")?;
 
@@ -258,7 +266,8 @@ impl Database {
 
     pub(crate) fn execute_commit(&self) -> Result<ExecuteResult> {
         let wal_enabled = self
-            .shared.wal_enabled
+            .shared
+            .wal_enabled
             .load(std::sync::atomic::Ordering::Acquire);
 
         {
@@ -279,7 +288,7 @@ impl Database {
             // [Deadlock Fix - Push-Based] Capture dirty data before queuing
             // We read all dirty pages while holding storage locks, then release them,
             // then submit the data to the group commit queue.
-            
+
             let dirty_table_ids = self.shared.dirty_tracker.all_dirty_table_ids();
             let mut payload: SmallVec<[(u32, u32, Vec<u8>, u32); 4]> = SmallVec::new();
 
@@ -305,36 +314,46 @@ impl Database {
 
                 // Acquire locks and capture data
                 for (table_id, schema_name, table_name) in table_infos {
-                     let _table_lock = self.shared.page_locks.table_intent_exclusive(table_id);
-                     let dirty_pages = self.shared.dirty_tracker.dirty_pages_for_table(table_id);
-                     
-                     if dirty_pages.is_empty() { continue; }
-                     
-                     let page_tuples: Vec<(u32, u32)> = dirty_pages.iter().map(|&p| (table_id, p)).collect();
-                     let _page_locks = self.shared.page_locks.page_write_multi(&page_tuples);
-                     
-                     if let Ok(storage_arc) = file_manager.table_data(&schema_name, &table_name) {
-                         let storage = storage_arc.read();
-                         let db_size = storage.page_count();
-                         let pages_to_flush = self.shared.dirty_tracker.drain_for_table(table_id);
-                         
-                         for page_no in pages_to_flush {
-                             if let Ok(data) = storage.page(page_no) {
-                                  payload.push((table_id, page_no, data.to_vec(), db_size));
-                             }
-                         }
-                     }
+                    let _table_lock = self.shared.page_locks.table_intent_exclusive(table_id);
+                    let dirty_pages = self.shared.dirty_tracker.dirty_pages_for_table(table_id);
+
+                    if dirty_pages.is_empty() {
+                        continue;
+                    }
+
+                    let page_tuples: Vec<(u32, u32)> =
+                        dirty_pages.iter().map(|&p| (table_id, p)).collect();
+                    let _page_locks = self.shared.page_locks.page_write_multi(&page_tuples);
+
+                    if let Ok(storage_arc) = file_manager.table_data(&schema_name, &table_name) {
+                        let storage = storage_arc.read();
+                        let db_size = storage.page_count();
+                        let pages_to_flush = self.shared.dirty_tracker.drain_for_table(table_id);
+
+                        for page_no in pages_to_flush {
+                            if let Ok(data) = storage.page(page_no) {
+                                payload.push((table_id, page_no, data.to_vec(), db_size));
+                            }
+                        }
+                    }
                 }
             } // file_manager_guard dropped here, releasing locks
 
             if self.shared.group_commit_queue.is_enabled() {
                 match self.shared.group_commit_queue.submit_and_wait(payload) {
                     Ok(_batch_id) => {
-                        if let Some(pending_commits) = self.shared.group_commit_queue.take_pending() {
+                        if let Some(pending_commits) = self.shared.group_commit_queue.take_pending()
+                        {
                             let result = self.execute_group_wal_flush(&pending_commits);
                             match &result {
-                                Ok(()) => self.shared.group_commit_queue.complete_batch(&pending_commits),
-                                Err(e) => self.shared.group_commit_queue.fail_batch(&pending_commits, &e.to_string()),
+                                Ok(()) => self
+                                    .shared
+                                    .group_commit_queue
+                                    .complete_batch(&pending_commits),
+                                Err(e) => self
+                                    .shared
+                                    .group_commit_queue
+                                    .fail_batch(&pending_commits, &e.to_string()),
                             }
                             result?;
                         }
@@ -346,18 +365,18 @@ impl Database {
                 }
             } else if !payload.is_empty() {
                 // If group commit is disabled but WAL is on, we flush directly.
-                 let mut wal_guard = self.shared.wal.lock();
-                 let wal = wal_guard
-                     .as_mut()
-                     .ok_or_else(|| eyre::eyre!("WAL not initialized but WAL mode is enabled"))?;
-                 
-                 for (table_id, page_no, data, db_size) in payload {
-                      wal.write_frame_with_file_id(page_no, db_size, &data, table_id as u64)
-                       .wrap_err("failed to write WAL frame in direct commit")?;
-                 }
+                let mut wal_guard = self.shared.wal.lock();
+                let wal = wal_guard
+                    .as_mut()
+                    .ok_or_else(|| eyre::eyre!("WAL not initialized but WAL mode is enabled"))?;
+
+                for (table_id, page_no, data, db_size) in payload {
+                    wal.write_frame_with_file_id(page_no, db_size, &data, table_id as u64)
+                        .wrap_err("failed to write WAL frame in direct commit")?;
+                }
             }
         }
-        
+
         Ok(ExecuteResult::Commit)
     }
 
@@ -372,7 +391,7 @@ impl Database {
 
         for commit in pending_commits {
             for (table_id, page_no, data, db_size) in &commit.payload {
-                 wal.write_frame_with_file_id(*page_no, *db_size, data, *table_id as u64)
+                wal.write_frame_with_file_id(*page_no, *db_size, data, *table_id as u64)
                     .wrap_err("failed to write WAL frame in group commit")?;
             }
         }
@@ -553,16 +572,17 @@ impl Database {
         let mut btree = BTree::new(&mut *table_storage, 1)?;
 
         if entry.is_insert {
-            let row_values: Option<Vec<OwnedValue>> = if let Some(raw_value) = btree.get(&entry.key)? {
-                let user_data = get_user_data(raw_value);
-                if let Ok(record) = RecordView::new(user_data, &schema) {
-                    OwnedValue::extract_row_from_record(&record, &columns).ok()
+            let row_values: Option<Vec<OwnedValue>> =
+                if let Some(raw_value) = btree.get(&entry.key)? {
+                    let user_data = get_user_data(raw_value);
+                    if let Ok(record) = RecordView::new(user_data, &schema) {
+                        OwnedValue::extract_row_from_record(&record, &columns).ok()
+                    } else {
+                        None
+                    }
                 } else {
                     None
-                }
-            } else {
-                None
-            };
+                };
 
             let deleted = btree.delete(&entry.key)?;
 
@@ -581,8 +601,11 @@ impl Database {
                     if file_manager.index_exists(schema_name, &table_name, index_name) {
                         if let Some(value) = row_values.get(*col_idx) {
                             if !value.is_null() {
-                                let index_storage_arc =
-                                    file_manager.index_data_mut(schema_name, &table_name, index_name)?;
+                                let index_storage_arc = file_manager.index_data_mut(
+                                    schema_name,
+                                    &table_name,
+                                    index_name,
+                                )?;
                                 let mut index_storage = index_storage_arc.write();
 
                                 let index_root_page = {
@@ -591,7 +614,8 @@ impl Database {
                                     header.root_page()
                                 };
 
-                                let mut index_btree = BTree::new(&mut *index_storage, index_root_page)?;
+                                let mut index_btree =
+                                    BTree::new(&mut *index_storage, index_root_page)?;
                                 key_buf.clear();
                                 Self::encode_value_as_key(value, &mut key_buf);
                                 let _ = index_btree.delete(&key_buf);
@@ -610,8 +634,11 @@ impl Database {
                             .all(|&idx| row_values.get(idx).is_some_and(|v| !v.is_null()));
 
                         if all_non_null {
-                            let index_storage_arc =
-                                file_manager.index_data_mut(schema_name, &table_name, index_name)?;
+                            let index_storage_arc = file_manager.index_data_mut(
+                                schema_name,
+                                &table_name,
+                                index_name,
+                            )?;
                             let mut index_storage = index_storage_arc.write();
 
                             let index_root_page = {
@@ -653,8 +680,11 @@ impl Database {
                     if file_manager.index_exists(schema_name, &table_name, index_name) {
                         if let Some(value) = row_values.get(*col_idx) {
                             if !value.is_null() {
-                                let index_storage_arc =
-                                    file_manager.index_data_mut(schema_name, &table_name, index_name)?;
+                                let index_storage_arc = file_manager.index_data_mut(
+                                    schema_name,
+                                    &table_name,
+                                    index_name,
+                                )?;
                                 let mut index_storage = index_storage_arc.write();
 
                                 let index_root_page = {
@@ -663,11 +693,14 @@ impl Database {
                                     header.root_page()
                                 };
 
-                                let mut index_btree = BTree::new(&mut *index_storage, index_root_page)?;
+                                let mut index_btree =
+                                    BTree::new(&mut *index_storage, index_root_page)?;
                                 key_buf.clear();
                                 Self::encode_value_as_key(value, &mut key_buf);
 
-                                let pk_idx = columns.iter().position(|c| c.has_constraint(&Constraint::PrimaryKey));
+                                let pk_idx = columns
+                                    .iter()
+                                    .position(|c| c.has_constraint(&Constraint::PrimaryKey));
                                 if let Some(pk_idx) = pk_idx {
                                     if let Some(OwnedValue::Int(pk_val)) = row_values.get(pk_idx) {
                                         let row_id_bytes = (*pk_val as u64).to_be_bytes();
@@ -689,8 +722,11 @@ impl Database {
                             .all(|&idx| row_values.get(idx).is_some_and(|v| !v.is_null()));
 
                         if all_non_null {
-                            let index_storage_arc =
-                                file_manager.index_data_mut(schema_name, &table_name, index_name)?;
+                            let index_storage_arc = file_manager.index_data_mut(
+                                schema_name,
+                                &table_name,
+                                index_name,
+                            )?;
                             let mut index_storage = index_storage_arc.write();
 
                             let index_root_page = {
@@ -707,7 +743,9 @@ impl Database {
                                 }
                             }
 
-                            let pk_idx = columns.iter().position(|c| c.has_constraint(&Constraint::PrimaryKey));
+                            let pk_idx = columns
+                                .iter()
+                                .position(|c| c.has_constraint(&Constraint::PrimaryKey));
                             if let Some(pk_idx) = pk_idx {
                                 if let Some(OwnedValue::Int(pk_val)) = row_values.get(pk_idx) {
                                     let row_id_bytes = (*pk_val as u64).to_be_bytes();

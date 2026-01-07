@@ -425,6 +425,7 @@ pub struct PhysicalSecondaryIndexScan<'a> {
     pub table_def: Option<&'a TableDef>,
     pub reverse: bool,
     pub is_unique_index: bool,
+    pub key_range: Option<ScanRange<'a>>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -896,12 +897,11 @@ impl<'a> Planner<'a> {
                     if let Some(cte) = cte_context.get(table_ref.name) {
                         let alias = table_ref.alias.unwrap_or(table_ref.name);
                         let subquery_op =
-                            self.arena
-                                .alloc(LogicalOperator::Subquery(LogicalSubquery {
-                                    plan: cte.plan,
-                                    alias,
-                                    output_schema: cte.output_schema.clone(),
-                                }));
+                            self.arena.alloc(LogicalOperator::Subquery(LogicalSubquery {
+                                plan: cte.plan,
+                                alias,
+                                output_schema: cte.output_schema.clone(),
+                            }));
                         return Ok(subquery_op);
                     }
                 }
@@ -988,7 +988,9 @@ impl<'a> Planner<'a> {
         use crate::sql::ast::{FunctionArgs, FunctionCall};
 
         match expr {
-            Expr::Function(FunctionCall { name, over, args, .. }) => {
+            Expr::Function(FunctionCall {
+                name, over, args, ..
+            }) => {
                 if over.is_none() {
                     let func_name = name.name.to_ascii_lowercase();
                     if matches!(func_name.as_str(), "count" | "sum" | "avg" | "min" | "max") {
@@ -1014,12 +1016,19 @@ impl<'a> Planner<'a> {
             Expr::UnaryOp { expr: inner, .. } => {
                 self.traverse_expr_for_aggregates(inner, on_aggregate)
             }
-            Expr::Between { expr, low, high, .. } => {
+            Expr::Between {
+                expr, low, high, ..
+            } => {
                 self.traverse_expr_for_aggregates(expr, on_aggregate)
                     || self.traverse_expr_for_aggregates(low, on_aggregate)
                     || self.traverse_expr_for_aggregates(high, on_aggregate)
             }
-            Expr::Like { expr, pattern, escape, .. } => {
+            Expr::Like {
+                expr,
+                pattern,
+                escape,
+                ..
+            } => {
                 self.traverse_expr_for_aggregates(expr, on_aggregate)
                     || self.traverse_expr_for_aggregates(pattern, on_aggregate)
                     || escape
@@ -1037,7 +1046,11 @@ impl<'a> Planner<'a> {
                 self.traverse_expr_for_aggregates(left, on_aggregate)
                     || self.traverse_expr_for_aggregates(right, on_aggregate)
             }
-            Expr::Case { operand, conditions, else_result } => {
+            Expr::Case {
+                operand,
+                conditions,
+                else_result,
+            } => {
                 operand
                     .map(|o| self.traverse_expr_for_aggregates(o, on_aggregate))
                     .unwrap_or(false)
@@ -1054,7 +1067,11 @@ impl<'a> Planner<'a> {
                 self.traverse_expr_for_aggregates(array, on_aggregate)
                     || self.traverse_expr_for_aggregates(index, on_aggregate)
             }
-            Expr::ArraySlice { array, lower, upper } => {
+            Expr::ArraySlice {
+                array,
+                lower,
+                upper,
+            } => {
                 self.traverse_expr_for_aggregates(array, on_aggregate)
                     || lower
                         .map(|e| self.traverse_expr_for_aggregates(e, on_aggregate))
@@ -2170,12 +2187,14 @@ impl<'a> Planner<'a> {
             LogicalOperator::SetOp(set_op) => {
                 let left = self.logical_to_physical(set_op.left)?;
                 let right = self.logical_to_physical(set_op.right)?;
-                let physical = self.arena.alloc(PhysicalOperator::SetOpExec(PhysicalSetOpExec {
-                    left,
-                    right,
-                    kind: set_op.kind,
-                    all: set_op.all,
-                }));
+                let physical = self
+                    .arena
+                    .alloc(PhysicalOperator::SetOpExec(PhysicalSetOpExec {
+                        left,
+                        right,
+                        kind: set_op.kind,
+                        all: set_op.all,
+                    }));
                 Ok(physical)
             }
             LogicalOperator::Window(window) => {
@@ -2242,14 +2261,104 @@ impl<'a> Planner<'a> {
 
     fn try_optimize_filter_to_index_scan(
         &self,
-        _filter: &LogicalFilter<'a>,
+        filter: &LogicalFilter<'a>,
     ) -> Option<&'a PhysicalOperator<'a>> {
-        None
-        // NOTE: IndexScan optimization is disabled because the primary table BTree
-        // is keyed by internal row_id (u64 BE bytes), not by primary key column values.
-        // To enable this optimization, we would need a secondary index on the PK column
-        // that maps PK values -> row_ids. The encoding functions below are preserved
-        // for future use when proper index scan support is implemented.
+        fn find_scan<'b>(op: &'b LogicalOperator<'b>) -> Option<&'b LogicalScan<'b>> {
+            match op {
+                LogicalOperator::Scan(scan) => Some(scan),
+                LogicalOperator::Project(proj) => find_scan(proj.input),
+                _ => None,
+            }
+        }
+
+        fn find_project<'b>(op: &'b LogicalOperator<'b>) -> Option<&'b LogicalProject<'b>> {
+            match op {
+                LogicalOperator::Project(proj) => Some(proj),
+                _ => None,
+            }
+        }
+
+        let scan = find_scan(filter.input)?;
+        let table_def = self.catalog.resolve_table(scan.table).ok()?;
+
+        let (col_name, literal_expr) = self.extract_equality_predicate(filter.predicate)?;
+
+        let matching_index = table_def.indexes().iter().find(|idx| {
+            if idx.has_expressions() || idx.is_partial() {
+                return false;
+            }
+            if idx.index_type() != crate::schema::IndexType::BTree {
+                return false;
+            }
+            let cols = idx.columns();
+            cols.first()
+                .map(|first_col| first_col.eq_ignore_ascii_case(col_name))
+                .unwrap_or(false)
+        })?;
+
+        let key_bytes = self.encode_literal_to_bytes(literal_expr)?;
+
+        let index_name = self.arena.alloc_str(matching_index.name());
+        let table_def_alloc = self.arena.alloc(table_def.clone());
+        let index_columns: Vec<String> = matching_index.columns();
+
+        let residual = self.compute_residual_filter(filter.predicate, &index_columns);
+
+        let index_scan = self.arena.alloc(PhysicalOperator::SecondaryIndexScan(
+            PhysicalSecondaryIndexScan {
+                schema: scan.schema,
+                table: scan.table,
+                index_name,
+                table_def: Some(table_def_alloc),
+                reverse: false,
+                is_unique_index: matching_index.is_unique(),
+                key_range: Some(ScanRange::PrefixScan { prefix: key_bytes }),
+            },
+        ));
+
+        let with_residual = if let Some(residual_predicate) = residual {
+            self.arena.alloc(PhysicalOperator::FilterExec(PhysicalFilterExec {
+                input: index_scan,
+                predicate: residual_predicate,
+            }))
+        } else {
+            index_scan
+        };
+
+        let project = find_project(filter.input);
+        if let Some(proj) = project {
+            let physical_proj = self.arena.alloc(PhysicalOperator::ProjectExec(PhysicalProjectExec {
+                input: with_residual,
+                expressions: proj.expressions,
+                aliases: proj.aliases,
+            }));
+            return Some(physical_proj);
+        }
+
+        Some(with_residual)
+    }
+
+    fn extract_equality_predicate(&self, expr: &'a Expr<'a>) -> Option<(&'a str, &'a Expr<'a>)> {
+        use crate::sql::ast::BinaryOperator;
+
+        match expr {
+            Expr::BinaryOp { left, op: BinaryOperator::Eq, right } => {
+                match (left, right) {
+                    (Expr::Column(col_ref), lit @ Expr::Literal(_)) => {
+                        Some((col_ref.column, lit))
+                    }
+                    (lit @ Expr::Literal(_), Expr::Column(col_ref)) => {
+                        Some((col_ref.column, lit))
+                    }
+                    _ => None,
+                }
+            }
+            Expr::BinaryOp { left, op: BinaryOperator::And, right } => {
+                self.extract_equality_predicate(left)
+                    .or_else(|| self.extract_equality_predicate(right))
+            }
+            _ => None,
+        }
     }
 
     fn try_optimize_sort_to_index_scan(
@@ -2293,22 +2402,23 @@ impl<'a> Planner<'a> {
 
         let reverse = !sort_key.ascending;
 
-        let pk_col = table_def.columns().iter().find(|c| {
-            c.has_constraint(&crate::schema::table::Constraint::PrimaryKey)
-        });
+        let pk_col = table_def
+            .columns()
+            .iter()
+            .find(|c| c.has_constraint(&crate::schema::table::Constraint::PrimaryKey));
 
         if let Some(pk) = pk_col {
             if pk.name().eq_ignore_ascii_case(col_name) {
-                let table_scan =
-                    self.arena
-                        .alloc(PhysicalOperator::TableScan(PhysicalTableScan {
-                            schema: scan.schema,
-                            table: scan.table,
-                            alias: scan.alias,
-                            post_scan_filter: None,
-                            table_def: Some(table_def),
-                            reverse,
-                        }));
+                let table_scan = self
+                    .arena
+                    .alloc(PhysicalOperator::TableScan(PhysicalTableScan {
+                        schema: scan.schema,
+                        table: scan.table,
+                        alias: scan.alias,
+                        post_scan_filter: None,
+                        table_def: Some(table_def),
+                        reverse,
+                    }));
 
                 return match sort.input {
                     LogicalOperator::Scan(_) => Some(table_scan),
@@ -2349,6 +2459,7 @@ impl<'a> Planner<'a> {
                     table_def: Some(table_def_alloc),
                     reverse,
                     is_unique_index: idx.is_unique(),
+                    key_range: None,
                 },
             ));
 
@@ -2371,7 +2482,6 @@ impl<'a> Planner<'a> {
         None
     }
 
-    #[allow(dead_code)]
     fn compute_residual_filter(
         &self,
         predicate: &'a Expr<'a>,
@@ -2420,7 +2530,6 @@ impl<'a> Planner<'a> {
         }
     }
 
-    #[allow(dead_code)]
     fn predicate_uses_index_column(&self, expr: &Expr<'a>, index_columns: &[String]) -> bool {
         match expr {
             Expr::Column(col_ref) => index_columns
@@ -2911,7 +3020,6 @@ impl<'a> Planner<'a> {
         }
     }
 
-    #[allow(dead_code)]
     fn encode_literal_to_bytes(&self, expr: &Expr<'a>) -> Option<&'a [u8]> {
         match expr {
             Expr::Literal(lit) => {
@@ -2959,7 +3067,6 @@ impl<'a> Planner<'a> {
         }
     }
 
-    #[allow(dead_code)]
     fn encode_int_to_arena(&self, n: i64, buf: &mut bumpalo::collections::Vec<'a, u8>) {
         use crate::encoding::key::type_prefix;
         if n < 0 {
@@ -2973,7 +3080,6 @@ impl<'a> Planner<'a> {
         }
     }
 
-    #[allow(dead_code)]
     fn encode_float_to_arena(&self, f: f64, buf: &mut bumpalo::collections::Vec<'a, u8>) {
         use crate::encoding::key::type_prefix;
         if f.is_nan() {
@@ -2993,7 +3099,6 @@ impl<'a> Planner<'a> {
         }
     }
 
-    #[allow(dead_code)]
     fn encode_text_to_arena(&self, s: &str, buf: &mut bumpalo::collections::Vec<'a, u8>) {
         use crate::encoding::key::type_prefix;
         buf.push(type_prefix::TEXT);

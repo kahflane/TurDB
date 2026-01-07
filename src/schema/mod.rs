@@ -99,7 +99,9 @@ pub mod persistence;
 pub mod table;
 
 pub use catalog::Catalog;
-pub use table::{ColumnDef, Constraint, IndexColumnDef, IndexDef, IndexType, TableDef};
+pub use table::{
+    ColumnDef, Constraint, IndexColumnDef, IndexDef, IndexType, ReferentialAction, TableDef,
+};
 
 pub type SchemaId = u32;
 pub type TableId = u64;

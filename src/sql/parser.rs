@@ -1507,7 +1507,10 @@ impl<'a> Parser<'a> {
         Ok(self.arena.alloc_slice_copy(&exprs))
     }
 
-    fn parse_expr_list_fallback(&mut self, mut exprs: Vec<&'a Expr<'a>>) -> Result<&'a [&'a Expr<'a>]> {
+    fn parse_expr_list_fallback(
+        &mut self,
+        mut exprs: Vec<&'a Expr<'a>>,
+    ) -> Result<&'a [&'a Expr<'a>]> {
         loop {
             exprs.push(self.arena.alloc(self.parse_expr(0)?));
             if !self.consume_token(&Token::Comma) {
@@ -1913,8 +1916,11 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_referential_action(&mut self, keyword: Keyword) -> Result<Option<ReferentialAction>> {
-        if self.consume_keyword(Keyword::On) {
-            self.expect_keyword(keyword)?;
+        let is_on = self.check_keyword(Keyword::On);
+        let next_matches = matches!(self.lexer.peek(), Token::Keyword(k) if k == keyword);
+        if is_on && next_matches {
+            self.advance();
+            self.advance();
             if self.consume_keyword(Keyword::Cascade) {
                 Ok(Some(ReferentialAction::Cascade))
             } else if self.consume_keyword(Keyword::Restrict) {

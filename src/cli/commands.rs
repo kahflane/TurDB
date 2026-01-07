@@ -63,7 +63,10 @@ impl CommandHandler {
             ".tables" => list_tables(db),
             ".schema" => show_schema(db, args),
             ".indexes" => list_indexes(db, args),
-            _ => CommandResult::Error(format!("Unknown command: {}. Type .help for available commands.", cmd)),
+            _ => CommandResult::Error(format!(
+                "Unknown command: {}. Type .help for available commands.",
+                cmd
+            )),
         }
     }
 }
@@ -348,7 +351,8 @@ mod tests {
 
         let dir = tempdir().unwrap();
         let db = Database::create(dir.path().join("test")).unwrap();
-        db.execute("CREATE TABLE users (id INT, name TEXT)").unwrap();
+        db.execute("CREATE TABLE users (id INT, name TEXT)")
+            .unwrap();
 
         let result = CommandHandler::execute(".schema users", &db);
         match result {

@@ -489,10 +489,7 @@ mod truncate_tests {
         let result = db.execute("TRUNCATE empty_table").unwrap();
 
         assert!(
-            matches!(
-                result,
-                ExecuteResult::Truncate { rows_affected: 0 }
-            ),
+            matches!(result, ExecuteResult::Truncate { rows_affected: 0 }),
             "TRUNCATE on empty table SHOULD return rows_affected: 0"
         );
     }
@@ -501,8 +498,7 @@ mod truncate_tests {
     fn truncate_allows_reinsert_after() {
         let dir = tempdir().unwrap();
         let db = Database::create(dir.path().join("test_db")).unwrap();
-        db.execute("CREATE TABLE items (id INT, val TEXT)")
-            .unwrap();
+        db.execute("CREATE TABLE items (id INT, val TEXT)").unwrap();
         db.execute("INSERT INTO items VALUES (1, 'old')").unwrap();
 
         db.execute("TRUNCATE items").unwrap();
@@ -538,7 +534,9 @@ mod truncate_tests {
         let after = db.query("SELECT id FROM items").unwrap();
         assert_eq!(after.len(), 1);
         match &after[0].values[0] {
-            OwnedValue::Int(id) => assert_eq!(*id, 1, "First row after RESTART IDENTITY SHOULD have id 1"),
+            OwnedValue::Int(id) => {
+                assert_eq!(*id, 1, "First row after RESTART IDENTITY SHOULD have id 1")
+            }
             other => panic!("id SHOULD be Int, got {:?}", other),
         }
     }
@@ -961,6 +959,126 @@ mod constraint_tests {
         assert!(
             result.is_err(),
             "UNIQUE SHOULD reject duplicate email on UPDATE"
+        );
+    }
+
+    #[test]
+    fn on_delete_cascade_deletes_child_rows() {
+        let dir = tempdir().unwrap();
+        let db = Database::create(dir.path().join("test_db")).unwrap();
+        db.execute("CREATE TABLE departments (id INT PRIMARY KEY, name TEXT)")
+            .unwrap();
+        db.execute(
+            "CREATE TABLE employees (id INT PRIMARY KEY, name TEXT, dept_id INT REFERENCES departments(id) ON DELETE CASCADE)",
+        )
+        .unwrap();
+        db.execute("INSERT INTO departments VALUES (1, 'Engineering')")
+            .unwrap();
+        db.execute("INSERT INTO departments VALUES (2, 'Sales')")
+            .unwrap();
+        db.execute("INSERT INTO employees VALUES (100, 'Alice', 1)")
+            .unwrap();
+        db.execute("INSERT INTO employees VALUES (101, 'Bob', 1)")
+            .unwrap();
+        db.execute("INSERT INTO employees VALUES (102, 'Charlie', 2)")
+            .unwrap();
+
+        let result = db.execute("DELETE FROM departments WHERE id = 1");
+        assert!(
+            result.is_ok(),
+            "ON DELETE CASCADE SHOULD allow deleting referenced parent row"
+        );
+
+        let employees = db.query("SELECT * FROM employees").unwrap();
+        assert_eq!(
+            employees.len(),
+            1,
+            "ON DELETE CASCADE SHOULD have deleted 2 child rows, leaving 1"
+        );
+        match &employees[0].values[0] {
+            OwnedValue::Int(id) => {
+                assert_eq!(*id, 102, "Remaining employee SHOULD be Charlie (id=102)")
+            }
+            other => panic!("Expected Int for id, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn on_update_cascade_updates_child_fk_values() {
+        let dir = tempdir().unwrap();
+        let db = Database::create(dir.path().join("test_db")).unwrap();
+        db.execute("CREATE TABLE departments (id INT PRIMARY KEY, name TEXT)")
+            .unwrap();
+        db.execute(
+            "CREATE TABLE employees (id INT PRIMARY KEY, name TEXT, dept_id INT REFERENCES departments(id) ON UPDATE CASCADE)",
+        )
+        .unwrap();
+        db.execute("INSERT INTO departments VALUES (1, 'Engineering')")
+            .unwrap();
+        db.execute("INSERT INTO departments VALUES (2, 'Sales')")
+            .unwrap();
+        db.execute("INSERT INTO employees VALUES (100, 'Alice', 1)")
+            .unwrap();
+        db.execute("INSERT INTO employees VALUES (101, 'Bob', 1)")
+            .unwrap();
+        db.execute("INSERT INTO employees VALUES (102, 'Charlie', 2)")
+            .unwrap();
+
+        let result = db.execute("UPDATE departments SET id = 10 WHERE id = 1");
+        assert!(
+            result.is_ok(),
+            "ON UPDATE CASCADE SHOULD allow updating referenced parent PK"
+        );
+
+        let employees = db
+            .query("SELECT id, dept_id FROM employees WHERE dept_id = 10 ORDER BY id")
+            .unwrap();
+        assert_eq!(
+            employees.len(),
+            2,
+            "ON UPDATE CASCADE SHOULD have updated 2 child rows to dept_id=10"
+        );
+
+        for row in &employees {
+            match &row.values[1] {
+                OwnedValue::Int(dept_id) => {
+                    assert_eq!(
+                        *dept_id, 10,
+                        "Child row FK SHOULD be updated to new parent PK value"
+                    )
+                }
+                other => panic!("Expected Int for dept_id, got {:?}", other),
+            }
+        }
+
+        let dept1_employees = db
+            .query("SELECT * FROM employees WHERE dept_id = 1")
+            .unwrap();
+        assert_eq!(
+            dept1_employees.len(),
+            0,
+            "No employees SHOULD reference old dept_id=1"
+        );
+    }
+
+    #[test]
+    fn on_update_restrict_blocks_update_of_referenced_pk() {
+        let dir = tempdir().unwrap();
+        let db = Database::create(dir.path().join("test_db")).unwrap();
+        db.execute("CREATE TABLE departments (id INT PRIMARY KEY)")
+            .unwrap();
+        db.execute(
+            "CREATE TABLE employees (id INT PRIMARY KEY, dept_id INT REFERENCES departments(id) ON UPDATE RESTRICT)",
+        )
+        .unwrap();
+        db.execute("INSERT INTO departments VALUES (1)").unwrap();
+        db.execute("INSERT INTO employees VALUES (100, 1)").unwrap();
+
+        let result = db.execute("UPDATE departments SET id = 10 WHERE id = 1");
+
+        assert!(
+            result.is_err(),
+            "ON UPDATE RESTRICT SHOULD block update of referenced parent PK"
         );
     }
 }
@@ -2000,7 +2118,9 @@ mod insert_on_conflict_tests {
             "ON CONFLICT DO UPDATE SHOULD report 1 row affected (the updated row)"
         );
 
-        let rows = db.query("SELECT name, score FROM users WHERE id = 1").unwrap();
+        let rows = db
+            .query("SELECT name, score FROM users WHERE id = 1")
+            .unwrap();
         let name = match &rows[0].values[0] {
             OwnedValue::Text(s) => s.clone(),
             other => panic!("Expected Text, got {:?}", other),
@@ -2452,7 +2572,11 @@ mod returning_clause_tests {
             })
             .collect();
 
-        assert_eq!(vals, vec![2, 3], "Nested subquery SHOULD return vals [2, 3]");
+        assert_eq!(
+            vals,
+            vec![2, 3],
+            "Nested subquery SHOULD return vals [2, 3]"
+        );
     }
 
     #[test]
@@ -2601,40 +2725,19 @@ mod returning_clause_tests {
         );
 
         assert_eq!(rows[0].values[0], OwnedValue::Int(1));
-        assert_eq!(
-            rows[0].values[1],
-            OwnedValue::Text("Alice".to_string())
-        );
-        assert_eq!(
-            rows[0].values[2],
-            OwnedValue::Text("Widget".to_string())
-        );
+        assert_eq!(rows[0].values[1], OwnedValue::Text("Alice".to_string()));
+        assert_eq!(rows[0].values[2], OwnedValue::Text("Widget".to_string()));
 
         assert_eq!(rows[1].values[0], OwnedValue::Int(1));
-        assert_eq!(
-            rows[1].values[1],
-            OwnedValue::Text("Alice".to_string())
-        );
-        assert_eq!(
-            rows[1].values[2],
-            OwnedValue::Text("Gadget".to_string())
-        );
+        assert_eq!(rows[1].values[1], OwnedValue::Text("Alice".to_string()));
+        assert_eq!(rows[1].values[2], OwnedValue::Text("Gadget".to_string()));
 
         assert_eq!(rows[2].values[0], OwnedValue::Int(2));
-        assert_eq!(
-            rows[2].values[1],
-            OwnedValue::Text("Bob".to_string())
-        );
-        assert_eq!(
-            rows[2].values[2],
-            OwnedValue::Text("Thing".to_string())
-        );
+        assert_eq!(rows[2].values[1], OwnedValue::Text("Bob".to_string()));
+        assert_eq!(rows[2].values[2], OwnedValue::Text("Thing".to_string()));
 
         assert_eq!(rows[3].values[0], OwnedValue::Int(3));
-        assert_eq!(
-            rows[3].values[1],
-            OwnedValue::Text("Charlie".to_string())
-        );
+        assert_eq!(rows[3].values[1], OwnedValue::Text("Charlie".to_string()));
         assert_eq!(rows[3].values[2], OwnedValue::Null);
     }
 }
@@ -2673,11 +2776,19 @@ mod update_from_tests {
             .unwrap();
 
         assert!(
-            matches!(result, ExecuteResult::Update { rows_affected: 2, .. }),
+            matches!(
+                result,
+                ExecuteResult::Update {
+                    rows_affected: 2,
+                    ..
+                }
+            ),
             "UPDATE...FROM SHOULD update 2 rows that match the join condition"
         );
 
-        let rows = db.query("SELECT id, price FROM products ORDER BY id").unwrap();
+        let rows = db
+            .query("SELECT id, price FROM products ORDER BY id")
+            .unwrap();
         assert_eq!(rows.len(), 3, "All 3 products should still exist");
 
         assert_eq!(
@@ -2726,11 +2837,19 @@ mod update_from_tests {
             .unwrap();
 
         assert!(
-            matches!(result, ExecuteResult::Update { rows_affected: 1, .. }),
+            matches!(
+                result,
+                ExecuteResult::Update {
+                    rows_affected: 1,
+                    ..
+                }
+            ),
             "UPDATE...FROM with alias SHOULD update 1 row in Engineering dept"
         );
 
-        let rows = db.query("SELECT id, salary FROM employees ORDER BY id").unwrap();
+        let rows = db
+            .query("SELECT id, salary FROM employees ORDER BY id")
+            .unwrap();
 
         assert_eq!(
             rows[0].values[1],
@@ -2763,8 +2882,10 @@ mod update_from_tests {
         db.execute("INSERT INTO orders VALUES (3, 100, 'shipped')")
             .unwrap();
 
-        db.execute("INSERT INTO customers VALUES (100, 'gold')").unwrap();
-        db.execute("INSERT INTO customers VALUES (200, 'silver')").unwrap();
+        db.execute("INSERT INTO customers VALUES (100, 'gold')")
+            .unwrap();
+        db.execute("INSERT INTO customers VALUES (200, 'silver')")
+            .unwrap();
 
         db.execute("INSERT INTO promotions VALUES ('gold', 'priority')")
             .unwrap();
@@ -2781,11 +2902,19 @@ mod update_from_tests {
             .unwrap();
 
         assert!(
-            matches!(result, ExecuteResult::Update { rows_affected: 3, .. }),
+            matches!(
+                result,
+                ExecuteResult::Update {
+                    rows_affected: 3,
+                    ..
+                }
+            ),
             "UPDATE...FROM with multiple tables SHOULD update 3 rows"
         );
 
-        let rows = db.query("SELECT id, status FROM orders ORDER BY id").unwrap();
+        let rows = db
+            .query("SELECT id, status FROM orders ORDER BY id")
+            .unwrap();
         assert_eq!(
             rows[0].values[1],
             OwnedValue::Text("priority".to_string()),
@@ -2825,7 +2954,13 @@ mod update_from_tests {
             .unwrap();
 
         assert!(
-            matches!(result, ExecuteResult::Update { rows_affected: 0, .. }),
+            matches!(
+                result,
+                ExecuteResult::Update {
+                    rows_affected: 0,
+                    ..
+                }
+            ),
             "UPDATE...FROM with no matching rows SHOULD update 0 rows"
         );
 
@@ -2864,7 +2999,10 @@ mod update_from_tests {
             .unwrap();
 
         match result {
-            ExecuteResult::Update { rows_affected, returned } => {
+            ExecuteResult::Update {
+                rows_affected,
+                returned,
+            } => {
                 assert_eq!(rows_affected, 1, "SHOULD update 1 row");
                 let returned_rows = returned.expect("RETURNING SHOULD produce rows");
                 assert_eq!(returned_rows.len(), 1, "SHOULD return 1 row");
@@ -3344,17 +3482,13 @@ mod wal_edge_case_tests {
         {
             let db = Database::create(&db_path).unwrap();
             db.execute("PRAGMA WAL ON").unwrap();
-            db.execute("CREATE TABLE bulk (id INT, data TEXT)")
-                .unwrap();
+            db.execute("CREATE TABLE bulk (id INT, data TEXT)").unwrap();
 
             // Start a transaction with many inserts
             db.execute("BEGIN").unwrap();
             for i in 0..100 {
-                db.execute(&format!(
-                    "INSERT INTO bulk VALUES ({}, 'data_{}') ",
-                    i, i
-                ))
-                .unwrap();
+                db.execute(&format!("INSERT INTO bulk VALUES ({}, 'data_{}') ", i, i))
+                    .unwrap();
             }
             db.execute("COMMIT").unwrap();
         }
@@ -3367,7 +3501,10 @@ mod wal_edge_case_tests {
                 OwnedValue::Int(n) => *n,
                 other => panic!("Expected Int, got {:?}", other),
             };
-            assert_eq!(count, 100, "All 100 rows should persist after large transaction");
+            assert_eq!(
+                count, 100,
+                "All 100 rows should persist after large transaction"
+            );
         }
     }
 
@@ -3393,7 +3530,11 @@ mod wal_edge_case_tests {
         {
             let db = Database::open(&db_path).unwrap();
             let rows = db.query("SELECT * FROM temp").unwrap();
-            assert_eq!(rows.len(), 1, "Only committed row should exist after rollback");
+            assert_eq!(
+                rows.len(),
+                1,
+                "Only committed row should exist after rollback"
+            );
             assert_eq!(rows[0].values[0], OwnedValue::Int(1));
         }
     }
@@ -3471,18 +3612,21 @@ mod toast_tests {
     fn toast_insert_and_read_large_text() {
         let dir = tempdir().unwrap();
         let db = Database::create(dir.path().join("toast_test")).unwrap();
-        
+
         db.execute("PRAGMA WAL=ON").unwrap();
-        
-        db.execute("CREATE TABLE test (id BIGINT PRIMARY KEY, description TEXT)").unwrap();
-        
+
+        db.execute("CREATE TABLE test (id BIGINT PRIMARY KEY, description TEXT)")
+            .unwrap();
+
         // Insert a value larger than TOAST_THRESHOLD (1000 bytes)
         let large_text = "x".repeat(5000);
         let sql = format!("INSERT INTO test VALUES (1, '{}')", large_text);
         db.execute(&sql).unwrap();
-        
+
         // Read it back
-        let rows = db.query("SELECT id, description FROM test WHERE id = 1").unwrap();
+        let rows = db
+            .query("SELECT id, description FROM test WHERE id = 1")
+            .unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].values[0], OwnedValue::Int(1));
         if let OwnedValue::Text(text) = &rows[0].values[1] {
@@ -3492,85 +3636,105 @@ mod toast_tests {
             panic!("Expected Text value");
         }
     }
-    
+
     #[test]
     fn toast_insert_multiple_large_values() {
         let dir = tempdir().unwrap();
         let db = Database::create(dir.path().join("toast_test2")).unwrap();
-        
+
         db.execute("PRAGMA WAL=ON").unwrap();
-        
-        db.execute("CREATE TABLE test (id BIGINT PRIMARY KEY, description TEXT)").unwrap();
-        
+
+        db.execute("CREATE TABLE test (id BIGINT PRIMARY KEY, description TEXT)")
+            .unwrap();
+
         // Insert 10 large values
         for i in 1..=10 {
             let large_text = format!("{}", i).repeat(2000);
             let sql = format!("INSERT INTO test VALUES ({}, '{}')", i, large_text);
             db.execute(&sql).unwrap();
         }
-        
+
         // Read them back
-        let rows = db.query("SELECT id, LENGTH(description) as len FROM test ORDER BY id").unwrap();
+        let rows = db
+            .query("SELECT id, LENGTH(description) as len FROM test ORDER BY id")
+            .unwrap();
         assert_eq!(rows.len(), 10);
     }
-    
+
     #[test]
     fn toast_delete_rows_should_not_corrupt_other_rows() {
         let dir = tempdir().unwrap();
         let db = Database::create(dir.path().join("toast_delete_test")).unwrap();
-        
-        db.execute("CREATE TABLE test (id BIGINT PRIMARY KEY, description TEXT)").unwrap();
-        
+
+        db.execute("CREATE TABLE test (id BIGINT PRIMARY KEY, description TEXT)")
+            .unwrap();
+
         // Insert 20 rows with large text values
         for i in 1..=20 {
             let large_text = format!("row_{}_", i).repeat(500);
             let sql = format!("INSERT INTO test VALUES ({}, '{}')", i, large_text);
             db.execute(&sql).unwrap();
         }
-        
+
         // Verify all rows can be read with just id column (no TOAST deref)
         let rows = db.query("SELECT id FROM test ORDER BY id").unwrap();
         assert_eq!(rows.len(), 20, "Should have 20 rows before delete");
-        
+
         // Delete first row - this is the critical operation
         db.execute("DELETE FROM test WHERE id = 6").unwrap();
-        
+
         // Check count after delete
         let count_after = db.query("SELECT COUNT(*) FROM test").unwrap();
-        assert_eq!(count_after[0].values[0], OwnedValue::Int(19), "Should have 19 rows after delete");
-        
+        assert_eq!(
+            count_after[0].values[0],
+            OwnedValue::Int(19),
+            "Should have 19 rows after delete"
+        );
+
         // Get all IDs after delete (no TOAST deref needed)
         let ids_after = db.query("SELECT id FROM test ORDER BY id").unwrap();
         assert_eq!(ids_after.len(), 19, "Should have 19 rows after delete");
-        
+
         // Print all IDs to see what we have
-        let id_values: Vec<i64> = ids_after.iter().filter_map(|row| {
-            if let OwnedValue::Int(i) = row.values[0] {
-                Some(i)
-            } else {
-                None
-            }
-        }).collect();
-        
+        let id_values: Vec<i64> = ids_after
+            .iter()
+            .filter_map(|row| {
+                if let OwnedValue::Int(i) = row.values[0] {
+                    Some(i)
+                } else {
+                    None
+                }
+            })
+            .collect();
+
         // Row 10 should still be present
         assert!(id_values.contains(&10), "ID 10 should be in the list");
-        
+
         // Now try to read row 10's description (this will deref TOAST)
-        let row10 = db.query("SELECT id, description FROM test WHERE id = 10").unwrap();
+        let row10 = db
+            .query("SELECT id, description FROM test WHERE id = 10")
+            .unwrap();
         assert_eq!(row10.len(), 1, "Should find row 10");
         if let OwnedValue::Text(text) = &row10[0].values[1] {
-            assert!(text.starts_with("row_10_"), "Row 10 description should start with row_10_");
+            assert!(
+                text.starts_with("row_10_"),
+                "Row 10 description should start with row_10_"
+            );
         } else {
             panic!("Expected Text value for row 10 description");
         }
-        
+
         // Delete more rows and verify remaining data is intact
         db.execute("DELETE FROM test WHERE id < 10").unwrap();
-        
+
         // Verify we can read all remaining rows with their full TOAST data
         let remaining = db.query("SELECT * FROM test ORDER BY id").unwrap();
-        assert_eq!(remaining.len(), 11, "Should have 11 rows after deleting id < 10");
-        
+        assert_eq!(
+            remaining.len(),
+            11,
+            "Should have 11 rows after deleting id < 10"
+        );
+
         for row in &remaining {
             if let OwnedValue::Text(text) = &row.values[1] {
                 assert!(text.len() > 1000, "Each row should have large text value");
@@ -3579,33 +3743,41 @@ mod toast_tests {
             }
         }
     }
-    
+
     #[test]
     fn toast_delete_with_wal_enabled() {
         let dir = tempdir().unwrap();
         let db = Database::create(dir.path().join("toast_wal_test")).unwrap();
-        
+
         db.execute("PRAGMA WAL=ON").unwrap();
-        
-        db.execute("CREATE TABLE test (id BIGINT PRIMARY KEY, description TEXT)").unwrap();
-        
+
+        db.execute("CREATE TABLE test (id BIGINT PRIMARY KEY, description TEXT)")
+            .unwrap();
+
         // Insert rows with large text values
         for i in 1..=10 {
             let large_text = format!("wal_row_{}_", i).repeat(500);
             let sql = format!("INSERT INTO test VALUES ({}, '{}')", i, large_text);
             db.execute(&sql).unwrap();
         }
-        
+
         // Delete some rows
         db.execute("DELETE FROM test WHERE id <= 5").unwrap();
-        
+
         // Verify remaining rows
         let remaining = db.query("SELECT * FROM test ORDER BY id").unwrap();
-        assert_eq!(remaining.len(), 5, "Should have 5 rows after deleting id <= 5");
-        
+        assert_eq!(
+            remaining.len(),
+            5,
+            "Should have 5 rows after deleting id <= 5"
+        );
+
         for row in &remaining {
             if let OwnedValue::Text(text) = &row.values[1] {
-                assert!(text.starts_with("wal_row_"), "Each row should have correct text");
+                assert!(
+                    text.starts_with("wal_row_"),
+                    "Each row should have correct text"
+                );
             } else {
                 panic!("Expected Text value");
             }

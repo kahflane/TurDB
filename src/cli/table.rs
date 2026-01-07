@@ -122,7 +122,12 @@ impl TableFormatter {
         output.push('|');
         for (i, header) in self.headers.iter().enumerate() {
             let width = self.widths.get(i).copied().unwrap_or(1);
-            let _ = write!(output, " {:<width$} |", truncate(header, width), width = width);
+            let _ = write!(
+                output,
+                " {:<width$} |",
+                truncate(header, width),
+                width = width
+            );
         }
         output.push('\n');
     }
@@ -143,7 +148,10 @@ fn format_value(value: &OwnedValue) -> String {
         OwnedValue::Null => "NULL".to_string(),
         OwnedValue::Bool(b) => if *b { "true" } else { "false" }.to_string(),
         OwnedValue::Int(i) => i.to_string(),
-        OwnedValue::Float(f) => format!("{:.6}", f).trim_end_matches('0').trim_end_matches('.').to_string(),
+        OwnedValue::Float(f) => format!("{:.6}", f)
+            .trim_end_matches('0')
+            .trim_end_matches('.')
+            .to_string(),
         OwnedValue::Text(s) => s.clone(),
         OwnedValue::Blob(b) => format_blob(b),
         OwnedValue::Uuid(u) => format_uuid(u),
@@ -171,7 +179,10 @@ fn format_blob(bytes: &[u8]) -> String {
         let hex: String = bytes.iter().map(|b| format!("{:02X}", b)).collect();
         format!("x'{}'", hex)
     } else {
-        let hex: String = bytes[..BLOB_PREVIEW_BYTES].iter().map(|b| format!("{:02X}", b)).collect();
+        let hex: String = bytes[..BLOB_PREVIEW_BYTES]
+            .iter()
+            .map(|b| format!("{:02X}", b))
+            .collect();
         format!("x'{}'... ({} bytes)", hex, bytes.len())
     }
 }
@@ -216,7 +227,10 @@ fn format_time(micros: i64) -> String {
     if micros_part == 0 {
         format!("{:02}:{:02}:{:02}", hours, minutes, seconds)
     } else {
-        format!("{:02}:{:02}:{:02}.{:06}", hours, minutes, seconds, micros_part)
+        format!(
+            "{:02}:{:02}:{:02}.{:06}",
+            hours, minutes, seconds, micros_part
+        )
     }
 }
 
@@ -235,9 +249,15 @@ fn format_timestamp(micros: i64) -> String {
     let secs = time_of_day % 60;
 
     if micros_part == 0 {
-        format!("{:04}-{:02}-{:02} {:02}:{:02}:{:02}", year, month, day, hours, minutes, secs)
+        format!(
+            "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+            year, month, day, hours, minutes, secs
+        )
     } else {
-        format!("{:04}-{:02}-{:02} {:02}:{:02}:{:02}.{:06}", year, month, day, hours, minutes, secs, micros_part)
+        format!(
+            "{:04}-{:02}-{:02} {:02}:{:02}:{:02}.{:06}",
+            year, month, day, hours, minutes, secs, micros_part
+        )
     }
 }
 
@@ -248,15 +268,27 @@ fn format_interval(micros: i64, days: i32, months: i32) -> String {
         let years = months / 12;
         let remaining_months = months % 12;
         if years != 0 {
-            parts.push(format!("{} year{}", years, if years.abs() == 1 { "" } else { "s" }));
+            parts.push(format!(
+                "{} year{}",
+                years,
+                if years.abs() == 1 { "" } else { "s" }
+            ));
         }
         if remaining_months != 0 {
-            parts.push(format!("{} mon{}", remaining_months, if remaining_months.abs() == 1 { "" } else { "s" }));
+            parts.push(format!(
+                "{} mon{}",
+                remaining_months,
+                if remaining_months.abs() == 1 { "" } else { "s" }
+            ));
         }
     }
 
     if days != 0 {
-        parts.push(format!("{} day{}", days, if days.abs() == 1 { "" } else { "s" }));
+        parts.push(format!(
+            "{} day{}",
+            days,
+            if days.abs() == 1 { "" } else { "s" }
+        ));
     }
 
     if micros != 0 {
@@ -318,7 +350,12 @@ fn format_decimal(value: i128, scale: i16) -> String {
         let divisor = 10i128.pow(scale as u32);
         let int_part = value / divisor;
         let frac_part = (value % divisor).abs();
-        format!("{}.{:0>width$}", int_part, frac_part, width = scale as usize)
+        format!(
+            "{}.{:0>width$}",
+            int_part,
+            frac_part,
+            width = scale as usize
+        )
     }
 }
 
@@ -350,7 +387,10 @@ mod tests {
         let formatter = TableFormatter::new(headers, &rows);
         let output = formatter.render();
 
-        assert!(output.contains("+----+------+"), "Should have separator line");
+        assert!(
+            output.contains("+----+------+"),
+            "Should have separator line"
+        );
         assert!(output.contains("| id | name |"), "Should have header row");
         assert_eq!(formatter.row_count(), 0);
     }
@@ -366,7 +406,10 @@ mod tests {
         let formatter = TableFormatter::new(headers, &rows);
         let output = formatter.render();
 
-        assert!(output.contains("| 1  | Alice |"), "Should have data row with id=1, name=Alice");
+        assert!(
+            output.contains("| 1  | Alice |"),
+            "Should have data row with id=1, name=Alice"
+        );
         assert_eq!(formatter.row_count(), 1);
     }
 
@@ -374,8 +417,14 @@ mod tests {
     fn multiple_rows_render_correctly() {
         let headers = vec!["id".to_string(), "name".to_string()];
         let rows = vec![
-            make_row(vec![OwnedValue::Int(1), OwnedValue::Text("Alice".to_string())]),
-            make_row(vec![OwnedValue::Int(2), OwnedValue::Text("Bob".to_string())]),
+            make_row(vec![
+                OwnedValue::Int(1),
+                OwnedValue::Text("Alice".to_string()),
+            ]),
+            make_row(vec![
+                OwnedValue::Int(2),
+                OwnedValue::Text("Bob".to_string()),
+            ]),
         ];
 
         let formatter = TableFormatter::new(headers, &rows);
@@ -394,7 +443,10 @@ mod tests {
         let formatter = TableFormatter::new(headers, &rows);
         let output = formatter.render();
 
-        assert!(output.contains("| NULL  |"), "NULL should be displayed as 'NULL'");
+        assert!(
+            output.contains("| NULL  |"),
+            "NULL should be displayed as 'NULL'"
+        );
     }
 
     #[test]
@@ -443,8 +495,8 @@ mod tests {
     #[test]
     fn uuid_formats_with_dashes() {
         let uuid_bytes: [u8; 16] = [
-            0x55, 0x0e, 0x84, 0x00, 0xe2, 0x9b, 0x41, 0xd4,
-            0xa7, 0x16, 0x44, 0x66, 0x55, 0x44, 0x00, 0x00,
+            0x55, 0x0e, 0x84, 0x00, 0xe2, 0x9b, 0x41, 0xd4, 0xa7, 0x16, 0x44, 0x66, 0x55, 0x44,
+            0x00, 0x00,
         ];
         let formatted = format_value(&OwnedValue::Uuid(uuid_bytes));
         assert_eq!(formatted, "550e8400-e29b-41d4-a716-446655440000");
@@ -466,7 +518,10 @@ mod tests {
 
     #[test]
     fn long_text_is_truncated_at_max_width() {
-        let truncated = truncate("This is a very long string that exceeds the maximum width", 20);
+        let truncated = truncate(
+            "This is a very long string that exceeds the maximum width",
+            20,
+        );
         assert_eq!(truncated.len(), 20);
         assert!(truncated.ends_with("..."));
     }
@@ -488,7 +543,10 @@ mod tests {
 
         let formatter = TableFormatter::new(headers, &rows);
 
-        assert_eq!(formatter.widths[0], 14, "Width should be based on longest value");
+        assert_eq!(
+            formatter.widths[0], 14,
+            "Width should be based on longest value"
+        );
     }
 
     #[test]

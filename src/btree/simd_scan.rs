@@ -182,19 +182,9 @@ pub unsafe fn simd_prefix_search_avx2(
         let eq_mask = _mm256_movemask_epi8(cmp_eq) as u32;
 
         if lt_mask == 0xFFFFFFFF {
-            if eq_mask != 0 {
-                let eq_idx = (eq_mask.trailing_zeros() / 4) as usize;
-                let last_eq_idx = (32 - eq_mask.leading_zeros()) as usize / 4;
-                return (batch_start + eq_idx, batch_start + last_eq_idx, eq_mask);
-            }
             left = batch_start + AVX2_BATCH_SIZE;
             continue;
         } else if lt_mask == 0 {
-            if eq_mask != 0 {
-                let eq_idx = (eq_mask.trailing_zeros() / 4) as usize;
-                let last_eq_idx = (32 - eq_mask.leading_zeros()) as usize / 4;
-                return (batch_start + eq_idx, batch_start + last_eq_idx, eq_mask);
-            }
             right = batch_start;
             continue;
         }
@@ -206,15 +196,18 @@ pub unsafe fn simd_prefix_search_avx2(
         }
         right = batch_start + first_ge_idx.min(7) + 1;
 
-        // If there are equal matches, ensure we include all of them
         if eq_mask != 0 {
-            let last_eq_idx = (32 - eq_mask.leading_zeros()) as usize / 4;
-             if batch_start + last_eq_idx > right {
-                 right = batch_start + last_eq_idx;
-             }
+            let first_eq_idx = (eq_mask.trailing_zeros() / 4) as usize;
+            let last_eq_idx = if eq_mask.leading_zeros() == 0 {
+                7
+            } else {
+                (31 - eq_mask.leading_zeros()) as usize / 4
+            };
+            left = left.min(batch_start + first_eq_idx);
+            right = right.max(batch_start + last_eq_idx + 1);
         }
 
-        return (left, right, eq_mask);
+        break;
     }
 
     (left, right, 0)
@@ -271,32 +264,32 @@ pub unsafe fn simd_prefix_search_neon(
 
         // Calculate count of LT (Less Than) items
         let num_lt = (lt_mask_val.trailing_ones() / 16) as usize;
-        
+
         let new_left = if num_lt > 0 {
             batch_start + num_lt
         } else {
             left
         };
-        
+
         // Calculate index of first GT (Greater Than) item
         let lt_eq_mask = lt_mask_val | eq_mask_val;
         let gt_mask = !lt_eq_mask;
-        
+
         let mut new_right = right;
         if gt_mask != 0 {
-             let first_gt = (gt_mask.trailing_zeros() / 16) as usize;
-             if first_gt < 4 {
+            let first_gt = (gt_mask.trailing_zeros() / 16) as usize;
+            if first_gt < 4 {
                 new_right = batch_start + first_gt;
-             }
+            }
         }
-        
+
         if new_left <= left && new_right >= right {
-             break; 
+            break;
         }
-        
+
         left = new_left;
         right = new_right;
-        
+
         if left >= right {
             break;
         }
@@ -342,7 +335,7 @@ pub fn simd_prefix_search_scalar(
                 // We should break and let the standard binary search handle strict range.
                 // Or try to expand locally?
                 // Safest is to just break and return current range, assuming binary search is fast enough.
-                start_eq_mask = 1; 
+                start_eq_mask = 1;
                 break;
             }
         }
@@ -540,20 +533,21 @@ pub fn prefetch_slots(page_data: &[u8], start_index: usize, _cell_count: usize) 
     if slot_offset + 64 <= PAGE_SIZE {
         // SAFETY: The pointer is valid (within page bounds) and aligned for prefetch
         unsafe {
-            _mm_prefetch(page_data.as_ptr().add(slot_offset) as *const i8, _MM_HINT_T0);
+            _mm_prefetch(
+                page_data.as_ptr().add(slot_offset) as *const i8,
+                _MM_HINT_T0,
+            );
         }
     }
 }
 
 #[cfg(target_arch = "aarch64")]
 #[inline]
-pub fn prefetch_slots(_page_data: &[u8], _start_index: usize, _cell_count: usize) {
-}
+pub fn prefetch_slots(_page_data: &[u8], _start_index: usize, _cell_count: usize) {}
 
 #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
 #[inline]
-pub fn prefetch_slots(_page_data: &[u8], _start_index: usize, _cell_count: usize) {
-}
+pub fn prefetch_slots(_page_data: &[u8], _start_index: usize, _cell_count: usize) {}
 
 #[cfg(test)]
 mod tests {
@@ -673,32 +667,31 @@ mod tests {
         // Create 200 keys: 0, 2, ...
         // Note: loop limit 500 to match reproduction test scale if needed, but 250 (125 items) is enough
         for i in (0..500).step_by(2) {
-             let k = (i as u64).to_be_bytes().to_vec();
-             keys.push(k);
+            let k = (i as u64).to_be_bytes().to_vec();
+            keys.push(k);
         }
-        
+
         // Setup: Indices 0..120 exist. Key at 120 is 240.
         // We want to insert 242.
-        
+
         let limit = 121; // include 240
         let keys_slice = &keys[0..limit];
         let keys_refs: Vec<&[u8]> = keys_slice.iter().map(|k| k.as_slice()).collect();
-        
+
         let page = create_test_page_with_keys(&keys_refs);
-        
+
         let target_key = &keys[limit]; // 242
         println!("Target Key: {:?}", target_key);
-        
+
         let result = find_key_simd(&page, target_key, keys_refs.len());
-         match result {
-             SearchResult::NotFound(idx) => {
-                 println!("Found insertion point at {}", idx);
-                 assert_eq!(idx, limit, "Should insert at {} (after 240)", limit);
-             },
-             _ => panic!("Should result in NotFound"),
+        match result {
+            SearchResult::NotFound(idx) => {
+                println!("Found insertion point at {}", idx);
+                assert_eq!(idx, limit, "Should insert at {} (after 240)", limit);
+            }
+            _ => panic!("Should result in NotFound"),
         }
     }
-
 
     #[test]
     fn test_find_key_simd_with_high_byte_keys() {
@@ -727,12 +720,7 @@ mod tests {
 
     #[test]
     fn test_find_key_simd_not_found_high_byte() {
-        let keys: Vec<&[u8]> = vec![
-            b"aaa",
-            b"ccc",
-            b"\x80\x00\x00",
-            b"\xff\x00\x00",
-        ];
+        let keys: Vec<&[u8]> = vec![b"aaa", b"ccc", b"\x80\x00\x00", b"\xff\x00\x00"];
 
         let page = create_test_page_with_keys(&keys);
 
@@ -821,9 +809,8 @@ mod tests {
         let page = create_test_page_with_keys(&keys);
 
         let target_prefix_mid = 0x80000000u32;
-        let (left, right, _) = unsafe {
-            simd_prefix_search_avx2(&page, target_prefix_mid, keys.len())
-        };
+        let (left, right, _) =
+            unsafe { simd_prefix_search_avx2(&page, target_prefix_mid, keys.len()) };
 
         assert!(
             left <= 3 && right >= 4,
@@ -846,9 +833,7 @@ mod tests {
         let page = create_test_page_with_keys(&keys);
 
         let target_prefix = 0x80000000u32;
-        let (left, right, _) = unsafe {
-            simd_prefix_search_neon(&page, target_prefix, keys.len())
-        };
+        let (left, right, _) = unsafe { simd_prefix_search_neon(&page, target_prefix, keys.len()) };
 
         assert!(
             left <= 2 && right >= 3,
@@ -860,10 +845,7 @@ mod tests {
 
     #[test]
     fn test_scalar_handles_signed_boundary() {
-        let keys: Vec<&[u8]> = vec![
-            b"\x7f\xff\xff\xff",
-            b"\x80\x00\x00\x00",
-        ];
+        let keys: Vec<&[u8]> = vec![b"\x7f\xff\xff\xff", b"\x80\x00\x00\x00"];
 
         let page = create_test_page_with_keys(&keys);
 

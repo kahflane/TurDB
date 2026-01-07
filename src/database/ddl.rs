@@ -49,7 +49,7 @@
 //! This is done in batches (10,000 rows) to avoid holding locks too long.
 //! Related indexes are automatically dropped before the column is removed.
 
-use crate::database::{ExecuteResult, Database};
+use crate::database::{Database, ExecuteResult};
 use crate::schema::ColumnDef as SchemaColumnDef;
 use crate::storage::{TableFileHeader, DEFAULT_SCHEMA};
 use crate::types::{create_record_schema, OwnedValue};
@@ -130,12 +130,15 @@ impl Database {
                         ColumnConstraint::References {
                             table,
                             column: ref_col,
-                            ..
+                            on_delete,
+                            on_update,
                         } => {
                             let fk_column = ref_col.unwrap_or(col.name);
                             column = column.with_constraint(SchemaConstraint::ForeignKey {
                                 table: table.to_string(),
                                 column: fk_column.to_string(),
+                                on_delete: Self::convert_referential_action(*on_delete),
+                                on_update: Self::convert_referential_action(*on_update),
                             });
                         }
                         ColumnConstraint::AutoIncrement => {
@@ -145,7 +148,10 @@ impl Database {
                     }
                 }
 
-                if matches!(col.data_type, SqlDataType::Serial | SqlDataType::BigSerial | SqlDataType::SmallSerial) {
+                if matches!(
+                    col.data_type,
+                    SqlDataType::Serial | SqlDataType::BigSerial | SqlDataType::SmallSerial
+                ) {
                     column = column.with_constraint(SchemaConstraint::AutoIncrement);
                     column = column.with_constraint(SchemaConstraint::NotNull);
                 }
@@ -430,7 +436,8 @@ impl Database {
         )?;
 
         {
-            let index_storage_arc = file_manager.index_data_mut(schema_name, table_name, index_name)?;
+            let index_storage_arc =
+                file_manager.index_data_mut(schema_name, table_name, index_name)?;
             let mut index_storage = index_storage_arc.write();
             index_storage.grow(2)?;
             BTree::create(&mut *index_storage, 1)?;
@@ -573,12 +580,17 @@ impl Database {
             let catalog_guard = self.shared.catalog.read();
             let catalog = catalog_guard.as_ref().unwrap();
             let table_def = catalog.resolve_table(table_name)?;
-            let indexes: Vec<String> = table_def.indexes().iter().map(|i| i.name().to_string()).collect();
+            let indexes: Vec<String> = table_def
+                .indexes()
+                .iter()
+                .map(|i| i.name().to_string())
+                .collect();
             drop(catalog_guard);
 
             for index_name in indexes {
                 if file_manager.index_exists(schema_name, table_name, &index_name) {
-                    let index_storage_arc = file_manager.index_data_mut(schema_name, table_name, &index_name)?;
+                    let index_storage_arc =
+                        file_manager.index_data_mut(schema_name, table_name, &index_name)?;
                     let mut index_storage = index_storage_arc.write();
                     let index_btree = BTree::new(&mut *index_storage, root_page)?;
                     let mut index_cursor = index_btree.cursor_first()?;
@@ -631,7 +643,11 @@ impl Database {
                         .get_schema_mut(schema_name)
                         .ok_or_else(|| eyre::eyre!("schema '{}' not found", schema_name))?;
                     if !schema.table_exists(table_name) {
-                        bail!("table '{}' not found in schema '{}'", table_name, schema_name);
+                        bail!(
+                            "table '{}' not found in schema '{}'",
+                            table_name,
+                            schema_name
+                        );
                     }
                     schema.rename_table(table_name, new_name);
                 }
@@ -645,7 +661,11 @@ impl Database {
                     .get_schema_mut(schema_name)
                     .ok_or_else(|| eyre::eyre!("schema '{}' not found", schema_name))?;
                 if !schema.table_exists(table_name) {
-                    bail!("table '{}' not found in schema '{}'", table_name, schema_name);
+                    bail!(
+                        "table '{}' not found in schema '{}'",
+                        table_name,
+                        schema_name
+                    );
                 }
                 let table = schema.get_table_mut(table_name).unwrap();
                 if !table.rename_column(old_name, new_name) {
@@ -660,7 +680,11 @@ impl Database {
                     .get_schema_mut(schema_name)
                     .ok_or_else(|| eyre::eyre!("schema '{}' not found", schema_name))?;
                 if !schema.table_exists(table_name) {
-                    bail!("table '{}' not found in schema '{}'", table_name, schema_name);
+                    bail!(
+                        "table '{}' not found in schema '{}'",
+                        table_name,
+                        schema_name
+                    );
                 }
                 let table = schema.get_table_mut(table_name).unwrap();
                 let column = Self::ast_column_to_schema_column(col_def)?;
@@ -668,15 +692,17 @@ impl Database {
                 table.add_column(column);
                 format!("added column '{}'", col_name)
             }
-            AlterTableAction::DropColumn { name, if_exists, .. } => {
-                self.migrate_table_drop_column(schema_name, table_name, name, *if_exists)?
-            }
+            AlterTableAction::DropColumn {
+                name, if_exists, ..
+            } => self.migrate_table_drop_column(schema_name, table_name, name, *if_exists)?,
             _ => bail!("ALTER TABLE action not yet supported"),
         };
 
         self.save_catalog()?;
 
-        Ok(ExecuteResult::AlterTable { action: action_desc })
+        Ok(ExecuteResult::AlterTable {
+            action: action_desc,
+        })
     }
 
     fn migrate_table_drop_column(

@@ -285,10 +285,7 @@ fn compare_turdb_sql_vs_qdrant_euclidean() {
     );
 
     if !failed_queries.is_empty() {
-        println!(
-            "\n  Failed queries (below {}% recall):",
-            MIN_RECALL * 100.0
-        );
+        println!("\n  Failed queries (below {}% recall):", MIN_RECALL * 100.0);
         for (idx, recall) in failed_queries.iter().take(10) {
             println!("    Query idx {}: {:.2}%", idx, recall * 100.0);
         }

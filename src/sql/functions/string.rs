@@ -151,7 +151,7 @@ fn eval_substr<'a>(args: &[Option<Value<'a>>]) -> Option<Value<'a>> {
     let text = get_text(args.first()?)?;
     let pos = get_int(args.get(1)?)?;
     let len = args.get(2).and_then(get_int);
-    
+
     let chars: Vec<char> = text.chars().collect();
     let start = if pos > 0 {
         (pos - 1) as usize
@@ -160,7 +160,7 @@ fn eval_substr<'a>(args: &[Option<Value<'a>>]) -> Option<Value<'a>> {
     } else {
         return Some(Value::Text(Cow::Borrowed("")));
     };
-    
+
     let result: String = match len {
         Some(l) if l >= 0 => chars.iter().skip(start).take(l as usize).collect(),
         Some(_) => return Some(Value::Text(Cow::Borrowed(""))),
@@ -173,13 +173,13 @@ fn eval_substring_index<'a>(args: &[Option<Value<'a>>]) -> Option<Value<'a>> {
     let text = get_text(args.first()?)?;
     let delim = get_text(args.get(1)?)?;
     let count = get_int(args.get(2)?)?;
-    
+
     if delim.is_empty() {
         return Some(Value::Text(Cow::Borrowed("")));
     }
-    
+
     let parts: Vec<&str> = text.split(delim.as_ref()).collect();
-    
+
     let result = if count > 0 {
         let take = (count as usize).min(parts.len());
         parts[..take].join(delim.as_ref())
@@ -189,14 +189,14 @@ fn eval_substring_index<'a>(args: &[Option<Value<'a>>]) -> Option<Value<'a>> {
     } else {
         String::new()
     };
-    
+
     Some(Value::Text(Cow::Owned(result)))
 }
 
 fn eval_instr<'a>(args: &[Option<Value<'a>>]) -> Option<Value<'a>> {
     let haystack = get_text(args.first()?)?;
     let needle = get_text(args.get(1)?)?;
-    
+
     let pos = haystack.find(needle.as_ref()).map(|p| p + 1).unwrap_or(0);
     Some(Value::Int(pos as i64))
 }
@@ -205,18 +205,18 @@ fn eval_locate<'a>(args: &[Option<Value<'a>>]) -> Option<Value<'a>> {
     let needle = get_text(args.first()?)?;
     let haystack = get_text(args.get(1)?)?;
     let start = args.get(2).and_then(get_int).unwrap_or(1);
-    
+
     if start < 1 {
         return Some(Value::Int(0));
     }
-    
+
     let chars: Vec<char> = haystack.chars().collect();
     let search_start = (start - 1) as usize;
-    
+
     if search_start >= chars.len() {
         return Some(Value::Int(0));
     }
-    
+
     let search_str: String = chars[search_start..].iter().collect();
     let pos = search_str
         .find(needle.as_ref())
@@ -226,7 +226,7 @@ fn eval_locate<'a>(args: &[Option<Value<'a>>]) -> Option<Value<'a>> {
             char_pos + search_start + 1
         })
         .unwrap_or(0);
-    
+
     Some(Value::Int(pos as i64))
 }
 
@@ -234,9 +234,9 @@ fn eval_field<'a>(args: &[Option<Value<'a>>]) -> Option<Value<'a>> {
     if args.is_empty() {
         return Some(Value::Int(0));
     }
-    
+
     let target = get_text(args.first()?)?;
-    
+
     for (i, arg) in args.iter().skip(1).enumerate() {
         if let Some(val) = get_text(arg) {
             if val == target {
@@ -244,20 +244,20 @@ fn eval_field<'a>(args: &[Option<Value<'a>>]) -> Option<Value<'a>> {
             }
         }
     }
-    
+
     Some(Value::Int(0))
 }
 
 fn eval_find_in_set<'a>(args: &[Option<Value<'a>>]) -> Option<Value<'a>> {
     let needle = get_text(args.first()?)?;
     let haystack = get_text(args.get(1)?)?;
-    
+
     for (i, item) in haystack.split(',').enumerate() {
         if item == needle.as_ref() {
             return Some(Value::Int((i + 1) as i64));
         }
     }
-    
+
     Some(Value::Int(0))
 }
 
@@ -279,10 +279,10 @@ fn eval_concat_ws<'a>(args: &[Option<Value<'a>>]) -> Option<Value<'a>> {
     if args.is_empty() {
         return Some(Value::Null);
     }
-    
+
     let sep = get_text(args.first()?)?;
     let mut parts: Vec<String> = Vec::new();
-    
+
     for arg in args.iter().skip(1) {
         match arg.as_ref() {
             Some(Value::Text(s)) => parts.push(s.to_string()),
@@ -292,7 +292,7 @@ fn eval_concat_ws<'a>(args: &[Option<Value<'a>>]) -> Option<Value<'a>> {
             _ => {}
         }
     }
-    
+
     Some(Value::Text(Cow::Owned(parts.join(sep.as_ref()))))
 }
 
@@ -300,26 +300,26 @@ fn eval_lpad<'a>(args: &[Option<Value<'a>>]) -> Option<Value<'a>> {
     let text = get_text(args.first()?)?;
     let target_len = get_int(args.get(1)?)? as usize;
     let pad = get_text(args.get(2)?)?;
-    
+
     let char_count = text.chars().count();
     if char_count >= target_len {
         let result: String = text.chars().take(target_len).collect();
         return Some(Value::Text(Cow::Owned(result)));
     }
-    
+
     if pad.is_empty() {
         return Some(Value::Text(Cow::Owned(text.to_string())));
     }
-    
+
     let pad_chars: Vec<char> = pad.chars().collect();
     let pad_needed = target_len - char_count;
     let mut result = String::with_capacity(target_len);
-    
+
     for i in 0..pad_needed {
         result.push(pad_chars[i % pad_chars.len()]);
     }
     result.push_str(&text);
-    
+
     Some(Value::Text(Cow::Owned(result)))
 }
 
@@ -327,25 +327,25 @@ fn eval_rpad<'a>(args: &[Option<Value<'a>>]) -> Option<Value<'a>> {
     let text = get_text(args.first()?)?;
     let target_len = get_int(args.get(1)?)? as usize;
     let pad = get_text(args.get(2)?)?;
-    
+
     let char_count = text.chars().count();
     if char_count >= target_len {
         let result: String = text.chars().take(target_len).collect();
         return Some(Value::Text(Cow::Owned(result)));
     }
-    
+
     if pad.is_empty() {
         return Some(Value::Text(Cow::Owned(text.to_string())));
     }
-    
+
     let pad_chars: Vec<char> = pad.chars().collect();
     let pad_needed = target_len - char_count;
     let mut result = text.to_string();
-    
+
     for i in 0..pad_needed {
         result.push(pad_chars[i % pad_chars.len()]);
     }
-    
+
     Some(Value::Text(Cow::Owned(result)))
 }
 
@@ -368,8 +368,10 @@ fn eval_replace<'a>(args: &[Option<Value<'a>>]) -> Option<Value<'a>> {
     let text = get_text(args.first()?)?;
     let from = get_text(args.get(1)?)?;
     let to = get_text(args.get(2)?)?;
-    
-    Some(Value::Text(Cow::Owned(text.replace(from.as_ref(), to.as_ref()))))
+
+    Some(Value::Text(Cow::Owned(
+        text.replace(from.as_ref(), to.as_ref()),
+    )))
 }
 
 fn eval_reverse<'a>(args: &[Option<Value<'a>>]) -> Option<Value<'a>> {
@@ -381,21 +383,21 @@ fn eval_reverse<'a>(args: &[Option<Value<'a>>]) -> Option<Value<'a>> {
 fn eval_repeat<'a>(args: &[Option<Value<'a>>]) -> Option<Value<'a>> {
     let text = get_text(args.first()?)?;
     let count = get_int(args.get(1)?)?;
-    
+
     if count <= 0 {
         return Some(Value::Text(Cow::Borrowed("")));
     }
-    
+
     Some(Value::Text(Cow::Owned(text.repeat(count as usize))))
 }
 
 fn eval_space<'a>(args: &[Option<Value<'a>>]) -> Option<Value<'a>> {
     let count = get_int(args.first()?)?;
-    
+
     if count <= 0 {
         return Some(Value::Text(Cow::Borrowed("")));
     }
-    
+
     Some(Value::Text(Cow::Owned(" ".repeat(count as usize))))
 }
 
@@ -404,37 +406,37 @@ fn eval_insert<'a>(args: &[Option<Value<'a>>]) -> Option<Value<'a>> {
     let pos = get_int(args.get(1)?)?;
     let len = get_int(args.get(2)?)?;
     let newstr = get_text(args.get(3)?)?;
-    
+
     if pos < 1 || len < 0 {
         return Some(Value::Text(Cow::Owned(text.to_string())));
     }
-    
+
     let chars: Vec<char> = text.chars().collect();
     let start = (pos - 1) as usize;
-    
+
     if start > chars.len() {
         return Some(Value::Text(Cow::Owned(text.to_string())));
     }
-    
+
     let end = (start + len as usize).min(chars.len());
-    
+
     let mut result: String = chars[..start].iter().collect();
     result.push_str(&newstr);
     result.extend(chars[end..].iter());
-    
+
     Some(Value::Text(Cow::Owned(result)))
 }
 
 fn eval_strcmp<'a>(args: &[Option<Value<'a>>]) -> Option<Value<'a>> {
     let s1 = get_text(args.first()?)?;
     let s2 = get_text(args.get(1)?)?;
-    
+
     let result = match s1.cmp(&s2) {
         std::cmp::Ordering::Less => -1,
         std::cmp::Ordering::Equal => 0,
         std::cmp::Ordering::Greater => 1,
     };
-    
+
     Some(Value::Int(result))
 }
 
@@ -446,15 +448,18 @@ fn eval_format<'a>(args: &[Option<Value<'a>>]) -> Option<Value<'a>> {
         _ => return None,
     };
     let decimals = get_int(args.get(1)?)?.max(0) as usize;
-    
+
     let formatted = format!("{:.prec$}", number, prec = decimals);
     let parts: Vec<&str> = formatted.split('.').collect();
     let integer_part = parts.first().unwrap_or(&"0");
     let decimal_part = parts.get(1);
 
     let is_negative = integer_part.starts_with('-');
-    let abs_integer: String = integer_part.chars().filter(|c| c.is_ascii_digit()).collect();
-    
+    let abs_integer: String = integer_part
+        .chars()
+        .filter(|c| c.is_ascii_digit())
+        .collect();
+
     let mut with_commas = String::new();
     for (i, c) in abs_integer.chars().rev().enumerate() {
         if i > 0 && i % 3 == 0 {
@@ -474,7 +479,7 @@ fn eval_format<'a>(args: &[Option<Value<'a>>]) -> Option<Value<'a>> {
     } else {
         result
     };
-    
+
     Some(Value::Text(Cow::Owned(result)))
 }
 
@@ -501,14 +506,20 @@ mod tests {
             Some(Value::Text(Cow::Borrowed("."))),
             Some(Value::Int(2)),
         ];
-        assert_eq!(eval_substring_index(&args), Some(Value::Text(Cow::Owned("www.mysql".to_string()))));
+        assert_eq!(
+            eval_substring_index(&args),
+            Some(Value::Text(Cow::Owned("www.mysql".to_string())))
+        );
 
         let args = vec![
             Some(Value::Text(Cow::Borrowed("www.mysql.com"))),
             Some(Value::Text(Cow::Borrowed("."))),
             Some(Value::Int(-2)),
         ];
-        assert_eq!(eval_substring_index(&args), Some(Value::Text(Cow::Owned("mysql.com".to_string()))));
+        assert_eq!(
+            eval_substring_index(&args),
+            Some(Value::Text(Cow::Owned("mysql.com".to_string())))
+        );
     }
 
     #[test]
@@ -519,7 +530,10 @@ mod tests {
             Some(Value::Null),
             Some(Value::Text(Cow::Borrowed("b"))),
         ];
-        assert_eq!(eval_concat_ws(&args), Some(Value::Text(Cow::Owned("a,b".to_string()))));
+        assert_eq!(
+            eval_concat_ws(&args),
+            Some(Value::Text(Cow::Owned("a,b".to_string())))
+        );
     }
 
     #[test]
@@ -529,7 +543,10 @@ mod tests {
             Some(Value::Int(5)),
             Some(Value::Text(Cow::Borrowed("?!"))),
         ];
-        assert_eq!(eval_lpad(&args), Some(Value::Text(Cow::Owned("?!?hi".to_string()))));
+        assert_eq!(
+            eval_lpad(&args),
+            Some(Value::Text(Cow::Owned("?!?hi".to_string())))
+        );
     }
 
     #[test]
@@ -540,7 +557,10 @@ mod tests {
             Some(Value::Int(4)),
             Some(Value::Text(Cow::Borrowed("What"))),
         ];
-        assert_eq!(eval_insert(&args), Some(Value::Text(Cow::Owned("QuWhattic".to_string()))));
+        assert_eq!(
+            eval_insert(&args),
+            Some(Value::Text(Cow::Owned("QuWhattic".to_string())))
+        );
     }
 
     #[test]

@@ -100,7 +100,9 @@
 //! - Position in file if applicable
 
 use crate::records::types::DataType;
-use crate::schema::{Catalog, ColumnDef, Constraint, IndexDef, IndexType, Schema, TableDef};
+use crate::schema::{
+    Catalog, ColumnDef, Constraint, IndexDef, IndexType, ReferentialAction, Schema, TableDef,
+};
 use eyre::{bail, ensure, Result, WrapErr};
 use std::fs::File;
 use std::io::{Read, Write};
@@ -240,7 +242,12 @@ impl CatalogPersistence {
             Constraint::Unique => {
                 buf.push(2);
             }
-            Constraint::ForeignKey { table, column } => {
+            Constraint::ForeignKey {
+                table,
+                column,
+                on_delete,
+                on_update,
+            } => {
                 buf.push(3);
                 let table_bytes = table.as_bytes();
                 buf.extend((table_bytes.len() as u16).to_le_bytes());
@@ -248,6 +255,8 @@ impl CatalogPersistence {
                 let column_bytes = column.as_bytes();
                 buf.extend((column_bytes.len() as u16).to_le_bytes());
                 buf.extend(column_bytes);
+                buf.push(Self::encode_referential_action(*on_delete));
+                buf.push(Self::encode_referential_action(*on_update));
             }
             Constraint::Check(expr) => {
                 buf.push(4);
@@ -260,6 +269,29 @@ impl CatalogPersistence {
             }
         }
         Ok(())
+    }
+
+    fn encode_referential_action(action: Option<ReferentialAction>) -> u8 {
+        match action {
+            None => 0,
+            Some(ReferentialAction::Cascade) => 1,
+            Some(ReferentialAction::Restrict) => 2,
+            Some(ReferentialAction::NoAction) => 3,
+            Some(ReferentialAction::SetNull) => 4,
+            Some(ReferentialAction::SetDefault) => 5,
+        }
+    }
+
+    fn decode_referential_action(byte: u8) -> Option<ReferentialAction> {
+        match byte {
+            0 => None,
+            1 => Some(ReferentialAction::Cascade),
+            2 => Some(ReferentialAction::Restrict),
+            3 => Some(ReferentialAction::NoAction),
+            4 => Some(ReferentialAction::SetNull),
+            5 => Some(ReferentialAction::SetDefault),
+            _ => None,
+        }
     }
 
     fn serialize_index(index: &IndexDef, buf: &mut Vec<u8>) -> Result<()> {
@@ -645,7 +677,24 @@ impl CatalogPersistence {
                     .to_string();
                 pos += column_len;
 
-                Ok((Constraint::ForeignKey { table, column }, pos))
+                let (on_delete, on_update) = if pos + 2 <= bytes.len() {
+                    let on_delete = Self::decode_referential_action(bytes[pos]);
+                    let on_update = Self::decode_referential_action(bytes[pos + 1]);
+                    pos += 2;
+                    (on_delete, on_update)
+                } else {
+                    (None, None)
+                };
+
+                Ok((
+                    Constraint::ForeignKey {
+                        table,
+                        column,
+                        on_delete,
+                        on_update,
+                    },
+                    pos,
+                ))
             }
             4 => {
                 ensure!(

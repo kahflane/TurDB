@@ -176,7 +176,7 @@ impl PreparedStatement {
             cached_update_plan: RefCell::new(None),
         }
     }
-    
+
     pub fn sql(&self) -> &str {
         &self.sql
     }

@@ -65,7 +65,7 @@
 //! separators when two leaf splits have different left_max values that both allow
 //! truncation to the same prefix. Full keys are now used as separators instead.
 //!
-//! The `separator_len()` function (preserved for potential future use) computes 
+//! The `separator_len()` function (preserved for potential future use) computes
 //! the minimal prefix of right_min that is strictly greater than left_max:
 //!
 //! ```text

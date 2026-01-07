@@ -74,13 +74,33 @@ pub enum IndexType {
     Hnsw,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReferentialAction {
+    Cascade,
+    Restrict,
+    NoAction,
+    SetNull,
+    SetDefault,
+}
+
+impl Default for ReferentialAction {
+    fn default() -> Self {
+        ReferentialAction::NoAction
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Constraint {
     NotNull,
     PrimaryKey,
     Unique,
     AutoIncrement,
-    ForeignKey { table: String, column: String },
+    ForeignKey {
+        table: String,
+        column: String,
+        on_delete: Option<ReferentialAction>,
+        on_update: Option<ReferentialAction>,
+    },
     Check(String),
 }
 
@@ -143,12 +163,16 @@ impl ColumnDef {
                         Constraint::ForeignKey {
                             table: t1,
                             column: c1,
+                            on_delete: d1,
+                            on_update: u1,
                         },
                         Constraint::ForeignKey {
                             table: t2,
                             column: c2,
+                            on_delete: d2,
+                            on_update: u2,
                         },
-                    ) => t1 == t2 && c1 == c2,
+                    ) => t1 == t2 && c1 == c2 && d1 == d2 && u1 == u2,
                     (Constraint::Check(e1), Constraint::Check(e2)) => e1 == e2,
                     _ => false,
                 }

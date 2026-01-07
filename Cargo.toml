@@ -69,3 +69,6 @@ strip = true
 [profile.dev]
 opt-level = 1
 debug = true
+
+[profile.bench]
+debug = true

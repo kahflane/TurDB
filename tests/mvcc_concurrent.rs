@@ -36,7 +36,8 @@ use std::time::Instant;
 use turdb::Database;
 
 const SQLITE_DB_PATH: &str = "/Users/julfikar/Downloads/_meta-kaggle.db";
-const TURDB_PATH: &str = "/Users/julfikar/Documents/PassionFruit.nosync/turdb/turdb-core/.worktrees/mvcc_test";
+const TURDB_PATH: &str =
+    "/Users/julfikar/Documents/PassionFruit.nosync/turdb/turdb-core/.worktrees/mvcc_test";
 const BATCH_SIZE: i64 = 10000;
 const INSERT_BATCH_SIZE: usize = 5000;
 
@@ -174,6 +175,23 @@ fn escape_sql_value(value: rusqlite::types::Value) -> String {
     }
 }
 
+fn sqlite_to_owned_value(value: rusqlite::types::Value) -> turdb::OwnedValue {
+    use rusqlite::types::Value;
+    match value {
+        Value::Null => turdb::OwnedValue::Null,
+        Value::Integer(i) => turdb::OwnedValue::Int(i),
+        Value::Real(f) => {
+            if f.is_nan() || f.is_infinite() {
+                turdb::OwnedValue::Null
+            } else {
+                turdb::OwnedValue::Float(f)
+            }
+        }
+        Value::Text(s) => turdb::OwnedValue::Text(s),
+        Value::Blob(b) => turdb::OwnedValue::Blob(b),
+    }
+}
+
 #[derive(Debug)]
 struct TableImportResult {
     table_name: String,
@@ -193,17 +211,19 @@ fn import_table_concurrent(
     let table_name = table.name.to_string();
 
     let result = (|| -> eyre::Result<u64> {
-        println!("[Thread {}] Starting import of table: {}", thread_id, table.name);
+        println!(
+            "[Thread {}] Starting import of table: {}",
+            thread_id, table.name
+        );
 
         db.execute(table.turdb_ddl)?;
 
         let sqlite_conn = Connection::open(SQLITE_DB_PATH)?;
 
-        let count: i64 = sqlite_conn.query_row(
-            &format!("SELECT COUNT(*) FROM {}", table.name),
-            [],
-            |row| row.get(0),
-        )?;
+        let count: i64 =
+            sqlite_conn.query_row(&format!("SELECT COUNT(*) FROM {}", table.name), [], |row| {
+                row.get(0)
+            })?;
         println!("[Thread {}] {} has {} rows", thread_id, table.name, count);
 
         if count == 0 {
@@ -273,8 +293,11 @@ fn import_table_concurrent(
         }
 
         db.execute("COMMIT")?;
-        println!("[Thread {}] {} committed successfully ({} rows)", thread_id, table.name, total_inserted);
-        
+        println!(
+            "[Thread {}] {} committed successfully ({} rows)",
+            thread_id, table.name, total_inserted
+        );
+
         Ok(total_inserted)
     })();
 
@@ -302,7 +325,7 @@ fn verify_table_data(db: &Database, table: &TableSchema) -> eyre::Result<(u64, b
     let turdb_table = camel_to_snake(table.name);
     let query = format!("SELECT COUNT(*) FROM {}", turdb_table);
     let rows = db.query(&query)?;
-    
+
     if rows.is_empty() {
         return Ok((0, false));
     }
@@ -313,11 +336,10 @@ fn verify_table_data(db: &Database, table: &TableSchema) -> eyre::Result<(u64, b
     };
 
     let sqlite_conn = Connection::open(SQLITE_DB_PATH)?;
-    let expected_count: i64 = sqlite_conn.query_row(
-        &format!("SELECT COUNT(*) FROM {}", table.name),
-        [],
-        |row| row.get(0),
-    )?;
+    let expected_count: i64 =
+        sqlite_conn.query_row(&format!("SELECT COUNT(*) FROM {}", table.name), [], |row| {
+            row.get(0)
+        })?;
 
     Ok((count, count == expected_count as u64))
 }
@@ -325,7 +347,10 @@ fn verify_table_data(db: &Database, table: &TableSchema) -> eyre::Result<(u64, b
 #[test]
 fn concurrent_import_small_tables() {
     if !sqlite_db_exists() {
-        eprintln!("Skipping test: SQLite database not found at {}", SQLITE_DB_PATH);
+        eprintln!(
+            "Skipping test: SQLite database not found at {}",
+            SQLITE_DB_PATH
+        );
         return;
     }
 
@@ -336,8 +361,10 @@ fn concurrent_import_small_tables() {
 
     let db = Database::create(TURDB_PATH).expect("Failed to create database");
     db.execute("PRAGMA WAL=ON").expect("Failed to set WAL mode");
-    db.execute("PRAGMA synchronous=NORMAL").expect("Failed to set synchronous mode");
-    db.execute("SET foreign_keys = ON").expect("Failed to disable foreign keys");
+    db.execute("PRAGMA synchronous=NORMAL")
+        .expect("Failed to set synchronous mode");
+    db.execute("SET foreign_keys = ON")
+        .expect("Failed to disable foreign keys");
 
     println!("\n=== MVCC Concurrent Import Test ===");
     println!("Tables to import: {}", SMALL_TABLES.len());
@@ -352,9 +379,7 @@ fn concurrent_import_small_tables() {
         .map(|(idx, table)| {
             let db_conn = db.clone();
             let total_rows_clone = Arc::clone(&total_rows);
-            thread::spawn(move || {
-                import_table_concurrent(db_conn, table, idx, total_rows_clone)
-            })
+            thread::spawn(move || import_table_concurrent(db_conn, table, idx, total_rows_clone))
         })
         .collect();
 
@@ -412,20 +437,36 @@ fn concurrent_import_small_tables() {
                     println!("✓ {} - {} rows verified", camel_to_snake(table.name), count);
                 } else {
                     verification_failed += 1;
-                    println!("✗ {} - row count mismatch: {} rows", camel_to_snake(table.name), count);
+                    println!(
+                        "✗ {} - row count mismatch: {} rows",
+                        camel_to_snake(table.name),
+                        count
+                    );
                 }
             }
             Err(e) => {
                 verification_failed += 1;
-                println!("✗ {} - verification error: {}", camel_to_snake(table.name), e);
+                println!(
+                    "✗ {} - verification error: {}",
+                    camel_to_snake(table.name),
+                    e
+                );
             }
         }
     }
 
     println!("\n=== Summary ===");
-    println!("Tables imported:     {}/{}", success_count, SMALL_TABLES.len());
+    println!(
+        "Tables imported:     {}/{}",
+        success_count,
+        SMALL_TABLES.len()
+    );
     println!("Import failures:     {}", failure_count);
-    println!("Verification passed: {}/{}", verification_passed, SMALL_TABLES.len());
+    println!(
+        "Verification passed: {}/{}",
+        verification_passed,
+        SMALL_TABLES.len()
+    );
     println!("Verification failed: {}", verification_failed);
     println!("Total rows imported: {}", total_imported_rows);
     println!("Total wall time:     {:.2}s", overall_elapsed.as_secs_f64());
@@ -441,10 +482,206 @@ fn concurrent_import_small_tables() {
     println!("\n=== MVCC Concurrent Import Test PASSED ===\n");
 }
 
+fn import_table_fast(
+    db: Database,
+    table: &'static TableSchema,
+    thread_id: usize,
+    total_rows_counter: Arc<AtomicU64>,
+) -> TableImportResult {
+    let start = Instant::now();
+    let table_name = table.name.to_string();
+
+    let result = (|| -> eyre::Result<u64> {
+        println!(
+            "[Thread {}] Starting FAST import of table: {}",
+            thread_id, table.name
+        );
+
+        db.execute(table.turdb_ddl)?;
+
+        let sqlite_conn = Connection::open(SQLITE_DB_PATH)?;
+
+        let count: i64 =
+            sqlite_conn.query_row(&format!("SELECT COUNT(*) FROM {}", table.name), [], |row| {
+                row.get(0)
+            })?;
+        println!("[Thread {}] {} has {} rows", thread_id, table.name, count);
+
+        if count == 0 {
+            return Ok(0);
+        }
+
+        let col_count = table.columns.split(',').count();
+        let turdb_table = camel_to_snake(table.name);
+        let mut total_inserted: u64 = 0;
+        let mut offset: i64 = 0;
+        const FAST_BATCH_SIZE: usize = 10000;
+
+        loop {
+            let query = format!(
+                "SELECT {} FROM {} LIMIT {} OFFSET {}",
+                table.columns, table.name, BATCH_SIZE, offset
+            );
+
+            let mut stmt = sqlite_conn.prepare(&query)?;
+            let mut rows = stmt.query([])?;
+            let mut value_batches: Vec<Vec<turdb::OwnedValue>> = Vec::with_capacity(FAST_BATCH_SIZE);
+            let mut loop_batch_count = 0u64;
+
+            while let Some(row) = rows.next()? {
+                let mut values: Vec<turdb::OwnedValue> = Vec::with_capacity(col_count);
+                for i in 0..col_count {
+                    let val = row.get_ref(i)?.into();
+                    values.push(sqlite_to_owned_value(val));
+                }
+                value_batches.push(values);
+                loop_batch_count += 1;
+                total_inserted += 1;
+                if value_batches.len() >= FAST_BATCH_SIZE {
+                    db.bulk_insert(&turdb_table, std::mem::take(&mut value_batches))?;
+                    total_rows_counter.fetch_add(FAST_BATCH_SIZE as u64, Ordering::Relaxed);
+                    value_batches = Vec::with_capacity(FAST_BATCH_SIZE);
+                }
+            }
+
+            if !value_batches.is_empty() {
+                let batch_len = value_batches.len();
+                db.bulk_insert(&turdb_table, value_batches)?;
+                total_rows_counter.fetch_add(batch_len as u64, Ordering::Relaxed);
+            }
+
+            if loop_batch_count < BATCH_SIZE as u64 {
+                break;
+            }
+            offset += BATCH_SIZE;
+        }
+
+        Ok(total_inserted)
+    })();
+
+    let duration = start.elapsed();
+    match result {
+        Ok(rows) => TableImportResult {
+            table_name,
+            rows_inserted: rows,
+            duration_ms: duration.as_millis() as u64,
+            success: true,
+            error_message: None,
+        },
+        Err(e) => TableImportResult {
+            table_name,
+            rows_inserted: 0,
+            duration_ms: duration.as_millis() as u64,
+            success: false,
+            error_message: Some(e.to_string()),
+        },
+    }
+}
+
+#[test]
+fn fast_import_small_tables() {
+    if !sqlite_db_exists() {
+        eprintln!(
+            "Skipping test: SQLite database not found at {}",
+            SQLITE_DB_PATH
+        );
+        return;
+    }
+
+    let fast_turdb_path = format!("{}_fast", TURDB_PATH);
+    if Path::new(&fast_turdb_path).exists() {
+        std::fs::remove_dir_all(&fast_turdb_path).expect("Failed to remove existing TurDB directory");
+        println!("Removed existing TurDB directory at {}", fast_turdb_path);
+    }
+
+    let db = Database::create(&fast_turdb_path).expect("Failed to create database");
+
+    println!("\n=== FAST Import Test (using bulk_insert) ===");
+    println!("Tables to import: {}", SMALL_TABLES.len());
+    println!("Using {} concurrent threads\n", SMALL_TABLES.len());
+
+    let overall_start = Instant::now();
+    let total_rows = Arc::new(AtomicU64::new(0));
+
+    let handles: Vec<_> = SMALL_TABLES
+        .iter()
+        .enumerate()
+        .map(|(idx, table)| {
+            let db_conn = db.clone();
+            let total_rows_clone = Arc::clone(&total_rows);
+            thread::spawn(move || import_table_fast(db_conn, table, idx, total_rows_clone))
+        })
+        .collect();
+
+    let mut results: Vec<TableImportResult> = Vec::new();
+    for handle in handles {
+        match handle.join() {
+            Ok(result) => results.push(result),
+            Err(e) => {
+                eprintln!("Thread panicked: {:?}", e);
+            }
+        }
+    }
+
+    let overall_elapsed = overall_start.elapsed();
+
+    println!("\n=== Fast Import Results ===");
+    let mut success_count = 0;
+    let mut failure_count = 0;
+    let mut total_imported_rows = 0u64;
+
+    for result in &results {
+        if result.success {
+            success_count += 1;
+            total_imported_rows += result.rows_inserted;
+            println!(
+                "✓ {} - {} rows in {}ms ({:.0} rows/sec)",
+                result.table_name,
+                result.rows_inserted,
+                result.duration_ms,
+                if result.duration_ms > 0 {
+                    (result.rows_inserted as f64 / result.duration_ms as f64) * 1000.0
+                } else {
+                    0.0
+                }
+            );
+        } else {
+            failure_count += 1;
+            println!(
+                "✗ {} - FAILED: {}",
+                result.table_name,
+                result.error_message.as_deref().unwrap_or("unknown error")
+            );
+        }
+    }
+
+    println!("\n=== Summary ===");
+    println!(
+        "Tables imported:     {}/{}",
+        success_count,
+        SMALL_TABLES.len()
+    );
+    println!("Import failures:     {}", failure_count);
+    println!("Total rows imported: {}", total_imported_rows);
+    println!("Total wall time:     {:.2}s", overall_elapsed.as_secs_f64());
+    println!(
+        "Throughput:          {:.0} rows/sec",
+        total_imported_rows as f64 / overall_elapsed.as_secs_f64()
+    );
+
+    assert_eq!(failure_count, 0, "Some imports failed");
+    assert!(total_imported_rows > 0, "No rows were imported");
+
+    println!("\n=== FAST Import Test PASSED ===\n");
+}
+
 #[test]
 fn concurrent_read_write_isolation() {
     if !sqlite_db_exists() {
-        eprintln!("Skipping test: SQLite database not found at {}", SQLITE_DB_PATH);
+        eprintln!(
+            "Skipping test: SQLite database not found at {}",
+            SQLITE_DB_PATH
+        );
         return;
     }
 
@@ -462,8 +699,11 @@ fn concurrent_read_write_isolation() {
     println!("\n=== Read-Write Isolation Test ===");
 
     for i in 1..=100 {
-        db.execute(&format!("INSERT INTO test_isolation VALUES ({}, 'initial_{}')", i, i))
-            .expect("Failed to insert initial data");
+        db.execute(&format!(
+            "INSERT INTO test_isolation VALUES ({}, 'initial_{}')",
+            i, i
+        ))
+        .expect("Failed to insert initial data");
     }
 
     let db_writer = db.clone();
@@ -476,7 +716,10 @@ fn concurrent_read_write_isolation() {
             for i in 0..50 {
                 let id = 1000 + batch * 50 + i;
                 db_writer
-                    .execute(&format!("INSERT INTO test_isolation VALUES ({}, 'writer_{}')", id, id))
+                    .execute(&format!(
+                        "INSERT INTO test_isolation VALUES ({}, 'writer_{}')",
+                        id, id
+                    ))
                     .expect("Failed to insert");
                 inserted += 1;
             }
@@ -508,7 +751,9 @@ fn concurrent_read_write_isolation() {
     println!("Writer inserted: {} rows", inserted);
     println!("Reader saw counts: {:?}", read_counts);
 
-    let final_rows = db.query("SELECT COUNT(*) FROM test_isolation").expect("Failed to final query");
+    let final_rows = db
+        .query("SELECT COUNT(*) FROM test_isolation")
+        .expect("Failed to final query");
     let final_count = if let Some(turdb::OwnedValue::Int(n)) = final_rows[0].get(0) {
         *n
     } else {
@@ -519,7 +764,11 @@ fn concurrent_read_write_isolation() {
     assert_eq!(final_count, 100 + inserted as i64, "Row count mismatch");
 
     for count in &read_counts {
-        assert!(*count >= 100, "Read count should never be less than initial: {}", count);
+        assert!(
+            *count >= 100,
+            "Read count should never be less than initial: {}",
+            count
+        );
     }
 
     let is_monotonic = read_counts.windows(2).all(|w| w[0] <= w[1]);
@@ -531,7 +780,10 @@ fn concurrent_read_write_isolation() {
 #[test]
 fn concurrent_multi_table_transactions() {
     if !sqlite_db_exists() {
-        eprintln!("Skipping test: SQLite database not found at {}", SQLITE_DB_PATH);
+        eprintln!(
+            "Skipping test: SQLite database not found at {}",
+            SQLITE_DB_PATH
+        );
         return;
     }
 
@@ -625,8 +877,10 @@ fn stress_test_transaction_slots() {
 
     println!("\n=== Transaction Slot Stress Test ===");
 
-    db.execute("CREATE TABLE stress_test (id BIGINT primary key auto_increment, thread_id INT, seq INT)")
-        .expect("Failed to create table");
+    db.execute(
+        "CREATE TABLE stress_test (id BIGINT primary key auto_increment, thread_id INT, seq INT)",
+    )
+    .expect("Failed to create table");
 
     let num_threads = 32;
     let ops_per_thread = 50;
@@ -680,10 +934,15 @@ fn stress_test_transaction_slots() {
     println!("Successful:        {}", total_success);
     println!("Failed:            {}", total_failure);
 
-    let rows = db.query("SELECT COUNT(*) FROM stress_test").expect("Failed to count");
+    let rows = db
+        .query("SELECT COUNT(*) FROM stress_test")
+        .expect("Failed to count");
     if let Some(turdb::OwnedValue::Int(n)) = rows[0].get(0) {
         println!("Rows in table:     {}", n);
-        assert_eq!(*n as u64, total_success, "Row count doesn't match success count");
+        assert_eq!(
+            *n as u64, total_success,
+            "Row count doesn't match success count"
+        );
     }
 
     println!("=== Transaction Slot Stress Test PASSED ===\n");
@@ -693,56 +952,56 @@ fn stress_test_transaction_slots() {
 fn two_connections_can_hold_simultaneous_transactions() {
     let temp_dir = tempfile::tempdir().expect("Failed to create temp dir");
     let db_path = temp_dir.path().join("concurrent_txn_test");
-    
+
     let db = Database::create(&db_path).expect("Failed to create database");
-    
+
     db.execute("CREATE TABLE t1 (id INT PRIMARY KEY, value TEXT)")
         .expect("Failed to create t1");
     db.execute("CREATE TABLE t2 (id INT PRIMARY KEY, value TEXT)")
         .expect("Failed to create t2");
-    
+
     let db1 = db.clone();
     let db2 = db.clone();
-    
+
     let barrier = Arc::new(Barrier::new(2));
     let barrier1 = Arc::clone(&barrier);
     let barrier2 = Arc::clone(&barrier);
-    
+
     let handle1 = thread::spawn(move || {
         db1.execute("BEGIN").expect("Thread 1: Failed to BEGIN");
-        
+
         barrier1.wait();
-        
+
         db1.execute("INSERT INTO t1 VALUES (1, 'from thread 1')")
             .expect("Thread 1: Failed to INSERT");
-        
+
         barrier1.wait();
-        
+
         db1.execute("COMMIT").expect("Thread 1: Failed to COMMIT");
     });
-    
+
     let handle2 = thread::spawn(move || {
         db2.execute("BEGIN").expect("Thread 2: Failed to BEGIN");
-        
+
         barrier2.wait();
-        
+
         db2.execute("INSERT INTO t2 VALUES (2, 'from thread 2')")
             .expect("Thread 2: Failed to INSERT");
-        
+
         barrier2.wait();
-        
+
         db2.execute("COMMIT").expect("Thread 2: Failed to COMMIT");
     });
-    
+
     handle1.join().expect("Thread 1 panicked");
     handle2.join().expect("Thread 2 panicked");
-    
+
     let rows1 = db.query("SELECT * FROM t1").expect("Failed to query t1");
     let rows2 = db.query("SELECT * FROM t2").expect("Failed to query t2");
-    
+
     assert_eq!(rows1.len(), 1, "t1 should have 1 row");
     assert_eq!(rows2.len(), 1, "t2 should have 1 row");
-    
+
     println!("=== Two Connections Simultaneous Transactions Test PASSED ===");
 }
 
@@ -750,37 +1009,55 @@ fn two_connections_can_hold_simultaneous_transactions() {
 fn cloned_connections_have_independent_transactions() {
     let temp_dir = tempfile::tempdir().expect("Failed to create temp dir");
     let db_path = temp_dir.path().join("independent_txn_test");
-    
+
     let db = Database::create(&db_path).expect("Failed to create database");
-    
+
     db.execute("CREATE TABLE test (id INT PRIMARY KEY, value INT)")
         .expect("Failed to create table");
-    
-    db.execute("INSERT INTO test VALUES (1, 100)").expect("Failed to insert");
-    
+
+    db.execute("INSERT INTO test VALUES (1, 100)")
+        .expect("Failed to insert");
+
     let conn1 = db.clone();
     let conn2 = db.clone();
-    
+
     conn1.execute("BEGIN").expect("conn1: Failed to BEGIN");
-    conn1.execute("INSERT INTO test VALUES (2, 200)").expect("conn1: Failed to INSERT");
-    
+    conn1
+        .execute("INSERT INTO test VALUES (2, 200)")
+        .expect("conn1: Failed to INSERT");
+
     conn2.execute("BEGIN").expect("conn2: Failed to BEGIN");
-    conn2.execute("INSERT INTO test VALUES (3, 300)").expect("conn2: Failed to INSERT");
-    
-    conn1.execute("ROLLBACK").expect("conn1: Failed to ROLLBACK");
-    
+    conn2
+        .execute("INSERT INTO test VALUES (3, 300)")
+        .expect("conn2: Failed to INSERT");
+
+    conn1
+        .execute("ROLLBACK")
+        .expect("conn1: Failed to ROLLBACK");
+
     conn2.execute("COMMIT").expect("conn2: Failed to COMMIT");
-    
-    let rows = db.query("SELECT id FROM test ORDER BY id").expect("Failed to query");
-    assert_eq!(rows.len(), 2, "Should have 2 rows (initial + conn2's insert)");
-    
-    let ids: Vec<i64> = rows.iter()
+
+    let rows = db
+        .query("SELECT id FROM test ORDER BY id")
+        .expect("Failed to query");
+    assert_eq!(
+        rows.len(),
+        2,
+        "Should have 2 rows (initial + conn2's insert)"
+    );
+
+    let ids: Vec<i64> = rows
+        .iter()
         .filter_map(|r| match r.get(0) {
             Some(turdb::OwnedValue::Int(i)) => Some(*i),
             _ => None,
         })
         .collect();
-    assert_eq!(ids, vec![1, 3], "Should have rows 1 and 3 (2 was rolled back)");
-    
+    assert_eq!(
+        ids,
+        vec![1, 3],
+        "Should have rows 1 and 3 (2 was rolled back)"
+    );
+
     println!("=== Cloned Connections Independent Transactions Test PASSED ===");
 }

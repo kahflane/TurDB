@@ -229,6 +229,10 @@ impl<'a> Transaction<'a> {
         self.write_entries.push(entry);
     }
 
+    pub fn add_write_entries_batch(&mut self, entries: impl IntoIterator<Item = WriteEntry>) {
+        self.write_entries.extend(entries);
+    }
+
     pub fn commit(mut self) -> TxnId {
         self.state = TxnState::Committed;
         self.committed = true;

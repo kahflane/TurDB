@@ -336,7 +336,10 @@ impl Wal {
                 }
 
                 let page_mut = storage.page_mut(header.page_no).wrap_err_with(|| {
-                    format!("failed to get page {} for WAL recovery of segment {}", header.page_no, i)
+                    format!(
+                        "failed to get page {} for WAL recovery of segment {}",
+                        header.page_no, i
+                    )
                 })?;
 
                 page_mut.copy_from_slice(&page_data);
@@ -347,11 +350,7 @@ impl Wal {
         Ok(frames_applied)
     }
 
-    pub fn recover_for_file(
-        &self,
-        storage: &mut super::MmapStorage,
-        file_id: u64,
-    ) -> Result<u32> {
+    pub fn recover_for_file(&self, storage: &mut super::MmapStorage, file_id: u64) -> Result<u32> {
         let max_segment = Self::find_latest_segment(&self.dir)?;
         let mut frames_applied = 0;
 
@@ -401,13 +400,14 @@ impl Wal {
     pub fn remove_closed_segments(&self, paths: &[PathBuf]) -> Result<()> {
         let mut guard = self.closed_segments.lock();
         guard.retain(|p| !paths.contains(p));
-        
+
         for path in paths {
             if path.exists() {
-                remove_file(path).wrap_err_with(|| format!("failed to remove closed WAL segment {:?}", path))?;
+                remove_file(path)
+                    .wrap_err_with(|| format!("failed to remove closed WAL segment {:?}", path))?;
             }
         }
-        
+
         Ok(())
     }
 
@@ -423,15 +423,20 @@ impl Wal {
                 continue;
             }
 
-            let file_name = segment_path.file_name().unwrap_or_default().to_string_lossy();
+            let file_name = segment_path
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy();
             let num_part = if file_name.starts_with("wal.") && file_name.len() == 10 {
                 &file_name[4..]
             } else {
                 continue;
             };
-            
+
             let sequence = num_part.parse::<u64>().unwrap_or(0);
-            if sequence == 0 { continue; }
+            if sequence == 0 {
+                continue;
+            }
 
             let mut segment = WalSegment::open(segment_path, sequence)?;
 
@@ -468,7 +473,9 @@ impl Wal {
     pub fn checkpoint(&self, storage: &mut super::MmapStorage) -> Result<u32> {
         let frames_applied = self.recover(storage)?;
 
-        storage.sync().wrap_err("failed to sync storage during checkpoint")?;
+        storage
+            .sync()
+            .wrap_err("failed to sync storage during checkpoint")?;
 
         self.truncate()?;
 
@@ -665,7 +672,7 @@ impl Wal {
         let mut segment_guard = self.current_segment.lock();
         let current_sequence = segment_guard.sequence;
         let old_path = segment_guard.path.clone(); // Assumption: WalSegment has path
-        
+
         let new_sequence = current_sequence + 1;
         let new_segment_path = self.dir.join(format!("wal.{:06}", new_sequence));
         let new_segment = WalSegment::create(&new_segment_path, new_sequence)
@@ -720,7 +727,10 @@ impl WalSegment {
         file.seek(SeekFrom::Start(0))
             .wrap_err("failed to seek to start of WAL segment")?;
 
-        let len = file.metadata().wrap_err("failed to get WAL segment metadata")?.len();
+        let len = file
+            .metadata()
+            .wrap_err("failed to get WAL segment metadata")?
+            .len();
 
         Ok(Self {
             file,
@@ -1724,7 +1734,8 @@ mod tests {
             "segment 2 should exist before checkpoint"
         );
 
-        wal.checkpoint(&mut storage).expect("checkpoint should succeed");
+        wal.checkpoint(&mut storage)
+            .expect("checkpoint should succeed");
 
         assert!(
             !wal_dir.join("wal.000001").exists(),

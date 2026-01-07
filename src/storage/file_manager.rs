@@ -111,7 +111,6 @@ use super::{MmapStorage, PAGE_SIZE};
 use parking_lot::RwLock;
 use std::sync::Arc;
 
-
 pub const DEFAULT_MAX_OPEN_FILES: usize = 64;
 pub const MIN_MAX_OPEN_FILES: usize = 8;
 
@@ -233,7 +232,7 @@ impl<K: Clone + Eq + std::hash::Hash, V> LruFileCache<K, V> {
 
         self.order.push(key.clone());
         self.map.insert(key, value);
-        
+
         evicted
     }
 
@@ -589,7 +588,11 @@ impl FileManager {
         Ok(self.open_files.get(&key).unwrap().clone())
     }
 
-    pub fn table_data_mut(&mut self, schema: &str, table: &str) -> Result<Arc<RwLock<MmapStorage>>> {
+    pub fn table_data_mut(
+        &mut self,
+        schema: &str,
+        table: &str,
+    ) -> Result<Arc<RwLock<MmapStorage>>> {
         ensure!(
             self.table_exists(schema, table),
             "table '{}.{}' does not exist",

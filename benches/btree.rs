@@ -300,7 +300,9 @@ fn bench_interior_node_operations(c: &mut Criterion) {
 }
 
 fn bench_simd_find_key(c: &mut Criterion) {
-    use turdb::btree::{find_key_simd, extract_prefix, SearchResult, LEAF_CONTENT_START, SLOT_SIZE};
+    use turdb::btree::{
+        extract_prefix, find_key_simd, SearchResult, LEAF_CONTENT_START, SLOT_SIZE,
+    };
     use turdb::storage::{PageHeader, PageType};
 
     fn create_page_with_n_keys(n: usize) -> Vec<u8> {
@@ -388,7 +390,11 @@ fn bench_simd_find_key(c: &mut Criterion) {
         group.bench_with_input(BenchmarkId::new("simd", count), count, |b, &count| {
             b.iter(|| {
                 for key in &search_keys {
-                    hint_black_box(find_key_simd(black_box(&page), black_box(key.as_bytes()), count));
+                    hint_black_box(find_key_simd(
+                        black_box(&page),
+                        black_box(key.as_bytes()),
+                        count,
+                    ));
                 }
             });
         });
@@ -396,7 +402,11 @@ fn bench_simd_find_key(c: &mut Criterion) {
         group.bench_with_input(BenchmarkId::new("scalar", count), count, |b, &count| {
             b.iter(|| {
                 for key in &search_keys {
-                    hint_black_box(scalar_find_key(black_box(&page), black_box(key.as_bytes()), count));
+                    hint_black_box(scalar_find_key(
+                        black_box(&page),
+                        black_box(key.as_bytes()),
+                        count,
+                    ));
                 }
             });
         });

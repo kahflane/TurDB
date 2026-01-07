@@ -187,9 +187,8 @@ impl Database {
 
             if path.extension().map(|e| e == "tbd").unwrap_or(false) {
                 let mut header_bytes = [0u8; FILE_HEADER_SIZE];
-                let mut file = fs::File::open(&path).wrap_err_with(|| {
-                    format!("failed to open table file {:?} for relay", path)
-                })?;
+                let mut file = fs::File::open(&path)
+                    .wrap_err_with(|| format!("failed to open table file {:?} for relay", path))?;
 
                 if file
                     .read(&mut header_bytes)
@@ -213,13 +212,14 @@ impl Database {
                     format!("failed to open storage {:?} for WAL replay", path)
                 })?;
 
-                let frames = Wal::replay_segments_to_storage(segments, &mut storage, table_id as u64)
-                    .wrap_err_with(|| {
-                        format!(
-                            "failed to replay WAL frames for table_id={} from segments",
-                            table_id
-                        )
-                    })?;
+                let frames =
+                    Wal::replay_segments_to_storage(segments, &mut storage, table_id as u64)
+                        .wrap_err_with(|| {
+                            format!(
+                                "failed to replay WAL frames for table_id={} from segments",
+                                table_id
+                            )
+                        })?;
 
                 if frames > 0 {
                     storage.sync().wrap_err_with(|| {

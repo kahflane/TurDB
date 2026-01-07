@@ -107,7 +107,9 @@ fn count_params_in_expr(expr: &crate::sql::ast::Expr) -> usize {
     use crate::sql::ast::Expr;
     match expr {
         Expr::Parameter(_) => 1,
-        Expr::BinaryOp { left, right, .. } => count_params_in_expr(left) + count_params_in_expr(right),
+        Expr::BinaryOp { left, right, .. } => {
+            count_params_in_expr(left) + count_params_in_expr(right)
+        }
         Expr::UnaryOp { expr, .. } => count_params_in_expr(expr),
         Expr::Cast { expr, .. } => count_params_in_expr(expr),
         _ => 0,
@@ -170,18 +172,89 @@ impl Database {
             .collect();
 
         #[allow(clippy::type_complexity)]
-        let from_tables_data: Option<Vec<(
-            String,
-            String,
-            Option<&str>,
-            Vec<crate::schema::table::ColumnDef>,
-        )>> = if let Some(from_clause) = update.from {
+        let from_tables_data: Option<
+            Vec<(
+                String,
+                String,
+                Option<&str>,
+                Vec<crate::schema::table::ColumnDef>,
+            )>,
+        > = if let Some(from_clause) = update.from {
             let mut tables = Vec::new();
             Self::extract_tables_from_clause(*from_clause, catalog, &mut tables)?;
             Some(tables)
         } else {
             None
         };
+
+        let mut fk_references: Vec<(
+            String,
+            String,
+            String,
+            usize,
+            Option<crate::schema::ReferentialAction>,
+        )> = Vec::new();
+        for (schema_key, schema_val) in catalog.schemas() {
+            for (child_table_name, child_table_def) in schema_val.tables() {
+                for col in child_table_def.columns().iter() {
+                    for constraint in col.constraints() {
+                        if let Constraint::ForeignKey {
+                            table,
+                            column,
+                            on_update,
+                            ..
+                        } = constraint
+                        {
+                            if table == table_name {
+                                let ref_col_idx =
+                                    columns.iter().position(|c| c.name() == column).unwrap_or(0);
+                                fk_references.push((
+                                    schema_key.clone(),
+                                    child_table_name.clone(),
+                                    col.name().to_string(),
+                                    ref_col_idx,
+                                    *on_update,
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        #[allow(clippy::type_complexity)]
+        let child_table_schemas: Vec<(
+            String,
+            String,
+            Vec<crate::schema::table::ColumnDef>,
+            usize,
+            usize,
+            Option<crate::schema::ReferentialAction>,
+        )> = fk_references
+            .iter()
+            .map(|(schema_key, child_name, fk_col_name, ref_col_idx, on_update)| {
+                let child_def = catalog
+                    .schemas()
+                    .get(schema_key)
+                    .unwrap()
+                    .tables()
+                    .get(child_name)
+                    .unwrap();
+                let fk_col_idx = child_def
+                    .columns()
+                    .iter()
+                    .position(|c| c.name() == fk_col_name)
+                    .unwrap_or(0);
+                (
+                    schema_key.clone(),
+                    child_name.clone(),
+                    child_def.columns().to_vec(),
+                    fk_col_idx,
+                    *ref_col_idx,
+                    *on_update,
+                )
+            })
+            .collect();
 
         drop(catalog_guard);
 
@@ -226,29 +299,51 @@ impl Database {
         let btree = BTree::new(&mut *storage, root_page)?;
 
         let mut pk_lookup_info: Option<(Vec<u8>, OwnedValue)> = 'pk_analysis: {
-            if let Some(crate::sql::ast::Expr::BinaryOp { left, op: crate::sql::ast::BinaryOperator::Eq, right }) = update.where_clause.as_ref() {
-                if let Some(pk_idx) = columns.iter().position(|c| c.has_constraint(&Constraint::PrimaryKey)) {
+            if let Some(crate::sql::ast::Expr::BinaryOp {
+                left,
+                op: crate::sql::ast::BinaryOperator::Eq,
+                right,
+            }) = update.where_clause.as_ref()
+            {
+                if let Some(pk_idx) = columns
+                    .iter()
+                    .position(|c| c.has_constraint(&Constraint::PrimaryKey))
+                {
                     let pk_col_name = columns[pk_idx].name();
 
                     let val_expr = match (&**left, &**right) {
-                        (crate::sql::ast::Expr::Column(c), val) if c.column.eq_ignore_ascii_case(pk_col_name) => Some(val),
-                        (val, crate::sql::ast::Expr::Column(c)) if c.column.eq_ignore_ascii_case(pk_col_name) => Some(val),
+                        (crate::sql::ast::Expr::Column(c), val)
+                            if c.column.eq_ignore_ascii_case(pk_col_name) =>
+                        {
+                            Some(val)
+                        }
+                        (val, crate::sql::ast::Expr::Column(c))
+                            if c.column.eq_ignore_ascii_case(pk_col_name) =>
+                        {
+                            Some(val)
+                        }
                         _ => None,
                     };
 
                     if let Some(expr) = val_expr {
                         let val_opt = if let crate::sql::ast::Expr::Parameter(param_ref) = expr {
-                             match param_ref {
-                                 crate::sql::ast::ParameterRef::Anonymous => {
-                                     let mut param_offset = 0;
-                                     for assign in update.assignments {
-                                         param_offset += count_params_in_expr(assign.value);
-                                     }
-                                     params.get(param_offset).cloned()
-                                 },
-                                 crate::sql::ast::ParameterRef::Positional(idx) => if *idx > 0 { params.get((*idx - 1) as usize).cloned() } else { None },
-                                 _ => None,
-                             }
+                            match param_ref {
+                                crate::sql::ast::ParameterRef::Anonymous => {
+                                    let mut param_offset = 0;
+                                    for assign in update.assignments {
+                                        param_offset += count_params_in_expr(assign.value);
+                                    }
+                                    params.get(param_offset).cloned()
+                                }
+                                crate::sql::ast::ParameterRef::Positional(idx) => {
+                                    if *idx > 0 {
+                                        params.get((*idx - 1) as usize).cloned()
+                                    } else {
+                                        None
+                                    }
+                                }
+                                _ => None,
+                            }
                         } else {
                             Self::eval_literal(expr).ok()
                         };
@@ -257,7 +352,11 @@ impl Database {
                             let pk_index_name = format!("{}_pkey", pk_col_name);
 
                             if file_manager.index_exists(schema_name, table_name, &pk_index_name) {
-                                if let Ok(index_storage_arc) = file_manager.index_data_mut(schema_name, table_name, &pk_index_name) {
+                                if let Ok(index_storage_arc) = file_manager.index_data_mut(
+                                    schema_name,
+                                    table_name,
+                                    &pk_index_name,
+                                ) {
                                     let mut index_storage = index_storage_arc.write();
 
                                     let index_root_page = {
@@ -267,7 +366,8 @@ impl Database {
                                         header.root_page()
                                     };
 
-                                    let index_btree = BTree::new(&mut *index_storage, index_root_page)?;
+                                    let index_btree =
+                                        BTree::new(&mut *index_storage, index_root_page)?;
 
                                     let mut index_key = Vec::new();
                                     Self::encode_value_as_key(&val, &mut index_key);
@@ -287,48 +387,61 @@ impl Database {
         };
 
         #[allow(clippy::type_complexity)]
-        let mut rows_to_update: Vec<(Vec<u8>, Vec<u8>, Vec<OwnedValue>, Vec<OwnedValue>, Vec<(usize, OwnedValue)>)> = Vec::new();
+        let mut rows_to_update: Vec<(
+            Vec<u8>,
+            Vec<u8>,
+            Vec<OwnedValue>,
+            Vec<OwnedValue>,
+            Vec<(usize, OwnedValue)>,
+        )> = Vec::new();
 
         let mut precomputed_assignments: Vec<(usize, OwnedValue)> = Vec::new();
         let set_param_count: usize;
         {
             let mut param_idx = 0;
             for (col_idx, value_expr) in &assignment_indices {
-                let val = Self::eval_expr_with_params(value_expr, None, Some(params), &mut param_idx)?;
+                let val =
+                    Self::eval_expr_with_params(value_expr, None, Some(params), &mut param_idx)?;
                 precomputed_assignments.push((*col_idx, val));
             }
             set_param_count = param_idx;
         }
 
-        let predicate: Option<crate::sql::predicate::CompiledPredicate> = if let Some(w) = update.where_clause {
-             let col_map = columns.iter().enumerate().map(|(i, c)| (c.name().to_string(), i)).collect();
-             Some(crate::sql::predicate::CompiledPredicate::with_params(w, col_map, params, set_param_count))
-        } else {
-             None
-        };
+        let predicate: Option<crate::sql::predicate::CompiledPredicate> =
+            if let Some(w) = update.where_clause {
+                let col_map = columns
+                    .iter()
+                    .enumerate()
+                    .map(|(i, c)| (c.name().to_string(), i))
+                    .collect();
+                Some(crate::sql::predicate::CompiledPredicate::with_params(
+                    w,
+                    col_map,
+                    params,
+                    set_param_count,
+                ))
+            } else {
+                None
+            };
 
-        let modified_col_indices: HashSet<usize> = assignment_indices
-            .iter()
-            .map(|(idx, _)| *idx)
-            .collect();
+        let modified_col_indices: HashSet<usize> =
+            assignment_indices.iter().map(|(idx, _)| *idx).collect();
 
         let unique_col_indices: Vec<usize> = columns
             .iter()
             .enumerate()
             .filter(|(idx, col)| {
-                (col.has_constraint(&Constraint::Unique) || col.has_constraint(&Constraint::PrimaryKey))
-                && modified_col_indices.contains(idx)
+                (col.has_constraint(&Constraint::Unique)
+                    || col.has_constraint(&Constraint::PrimaryKey))
+                    && modified_col_indices.contains(idx)
             })
             .map(|(idx, _)| idx)
             .collect();
 
-        let can_onepass = pk_lookup_info.is_some()
-            && unique_col_indices.is_empty()
-            && !has_toast;
+        let can_onepass = pk_lookup_info.is_some() && unique_col_indices.is_empty() && !has_toast;
 
         if can_onepass {
             if let Some((ref target_key, ref target_val)) = pk_lookup_info {
-                
                 let cursor = btree.cursor_seek(target_key)?;
 
                 if cursor.valid() && cursor.key()? == target_key.as_slice() {
@@ -336,8 +449,10 @@ impl Database {
                     let value = cursor.value()?;
                     let user_data = get_user_data(value);
                     let values = decoder.decode(key, user_data)?;
-                    let mut row_values: Vec<OwnedValue> = values.into_iter().map(OwnedValue::from).collect();
-                    let pk_idx = columns.iter()
+                    let mut row_values: Vec<OwnedValue> =
+                        values.into_iter().map(OwnedValue::from).collect();
+                    let pk_idx = columns
+                        .iter()
                         .position(|c| c.has_constraint(&Constraint::PrimaryKey))
                         .unwrap();
 
@@ -355,7 +470,11 @@ impl Database {
                             for constraint in col.constraints() {
                                 if let Constraint::Check(expr_str) = constraint {
                                     let col_value = row_values.get(col_idx);
-                                    if !Self::evaluate_check_expression(expr_str, col.name(), col_value) {
+                                    if !Self::evaluate_check_expression(
+                                        expr_str,
+                                        col.name(),
+                                        col_value,
+                                    ) {
                                         bail!(
                                             "CHECK constraint violated on column '{}' in table '{}': {}",
                                             col.name(),
@@ -367,17 +486,25 @@ impl Database {
                             }
                         }
 
-                        let user_record = OwnedValue::build_record_from_values(&row_values, &schema)?;
-                        
+                        let user_record =
+                            OwnedValue::build_record_from_values(&row_values, &schema)?;
+
                         let (txn_id, in_transaction) = {
                             let active_txn = self.active_txn.lock();
                             if let Some(ref txn) = *active_txn {
                                 (txn.txn_id, true)
                             } else {
-                                (self.shared.txn_manager.global_ts.fetch_add(1, Ordering::SeqCst), false)
+                                (
+                                    self.shared
+                                        .txn_manager
+                                        .global_ts
+                                        .fetch_add(1, Ordering::SeqCst),
+                                    false,
+                                )
                             }
                         };
-                        let record_data = wrap_record_for_update(txn_id, &user_record, 0, 0, in_transaction);
+                        let record_data =
+                            wrap_record_for_update(txn_id, &user_record, 0, 0, in_transaction);
 
                         drop(storage);
 
@@ -389,16 +516,28 @@ impl Database {
                         let storage_arc = file_manager.table_data_mut(schema_name, table_name)?;
                         let mut storage_inner = storage_arc.write();
 
-                        with_btree_storage!(wal_enabled, &mut *storage_inner, &self.shared.dirty_tracker, table_id as u32, root_page, |btree_mut: &mut crate::btree::BTree<_>| {
-                            if !btree_mut.update(target_key, &record_data)? {
-                                btree_mut.delete(target_key)?;
-                                btree_mut.insert(target_key, &record_data)?;
+                        with_btree_storage!(
+                            wal_enabled,
+                            &mut *storage_inner,
+                            &self.shared.dirty_tracker,
+                            table_id as u32,
+                            root_page,
+                            |btree_mut: &mut crate::btree::BTree<_>| {
+                                if !btree_mut.update(target_key, &record_data)? {
+                                    btree_mut.delete(target_key)?;
+                                    btree_mut.insert(target_key, &record_data)?;
+                                }
+                                Ok::<_, eyre::Report>(())
                             }
-                            Ok::<_, eyre::Report>(())
-                        });
+                        );
                         drop(storage_inner);
 
-                        self.flush_wal_if_autocommit(file_manager, schema_name, table_name, table_id as u32)?;
+                        self.flush_wal_if_autocommit(
+                            file_manager,
+                            schema_name,
+                            table_name,
+                            table_id as u32,
+                        )?;
 
                         {
                             let mut active_txn = self.active_txn.lock();
@@ -436,9 +575,9 @@ impl Database {
         // MULTIPASS: Fallback for complex queries
         loop {
             let mut cursor = if let Some((ref key, _)) = pk_lookup_info {
-                 btree.cursor_seek(key)?
+                btree.cursor_seek(key)?
             } else {
-                 btree.cursor_first()?
+                btree.cursor_first()?
             };
 
             while cursor.valid() {
@@ -453,10 +592,14 @@ impl Database {
                 let value = cursor.value()?;
                 let user_data = get_user_data(value);
                 let values = decoder.decode(key, user_data)?;
-                let mut row_values: Vec<OwnedValue> = values.into_iter().map(OwnedValue::from).collect();
+                let mut row_values: Vec<OwnedValue> =
+                    values.into_iter().map(OwnedValue::from).collect();
 
                 let should_update = if let Some((_, ref target_val)) = pk_lookup_info {
-                    if let Some(pk_idx) = columns.iter().position(|c| c.has_constraint(&Constraint::PrimaryKey)) {
+                    if let Some(pk_idx) = columns
+                        .iter()
+                        .position(|c| c.has_constraint(&Constraint::PrimaryKey))
+                    {
                         &row_values[pk_idx] == target_val
                     } else {
                         false
@@ -490,7 +633,8 @@ impl Database {
                         for constraint in col.constraints() {
                             if let Constraint::Check(expr_str) = constraint {
                                 let col_value = row_values.get(col_idx);
-                                if !Self::evaluate_check_expression(expr_str, col.name(), col_value) {
+                                if !Self::evaluate_check_expression(expr_str, col.name(), col_value)
+                                {
                                     bail!(
                                         "CHECK constraint violated on column '{}' in table '{}': {}",
                                         col.name(),
@@ -502,7 +646,13 @@ impl Database {
                         }
                     }
 
-                    rows_to_update.push((key.to_vec(), old_value, row_values, old_row_values, old_toast_values));
+                    rows_to_update.push((
+                        key.to_vec(),
+                        old_value,
+                        row_values,
+                        old_row_values,
+                        old_toast_values,
+                    ));
                 }
 
                 cursor.advance()?;
@@ -515,12 +665,13 @@ impl Database {
 
             break;
         }
-        
+
         drop(storage);
 
         if !unique_col_indices.is_empty() {
-            
-            for (update_key, _old_value, updated_values, _old_row_values, _old_toast) in &rows_to_update {
+            for (update_key, _old_value, updated_values, _old_row_values, _old_toast) in
+                &rows_to_update
+            {
                 for &col_idx in &unique_col_indices {
                     let new_val = &updated_values[col_idx];
                     if new_val.is_null() {
@@ -571,36 +722,44 @@ impl Database {
         let returned_rows: Option<Vec<Row>> = update.returning.map(|returning_cols| {
             rows_to_update
                 .iter()
-                .map(|(_key, _old_value, updated_values, _old_row_values, _old_toast)| {
-                    let row_values: Vec<OwnedValue> = returning_cols
-                        .iter()
-                        .flat_map(|col| match col {
-                            crate::sql::ast::SelectColumn::AllColumns => updated_values.clone(),
-                            crate::sql::ast::SelectColumn::TableAllColumns(_) => {
-                                updated_values.clone()
-                            }
-                            crate::sql::ast::SelectColumn::Expr { expr, .. } => {
-                                if let crate::sql::ast::Expr::Column(col_ref) = expr {
-                                    columns
-                                        .iter()
-                                        .position(|c| c.name().eq_ignore_ascii_case(col_ref.column))
-                                        .and_then(|idx| updated_values.get(idx).cloned())
-                                        .map(|v| vec![v])
-                                        .unwrap_or_default()
-                                } else {
-                                    vec![]
+                .map(
+                    |(_key, _old_value, updated_values, _old_row_values, _old_toast)| {
+                        let row_values: Vec<OwnedValue> = returning_cols
+                            .iter()
+                            .flat_map(|col| match col {
+                                crate::sql::ast::SelectColumn::AllColumns => updated_values.clone(),
+                                crate::sql::ast::SelectColumn::TableAllColumns(_) => {
+                                    updated_values.clone()
                                 }
-                            }
-                        })
-                        .collect();
-                    Row::new(row_values)
-                })
+                                crate::sql::ast::SelectColumn::Expr { expr, .. } => {
+                                    if let crate::sql::ast::Expr::Column(col_ref) = expr {
+                                        columns
+                                            .iter()
+                                            .position(|c| {
+                                                c.name().eq_ignore_ascii_case(col_ref.column)
+                                            })
+                                            .and_then(|idx| updated_values.get(idx).cloned())
+                                            .map(|v| vec![v])
+                                            .unwrap_or_default()
+                                    } else {
+                                        vec![]
+                                    }
+                                }
+                            })
+                            .collect();
+                        Row::new(row_values)
+                    },
+                )
                 .collect()
         });
 
-        let mut processed_rows: Vec<(Vec<u8>, Vec<OwnedValue>)> = Vec::with_capacity(rows_to_update.len());
+        let mut processed_rows: Vec<(Vec<u8>, Vec<OwnedValue>)> =
+            Vec::with_capacity(rows_to_update.len());
 
-        let wal_enabled = self.shared.wal_enabled.load(std::sync::atomic::Ordering::Acquire);
+        let wal_enabled = self
+            .shared
+            .wal_enabled
+            .load(std::sync::atomic::Ordering::Acquire);
         if wal_enabled {
             self.ensure_wal()?;
         }
@@ -608,7 +767,8 @@ impl Database {
         if has_toast {
             use crate::storage::toast::ToastPointer;
             for row_tuple in &mut rows_to_update {
-                let (_key, _old_value, updated_values, _old_row_values, old_toast_values) = row_tuple;
+                let (_key, _old_value, updated_values, _old_row_values, old_toast_values) =
+                    row_tuple;
 
                 for (_col_idx, old_val) in old_toast_values.iter() {
                     if let OwnedValue::ToastPointer(ptr) = old_val {
@@ -625,7 +785,10 @@ impl Database {
                     }
                 }
 
-                let pk_value = if let Some(pk_idx) = columns.iter().position(|c| c.has_constraint(&Constraint::PrimaryKey)) {
+                let pk_value = if let Some(pk_idx) = columns
+                    .iter()
+                    .position(|c| c.has_constraint(&Constraint::PrimaryKey))
+                {
                     if let OwnedValue::Int(id) = &updated_values[pk_idx] {
                         *id as u64
                     } else {
@@ -684,7 +847,9 @@ impl Database {
 
                 let mut index_btree = BTree::new(&mut *index_storage, index_root_page)?;
 
-                for (_row_key, _old_value, new_row_values, old_row_values, _old_toast) in &rows_to_update {
+                for (_row_key, _old_value, new_row_values, old_row_values, _old_toast) in
+                    &rows_to_update
+                {
                     if let Some(old_value) = old_row_values.get(*col_idx) {
                         if !old_value.is_null() {
                             key_buf.clear();
@@ -697,7 +862,10 @@ impl Database {
                         if !new_value.is_null() {
                             key_buf.clear();
                             Self::encode_value_as_key(new_value, &mut key_buf);
-                            if let Some(pk_idx) = columns.iter().position(|c| c.has_constraint(&Constraint::PrimaryKey)) {
+                            if let Some(pk_idx) = columns
+                                .iter()
+                                .position(|c| c.has_constraint(&Constraint::PrimaryKey))
+                            {
                                 if let Some(OwnedValue::Int(pk_val)) = new_row_values.get(pk_idx) {
                                     let row_id_bytes = (*pk_val as u64).to_be_bytes();
                                     let _ = index_btree.insert(&key_buf, &row_id_bytes);
@@ -713,7 +881,9 @@ impl Database {
             if col_indices.is_empty() {
                 continue;
             }
-            let any_modified = col_indices.iter().any(|idx| modified_col_indices.contains(idx));
+            let any_modified = col_indices
+                .iter()
+                .any(|idx| modified_col_indices.contains(idx));
             if !any_modified {
                 continue;
             }
@@ -730,7 +900,9 @@ impl Database {
 
                 let mut index_btree = BTree::new(&mut *index_storage, index_root_page)?;
 
-                for (_row_key, _old_value, new_row_values, old_row_values, _old_toast) in &rows_to_update {
+                for (_row_key, _old_value, new_row_values, old_row_values, _old_toast) in
+                    &rows_to_update
+                {
                     let old_all_non_null = col_indices
                         .iter()
                         .all(|&idx| old_row_values.get(idx).is_some_and(|v| !v.is_null()));
@@ -756,7 +928,10 @@ impl Database {
                                 Self::encode_value_as_key(value, &mut key_buf);
                             }
                         }
-                        if let Some(pk_idx) = columns.iter().position(|c| c.has_constraint(&Constraint::PrimaryKey)) {
+                        if let Some(pk_idx) = columns
+                            .iter()
+                            .position(|c| c.has_constraint(&Constraint::PrimaryKey))
+                        {
                             if let Some(OwnedValue::Int(pk_val)) = new_row_values.get(pk_idx) {
                                 let row_id_bytes = (*pk_val as u64).to_be_bytes();
                                 let _ = index_btree.insert(&key_buf, &row_id_bytes);
@@ -776,26 +951,182 @@ impl Database {
             if let Some(ref txn) = *active_txn {
                 (txn.txn_id, true)
             } else {
-                (self.shared.txn_manager.global_ts.fetch_add(1, Ordering::SeqCst), false)
+                (
+                    self.shared
+                        .txn_manager
+                        .global_ts
+                        .fetch_add(1, Ordering::SeqCst),
+                    false,
+                )
             }
         };
 
         let storage_arc = file_manager.table_data_mut(schema_name, table_name)?;
         let mut storage = storage_arc.write();
 
-        with_btree_storage!(wal_enabled, &mut *storage, &self.shared.dirty_tracker, table_id as u32, root_page, |btree_mut: &mut crate::btree::BTree<_>| {
-            for (key, updated_values) in &processed_rows {
-                let user_record = OwnedValue::build_record_from_values(updated_values, &schema)?;
-                let record_data = wrap_record_for_update(txn_id, &user_record, 0, 0, in_transaction);
+        with_btree_storage!(
+            wal_enabled,
+            &mut *storage,
+            &self.shared.dirty_tracker,
+            table_id as u32,
+            root_page,
+            |btree_mut: &mut crate::btree::BTree<_>| {
+                for (key, updated_values) in &processed_rows {
+                    let user_record =
+                        OwnedValue::build_record_from_values(updated_values, &schema)?;
+                    let record_data =
+                        wrap_record_for_update(txn_id, &user_record, 0, 0, in_transaction);
 
-                if !btree_mut.update(key, &record_data)? {
-                    btree_mut.delete(key)?;
-                    btree_mut.insert(key, &record_data)?;
+                    if !btree_mut.update(key, &record_data)? {
+                        btree_mut.delete(key)?;
+                        btree_mut.insert(key, &record_data)?;
+                    }
+                }
+                Ok::<_, eyre::Report>(())
+            }
+        );
+        drop(storage);
+
+        let relevant_fk_refs: Vec<_> = child_table_schemas
+            .iter()
+            .filter(|(_, _, _, _, _, on_update)| on_update.is_some())
+            .filter(|(_, _, _, _, parent_ref_col_idx, _)| {
+                modified_col_indices.contains(parent_ref_col_idx)
+            })
+            .collect();
+
+        if !relevant_fk_refs.is_empty() {
+            let mut value_changes: Vec<(usize, OwnedValue, OwnedValue)> = Vec::new();
+            for (_key, _old_value, new_values, old_values, _toast) in &rows_to_update {
+                for &parent_col_idx in &modified_col_indices {
+                    let is_fk_ref = relevant_fk_refs
+                        .iter()
+                        .any(|(_, _, _, _, ref_idx, _)| *ref_idx == parent_col_idx);
+                    if is_fk_ref {
+                        if let (Some(old_v), Some(new_v)) =
+                            (old_values.get(parent_col_idx), new_values.get(parent_col_idx))
+                        {
+                            if old_v != new_v {
+                                value_changes
+                                    .push((parent_col_idx, old_v.clone(), new_v.clone()));
+                            }
+                        }
+                    }
                 }
             }
-            Ok::<_, eyre::Report>(())
-        });
-        drop(storage);
+
+            if !value_changes.is_empty() {
+                for (
+                    child_schema,
+                    child_name,
+                    child_columns,
+                    fk_col_idx,
+                    parent_ref_col_idx,
+                    on_update,
+                ) in &relevant_fk_refs
+                {
+                    let child_storage_arc =
+                        file_manager.table_data_mut(child_schema, child_name)?;
+                    let mut child_storage = child_storage_arc.write();
+                    let child_btree = BTree::new(&mut *child_storage, 1u32)?;
+                    let mut child_cursor = child_btree.cursor_first()?;
+                    let child_record_schema = create_record_schema(child_columns);
+
+                    let mut cascade_updates: Vec<(Vec<u8>, Vec<OwnedValue>, OwnedValue)> =
+                        Vec::new();
+
+                    while child_cursor.valid() {
+                        let child_key = child_cursor.key()?.to_vec();
+                        let child_value = child_cursor.value()?;
+                        let child_user_data = get_user_data(child_value);
+                        let child_record =
+                            RecordView::new(child_user_data, &child_record_schema)?;
+                        let child_row =
+                            OwnedValue::extract_row_from_record(&child_record, child_columns)?;
+
+                        if let Some(child_fk_val) = child_row.get(*fk_col_idx) {
+                            for (changed_parent_col_idx, old_val, new_val) in &value_changes {
+                                if *changed_parent_col_idx == *parent_ref_col_idx
+                                    && child_fk_val == old_val
+                                {
+                                    match on_update {
+                                        Some(crate::schema::ReferentialAction::Cascade) => {
+                                            cascade_updates.push((
+                                                child_key.clone(),
+                                                child_row.clone(),
+                                                new_val.clone(),
+                                            ));
+                                        }
+                                        Some(crate::schema::ReferentialAction::SetNull) => {
+                                            cascade_updates.push((
+                                                child_key.clone(),
+                                                child_row.clone(),
+                                                OwnedValue::Null,
+                                            ));
+                                        }
+                                        Some(crate::schema::ReferentialAction::SetDefault) => {
+                                            let default_val = child_columns
+                                                .get(*fk_col_idx)
+                                                .and_then(
+                                                    |c: &crate::schema::table::ColumnDef| {
+                                                        c.default_value()
+                                                    },
+                                                )
+                                                .map(|d: &str| OwnedValue::Text(d.to_string()))
+                                                .unwrap_or(OwnedValue::Null);
+                                            cascade_updates.push((
+                                                child_key.clone(),
+                                                child_row.clone(),
+                                                default_val,
+                                            ));
+                                        }
+                                        Some(crate::schema::ReferentialAction::Restrict)
+                                        | Some(crate::schema::ReferentialAction::NoAction)
+                                        | None => {
+                                            bail!(
+                                                "FOREIGN KEY constraint violated: cannot update '{}' because row is referenced by '{}'",
+                                                table_name,
+                                                child_name
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        child_cursor.advance()?;
+                    }
+
+                    drop(child_storage);
+
+                    if !cascade_updates.is_empty() {
+                        let child_storage_arc =
+                            file_manager.table_data_mut(child_schema, child_name)?;
+                        let mut child_storage = child_storage_arc.write();
+                        let mut child_btree = BTree::new(&mut *child_storage, 1u32)?;
+
+                        for (child_key, mut child_row, new_fk_val) in cascade_updates {
+                            child_row[*fk_col_idx] = new_fk_val;
+                            let child_record = OwnedValue::build_record_from_values(
+                                &child_row,
+                                &child_record_schema,
+                            )?;
+                            let child_record_data = wrap_record_for_update(
+                                txn_id,
+                                &child_record,
+                                0,
+                                0,
+                                in_transaction,
+                            );
+                            if !child_btree.update(&child_key, &child_record_data)? {
+                                child_btree.delete(&child_key)?;
+                                child_btree.insert(&child_key, &child_record_data)?;
+                            }
+                        }
+                    }
+                }
+            }
+        }
 
         self.flush_wal_if_autocommit(file_manager, schema_name, table_name, table_id as u32)?;
 
@@ -804,7 +1135,8 @@ impl Database {
         {
             let mut active_txn = self.active_txn.lock();
             if let Some(ref mut txn) = *active_txn {
-                for (key, old_value, _updated_values, _old_row_values, _old_toast) in rows_to_update {
+                for (key, old_value, _updated_values, _old_row_values, _old_toast) in rows_to_update
+                {
                     txn.add_write_entry_with_undo(
                         WriteEntry {
                             table_id: table_id as u32,
@@ -849,15 +1181,9 @@ impl Database {
         let mut combined_column_map: Vec<(String, usize)> = Vec::new();
         for (idx, col) in columns.iter().enumerate() {
             combined_column_map.push((col.name().to_string(), idx));
-            combined_column_map.push((
-                format!("{}.{}", table_name, col.name()),
-                idx,
-            ));
+            combined_column_map.push((format!("{}.{}", table_name, col.name()), idx));
             if let Some(alias) = table_alias {
-                combined_column_map.push((
-                    format!("{}.{}", alias, col.name()),
-                    idx,
-                ));
+                combined_column_map.push((format!("{}.{}", alias, col.name()), idx));
             }
         }
 
@@ -900,8 +1226,11 @@ impl Database {
         let file_manager = file_manager_guard.as_mut().unwrap();
 
         let mut all_from_rows: Vec<Vec<Vec<OwnedValue>>> = Vec::new();
-        for (i, (from_schema_name, from_table_name, _, from_columns)) in from_tables.iter().enumerate() {
-            let from_storage_arc = file_manager.table_data_mut(from_schema_name, from_table_name)?;
+        for (i, (from_schema_name, from_table_name, _, from_columns)) in
+            from_tables.iter().enumerate()
+        {
+            let from_storage_arc =
+                file_manager.table_data_mut(from_schema_name, from_table_name)?;
             let mut from_storage = from_storage_arc.write();
             let from_btree = BTree::new(&mut *from_storage, 1u32)?;
             let mut from_cursor = from_btree.cursor_first()?;
@@ -943,9 +1272,8 @@ impl Database {
                 values.into_iter().map(OwnedValue::from).collect();
 
             for from_row in &combined_from_rows {
-                let mut combined_values: Vec<Value<'_>> = Vec::with_capacity(
-                    target_row_values.len() + from_row.len(),
-                );
+                let mut combined_values: Vec<Value<'_>> =
+                    Vec::with_capacity(target_row_values.len() + from_row.len());
 
                 for val in &target_row_values {
                     combined_values.push(match val {
@@ -985,11 +1313,8 @@ impl Database {
                     let mut row_values = target_row_values.clone();
 
                     for (col_idx, value_expr) in &assignment_indices {
-                        let new_value = self.eval_expr_with_row(
-                            value_expr,
-                            &exec_row,
-                            &combined_column_map,
-                        )?;
+                        let new_value =
+                            self.eval_expr_with_row(value_expr, &exec_row, &combined_column_map)?;
                         row_values[*col_idx] = new_value;
                     }
 
@@ -1000,11 +1325,8 @@ impl Database {
                         for constraint in col.constraints() {
                             if let Constraint::Check(expr_str) = constraint {
                                 let col_value = row_values.get(col_idx);
-                                if !Self::evaluate_check_expression(
-                                    expr_str,
-                                    col.name(),
-                                    col_value,
-                                ) {
+                                if !Self::evaluate_check_expression(expr_str, col.name(), col_value)
+                                {
                                     bail!(
                                         "CHECK constraint violated on column '{}' in table '{}': {}",
                                         col.name(),
@@ -1118,25 +1440,39 @@ impl Database {
             if let Some(ref txn) = *active_txn {
                 (txn.txn_id, true)
             } else {
-                (self.shared.txn_manager.global_ts.fetch_add(1, Ordering::SeqCst), false)
+                (
+                    self.shared
+                        .txn_manager
+                        .global_ts
+                        .fetch_add(1, Ordering::SeqCst),
+                    false,
+                )
             }
         };
 
         let storage_arc = file_manager.table_data_mut(schema_name, table_name)?;
         let mut storage = storage_arc.write();
 
-        with_btree_storage!(wal_enabled, &mut *storage, &self.shared.dirty_tracker, table_id as u32, root_page, |btree_mut: &mut crate::btree::BTree<_>| {
-            for (key, _old_value, updated_values) in &rows_to_update {
-                let user_record = OwnedValue::build_record_from_values(updated_values, schema)?;
-                let record_data = wrap_record_for_update(txn_id, &user_record, 0, 0, in_transaction);
+        with_btree_storage!(
+            wal_enabled,
+            &mut *storage,
+            &self.shared.dirty_tracker,
+            table_id as u32,
+            root_page,
+            |btree_mut: &mut crate::btree::BTree<_>| {
+                for (key, _old_value, updated_values) in &rows_to_update {
+                    let user_record = OwnedValue::build_record_from_values(updated_values, schema)?;
+                    let record_data =
+                        wrap_record_for_update(txn_id, &user_record, 0, 0, in_transaction);
 
-                if !btree_mut.update(key, &record_data)? {
-                    btree_mut.delete(key)?;
-                    btree_mut.insert(key, &record_data)?;
+                    if !btree_mut.update(key, &record_data)? {
+                        btree_mut.delete(key)?;
+                        btree_mut.insert(key, &record_data)?;
+                    }
                 }
+                Ok::<_, eyre::Report>(())
             }
-            Ok::<_, eyre::Report>(())
-        });
+        );
 
         self.flush_wal_if_autocommit(file_manager, schema_name, table_name, table_id as u32)?;
 
@@ -1224,10 +1560,7 @@ impl Database {
                         Ok(OwnedValue::Null)
                     }
                 } else {
-                    bail!(
-                        "column '{}' not found in UPDATE...FROM context",
-                        col_name
-                    )
+                    bail!("column '{}' not found in UPDATE...FROM context", col_name)
                 }
             }
             Expr::BinaryOp { left, op, right } => {
@@ -1319,7 +1652,10 @@ impl Database {
     ) -> Result<ExecuteResult> {
         self.ensure_file_manager()?;
 
-        let wal_enabled = self.shared.wal_enabled.load(std::sync::atomic::Ordering::Acquire);
+        let wal_enabled = self
+            .shared
+            .wal_enabled
+            .load(std::sync::atomic::Ordering::Acquire);
         if wal_enabled {
             self.ensure_wal()?;
         }
@@ -1331,7 +1667,8 @@ impl Database {
         let arena = bumpalo::Bump::new();
         let mut parser = crate::sql::parser::Parser::new(&cached.original_sql, &arena);
 
-        let stmt = parser.parse_statement()
+        let stmt = parser
+            .parse_statement()
             .wrap_err("failed to re-parse cached UPDATE statement")?;
 
         if let crate::sql::ast::Statement::Update(update) = stmt {
@@ -1349,7 +1686,8 @@ impl Database {
     ) -> Result<ExecuteResult> {
         let storage_arc = {
             let storage_weak = cached.storage.borrow();
-            storage_weak.as_ref()
+            storage_weak
+                .as_ref()
                 .and_then(|weak| weak.upgrade())
                 .ok_or_else(|| eyre::eyre!("cached plan storage no longer valid"))?
         };
@@ -1368,9 +1706,13 @@ impl Database {
         }
         let root_page = cached.root_page.get();
 
-        let where_param_value = params.last().ok_or_else(|| eyre::eyre!("missing WHERE parameter"))?;
+        let where_param_value = params
+            .last()
+            .ok_or_else(|| eyre::eyre!("missing WHERE parameter"))?;
 
-        let pk_col_idx = cached.pk_column_index.ok_or_else(|| eyre::eyre!("PK column index not cached"))?;
+        let pk_col_idx = cached
+            .pk_column_index
+            .ok_or_else(|| eyre::eyre!("PK column index not cached"))?;
 
         self.ensure_catalog()?;
         let catalog_guard = self.shared.catalog.read();
@@ -1383,29 +1725,37 @@ impl Database {
         let mut file_manager_guard = self.shared.file_manager.write();
         let file_manager = file_manager_guard.as_mut().unwrap();
 
-        let target_key = if file_manager.index_exists(&cached.schema_name, &cached.table_name, &pk_index_name) {
-            if let Ok(index_storage_arc) = file_manager.index_data_mut(&cached.schema_name, &cached.table_name, &pk_index_name) {
-                let mut index_storage = index_storage_arc.write();
-                let index_root_page = {
-                    use crate::storage::IndexFileHeader;
-                    let page0 = index_storage.page(0)?;
-                    let header = IndexFileHeader::from_bytes(page0)?;
-                    header.root_page()
-                };
-                let index_btree = BTree::new(&mut *index_storage, index_root_page)?;
-                let mut index_key = Vec::new();
-                Self::encode_value_as_key(where_param_value, &mut index_key);
-                if let Some(handle) = index_btree.search(&index_key)? {
-                    index_btree.get_value(&handle)?.to_vec()
+        let target_key =
+            if file_manager.index_exists(&cached.schema_name, &cached.table_name, &pk_index_name) {
+                if let Ok(index_storage_arc) = file_manager.index_data_mut(
+                    &cached.schema_name,
+                    &cached.table_name,
+                    &pk_index_name,
+                ) {
+                    let mut index_storage = index_storage_arc.write();
+                    let index_root_page = {
+                        use crate::storage::IndexFileHeader;
+                        let page0 = index_storage.page(0)?;
+                        let header = IndexFileHeader::from_bytes(page0)?;
+                        header.root_page()
+                    };
+                    let index_btree = BTree::new(&mut *index_storage, index_root_page)?;
+                    let mut index_key = Vec::new();
+                    Self::encode_value_as_key(where_param_value, &mut index_key);
+                    if let Some(handle) = index_btree.search(&index_key)? {
+                        index_btree.get_value(&handle)?.to_vec()
+                    } else {
+                        return Ok(ExecuteResult::Update {
+                            rows_affected: 0,
+                            returned: None,
+                        });
+                    }
                 } else {
-                    return Ok(ExecuteResult::Update { rows_affected: 0, returned: None });
+                    bail!("failed to get index storage")
                 }
             } else {
-                bail!("failed to get index storage")
-            }
-        } else {
-            bail!("PK index not found for fast path")
-        };
+                bail!("PK index not found for fast path")
+            };
 
         drop(file_manager_guard);
 
@@ -1416,7 +1766,10 @@ impl Database {
         let cursor = btree.cursor_seek(&target_key)?;
 
         if !cursor.valid() || cursor.key()? != target_key.as_slice() {
-            return Ok(ExecuteResult::Update { rows_affected: 0, returned: None });
+            return Ok(ExecuteResult::Update {
+                rows_affected: 0,
+                returned: None,
+            });
         }
 
         let key = cursor.key()?;
@@ -1432,15 +1785,23 @@ impl Database {
 
         let mut storage = storage_arc.write();
 
-        with_btree_storage!(wal_enabled, &mut *storage, &self.shared.dirty_tracker, cached.table_id as u32, root_page, |btree_mut: &mut crate::btree::BTree<_>| {
-            let record_data = OwnedValue::build_record_from_values(&row_values, &cached.record_schema)?;
+        with_btree_storage!(
+            wal_enabled,
+            &mut *storage,
+            &self.shared.dirty_tracker,
+            cached.table_id as u32,
+            root_page,
+            |btree_mut: &mut crate::btree::BTree<_>| {
+                let record_data =
+                    OwnedValue::build_record_from_values(&row_values, &cached.record_schema)?;
 
-            if !btree_mut.update(&target_key, &record_data)? {
-                btree_mut.delete(&target_key)?;
-                btree_mut.insert(&target_key, &record_data)?;
+                if !btree_mut.update(&target_key, &record_data)? {
+                    btree_mut.delete(&target_key)?;
+                    btree_mut.insert(&target_key, &record_data)?;
+                }
+                Ok::<_, eyre::Report>(())
             }
-            Ok::<_, eyre::Report>(())
-        });
+        );
 
         Ok(ExecuteResult::Update {
             rows_affected: 1,

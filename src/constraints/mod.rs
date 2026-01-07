@@ -225,7 +225,7 @@ impl<'a> ConstraintValidator<'a> {
             let days = (now / 86400) as i32;
             return OwnedValue::Date(days);
         }
-        
+
         let parts: SmallVec<[&str; 4]> = s.split('-').collect();
         if parts.len() != 3 {
             return OwnedValue::Null;
@@ -266,7 +266,7 @@ impl<'a> ConstraintValidator<'a> {
             let micros = day_secs * 1_000_000;
             return OwnedValue::Time(micros);
         }
-        
+
         let parts: SmallVec<[&str; 4]> = s.split(':').collect();
         if parts.len() < 2 {
             return OwnedValue::Null;
@@ -299,7 +299,11 @@ impl<'a> ConstraintValidator<'a> {
 
     fn parse_timestamp_default(s: &str) -> OwnedValue {
         let upper = s.to_uppercase();
-        if upper == "CURRENT_TIMESTAMP" || upper == "NOW" || upper == "LOCALTIME" || upper == "LOCALTIMESTAMP" {
+        if upper == "CURRENT_TIMESTAMP"
+            || upper == "NOW"
+            || upper == "LOCALTIME"
+            || upper == "LOCALTIMESTAMP"
+        {
             use std::time::SystemTime;
             let now = SystemTime::now()
                 .duration_since(SystemTime::UNIX_EPOCH)
@@ -311,7 +315,7 @@ impl<'a> ConstraintValidator<'a> {
                 .unwrap_or(0);
             return OwnedValue::Timestamp(now);
         }
-        
+
         let datetime_parts: SmallVec<[&str; 2]> = s.split(&[' ', 'T'][..]).collect();
         if datetime_parts.is_empty() {
             return OwnedValue::Null;
@@ -678,6 +682,7 @@ impl<'a> ConstraintValidator<'a> {
                 if let Constraint::ForeignKey {
                     table: fk_table,
                     column: fk_column,
+                    ..
                 } = constraint
                 {
                     if let Some(value) = values.get(idx) {
