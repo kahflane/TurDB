@@ -76,6 +76,32 @@ impl SharedDatabase {
         }
         Ok(())
     }
+
+    pub(crate) fn checkpoint(&self) -> Result<u32> {
+        let closed_segments = {
+             let guard = self.wal.lock();
+             if let Some(wal) = guard.as_ref() {
+                 wal.rotate_segment()?;
+                 wal.get_closed_segments()
+             } else {
+                 return Ok(0);
+             }
+        };
+
+        if closed_segments.is_empty() { return Ok(0); }
+        
+        let root_dir = self.path.join(crate::storage::DEFAULT_SCHEMA);
+        let frames = Database::replay_schema_tables_from_segments(&root_dir, &closed_segments)?;
+        
+        {
+             let guard = self.wal.lock();
+             if let Some(wal) = guard.as_ref() {
+                 wal.remove_closed_segments(&closed_segments)?;
+             }
+        }
+        
+        Ok(frames)
+    }
 }
 
 impl Database {
@@ -108,14 +134,12 @@ impl Database {
 
         let wal_dir = path.join("wal");
 
-        let segment_path = wal_dir.join("wal.000001");
-        let wal_size_bytes = if segment_path.exists() {
-            std::fs::metadata(&segment_path)
-                .map(|m| m.len())
-                .unwrap_or(0)
-        } else {
-            0
-        };
+        let max_segment = Wal::find_latest_segment(&wal_dir).unwrap_or(1);
+        let mut wal_size_bytes = 0;
+        for i in 1..=max_segment {
+             let p = wal_dir.join(format!("wal.{:06}", i));
+             if let Ok(m) = std::fs::metadata(&p) { wal_size_bytes += m.len(); }
+        }
 
         let frames_recovered = if wal_size_bytes > 0 {
             Self::recover_all_tables(&path, &wal_dir)?
@@ -235,7 +259,7 @@ impl Database {
         Ok(())
     }
 
-    pub(crate) fn ensure_catalog(&self) -> Result<()> {
+    pub fn ensure_catalog(&self) -> Result<()> {
         if self.shared.catalog.read().is_some() {
             return Ok(());
         }
@@ -246,6 +270,10 @@ impl Database {
             *guard = Some(catalog);
         }
         Ok(())
+    }
+
+    pub fn checkpoint_wal(&self) -> Result<u32> {
+        self.shared.checkpoint()
     }
 
     fn populate_table_id_cache(&self, catalog: &Catalog) {

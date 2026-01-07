@@ -664,3 +664,86 @@ impl<'a> LeafNodeMut<'a> {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod reproduction_test {
+    use super::*;
+    use crate::storage::{PageHeader, PageType, PAGE_SIZE};
+
+    #[test]
+    fn test_many_keys_insertion() -> Result<()> {
+        let mut page = vec![0u8; PAGE_SIZE];
+        LeafNodeMut::init(&mut page)?;
+
+        // Insert 500 keys: 0, 2, 4, ... 998.
+        for i in (0..500).step_by(2) {
+             let key_val = (i as u64).to_be_bytes(); // 8 bytes
+             {
+                 let mut leaf = LeafNodeMut::from_page(&mut page)?;
+                 match leaf.insert_cell(&key_val, b"val") {
+                     Ok(_) => {},
+                     Err(e) => panic!("Failed to insert {}: {:?}", i, e),
+                 }
+             }
+        }
+        
+        // Check order
+        {
+            let leaf = LeafNode::from_page(&page)?;
+            assert_eq!(leaf.cell_count(), 250);
+            for i in 0..249 {
+                let k1 = leaf.key_at(i)?;
+                let k2 = leaf.key_at(i+1)?;
+                assert!(k1 < k2, "Keys out of order at {}: {:?} >= {:?}", i, k1, k2);
+            }
+        }
+        
+        // Insert key 1 (Small). Should go between 0 and 2.
+        let key_1 = (1u64).to_be_bytes();
+        {
+             let mut leaf = LeafNodeMut::from_page(&mut page)?;
+             leaf.insert_cell(&key_1, b"val")?;
+        }
+
+        // FULL VERIFY
+        {
+            let leaf = LeafNode::from_page(&page)?;
+            for i in 0..leaf.cell_count() as usize - 1 {
+                let k1 = leaf.key_at(i)?;
+                let k2 = leaf.key_at(i+1)?;
+                if k1 >= k2 {
+                    panic!("Keys out of order at {}: {:?} >= {:?}", i, k1, k2);
+                }
+            }
+        }
+
+        // Check order again
+        {
+            let leaf = LeafNode::from_page(&page)?;
+             // binary search check
+             let idx = match leaf.find_key(&key_1) {
+                 SearchResult::Found(i) => i,
+                 _ => panic!("Key 1 not found"),
+             };
+             // println!("Key 1 found at index {}", idx);
+             
+             // idx should be 1 (after 0)
+             // 0 is at index 0.
+             // 2 is at index 1 (before insert). now 2.
+             // 1 is at index 1.
+             
+             if idx > 0 {
+                 let k_prev = leaf.key_at(idx-1)?;
+                 let k_curr = leaf.key_at(idx)?;
+                 assert!(k_prev < k_curr, "Prev {:?} >= Curr {:?}", k_prev, k_curr);
+             }
+             if idx < (leaf.cell_count() as usize - 1) {
+                 let k_curr = leaf.key_at(idx)?;
+                 let k_next = leaf.key_at(idx+1)?;
+                 assert!(k_curr < k_next, "Curr {:?} >= Next {:?}", k_curr, k_next);
+             }
+        }
+
+        Ok(())
+    }
+}

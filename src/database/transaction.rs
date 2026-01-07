@@ -113,7 +113,7 @@
 use crate::mvcc::{TxnId, TxnState, UndoRegistry, WriteEntry};
 use crate::schema::table::{Constraint, IndexType};
 use crate::sql::ast::IsolationLevel;
-use crate::storage::{IndexFileHeader, WalStoragePerTable, DEFAULT_SCHEMA};
+use crate::storage::{IndexFileHeader, DEFAULT_SCHEMA};
 use eyre::{bail, Result, WrapErr};
 use smallvec::SmallVec;
 
@@ -276,15 +276,59 @@ impl Database {
         self.finalize_transaction_commit(txn)?;
 
         if wal_enabled {
+            // [Deadlock Fix - Push-Based] Capture dirty data before queuing
+            // We read all dirty pages while holding storage locks, then release them,
+            // then submit the data to the group commit queue.
+            
             let dirty_table_ids = self.shared.dirty_tracker.all_dirty_table_ids();
-            if dirty_table_ids.is_empty() {
-                return Ok(ExecuteResult::Commit);
-            }
+            let mut payload: SmallVec<[(u32, u32, Vec<u8>, u32); 4]> = SmallVec::new();
+
+            if !dirty_table_ids.is_empty() {
+                // To safely capture data, we need file manager access to get storage
+                let mut file_manager_guard = self.shared.file_manager.write();
+                let file_manager = file_manager_guard
+                    .as_mut()
+                    .ok_or_else(|| eyre::eyre!("file manager not available for commit"))?;
+
+                let mut table_infos: Vec<(u32, String, String)> = {
+                    let lookup = self.shared.table_id_lookup.read();
+                    dirty_table_ids
+                        .iter()
+                        .filter_map(|&table_id| {
+                            lookup
+                                .get(&table_id)
+                                .map(|(s, t)| (table_id, s.clone(), t.clone()))
+                        })
+                        .collect()
+                };
+                table_infos.sort_by_key(|(id, _, _)| *id);
+
+                // Acquire locks and capture data
+                for (table_id, schema_name, table_name) in table_infos {
+                     let _table_lock = self.shared.page_locks.table_intent_exclusive(table_id);
+                     let dirty_pages = self.shared.dirty_tracker.dirty_pages_for_table(table_id);
+                     
+                     if dirty_pages.is_empty() { continue; }
+                     
+                     let page_tuples: Vec<(u32, u32)> = dirty_pages.iter().map(|&p| (table_id, p)).collect();
+                     let _page_locks = self.shared.page_locks.page_write_multi(&page_tuples);
+                     
+                     if let Ok(storage_arc) = file_manager.table_data(&schema_name, &table_name) {
+                         let storage = storage_arc.read();
+                         let db_size = storage.page_count();
+                         let pages_to_flush = self.shared.dirty_tracker.drain_for_table(table_id);
+                         
+                         for page_no in pages_to_flush {
+                             if let Ok(data) = storage.page(page_no) {
+                                  payload.push((table_id, page_no, data.to_vec(), db_size));
+                             }
+                         }
+                     }
+                }
+            } // file_manager_guard dropped here, releasing locks
 
             if self.shared.group_commit_queue.is_enabled() {
-                let dirty_ids: SmallVec<[u32; 8]> = dirty_table_ids.into_iter().collect();
-
-                match self.shared.group_commit_queue.submit_and_wait(dirty_ids) {
+                match self.shared.group_commit_queue.submit_and_wait(payload) {
                     Ok(_batch_id) => {
                         if let Some(pending_commits) = self.shared.group_commit_queue.take_pending() {
                             let result = self.execute_group_wal_flush(&pending_commits);
@@ -300,57 +344,20 @@ impl Database {
                         bail!("group commit failed: {}", e);
                     }
                 }
-            }
-
-            let table_infos: Vec<(u32, String, String)> = {
-                let lookup = self.shared.table_id_lookup.read();
-                dirty_table_ids
-                    .iter()
-                    .filter_map(|&table_id| {
-                        lookup
-                            .get(&table_id)
-                            .map(|(s, t)| (table_id, s.clone(), t.clone()))
-                    })
-                    .collect()
-            };
-
-            let mut file_manager_guard = self.shared.file_manager.write();
-            let file_manager = file_manager_guard
-                .as_mut()
-                .ok_or_else(|| eyre::eyre!("file manager not available for WAL flush"))?;
-
-            let mut wal_guard = self.shared.wal.lock();
-            let wal = wal_guard
-                .as_mut()
-                .ok_or_else(|| eyre::eyre!("WAL not initialized but WAL mode is enabled"))?;
-
-            for (table_id, schema_name, table_name) in table_infos {
-                let _table_lock = self.shared.page_locks.table_intent_exclusive(table_id);
-
-                let dirty_pages = self.shared.dirty_tracker.dirty_pages_for_table(table_id);
-                let page_tuples: Vec<(u32, u32)> = dirty_pages.iter().map(|&p| (table_id, p)).collect();
-                let _page_locks = self.shared.page_locks.page_write_multi(&page_tuples);
-
-                let storage_arc = file_manager
-                    .table_data(&schema_name, &table_name)
-                    .wrap_err_with(|| {
-                        format!(
-                            "failed to get storage for table {}.{} during WAL flush",
-                            schema_name, table_name
-                        )
-                    })?;
-                let storage = storage_arc.read();
-
-                WalStoragePerTable::flush_wal_for_table(&self.shared.dirty_tracker, &storage, wal, table_id)
-                    .wrap_err_with(|| {
-                        format!(
-                            "failed to flush WAL for table {}.{} on commit",
-                            schema_name, table_name
-                        )
-                    })?;
+            } else if !payload.is_empty() {
+                // If group commit is disabled but WAL is on, we flush directly.
+                 let mut wal_guard = self.shared.wal.lock();
+                 let wal = wal_guard
+                     .as_mut()
+                     .ok_or_else(|| eyre::eyre!("WAL not initialized but WAL mode is enabled"))?;
+                 
+                 for (table_id, page_no, data, db_size) in payload {
+                      wal.write_frame_with_file_id(page_no, db_size, &data, table_id as u64)
+                       .wrap_err("failed to write WAL frame in direct commit")?;
+                 }
             }
         }
-
+        
         Ok(ExecuteResult::Commit)
     }
 
@@ -358,62 +365,17 @@ impl Database {
         &self,
         pending_commits: &[std::sync::Arc<super::group_commit::PendingCommit>],
     ) -> Result<()> {
-        use super::group_commit::collect_dirty_tables;
-
-        let all_dirty_table_ids = collect_dirty_tables(pending_commits);
-
-        if all_dirty_table_ids.is_empty() {
-            return Ok(());
-        }
-
-        let table_infos: Vec<(u32, String, String)> = {
-            let lookup = self.shared.table_id_lookup.read();
-            all_dirty_table_ids
-                .iter()
-                .filter_map(|&table_id| {
-                    lookup
-                        .get(&table_id)
-                        .map(|(s, t)| (table_id, s.clone(), t.clone()))
-                })
-                .collect()
-        };
-
-        let mut file_manager_guard = self.shared.file_manager.write();
-        let file_manager = file_manager_guard
-            .as_mut()
-            .ok_or_else(|| eyre::eyre!("file manager not available for group WAL flush"))?;
-
         let mut wal_guard = self.shared.wal.lock();
         let wal = wal_guard
             .as_mut()
             .ok_or_else(|| eyre::eyre!("WAL not initialized but WAL mode is enabled"))?;
 
-        for (table_id, schema_name, table_name) in table_infos {
-            let _table_lock = self.shared.page_locks.table_intent_exclusive(table_id);
-
-            let dirty_pages = self.shared.dirty_tracker.dirty_pages_for_table(table_id);
-            let page_tuples: Vec<(u32, u32)> = dirty_pages.iter().map(|&p| (table_id, p)).collect();
-            let _page_locks = self.shared.page_locks.page_write_multi(&page_tuples);
-
-            let storage_arc = file_manager
-                .table_data(&schema_name, &table_name)
-                .wrap_err_with(|| {
-                    format!(
-                        "failed to get storage for table {}.{} during group WAL flush",
-                        schema_name, table_name
-                    )
-                })?;
-            let storage = storage_arc.read();
-
-            WalStoragePerTable::flush_wal_for_table(&self.shared.dirty_tracker, &storage, wal, table_id)
-                .wrap_err_with(|| {
-                    format!(
-                        "failed to flush WAL for table {}.{} during group commit",
-                        schema_name, table_name
-                    )
-                })?;
+        for commit in pending_commits {
+            for (table_id, page_no, data, db_size) in &commit.payload {
+                 wal.write_frame_with_file_id(*page_no, *db_size, data, *table_id as u64)
+                    .wrap_err("failed to write WAL frame in group commit")?;
+            }
         }
-
         Ok(())
     }
 

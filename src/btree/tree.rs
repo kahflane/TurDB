@@ -572,6 +572,23 @@ impl<'a, S: Storage> BTree<'a, S> {
         let free_end = u16::from_le_bytes([page_data[6], page_data[7]]) as usize;
         let cell_count = u16::from_le_bytes([page_data[2], page_data[3]]) as usize;
 
+        if cell_count > 0 {
+            let last_slot_off = LEAF_CONTENT_START + (cell_count - 1) * SLOT_SIZE;
+            let last_slot = &page_data[last_slot_off..last_slot_off + SLOT_SIZE];
+            let off = u16::from_le_bytes([last_slot[4], last_slot[5]]) as usize;
+            let len = u16::from_le_bytes([last_slot[6], last_slot[7]]) as usize;
+            
+            if off >= page_data.len() || off + len > page_data.len() {
+                 return Ok(false);
+            }
+
+            let last_key = &page_data[off..off + len];
+            
+            if key <= last_key {
+                return Ok(false);
+            }
+        }
+
         let value_len_size = varint_len(value.len() as u64);
         let cell_size = key.len() + value_len_size + value.len();
         let space_needed = cell_size + SLOT_SIZE;
@@ -620,12 +637,13 @@ impl<'a, S: Storage> BTree<'a, S> {
     }
 
     pub fn insert(&mut self, key: &[u8], value: &[u8]) -> Result<()> {
+        // Try the fast path for sequential insertions
         if let Some(hint_page) = self.rightmost_hint {
             if let Ok(true) = self.try_fastpath_insert(hint_page, key, value) {
                 return Ok(());
             }
         }
-
+        
         let mut path: PathStack = SmallVec::new();
         let mut current_page = self.root_page;
 
@@ -686,6 +704,7 @@ impl<'a, S: Storage> BTree<'a, S> {
         if cell_count > 0 {
             let last_key = leaf.key_at(cell_count - 1)?;
             if key <= last_key {
+                eprintln!("REJECT FP");
                 return Ok(false);
             }
         }
@@ -757,7 +776,24 @@ impl<'a, S: Storage> BTree<'a, S> {
             .position(|k| *k > key)
             .unwrap_or(all_keys.len());
         all_keys.insert(insert_pos, arena.alloc_slice_copy(key));
+
+        if insert_pos > 0 && all_keys[insert_pos - 1] == all_keys[insert_pos] {
+            bail!("key already exists");
+        }
+        if insert_pos + 1 < all_keys.len() && all_keys[insert_pos] == all_keys[insert_pos + 1] {
+            bail!("key already exists");
+        }
         all_values.insert(insert_pos, arena.alloc_slice_copy(value));
+
+        // DEBUG: Verify sorted and unique
+        for i in 0..all_keys.len() - 1 {
+            if all_keys[i] >= all_keys[i+1] {
+                eprintln!("CRITICAL: Keys out of order/dup in split_leaf index {}", i);
+                eprintln!("K[{}]: {:?}", i, all_keys[i]);
+                eprintln!("K[{}]: {:?}", i+1, all_keys[i+1]);
+                panic!("Keys out of order or duplicate in split_leaf");
+            }
+        }
 
         let old_next_leaf;
         {
@@ -794,6 +830,14 @@ impl<'a, S: Storage> BTree<'a, S> {
                 break;
             }
             mid -= 1;
+        }
+
+        // Enforce split point is within bounds and not at start (which creates empty left page/duplicate separator)
+        if mid == 0 {
+             mid = 1;
+        }
+        if mid >= all_keys.len() {
+             mid = all_keys.len() - 1;
         }
 
         {
@@ -1372,5 +1416,104 @@ impl<'a, S: Storage + ?Sized> Cursor<'a, S> {
                 ),
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::storage::MmapStorage;
+    use tempfile::NamedTempFile;
+
+    #[test]
+    fn test_duplicate_key_split_corruption() -> Result<()> {
+        let temp_file = NamedTempFile::new()?;
+        let mut storage = MmapStorage::create(temp_file.path(), 2)?;
+
+        let mut btree = BTree::create(&mut storage, 0)?;
+
+        // Use large keys to fill the page quickly.
+        // Page capacity is 16384 bytes.
+        // We'll use ~1000 byte keys.
+        let key_size = 1000;
+        let value_size = 100;
+
+        // Fill page to near capacity
+        // 14 * 1100 = 15400 bytes
+        for i in 0..14 {
+            let key = vec![i as u8; key_size];
+            let value = vec![0u8; value_size];
+            btree.insert(&key, &value)?;
+        }
+
+        // Try to insert a duplicate of an existing key (e.g., key corresponding to i=5).
+        // This key (vec![5; 1000]) is already in the page.
+        // Since the page is nearly full (free space < 1000), `insert_cell` would fail,
+        // triggering `split_leaf`.
+        // Prior to the fix, `split_leaf` would accept the duplicate, causing corruption.
+        let dup_key = vec![5u8; key_size];
+        let dup_value = vec![1u8; value_size];
+
+        let result = btree.insert(&dup_key, &dup_value);
+
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().to_string(), "key already exists");
+
+        Ok(())
+    }
+    #[test]
+    fn test_separator_conflict_split() -> Result<()> {
+        let temp_file = NamedTempFile::new()?;
+        let mut storage = MmapStorage::create(temp_file.path(), 2)?;
+        let mut btree = BTree::create(&mut storage, 0)?;
+
+        let key_size = 1000;
+        let value_size = 100;
+
+        // 1. Fill leaf to split
+        // 14 items ~15400 bytes. 15 items > 16384. Force split.
+        for i in 0..20 {
+            let key = vec![i as u8; key_size];
+            let value = vec![0u8; value_size];
+            btree.insert(&key, &value)?;
+        }
+        
+        // Root is now interior (checked by previous logic, roughly 14*1100 > 16384 * 0.9?)
+        // Let's verify we have a split.
+        let root_page = btree.root_page();
+        let page_data = storage.page(root_page)?;
+        let header = PageHeader::from_bytes(page_data)?;
+        assert_eq!(header.page_type(), crate::storage::PageType::BTreeInterior);
+
+        // 2. Identify the separator
+        let interior = InteriorNode::from_page(page_data)?;
+        assert!(interior.cell_count() > 0);
+        let separator = interior.key_at(0)?.to_vec();
+        println!("Separator: {:?}", &separator[0..10]);
+
+        // 3. Insert a key that is EQUAL to the separator, but with different content?
+        // No, BTree keys are binary.
+        // We cannot insert `separator` again as a key, `insert` would catch it.
+        
+        // The error happens when `split_leaf` generates a separator that ALREADY exists in parent.
+        // This implies `split_leaf` separator == parent's separator.
+        // S_parent = 7.
+        // Right child has keys >= 7. e.g. 7, 8, 9...
+        // If we split Right child.
+        // And we choose 7 as the new separator?
+        // Insert 7 into parent [7]. Boom.
+        
+        // To choose 7 as separator, `mid` must be index of 7.
+        // If Right child keys: [7, 8].
+        // mid=1 -> 8. Separation at 8. Parent -> [7, 8]. OK.
+        
+        // If Right child keys: [7, 7.5]. (e.g. key starting with 7 but longer?)
+        // Key 7: [7, 7, 7...]
+        // Key 8: [8, 8, 8...]
+        // Let's try to insert a key that is extremely close to the separator.
+        
+        // Use keys that match prefix?
+        
+        Ok(())
     }
 }

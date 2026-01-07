@@ -189,6 +189,7 @@ use super::PAGE_SIZE;
 pub struct Wal {
     dir: PathBuf,
     current_segment: Mutex<WalSegment>,
+    closed_segments: Mutex<Vec<PathBuf>>,
     page_index: RwLock<HashMap<(u64, u32), (u64, u64)>>,
     read_mmap: RwLock<Option<(u64, Mmap)>>,
     salt1: u32,
@@ -242,6 +243,7 @@ impl Wal {
         Ok(Self {
             dir: dir.to_path_buf(),
             current_segment: Mutex::new(segment),
+            closed_segments: Mutex::new(Vec::new()),
             page_index: RwLock::new(HashMap::new()),
             read_mmap: RwLock::new(None),
             salt1: Self::generate_salt(),
@@ -288,6 +290,7 @@ impl Wal {
         Ok(Self {
             dir: dir.to_path_buf(),
             current_segment: Mutex::new(segment),
+            closed_segments: Mutex::new(Vec::new()),
             page_index: RwLock::new(page_index),
             read_mmap: RwLock::new(None),
             salt1,
@@ -310,82 +313,159 @@ impl Wal {
         }
     }
 
-    pub fn recover(&mut self, storage: &mut super::MmapStorage) -> Result<u32> {
-        let segment_path = self.dir.join("wal.000001");
-
-        if !segment_path.exists() {
-            return Ok(0);
-        }
-
-        let mut segment = WalSegment::open(&segment_path, 1)?;
+    pub fn recover(&self, storage: &mut super::MmapStorage) -> Result<u32> {
+        let max_segment = Self::find_latest_segment(&self.dir)?;
         let mut frames_applied = 0;
 
-        while let Ok((header, page_data)) = segment.read_frame() {
-            if header.page_no >= storage.page_count() {
-                let required_pages = header.db_size.max(header.page_no + 1);
-                storage.grow(required_pages).wrap_err_with(|| {
-                    format!(
-                        "failed to grow storage to {} pages during WAL recovery",
-                        required_pages
-                    )
-                })?;
+        for i in 1..=max_segment {
+            let segment_path = self.dir.join(format!("wal.{:06}", i));
+            if !segment_path.exists() {
+                continue;
             }
 
-            let page_mut = storage.page_mut(header.page_no).wrap_err_with(|| {
-                format!("failed to get page {} for WAL recovery", header.page_no)
-            })?;
+            let mut segment = WalSegment::open(&segment_path, i)?;
+            while let Ok((header, page_data)) = segment.read_frame() {
+                if header.page_no >= storage.page_count() {
+                    let required_pages = header.db_size.max(header.page_no + 1);
+                    storage.grow(required_pages).wrap_err_with(|| {
+                        format!(
+                            "failed to grow storage to {} pages during WAL recovery of segment {}",
+                            required_pages, i
+                        )
+                    })?;
+                }
 
-            page_mut.copy_from_slice(&page_data);
-            frames_applied += 1;
+                let page_mut = storage.page_mut(header.page_no).wrap_err_with(|| {
+                    format!("failed to get page {} for WAL recovery of segment {}", header.page_no, i)
+                })?;
+
+                page_mut.copy_from_slice(&page_data);
+                frames_applied += 1;
+            }
         }
 
         Ok(frames_applied)
     }
 
     pub fn recover_for_file(
-        &mut self,
+        &self,
         storage: &mut super::MmapStorage,
         file_id: u64,
     ) -> Result<u32> {
-        let segment_path = self.dir.join("wal.000001");
-
-        if !segment_path.exists() {
-            return Ok(0);
-        }
-
-        let mut segment = WalSegment::open(&segment_path, 1)?;
+        let max_segment = Self::find_latest_segment(&self.dir)?;
         let mut frames_applied = 0;
 
-        while let Ok((header, page_data)) = segment.read_frame() {
-            if header.file_id != file_id {
+        for i in 1..=max_segment {
+            let segment_path = self.dir.join(format!("wal.{:06}", i));
+            if !segment_path.exists() {
                 continue;
             }
 
-            if header.page_no >= storage.page_count() {
-                let required_pages = header.db_size.max(header.page_no + 1);
-                storage.grow(required_pages).wrap_err_with(|| {
+            let mut segment = WalSegment::open(&segment_path, i)?;
+
+            while let Ok((header, page_data)) = segment.read_frame() {
+                if header.file_id != file_id {
+                    continue;
+                }
+
+                if header.page_no >= storage.page_count() {
+                    let required_pages = header.db_size.max(header.page_no + 1);
+                    storage.grow(required_pages).wrap_err_with(|| {
+                        format!(
+                            "failed to grow storage to {} pages during WAL recovery for file_id={} segment={}",
+                            required_pages, file_id, i
+                        )
+                    })?;
+                }
+
+                let page_mut = storage.page_mut(header.page_no).wrap_err_with(|| {
                     format!(
-                        "failed to grow storage to {} pages during WAL recovery for file_id={}",
-                        required_pages, file_id
+                        "failed to get page {} for WAL recovery (file_id={}) segment={}",
+                        header.page_no, file_id, i
                     )
                 })?;
+
+                page_mut.copy_from_slice(&page_data);
+                frames_applied += 1;
             }
-
-            let page_mut = storage.page_mut(header.page_no).wrap_err_with(|| {
-                format!(
-                    "failed to get page {} for WAL recovery (file_id={})",
-                    header.page_no, file_id
-                )
-            })?;
-
-            page_mut.copy_from_slice(&page_data);
-            frames_applied += 1;
         }
 
         Ok(frames_applied)
     }
 
-    pub fn checkpoint(&mut self, storage: &mut super::MmapStorage) -> Result<u32> {
+    pub fn get_closed_segments(&self) -> Vec<PathBuf> {
+        let guard = self.closed_segments.lock();
+        guard.clone()
+    }
+
+    pub fn remove_closed_segments(&self, paths: &[PathBuf]) -> Result<()> {
+        let mut guard = self.closed_segments.lock();
+        guard.retain(|p| !paths.contains(p));
+        
+        for path in paths {
+            if path.exists() {
+                remove_file(path).wrap_err_with(|| format!("failed to remove closed WAL segment {:?}", path))?;
+            }
+        }
+        
+        Ok(())
+    }
+
+    pub fn replay_segments_to_storage(
+        segments: &[PathBuf],
+        storage: &mut super::MmapStorage,
+        file_id: u64,
+    ) -> Result<u32> {
+        let mut frames_applied = 0;
+
+        for segment_path in segments {
+            if !segment_path.exists() {
+                continue;
+            }
+
+            let file_name = segment_path.file_name().unwrap_or_default().to_string_lossy();
+            let num_part = if file_name.starts_with("wal.") && file_name.len() == 10 {
+                &file_name[4..]
+            } else {
+                continue;
+            };
+            
+            let sequence = num_part.parse::<u64>().unwrap_or(0);
+            if sequence == 0 { continue; }
+
+            let mut segment = WalSegment::open(segment_path, sequence)?;
+
+            while let Ok((header, page_data)) = segment.read_frame() {
+                if header.file_id != file_id {
+                    continue;
+                }
+
+                if header.page_no >= storage.page_count() {
+                    let required_pages = header.db_size.max(header.page_no + 1);
+                    storage.grow(required_pages).wrap_err_with(|| {
+                        format!(
+                            "failed to grow storage to {} pages during WAL replay for file_id={} segment={}",
+                            required_pages, file_id, sequence
+                        )
+                    })?;
+                }
+
+                let page_mut = storage.page_mut(header.page_no).wrap_err_with(|| {
+                    format!(
+                        "failed to get page {} for WAL replay (file_id={}) segment={}",
+                        header.page_no, file_id, sequence
+                    )
+                })?;
+
+                page_mut.copy_from_slice(&page_data);
+                frames_applied += 1;
+            }
+        }
+
+        Ok(frames_applied)
+    }
+
+    pub fn checkpoint(&self, storage: &mut super::MmapStorage) -> Result<u32> {
         let frames_applied = self.recover(storage)?;
 
         storage.sync().wrap_err("failed to sync storage during checkpoint")?;
@@ -395,7 +475,7 @@ impl Wal {
         Ok(frames_applied)
     }
 
-    pub fn truncate(&mut self) -> Result<()> {
+    pub fn truncate(&self) -> Result<()> {
         use std::io::Write;
 
         let mut segment = self.current_segment.lock();
@@ -523,12 +603,12 @@ impl Wal {
         Ok(Some(page_data.to_vec()))
     }
 
-    pub fn write_frame(&mut self, page_no: u32, db_size: u32, page_data: &[u8]) -> Result<()> {
+    pub fn write_frame(&self, page_no: u32, db_size: u32, page_data: &[u8]) -> Result<()> {
         self.write_frame_with_file_id(page_no, db_size, page_data, 0)
     }
 
     pub fn write_frame_with_file_id(
-        &mut self,
+        &self,
         page_no: u32,
         db_size: u32,
         page_data: &[u8],
@@ -581,17 +661,22 @@ impl Wal {
         self.current_offset() >= MAX_SEGMENT_SIZE
     }
 
-    pub fn rotate_segment(&mut self) -> Result<()> {
+    pub fn rotate_segment(&self) -> Result<()> {
         let mut segment_guard = self.current_segment.lock();
         let current_sequence = segment_guard.sequence;
+        let old_path = segment_guard.path.clone(); // Assumption: WalSegment has path
+        
         let new_sequence = current_sequence + 1;
-
         let new_segment_path = self.dir.join(format!("wal.{:06}", new_sequence));
         let new_segment = WalSegment::create(&new_segment_path, new_sequence)
             .wrap_err_with(|| format!("failed to create new WAL segment {}", new_sequence))?;
 
         *segment_guard = new_segment;
         drop(segment_guard);
+
+        // Add old to closed segments
+        let mut closed = self.closed_segments.lock();
+        closed.push(old_path);
 
         let mut mmap_guard = self.read_mmap.write();
         *mmap_guard = None;
@@ -604,6 +689,7 @@ pub struct WalSegment {
     file: File,
     sequence: u64,
     offset: u64,
+    pub path: PathBuf,
 }
 
 impl WalSegment {
@@ -620,6 +706,7 @@ impl WalSegment {
             file,
             sequence,
             offset: 0,
+            path: path.to_path_buf(),
         })
     }
 
@@ -633,10 +720,13 @@ impl WalSegment {
         file.seek(SeekFrom::Start(0))
             .wrap_err("failed to seek to start of WAL segment")?;
 
+        let len = file.metadata().wrap_err("failed to get WAL segment metadata")?.len();
+
         Ok(Self {
             file,
             sequence,
-            offset: 0,
+            offset: len,
+            path: path.to_path_buf(),
         })
     }
 

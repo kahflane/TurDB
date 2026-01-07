@@ -298,30 +298,28 @@ impl Database {
         let mut file_manager_guard = self.shared.file_manager.write();
         let file_manager = file_manager_guard.as_mut().unwrap();
 
-        let mut count = 0;
-        let mut key_buf: SmallVec<[u8; 64]> = SmallVec::new();
-        let mut returned_rows: Option<Vec<Row>> = insert.returning.map(|_| Vec::new());
+        // [Deadlock Fix] Pre-acquire all storage handles to release FileManager lock early
+        let mut storage_map: hashbrown::HashMap<crate::storage::FileKey, std::sync::Arc<parking_lot::RwLock<crate::storage::MmapStorage>>> = hashbrown::HashMap::new();
 
-        let mut auto_increment_current = if auto_increment_col_idx.is_some() {
-            let storage_arc = file_manager.table_data_mut(schema_name, table_name)?;
-            let storage = storage_arc.write();
+        // 1. Main Table Storage
+        let table_file_key = crate::storage::FileManager::make_table_key(schema_name, table_name);
+        let main_storage_arc = file_manager.table_data_mut(schema_name, table_name)?;
+        storage_map.insert(table_file_key.clone(), main_storage_arc.clone());
+
+        // 2. Initialize Headers (AutoInc, Hint) using the handle
+        // We do this while holding FileManager lock to ensure consistency, but we could do it after.
+        // Doing it here matches original logic's timing.
+        let (mut auto_increment_current, hint) = {
+            let storage = main_storage_arc.write();
             let page = storage.page(0)?;
             let header = TableFileHeader::from_bytes(page)?;
-            header.auto_increment()
-        } else {
-            0
+            let ai = if auto_increment_col_idx.is_some() { header.auto_increment() } else { 0 };
+            (ai, header.rightmost_hint())
         };
         let mut auto_increment_max = auto_increment_current;
+        let mut rightmost_hint = if hint > 0 { Some(hint) } else { None };
 
-        let mut rightmost_hint: Option<u32> = {
-            let storage_arc = file_manager.table_data_mut(schema_name, table_name)?;
-            let storage = storage_arc.write();
-            let page = storage.page(0)?;
-            let header = TableFileHeader::from_bytes(page)?;
-            let hint = header.rightmost_hint();
-            if hint > 0 { Some(hint) } else { None }
-        };
-
+        // 3. TOAST Storage
         let mut toast_rightmost_hints: SmallVec<[Option<u32>; 8]> = SmallVec::new();
         let toastable_col_indices: SmallVec<[usize; 8]> = if has_toast {
             toast_rightmost_hints.resize(columns.len(), None);
@@ -334,44 +332,78 @@ impl Database {
             SmallVec::new()
         };
 
-        let table_file_key = crate::storage::FileManager::make_table_key(schema_name, table_name);
-        let mut record_builder = crate::records::RecordBuilder::new(&schema);
-
         use crate::storage::FileKey;
         let toast_file_key: Option<FileKey>;
         let mut toast_table_id: u32 = 0;
         let mut toast_root_page: u32 = 1;
         let mut toast_initial_root_page: u32 = 1;
         let mut toast_rightmost_hint: Option<u32> = None;
+
         if has_toast {
             let toast_table_name_owned = crate::storage::toast::toast_table_name(table_name);
-            toast_file_key = Some(crate::storage::FileManager::make_table_key(schema_name, &toast_table_name_owned));
-            let toast_storage_arc = file_manager.table_data_mut(schema_name, &toast_table_name_owned)?;
-            let toast_storage = toast_storage_arc.write();
-            let page0 = toast_storage.page(0)?;
-            let header = crate::storage::TableFileHeader::from_bytes(page0)?;
-            toast_table_id = header.table_id() as u32;
-            toast_root_page = header.root_page();
-            toast_initial_root_page = toast_root_page;
-            let hint = header.rightmost_hint();
-            toast_rightmost_hint = if hint > 0 { Some(hint) } else { None };
+            let key = crate::storage::FileManager::make_table_key(schema_name, &toast_table_name_owned);
+            
+            // Ensure TOAST table exists (it should if has_toast is true)
+            if file_manager.table_exists(schema_name, &toast_table_name_owned) {
+                let toast_storage_arc = file_manager.table_data_mut(schema_name, &toast_table_name_owned)?;
+                let toast_storage = toast_storage_arc.write();
+                let page0 = toast_storage.page(0)?;
+                let header = crate::storage::TableFileHeader::from_bytes(page0)?;
+                toast_table_id = header.table_id() as u32;
+                toast_root_page = header.root_page();
+                toast_initial_root_page = toast_root_page;
+                let hint = header.rightmost_hint();
+                toast_rightmost_hint = if hint > 0 { Some(hint) } else { None };
+                
+                drop(toast_storage);
+                storage_map.insert(key.clone(), toast_storage_arc);
+                toast_file_key = Some(key);
+            } else {
+                // This shouldn't typically happen if metadata says has_toast
+                toast_file_key = None;
+            }
         } else {
             toast_file_key = None;
         }
 
-        let unique_column_keys: Vec<(usize, FileKey, bool, bool)> = unique_columns
-            .iter()
-            .filter(|(_, _, _, is_auto_increment)| !is_auto_increment)
-            .filter_map(|(col_idx, index_name, is_pk, _is_auto_increment)| {
-                if file_manager.index_exists(schema_name, table_name, index_name) {
-                    let _ = file_manager.index_data_mut(schema_name, table_name, index_name);
-                    let key = crate::storage::FileManager::make_index_key(schema_name, table_name, index_name);
-                    Some((*col_idx, key, *is_pk, false))
-                } else {
-                    None
-                }
-            })
-            .collect();
+        // 4. Unique Indexes
+        // Reconstruct unique_column_keys logic but populate storage_map
+        let mut unique_column_keys: Vec<(usize, FileKey, bool, bool)> = Vec::new();
+        for (col_idx, index_name, is_pk, is_auto_increment) in &unique_columns {
+            if *is_auto_increment { continue; }
+            if file_manager.index_exists(schema_name, table_name, index_name) {
+                let storage = file_manager.index_data_mut(schema_name, table_name, index_name)?;
+                let key = crate::storage::FileManager::make_index_key(schema_name, table_name, index_name);
+                storage_map.insert(key.clone(), storage);
+                unique_column_keys.push((*col_idx, key, *is_pk, false));
+            }
+        }
+
+        // 5. Implicit Unique Indexes (Iterate unique_indexes)
+        for (_, index_name) in &unique_indexes {
+            if file_manager.index_exists(schema_name, table_name, index_name) {
+                let storage = file_manager.index_data_mut(schema_name, table_name, index_name)?;
+                let key = crate::storage::FileManager::make_index_key(schema_name, table_name, index_name);
+                storage_map.insert(key, storage);
+            }
+        }
+
+        // 6. FK Constraints
+        for (_, fk_table, _) in &fk_constraints {
+             if file_manager.table_exists(schema_name, fk_table) {
+                 let storage = file_manager.table_data_mut(schema_name, fk_table)?;
+                 let key = crate::storage::FileManager::make_table_key(schema_name, fk_table);
+                 storage_map.insert(key, storage);
+             }
+        }
+
+        let mut record_builder = crate::records::RecordBuilder::new(&schema);
+        let mut count = 0;
+        let mut key_buf: SmallVec<[u8; 64]> = SmallVec::new();
+        let mut returned_rows: Option<Vec<Row>> = insert.returning.map(|_| Vec::new());
+
+        // CRITICAL: Release the global FileManager lock!
+        drop(file_manager_guard);
 
         for row_values in rows_to_insert.iter() {
             let mut values: Vec<OwnedValue> = row_values.clone();
@@ -441,7 +473,9 @@ impl Database {
                             );
                         }
 
-                        let ref_storage_arc = file_manager.table_data_mut(schema_name, fk_table)?;
+                        let fk_key = crate::storage::FileManager::make_table_key(schema_name, fk_table);
+                        let ref_storage_arc = storage_map.get(&fk_key)
+                            .ok_or_else(|| eyre::eyre!("referenced table storage not found"))?;
                         let mut ref_storage = ref_storage_arc.write();
                         let ref_btree = BTree::new(&mut *ref_storage, 1)?;
                         let ref_schema = create_record_schema(ref_columns);
@@ -487,7 +521,7 @@ impl Database {
                         continue;
                     }
 
-                    let index_storage_arc = file_manager.index_data_mut_with_key(index_key)
+                    let index_storage_arc = storage_map.get(index_key)
                         .ok_or_else(|| eyre::eyre!("index storage not found"))?;
                     let mut index_storage = index_storage_arc.write();
                     let index_btree = BTree::new(&mut *index_storage, root_page)?;
@@ -519,12 +553,12 @@ impl Database {
                     let all_non_null = col_indices
                         .iter()
                         .all(|&idx| values.get(idx).map(|v| !v.is_null()).unwrap_or(false));
-
-                    if all_non_null
-                        && file_manager.index_exists(schema_name, table_name, index_name)
-                    {
-                        let index_storage_arc =
-                            file_manager.index_data_mut(schema_name, table_name, index_name)?;
+                    
+                    let key = crate::storage::FileManager::make_index_key(schema_name, table_name, index_name);
+                    
+                    // We only check if map has it, because we populated based on existence
+                    if all_non_null && storage_map.contains_key(&key) {
+                        let index_storage_arc = storage_map.get(&key).unwrap();
                         let mut index_storage = index_storage_arc.write();
                         let index_btree = BTree::new(&mut *index_storage, root_page)?;
 
@@ -568,8 +602,8 @@ impl Database {
                         }
                         OnConflictAction::DoUpdate(assignments) => {
                             if let Some(existing_key) = conflicting_key {
-                                let table_storage_arc =
-                                    file_manager.table_data_mut(schema_name, table_name)?;
+                                let table_storage_arc = storage_map.get(&table_file_key)
+                                    .ok_or_else(|| eyre::eyre!("table storage not found"))?;
                                 let mut table_storage = table_storage_arc.write();
                                 let btree = BTree::new(&mut *table_storage, root_page)?;
 
@@ -672,7 +706,7 @@ impl Database {
                     if let Some(data) = data {
                         if needs_toast(data) {
                             let toast_key = toast_file_key.as_ref().unwrap();
-                            let toast_storage_arc = file_manager.table_data_mut_with_key(toast_key)
+                            let toast_storage_arc = storage_map.get(toast_key)
                                 .ok_or_else(|| eyre::eyre!("toast storage not found"))?;
                             let mut toast_storage = toast_storage_arc.write();
 
@@ -708,7 +742,7 @@ impl Database {
                 }
             }
 
-            let table_storage_arc = file_manager.table_data_mut_with_key(&table_file_key)
+            let table_storage_arc = storage_map.get(&table_file_key)
                 .ok_or_else(|| eyre::eyre!("table storage not found in cache"))?;
             let mut table_storage = table_storage_arc.write();
 
@@ -757,7 +791,7 @@ impl Database {
                         continue;
                     }
 
-                    let index_storage_arc = file_manager.index_data_mut_with_key(index_key)
+                    let index_storage_arc = storage_map.get(index_key)
                         .ok_or_else(|| eyre::eyre!("index storage not found"))?;
                     let mut index_storage = index_storage_arc.write();
 
@@ -775,10 +809,10 @@ impl Database {
                 let all_non_null = col_indices
                     .iter()
                     .all(|&idx| values.get(idx).map(|v| !v.is_null()).unwrap_or(false));
+                let key = crate::storage::FileManager::make_index_key(schema_name, table_name, index_name);
 
-                if all_non_null && file_manager.index_exists(schema_name, table_name, index_name) {
-                    let index_storage_arc =
-                        file_manager.index_data_mut(schema_name, table_name, index_name)?;
+                if all_non_null && storage_map.contains_key(&key) {
+                    let index_storage_arc = storage_map.get(&key).unwrap();
                     let mut index_storage = index_storage_arc.write();
 
                     key_buf.clear();
@@ -822,42 +856,52 @@ impl Database {
             }
         }
 
+        // Cleanup and Header Updates
         if auto_increment_col_idx.is_some() && auto_increment_max > 0 {
-            let storage_arc = file_manager.table_data_mut(schema_name, table_name)?;
-            let mut storage = storage_arc.write();
-            let page = storage.page_mut(0)?;
-            let header = TableFileHeader::from_bytes_mut(page)?;
-            if auto_increment_max > header.auto_increment() {
-                header.set_auto_increment(auto_increment_max);
+            if let Some(storage_arc) = storage_map.get(&table_file_key) {
+                let mut storage = storage_arc.write();
+                let page = storage.page_mut(0)?;
+                let header = TableFileHeader::from_bytes_mut(page)?;
+                if auto_increment_max > header.auto_increment() {
+                    header.set_auto_increment(auto_increment_max);
+                }
             }
         }
 
         if let Some(hint) = rightmost_hint {
-            let storage_arc = file_manager.table_data_mut(schema_name, table_name)?;
-            let mut storage = storage_arc.write();
-            let page = storage.page_mut(0)?;
-            let header = TableFileHeader::from_bytes_mut(page)?;
-            header.set_rightmost_hint(hint);
+            if let Some(storage_arc) = storage_map.get(&table_file_key) {
+                let mut storage = storage_arc.write();
+                let page = storage.page_mut(0)?;
+                let header = TableFileHeader::from_bytes_mut(page)?;
+                header.set_rightmost_hint(hint);
+            }
         }
 
         if count > 0 {
-            let storage_arc = file_manager.table_data_mut(schema_name, table_name)?;
-            let mut storage = storage_arc.write();
-            let page = storage.page_mut(0)?;
-            let header = TableFileHeader::from_bytes_mut(page)?;
-            let new_row_count = header.row_count().saturating_add(count as u64);
-            header.set_row_count(new_row_count);
+            if let Some(storage_arc) = storage_map.get(&table_file_key) {
+                let mut storage = storage_arc.write();
+                let page = storage.page_mut(0)?;
+                let header = TableFileHeader::from_bytes_mut(page)?;
+                let new_row_count = header.row_count().saturating_add(count as u64);
+                header.set_row_count(new_row_count);
+            }
         }
 
         if has_toast && toast_root_page != toast_initial_root_page {
-            let toast_table_name_owned = crate::storage::toast::toast_table_name(table_name);
-            let toast_storage_arc = file_manager.table_data_mut(schema_name, &toast_table_name_owned)?;
-            let mut toast_storage = toast_storage_arc.write();
-            let page0 = toast_storage.page_mut(0)?;
-            let header = crate::storage::TableFileHeader::from_bytes_mut(page0)?;
-
-            header.set_root_page(toast_root_page);
+            if let Some(ref key) = toast_file_key {
+                if let Some(toast_storage_arc) = storage_map.get(key) {
+                     let mut toast_storage = toast_storage_arc.write();
+                     let page0 = toast_storage.page_mut(0)?;
+                     let header = crate::storage::TableFileHeader::from_bytes_mut(page0)?;
+                     header.set_root_page(toast_root_page);
+                }
+            }
         }
+
+        // Re-acquire File Manager for WAL flush
+        self.ensure_file_manager()?;
+        let mut file_manager_guard = self.shared.file_manager.write();
+        let file_manager = file_manager_guard.as_mut().unwrap();
 
         self.flush_wal_if_autocommit(file_manager, schema_name, table_name, table_id as u32)?;
 

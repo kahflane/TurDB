@@ -335,9 +335,9 @@ fn concurrent_import_small_tables() {
     }
 
     let db = Database::create(TURDB_PATH).expect("Failed to create database");
-    db.execute("PRAGMA WAL=ON").expect("Failed to enable WAL");
+    db.execute("PRAGMA WAL=ON").expect("Failed to set WAL mode");
     db.execute("PRAGMA synchronous=NORMAL").expect("Failed to set synchronous mode");
-    db.execute("SET foreign_keys = OFF").expect("Failed to disable foreign keys");
+    db.execute("SET foreign_keys = ON").expect("Failed to disable foreign keys");
 
     println!("\n=== MVCC Concurrent Import Test ===");
     println!("Tables to import: {}", SMALL_TABLES.len());

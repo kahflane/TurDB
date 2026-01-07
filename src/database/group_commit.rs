@@ -1,60 +1,30 @@
 //! # Group Commit Implementation
 //!
-//! This module implements group commit for TurDB, a critical optimization that
-//! batches multiple transaction commits into a single WAL flush operation.
-//! This dramatically reduces I/O overhead, especially on IoT devices where
-//! storage write latency is high.
+//! This module implements a "Push-Based" group commit mechanism for TurDB.
+//! Transactions buffer their dirty pages and "push" them into the commit queue,
+//! allowing the leader to write to WAL without acquiring any storage locks.
 //!
 //! ## Design Overview
 //!
 //! ```text
-//! Thread 1 ──┐
-//! Thread 2 ──┼──► GroupCommitQueue ──► Single WAL Flush ──► Notify All
-//! Thread 3 ──┘
+//! Thread 1 (Buffer Data) ──┐
+//! Thread 2 (Buffer Data) ──┼──► GroupCommitQueue (Data Payloads) ──► Write WAL
+//! Thread 3 (Buffer Data) ──┘
 //! ```
 //!
-//! ## How It Works
+//! ## Locking Model (Deadlock Free)
 //!
-//! 1. Multiple threads submit commit requests to the queue
-//! 2. A configurable timeout or batch size triggers the flush
-//! 3. All pending commits are flushed to WAL in a single I/O operation
-//! 4. All waiting threads are notified of completion
-//!
-//! ## Leader Election Protocol
-//!
-//! When multiple threads call `submit_and_wait()` concurrently, one thread
-//! becomes the "leader" responsible for performing the actual WAL flush:
-//!
-//! ```text
-//! Thread A (Leader):                Thread B (Waiter):
-//! ─────────────────                 ─────────────────
-//! submit_and_wait()                 submit_and_wait()
-//!   └─► adds pending                  └─► adds pending
-//!   └─► should_flush? YES             └─► should_flush? NO (in progress)
-//!   └─► sets flush_in_progress        └─► waits on flush_complete
-//!   └─► returns IMMEDIATELY
-//! take_pending()
-//! execute_group_wal_flush()
-//! complete_batch()
-//!   └─► notifies flush_complete ──────► wakes up, returns
-//! ```
-//!
-//! The leader is the first thread to set `flush_in_progress = true`. That
-//! thread returns from `wait_for_completion()` immediately (without waiting
-//! for completion) so it can proceed to call `take_pending()` and execute
-//! the WAL flush. Other threads block on `flush_complete` until the leader
-//! calls `complete_batch()`.
-//!
-//! ## Performance Benefits
-//!
-//! - Reduces fsync() calls from N to 1 for N concurrent commits
-//! - Amortizes WAL write overhead across multiple transactions
-//! - Typical speedup: 5-10x for write-heavy workloads
-//!
-//! ## Thread Safety
-//!
-//! `GroupCommitQueue` is `Send + Sync`. Internal synchronization uses
-//! `parking_lot::Mutex` and `Condvar` for efficient waiting.
+//! 1. **Transaction Phase**:
+//!    - Acquire Table/Page Locks.
+//!    - Update Memory.
+//!    - Read Dirty Pages -> Buffer.
+//!    - **Release Locks**.
+//! 2. **Commit Phase**:
+//!    - Submit Buffer to Queue.
+//!    - Wait for Flush.
+//! 3. **Flush Phase** (Leader):
+//!    - Buffer -> WAL File.
+//!    - No Storage Locks required.
 
 use parking_lot::{Condvar, Mutex};
 use smallvec::SmallVec;
@@ -108,8 +78,8 @@ impl GroupCommitConfig {
 pub struct PendingCommit {
     /// Unique batch ID for this commit
     pub batch_id: u64,
-    /// Table IDs with dirty pages to flush
-    pub dirty_table_ids: SmallVec<[u32; 8]>,
+    /// Buffered dirty pages: (table_id, page_id, data)
+    pub payload: SmallVec<[(u32, u32, Vec<u8>, u32); 4]>,
     /// Completion flag - set to true when WAL flush completes
     pub completed: AtomicBool,
     /// Error message if commit failed (empty string means success)
@@ -117,10 +87,10 @@ pub struct PendingCommit {
 }
 
 impl PendingCommit {
-    pub fn new(batch_id: u64, dirty_table_ids: SmallVec<[u32; 8]>) -> Self {
+    pub fn new(batch_id: u64, payload: SmallVec<[(u32, u32, Vec<u8>, u32); 4]>) -> Self {
         Self {
             batch_id,
-            dirty_table_ids,
+            payload,
             completed: AtomicBool::new(false),
             error: Mutex::new(None),
         }
@@ -255,8 +225,8 @@ impl GroupCommitQueue {
     /// Submit a commit request and wait for it to complete
     ///
     /// Returns the batch ID this commit was part of, or an error message
-    pub fn submit_and_wait(&self, dirty_table_ids: SmallVec<[u32; 8]>) -> Result<u64, String> {
-        if !self.is_enabled() || dirty_table_ids.is_empty() {
+    pub fn submit_and_wait(&self, payload: SmallVec<[(u32, u32, Vec<u8>, u32); 4]>) -> Result<u64, String> {
+        if !self.is_enabled() || payload.is_empty() {
             return Ok(0);
         }
 
@@ -269,7 +239,7 @@ impl GroupCommitQueue {
                 state.batch_start = Some(Instant::now());
             }
 
-            let pending = std::sync::Arc::new(PendingCommit::new(batch_id, dirty_table_ids));
+            let pending = std::sync::Arc::new(PendingCommit::new(batch_id, payload));
             state.pending.push_back(std::sync::Arc::clone(&pending));
 
             let should_flush = state.pending.len() >= self.config.max_batch_size;
@@ -286,7 +256,7 @@ impl GroupCommitQueue {
     }
 
     /// Submit a commit request without waiting (for async usage)
-    pub fn submit_async(&self, dirty_table_ids: SmallVec<[u32; 8]>) -> std::sync::Arc<PendingCommit> {
+    pub fn submit_async(&self, payload: SmallVec<[(u32, u32, Vec<u8>, u32); 4]>) -> std::sync::Arc<PendingCommit> {
         let mut state = self.state.lock();
         let batch_id = state.next_batch_id;
         state.next_batch_id += 1;
@@ -295,7 +265,7 @@ impl GroupCommitQueue {
             state.batch_start = Some(Instant::now());
         }
 
-        let pending = std::sync::Arc::new(PendingCommit::new(batch_id, dirty_table_ids));
+        let pending = std::sync::Arc::new(PendingCommit::new(batch_id, payload));
         state.pending.push_back(std::sync::Arc::clone(&pending));
 
         if state.pending.len() >= self.config.max_batch_size && !state.flush_in_progress {
@@ -306,7 +276,9 @@ impl GroupCommitQueue {
     }
 
     fn wait_for_completion(&self, pending: &PendingCommit) -> Result<(), String> {
-        let timeout = Duration::from_micros(self.config.max_wait_us * 10);
+        // Use a generous timeout for the actual flush operation, as disk I/O can be slow
+        // especially under load or with large batches. 10ms (old) was deemed too short.
+        let timeout = Duration::from_secs(30);
         let start = Instant::now();
 
         while !pending.is_completed() {
@@ -419,27 +391,10 @@ impl Default for GroupCommitQueue {
     }
 }
 
-/// Collect unique dirty table IDs from a batch of pending commits
-pub fn collect_dirty_tables(commits: &[std::sync::Arc<PendingCommit>]) -> SmallVec<[u32; 16]> {
-    use hashbrown::HashSet;
-
-    let mut seen: HashSet<u32> = HashSet::with_capacity(commits.len() * 2);
-    let mut result: SmallVec<[u32; 16]> = SmallVec::new();
-
-    for commit in commits {
-        for &table_id in commit.dirty_table_ids.iter() {
-            if seen.insert(table_id) {
-                result.push(table_id);
-            }
-        }
-    }
-
-    result
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use smallvec::smallvec;
 
     #[test]
     fn test_group_commit_config_default() {
@@ -451,7 +406,8 @@ mod tests {
 
     #[test]
     fn test_pending_commit_lifecycle() {
-        let pending = PendingCommit::new(1, SmallVec::from_slice(&[1, 2, 3]));
+        let payload = smallvec![(1, 100, vec![1, 2, 3], 10)];
+        let pending = PendingCommit::new(1, payload);
         assert!(!pending.is_completed());
         assert!(pending.take_error().is_none());
 
@@ -498,11 +454,11 @@ mod tests {
     fn test_queue_submit_async() {
         let queue = GroupCommitQueue::with_default_config();
 
-        let pending = queue.submit_async(SmallVec::from_slice(&[1]));
+        let pending = queue.submit_async(smallvec![(1, 0, vec![1], 10)]);
         assert_eq!(pending.batch_id, 1);
         assert_eq!(queue.pending_count(), 1);
 
-        let pending2 = queue.submit_async(SmallVec::from_slice(&[2]));
+        let pending2 = queue.submit_async(smallvec![(1, 0, vec![2], 10)]);
         assert_eq!(pending2.batch_id, 2);
         assert_eq!(queue.pending_count(), 2);
     }
@@ -511,8 +467,8 @@ mod tests {
     fn test_queue_take_pending() {
         let queue = GroupCommitQueue::with_default_config();
 
-        queue.submit_async(SmallVec::from_slice(&[1]));
-        queue.submit_async(SmallVec::from_slice(&[2]));
+        queue.submit_async(smallvec![(1, 0, vec![1], 10)]);
+        queue.submit_async(smallvec![(1, 0, vec![2], 10)]);
 
         let pending = queue.take_pending().unwrap();
         assert_eq!(pending.len(), 2);
@@ -523,8 +479,8 @@ mod tests {
     fn test_queue_complete_batch() {
         let queue = GroupCommitQueue::with_default_config();
 
-        let p1 = queue.submit_async(SmallVec::from_slice(&[1]));
-        let p2 = queue.submit_async(SmallVec::from_slice(&[2]));
+        let p1 = queue.submit_async(smallvec![(1, 0, vec![1], 10)]);
+        let p2 = queue.submit_async(smallvec![(1, 0, vec![2], 10)]);
 
         let pending = queue.take_pending().unwrap();
         queue.complete_batch(&pending);
@@ -535,30 +491,18 @@ mod tests {
     }
 
     #[test]
-    fn test_collect_dirty_tables() {
-        let commits = vec![
-            std::sync::Arc::new(PendingCommit::new(1, SmallVec::from_slice(&[1, 2]))),
-            std::sync::Arc::new(PendingCommit::new(2, SmallVec::from_slice(&[2, 3]))),
-            std::sync::Arc::new(PendingCommit::new(3, SmallVec::from_slice(&[1, 4]))),
-        ];
-
-        let dirty = collect_dirty_tables(&commits);
-        assert_eq!(dirty.len(), 4);
-    }
-
-    #[test]
     fn test_queue_disabled() {
         let queue = GroupCommitQueue::with_default_config();
         queue.set_enabled(false);
 
-        let result = queue.submit_and_wait(SmallVec::from_slice(&[1]));
+        let result = queue.submit_and_wait(smallvec![(1, 0, vec![1], 10)]);
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), 0);
         assert_eq!(queue.pending_count(), 0);
     }
 
     #[test]
-    fn test_queue_empty_dirty_tables() {
+    fn test_queue_empty_payload() {
         let queue = GroupCommitQueue::with_default_config();
 
         let result = queue.submit_and_wait(SmallVec::new());

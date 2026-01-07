@@ -172,4 +172,65 @@ impl Database {
 
         Ok(total_frames)
     }
+    pub(crate) fn replay_schema_tables_from_segments(
+        schema_path: &Path,
+        segments: &[std::path::PathBuf],
+    ) -> Result<u32> {
+        use std::fs;
+        use std::io::Read;
+
+        let mut total_frames = 0u32;
+
+        for entry in fs::read_dir(schema_path).wrap_err("failed to read schema directory")? {
+            let entry = entry.wrap_err("failed to read directory entry")?;
+            let path = entry.path();
+
+            if path.extension().map(|e| e == "tbd").unwrap_or(false) {
+                let mut header_bytes = [0u8; FILE_HEADER_SIZE];
+                let mut file = fs::File::open(&path).wrap_err_with(|| {
+                    format!("failed to open table file {:?} for relay", path)
+                })?;
+
+                if file
+                    .read(&mut header_bytes)
+                    .wrap_err("failed to read table header")?
+                    < FILE_HEADER_SIZE
+                {
+                    continue;
+                }
+
+                let header = match TableFileHeader::from_bytes(&header_bytes) {
+                    Ok(h) => h,
+                    Err(_) => continue,
+                };
+
+                let table_id = header.table_id();
+                if table_id == 0 {
+                    continue;
+                }
+
+                let mut storage = MmapStorage::open(&path).wrap_err_with(|| {
+                    format!("failed to open storage {:?} for WAL replay", path)
+                })?;
+
+                let frames = Wal::replay_segments_to_storage(segments, &mut storage, table_id as u64)
+                    .wrap_err_with(|| {
+                        format!(
+                            "failed to replay WAL frames for table_id={} from segments",
+                            table_id
+                        )
+                    })?;
+
+                if frames > 0 {
+                    storage.sync().wrap_err_with(|| {
+                        format!("failed to sync storage {:?} after replay", path)
+                    })?;
+                }
+
+                total_frames += frames;
+            }
+        }
+
+        Ok(total_frames)
+    }
 }

@@ -184,14 +184,16 @@ pub unsafe fn simd_prefix_search_avx2(
         if lt_mask == 0xFFFFFFFF {
             if eq_mask != 0 {
                 let eq_idx = (eq_mask.trailing_zeros() / 4) as usize;
-                return (batch_start + eq_idx, batch_start + eq_idx + 1, eq_mask);
+                let last_eq_idx = (32 - eq_mask.leading_zeros()) as usize / 4;
+                return (batch_start + eq_idx, batch_start + last_eq_idx, eq_mask);
             }
             left = batch_start + AVX2_BATCH_SIZE;
             continue;
         } else if lt_mask == 0 {
             if eq_mask != 0 {
                 let eq_idx = (eq_mask.trailing_zeros() / 4) as usize;
-                return (batch_start + eq_idx, batch_start + eq_idx + 1, eq_mask);
+                let last_eq_idx = (32 - eq_mask.leading_zeros()) as usize / 4;
+                return (batch_start + eq_idx, batch_start + last_eq_idx, eq_mask);
             }
             right = batch_start;
             continue;
@@ -203,6 +205,14 @@ pub unsafe fn simd_prefix_search_avx2(
             left = batch_start + first_ge_idx - 1;
         }
         right = batch_start + first_ge_idx.min(7) + 1;
+
+        // If there are equal matches, ensure we include all of them
+        if eq_mask != 0 {
+            let last_eq_idx = (32 - eq_mask.leading_zeros()) as usize / 4;
+             if batch_start + last_eq_idx > right {
+                 right = batch_start + last_eq_idx;
+             }
+        }
 
         return (left, right, eq_mask);
     }
@@ -253,36 +263,43 @@ pub unsafe fn simd_prefix_search_neon(
         let batch = vld1q_u32(prefixes.as_ptr());
         let cmp_lt = vcltq_u32(batch, target);
         let cmp_narrow = vmovn_u32(cmp_lt);
-        let mask_val = vget_lane_u64(vreinterpret_u64_u16(cmp_narrow), 0);
+        let lt_mask_val = vget_lane_u64(vreinterpret_u64_u16(cmp_narrow), 0);
 
         let cmp_eq = vceqq_u32(batch, target);
         let eq_narrow = vmovn_u32(cmp_eq);
-        let eq_mask = vget_lane_u64(vreinterpret_u64_u16(eq_narrow), 0) as u32;
+        let eq_mask_val = vget_lane_u64(vreinterpret_u64_u16(eq_narrow), 0);
 
-        if mask_val == 0xFFFFFFFFFFFFFFFF {
-            if eq_mask != 0 {
-                let eq_idx = (eq_mask.trailing_zeros() / 16) as usize;
-                return (batch_start + eq_idx, batch_start + eq_idx + 1, eq_mask);
-            }
-            left = batch_start + NEON_BATCH_SIZE;
-            continue;
-        } else if mask_val == 0 {
-            if eq_mask != 0 {
-                let eq_idx = (eq_mask.trailing_zeros() / 16) as usize;
-                return (batch_start + eq_idx, batch_start + eq_idx + 1, eq_mask);
-            }
-            right = batch_start;
-            continue;
+        // Calculate count of LT (Less Than) items
+        let num_lt = (lt_mask_val.trailing_ones() / 16) as usize;
+        
+        let new_left = if num_lt > 0 {
+            batch_start + num_lt
+        } else {
+            left
+        };
+        
+        // Calculate index of first GT (Greater Than) item
+        let lt_eq_mask = lt_mask_val | eq_mask_val;
+        let gt_mask = !lt_eq_mask;
+        
+        let mut new_right = right;
+        if gt_mask != 0 {
+             let first_gt = (gt_mask.trailing_zeros() / 16) as usize;
+             if first_gt < 4 {
+                new_right = batch_start + first_gt;
+             }
         }
-
-        let first_ge_idx = (mask_val.trailing_ones() / 16) as usize;
-
-        if first_ge_idx > 0 {
-            left = batch_start + first_ge_idx - 1;
+        
+        if new_left <= left && new_right >= right {
+             break; 
         }
-        right = batch_start + first_ge_idx.min(3) + 1;
-
-        return (left, right, eq_mask);
+        
+        left = new_left;
+        right = new_right;
+        
+        if left >= right {
+            break;
+        }
     }
 
     (left, right, 0)
@@ -300,7 +317,7 @@ pub fn simd_prefix_search_scalar(
 
     let mut left = 0usize;
     let mut right = cell_count;
-    let mut eq_mask = 0u32;
+    let mut start_eq_mask = 0u32;
 
     // Scalar binary search with batch processing
     while right - left >= SCALAR_BATCH_SIZE {
@@ -320,14 +337,18 @@ pub fn simd_prefix_search_scalar(
             std::cmp::Ordering::Less => left = mid + 1,
             std::cmp::Ordering::Greater => right = mid,
             std::cmp::Ordering::Equal => {
-                eq_mask = 1 << (mid % 32);
-                // Found equal prefix, narrow range to find exact position
-                return (mid.saturating_sub(1), mid + 1, eq_mask);
+                // Found equal prefix.
+                // We cannot simply return [mid-1, mid+1] because neighbors might also be equal.
+                // We should break and let the standard binary search handle strict range.
+                // Or try to expand locally?
+                // Safest is to just break and return current range, assuming binary search is fast enough.
+                start_eq_mask = 1; 
+                break;
             }
         }
     }
 
-    (left, right, eq_mask)
+    (left, right, start_eq_mask)
 }
 
 /// SIMD-accelerated key search in a leaf page
@@ -645,6 +666,39 @@ mod tests {
             prefix_high
         );
     }
+
+    #[test]
+    fn test_simd_bug_repro() {
+        let mut keys: Vec<Vec<u8>> = Vec::new();
+        // Create 200 keys: 0, 2, ...
+        // Note: loop limit 500 to match reproduction test scale if needed, but 250 (125 items) is enough
+        for i in (0..500).step_by(2) {
+             let k = (i as u64).to_be_bytes().to_vec();
+             keys.push(k);
+        }
+        
+        // Setup: Indices 0..120 exist. Key at 120 is 240.
+        // We want to insert 242.
+        
+        let limit = 121; // include 240
+        let keys_slice = &keys[0..limit];
+        let keys_refs: Vec<&[u8]> = keys_slice.iter().map(|k| k.as_slice()).collect();
+        
+        let page = create_test_page_with_keys(&keys_refs);
+        
+        let target_key = &keys[limit]; // 242
+        println!("Target Key: {:?}", target_key);
+        
+        let result = find_key_simd(&page, target_key, keys_refs.len());
+         match result {
+             SearchResult::NotFound(idx) => {
+                 println!("Found insertion point at {}", idx);
+                 assert_eq!(idx, limit, "Should insert at {} (after 240)", limit);
+             },
+             _ => panic!("Should result in NotFound"),
+        }
+    }
+
 
     #[test]
     fn test_find_key_simd_with_high_byte_keys() {
