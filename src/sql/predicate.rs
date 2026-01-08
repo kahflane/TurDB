@@ -1526,12 +1526,12 @@ impl<'a> CompiledPredicate<'a> {
     }
 
     fn eval_vector_l2_distance(&self, left: &Value<'a>, right: &Value<'a>) -> Option<Value<'a>> {
-        let (vec1, vec2) = match (left, right) {
-            (Value::Vector(v1), Value::Vector(v2)) if v1.len() == v2.len() => {
-                (v1.as_ref(), v2.as_ref())
-            }
-            _ => return None,
-        };
+        let vec1 = self.value_to_vec(left)?;
+        let vec2 = self.value_to_vec(right)?;
+
+        if vec1.len() != vec2.len() {
+            return None;
+        }
 
         let sum: f32 = vec1
             .iter()
@@ -1547,12 +1547,12 @@ impl<'a> CompiledPredicate<'a> {
         left: &Value<'a>,
         right: &Value<'a>,
     ) -> Option<Value<'a>> {
-        let (vec1, vec2) = match (left, right) {
-            (Value::Vector(v1), Value::Vector(v2)) if v1.len() == v2.len() => {
-                (v1.as_ref(), v2.as_ref())
-            }
-            _ => return None,
-        };
+        let vec1 = self.value_to_vec(left)?;
+        let vec2 = self.value_to_vec(right)?;
+
+        if vec1.len() != vec2.len() {
+            return None;
+        }
 
         let dot: f32 = vec1.iter().zip(vec2.iter()).map(|(a, b)| a * b).sum();
         let norm1: f32 = vec1.iter().map(|x| x * x).sum::<f32>().sqrt();
@@ -1569,15 +1569,36 @@ impl<'a> CompiledPredicate<'a> {
     }
 
     fn eval_vector_inner_product(&self, left: &Value<'a>, right: &Value<'a>) -> Option<Value<'a>> {
-        let (vec1, vec2) = match (left, right) {
-            (Value::Vector(v1), Value::Vector(v2)) if v1.len() == v2.len() => {
-                (v1.as_ref(), v2.as_ref())
-            }
-            _ => return None,
-        };
+        let vec1 = self.value_to_vec(left)?;
+        let vec2 = self.value_to_vec(right)?;
+
+        if vec1.len() != vec2.len() {
+            return None;
+        }
 
         let dot: f32 = vec1.iter().zip(vec2.iter()).map(|(a, b)| a * b).sum();
-        Some(Value::Float(-dot as f64))
+
+        Some(Value::Float(dot as f64))
+    }
+
+    fn value_to_vec(&self, val: &Value<'a>) -> Option<Cow<'a, [f32]>> {
+        match val {
+            Value::Vector(v) => Some(v.clone()),
+            Value::Text(s) => {
+                let trimmed = s.trim();
+                if trimmed.starts_with('[') && trimmed.ends_with(']') {
+                    let inner = &trimmed[1..trimmed.len() - 1];
+                    let parsed: Result<Vec<f32>, _> = inner
+                        .split(',')
+                        .map(|x| x.trim().parse::<f32>())
+                        .collect();
+                    parsed.ok().map(Cow::Owned)
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
     }
 
     fn eval_arithmetic_op<F, G>(

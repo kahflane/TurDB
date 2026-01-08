@@ -730,7 +730,21 @@ impl<'a> ExecutorBuilder<'a> {
             PhysicalOperator::FilterExec(filter) => self.compute_input_column_map(filter.input),
             PhysicalOperator::SortExec(sort) => self.compute_input_column_map(sort.input),
             PhysicalOperator::LimitExec(limit) => self.compute_input_column_map(limit.input),
-            PhysicalOperator::ProjectExec(project) => self.compute_input_column_map(project.input),
+            PhysicalOperator::ProjectExec(project) => project
+                .expressions
+                .iter()
+                .zip(project.aliases.iter())
+                .enumerate()
+                .filter_map(|(idx, (expr, alias))| {
+                    if let Some(name) = alias {
+                        Some((name.to_string(), idx))
+                    } else if let crate::sql::ast::Expr::Column(col) = expr {
+                        Some((col.column.to_string(), idx))
+                    } else {
+                        None
+                    }
+                })
+                .collect(),
             PhysicalOperator::WindowExec(window) => self.compute_input_column_map(window.input),
             PhysicalOperator::HashAggregate(agg) => {
                 self.build_aggregate_column_map(agg.group_by, agg.aggregates, &[])

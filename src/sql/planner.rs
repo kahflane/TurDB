@@ -781,7 +781,16 @@ impl<'a> Planner<'a> {
         } else {
             if !select.order_by.is_empty() {
                 for order_item in select.order_by.iter() {
-                    self.validate_expr_columns(order_item.expr, &tables_in_scope)?;
+                    let is_alias = if let crate::sql::ast::Expr::Column(col_ref) = order_item.expr {
+                        col_ref.table.is_none()
+                            && aliases.iter().any(|a| *a == Some(col_ref.column))
+                    } else {
+                        false
+                    };
+
+                    if !is_alias {
+                        self.validate_expr_columns(order_item.expr, &tables_in_scope)?;
+                    }
                 }
                 let sort_keys = self.convert_order_by(select.order_by);
                 let sort = self.arena.alloc(LogicalOperator::Sort(LogicalSort {
@@ -2000,6 +2009,9 @@ impl<'a> Planner<'a> {
                         }
                     }
                     BinaryOperator::Concat => DataType::Text,
+                    BinaryOperator::VectorL2Distance
+                    | BinaryOperator::VectorCosineDistance
+                    | BinaryOperator::VectorInnerProduct => DataType::Float8,
                     _ => DataType::Bool,
                 };
                 Ok((self.arena.alloc_str("?column?"), data_type, true))
