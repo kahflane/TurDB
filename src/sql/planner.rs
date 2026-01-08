@@ -72,7 +72,7 @@
 //!
 //! All operations respect the 256KB working memory budget:
 //!
-//! - Grace Hash Join: 16 partitions, spill to wal/ on overflow
+//! - Grace Hash Join: 16 partitions, spill to partition/ on overflow
 //! - Hash Aggregate: Fail fast on overflow (future: spill)
 //! - Sort: External merge sort on overflow
 //!

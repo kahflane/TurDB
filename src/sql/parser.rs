@@ -3060,8 +3060,14 @@ impl<'a> Parser<'a> {
         // PRAGMA name(value)
         // PRAGMA name value (space-separated)
         let value = if self.consume_token(&Token::Eq) {
-            // PRAGMA name = value
-            Some(self.expect_ident()?)
+            // PRAGMA name = value (identifier or integer)
+            match self.current {
+                Token::Integer(s) => {
+                    self.advance();
+                    Some(s)
+                }
+                _ => Some(self.expect_ident()?),
+            }
         } else if self.consume_token(&Token::LParen) {
             // PRAGMA name(value)
             let val = self.expect_ident()?;

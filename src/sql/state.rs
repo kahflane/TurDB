@@ -1,9 +1,12 @@
 use crate::sql::adapter::BTreeCursorAdapter;
 use crate::sql::ast::JoinType;
 use crate::sql::executor::{AggregateFunction, DynamicExecutor, ExecutorRow, RowSource, SortKey};
+use crate::sql::partition_spiller::PartitionSpiller;
 use crate::sql::predicate::CompiledPredicate;
 use crate::types::Value;
 use bumpalo::Bump;
+use smallvec::SmallVec;
+use std::path::PathBuf;
 
 pub struct LimitState<'a, S: RowSource> {
     pub child: Box<DynamicExecutor<'a, S>>,
@@ -199,6 +202,14 @@ pub struct GraceHashJoinState<'a, S: RowSource> {
     pub unmatched_build_idx: usize,
     pub left_col_count: usize,
     pub right_col_count: usize,
+    pub use_spill: bool,
+    pub left_spiller: Option<PartitionSpiller>,
+    pub right_spiller: Option<PartitionSpiller>,
+    pub spill_dir: Option<PathBuf>,
+    pub memory_budget: usize,
+    pub query_id: u64,
+    pub probe_row_buf: SmallVec<[Value<'static>; 16]>,
+    pub build_row_buf: SmallVec<[Value<'static>; 16]>,
 }
 
 pub struct IndexScanState<'a> {

@@ -463,6 +463,9 @@ impl<'a> ExecutorBuilder<'a> {
         join_type: JoinType,
         left_col_count: usize,
         right_col_count: usize,
+        spill_dir: Option<std::path::PathBuf>,
+        memory_budget: usize,
+        query_id: u64,
     ) -> GraceHashJoinState<'a, S> {
         GraceHashJoinState {
             left: Box::new(left),
@@ -488,6 +491,14 @@ impl<'a> ExecutorBuilder<'a> {
             unmatched_build_idx: 0,
             left_col_count,
             right_col_count,
+            use_spill: spill_dir.is_some(),
+            left_spiller: None,
+            right_spiller: None,
+            spill_dir,
+            memory_budget,
+            query_id,
+            probe_row_buf: smallvec::SmallVec::new(),
+            build_row_buf: smallvec::SmallVec::new(),
         }
     }
 

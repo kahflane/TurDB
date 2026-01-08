@@ -58,6 +58,8 @@ pub mod mvcc_scan;
 pub mod parser;
 pub mod planner;
 pub mod predicate;
+pub mod partition_spiller;
+pub mod row_serde;
 pub mod state;
 pub mod token;
 pub mod util;

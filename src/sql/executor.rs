@@ -75,6 +75,7 @@ use crate::sql::adapter::BTreeCursorAdapter;
 use crate::sql::ast::JoinType;
 use crate::sql::decoder::SimpleDecoder;
 use crate::sql::predicate::CompiledPredicate;
+use crate::sql::partition_spiller::PartitionSpiller;
 use crate::sql::state::{
     AggregateState, GraceHashJoinState, HashAggregateState, IndexScanState, LimitState,
     NestedLoopJoinState, SortState, WindowState,
@@ -1462,44 +1463,109 @@ impl<'a, S: RowSource> Executor<'a> for DynamicExecutor<'a, S> {
             }
             DynamicExecutor::GraceHashJoin(state) => {
                 if !state.partitioned {
-                    state.left.open()?;
-                    while let Some(row) = state.left.next()? {
-                        let hash = hash_keys(&row, &state.left_key_indices);
-                        let partition = (hash as usize) % state.num_partitions;
-                        let owned: Vec<Value<'static>> =
-                            row.values.iter().map(clone_value_owned).collect();
-                        state.left_partitions[partition].push(owned);
-                    }
-                    state.left.close()?;
+                    if state.use_spill {
+                        let spill_dir = state.spill_dir.clone().unwrap();
+                        std::fs::create_dir_all(&spill_dir).ok();
+                        state.left_spiller = Some(PartitionSpiller::new(
+                            spill_dir.clone(),
+                            state.num_partitions,
+                            state.memory_budget,
+                            state.query_id,
+                            'L',
+                        )?);
+                        state.right_spiller = Some(PartitionSpiller::new(
+                            spill_dir,
+                            state.num_partitions,
+                            state.memory_budget,
+                            state.query_id,
+                            'R',
+                        )?);
 
-                    state.right.open()?;
-                    while let Some(row) = state.right.next()? {
-                        let hash = hash_keys(&row, &state.right_key_indices);
-                        let partition = (hash as usize) % state.num_partitions;
-                        let owned: Vec<Value<'static>> =
-                            row.values.iter().map(clone_value_owned).collect();
-                        state.right_partitions[partition].push(owned);
+                        state.left.open()?;
+                        while let Some(row) = state.left.next()? {
+                            let hash = hash_keys(&row, &state.left_key_indices);
+                            let partition = (hash as usize) % state.num_partitions;
+                            let owned: SmallVec<[Value<'static>; 16]> =
+                                row.values.iter().map(clone_value_owned).collect();
+                            state
+                                .left_spiller
+                                .as_mut()
+                                .unwrap()
+                                .write_row(partition, owned)?;
+                        }
+                        state.left.close()?;
+
+                        state.right.open()?;
+                        while let Some(row) = state.right.next()? {
+                            let hash = hash_keys(&row, &state.right_key_indices);
+                            let partition = (hash as usize) % state.num_partitions;
+                            let owned: SmallVec<[Value<'static>; 16]> =
+                                row.values.iter().map(clone_value_owned).collect();
+                            state
+                                .right_spiller
+                                .as_mut()
+                                .unwrap()
+                                .write_row(partition, owned)?;
+                        }
+                        state.right.close()?;
+                    } else {
+                        state.left.open()?;
+                        while let Some(row) = state.left.next()? {
+                            let hash = hash_keys(&row, &state.left_key_indices);
+                            let partition = (hash as usize) % state.num_partitions;
+                            let owned: Vec<Value<'static>> =
+                                row.values.iter().map(clone_value_owned).collect();
+                            state.left_partitions[partition].push(owned);
+                        }
+                        state.left.close()?;
+
+                        state.right.open()?;
+                        while let Some(row) = state.right.next()? {
+                            let hash = hash_keys(&row, &state.right_key_indices);
+                            let partition = (hash as usize) % state.num_partitions;
+                            let owned: Vec<Value<'static>> =
+                                row.values.iter().map(clone_value_owned).collect();
+                            state.right_partitions[partition].push(owned);
+                        }
+                        state.right.close()?;
+
+                        for p in 0..state.num_partitions {
+                            state.build_matched[p] = vec![false; state.left_partitions[p].len()];
+                        }
                     }
-                    state.right.close()?;
                     state.partitioned = true;
-
-                    for p in 0..state.num_partitions {
-                        state.build_matched[p] = vec![false; state.left_partitions[p].len()];
-                    }
                 }
                 state.current_partition = 0;
                 state.current_probe_idx = 0;
                 state.current_match_idx = 0;
                 state.current_matches.clear();
                 state.partition_hash_table.clear();
-                state.partition_build_rows = std::mem::take(&mut state.left_partitions[0]);
-                for (idx, row) in state.partition_build_rows.iter().enumerate() {
-                    let hash = hash_keys_static(row, &state.left_key_indices);
-                    state
-                        .partition_hash_table
-                        .entry(hash)
-                        .or_insert_with(Vec::new)
-                        .push(idx);
+
+                if state.use_spill {
+                    state.left_spiller.as_mut().unwrap().start_read(0)?;
+                    while let Some(row) = state.left_spiller.as_mut().unwrap().read_next()? {
+                        let owned: Vec<Value<'static>> = row.iter().cloned().collect();
+                        let hash = hash_keys_static(&owned, &state.left_key_indices);
+                        let idx = state.partition_build_rows.len();
+                        state
+                            .partition_hash_table
+                            .entry(hash)
+                            .or_insert_with(Vec::new)
+                            .push(idx);
+                        state.partition_build_rows.push(owned);
+                    }
+                    state.build_matched[0] = vec![false; state.partition_build_rows.len()];
+                    state.right_spiller.as_mut().unwrap().start_read(0)?;
+                } else {
+                    state.partition_build_rows = std::mem::take(&mut state.left_partitions[0]);
+                    for (idx, row) in state.partition_build_rows.iter().enumerate() {
+                        let hash = hash_keys_static(row, &state.left_key_indices);
+                        state
+                            .partition_hash_table
+                            .entry(hash)
+                            .or_insert_with(Vec::new)
+                            .push(idx);
+                    }
                 }
                 state.probe_row_matched = false;
                 state.emitting_unmatched_build = false;
@@ -1755,8 +1821,28 @@ impl<'a, S: RowSource> Executor<'a> for DynamicExecutor<'a, S> {
                     }
 
                     state.partition_hash_table.clear();
-                    state.partition_build_rows =
-                        std::mem::take(&mut state.left_partitions[state.unmatched_build_partition]);
+                    state.partition_build_rows.clear();
+                    if state.use_spill {
+                        let partition = state.unmatched_build_partition;
+                        state.left_spiller.as_mut().unwrap().start_read(partition)?;
+                        while let Some(row) =
+                            state.left_spiller.as_mut().unwrap().read_next()?
+                        {
+                            let owned: Vec<Value<'static>> = row.iter().cloned().collect();
+                            state.partition_build_rows.push(owned);
+                        }
+                        state.build_matched[partition] =
+                            vec![false; state.partition_build_rows.len()];
+                        state
+                            .right_spiller
+                            .as_mut()
+                            .unwrap()
+                            .start_read(partition)?;
+                    } else {
+                        state.partition_build_rows = std::mem::take(
+                            &mut state.left_partitions[state.unmatched_build_partition],
+                        );
+                    }
                     for (idx, row) in state.partition_build_rows.iter().enumerate() {
                         let hash = hash_keys_static(row, &state.left_key_indices);
                         state
@@ -1781,8 +1867,12 @@ impl<'a, S: RowSource> Executor<'a> for DynamicExecutor<'a, S> {
                         state.build_matched[state.current_partition][build_idx] = true;
                     }
                     let build_row = &state.partition_build_rows[build_idx];
-                    let probe_row = &state.right_partitions[state.current_partition]
-                        [state.current_probe_idx - 1];
+                    let probe_row: &[Value<'static>] = if state.use_spill {
+                        &state.probe_row_buf
+                    } else {
+                        &state.right_partitions[state.current_partition]
+                            [state.current_probe_idx - 1]
+                    };
 
                     let combined: Vec<Value<'a>> = build_row
                         .iter()
@@ -1797,8 +1887,12 @@ impl<'a, S: RowSource> Executor<'a> for DynamicExecutor<'a, S> {
                     && !state.probe_row_matched
                     && (state.join_type == JoinType::Right || state.join_type == JoinType::Full)
                 {
-                    let probe_row = &state.right_partitions[state.current_partition]
-                        [state.current_probe_idx - 1];
+                    let probe_row: &[Value<'static>] = if state.use_spill {
+                        &state.probe_row_buf
+                    } else {
+                        &state.right_partitions[state.current_partition]
+                            [state.current_probe_idx - 1]
+                    };
                     let mut combined: Vec<Value<'a>> =
                         (0..state.left_col_count).map(|_| Value::Null).collect();
                     combined.extend(
@@ -1811,9 +1905,28 @@ impl<'a, S: RowSource> Executor<'a> for DynamicExecutor<'a, S> {
                     return Ok(Some(ExecutorRow::new(allocated)));
                 }
 
-                if state.current_probe_idx < state.right_partitions[state.current_partition].len() {
-                    let probe_row =
-                        &state.right_partitions[state.current_partition][state.current_probe_idx];
+                let has_more_probe = if state.use_spill {
+                    match state.right_spiller.as_mut().unwrap().read_next()? {
+                        Some(row) => {
+                            state.probe_row_buf.clear();
+                            state.probe_row_buf.extend(row.iter().cloned());
+                            true
+                        }
+                        None => false,
+                    }
+                } else {
+                    state.current_probe_idx
+                        < state.right_partitions[state.current_partition].len()
+                };
+
+                if has_more_probe {
+                    let probe_row: &[Value<'static>] = if state.use_spill {
+                        &state.probe_row_buf
+                    } else {
+                        let row = &state.right_partitions[state.current_partition]
+                            [state.current_probe_idx];
+                        row.as_slice()
+                    };
                     state.current_probe_idx += 1;
                     state.probe_row_matched = false;
                     let hash = hash_keys_static(probe_row, &state.right_key_indices);
@@ -1841,8 +1954,12 @@ impl<'a, S: RowSource> Executor<'a> for DynamicExecutor<'a, S> {
                     && !state.probe_row_matched
                     && (state.join_type == JoinType::Right || state.join_type == JoinType::Full)
                 {
-                    let probe_row = &state.right_partitions[state.current_partition]
-                        [state.current_probe_idx - 1];
+                    let probe_row: &[Value<'static>] = if state.use_spill {
+                        &state.probe_row_buf
+                    } else {
+                        &state.right_partitions[state.current_partition]
+                            [state.current_probe_idx - 1]
+                    };
                     let mut combined: Vec<Value<'a>> =
                         (0..state.left_col_count).map(|_| Value::Null).collect();
                     combined.extend(
@@ -1867,8 +1984,21 @@ impl<'a, S: RowSource> Executor<'a> for DynamicExecutor<'a, S> {
                 }
 
                 state.partition_hash_table.clear();
-                state.partition_build_rows =
-                    std::mem::take(&mut state.left_partitions[state.current_partition]);
+                state.partition_build_rows.clear();
+                if state.use_spill {
+                    let partition = state.current_partition;
+                    state.left_spiller.as_mut().unwrap().start_read(partition)?;
+                    while let Some(row) = state.left_spiller.as_mut().unwrap().read_next()? {
+                        let owned: Vec<Value<'static>> = row.iter().cloned().collect();
+                        state.partition_build_rows.push(owned);
+                    }
+                    state.build_matched[partition] =
+                        vec![false; state.partition_build_rows.len()];
+                    state.right_spiller.as_mut().unwrap().start_read(partition)?;
+                } else {
+                    state.partition_build_rows =
+                        std::mem::take(&mut state.left_partitions[state.current_partition]);
+                }
                 for (idx, row) in state.partition_build_rows.iter().enumerate() {
                     let hash = hash_keys_static(row, &state.left_key_indices);
                     state
@@ -1993,7 +2123,15 @@ impl<'a, S: RowSource> Executor<'a> for DynamicExecutor<'a, S> {
             DynamicExecutor::Limit(state) => state.child.close(),
             DynamicExecutor::Sort(state) => state.child.close(),
             DynamicExecutor::NestedLoopJoin(state) => state.left.close(),
-            DynamicExecutor::GraceHashJoin(_) => Ok(()),
+            DynamicExecutor::GraceHashJoin(state) => {
+                if let Some(ref mut spiller) = state.left_spiller {
+                    spiller.cleanup()?;
+                }
+                if let Some(ref mut spiller) = state.right_spiller {
+                    spiller.cleanup()?;
+                }
+                Ok(())
+            }
             DynamicExecutor::HashAggregate(state) => state.child.close(),
             DynamicExecutor::Window(state) => state.child.close(),
         }

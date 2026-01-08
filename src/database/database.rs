@@ -37,6 +37,7 @@ pub(crate) struct SharedDatabase {
     pub(crate) catalog: RwLock<Option<Catalog>>,
     pub(crate) wal: Mutex<Option<Wal>>,
     pub(crate) wal_dir: PathBuf,
+    pub(crate) partition_dir: PathBuf,
     pub(crate) next_row_id: std::sync::atomic::AtomicU64,
     pub(crate) next_table_id: std::sync::atomic::AtomicU64,
     pub(crate) next_index_id: std::sync::atomic::AtomicU64,
@@ -49,6 +50,8 @@ pub(crate) struct SharedDatabase {
     pub(crate) group_commit_queue: super::group_commit::GroupCommitQueue,
     /// Fine-grained page-level lock manager for write concurrency
     pub(crate) page_locks: super::page_locks::PageLockManager,
+    /// Memory budget for Grace Hash Join spill-to-disk (default: 256KB)
+    pub(crate) join_memory_budget: std::sync::atomic::AtomicUsize,
 }
 
 pub struct Database {
@@ -140,6 +143,7 @@ impl Database {
         let next_index_id = header.next_index_id();
 
         let wal_dir = path.join("wal");
+        let partition_dir = path.join("partition");
 
         let max_segment = Wal::find_latest_segment(&wal_dir).unwrap_or(1);
         let mut wal_size_bytes = 0;
@@ -162,6 +166,7 @@ impl Database {
             catalog: RwLock::new(None),
             wal: Mutex::new(None),
             wal_dir,
+            partition_dir,
             next_row_id: AtomicU64::new(1),
             next_table_id: AtomicU64::new(next_table_id),
             next_index_id: AtomicU64::new(next_index_id),
@@ -172,6 +177,7 @@ impl Database {
             table_id_lookup: RwLock::new(hashbrown::HashMap::new()),
             group_commit_queue: super::group_commit::GroupCommitQueue::with_default_config(),
             page_locks: super::page_locks::PageLockManager::new(),
+            join_memory_budget: std::sync::atomic::AtomicUsize::new(10 * 1024 * 1024),
         });
 
         let db = Self {
@@ -221,6 +227,7 @@ impl Database {
             .wrap_err("failed to write database header")?;
 
         let wal_dir = path.join("wal");
+        let partition_dir = path.join("partition");
 
         let shared = Arc::new(SharedDatabase {
             path,
@@ -228,6 +235,7 @@ impl Database {
             catalog: RwLock::new(None),
             wal: Mutex::new(None),
             wal_dir,
+            partition_dir,
             next_row_id: AtomicU64::new(1),
             next_table_id: AtomicU64::new(1),
             next_index_id: AtomicU64::new(1),
@@ -238,6 +246,7 @@ impl Database {
             table_id_lookup: RwLock::new(hashbrown::HashMap::new()),
             group_commit_queue: super::group_commit::GroupCommitQueue::with_default_config(),
             page_locks: super::page_locks::PageLockManager::new(),
+            join_memory_budget: std::sync::atomic::AtomicUsize::new(10 * 1024 * 1024),
         });
 
         Ok(Self {
@@ -1847,6 +1856,24 @@ impl Database {
                     crate::sql::predicate::CompiledPredicate::new(c, join_column_map.clone())
                 });
 
+                fn find_filter_for_join<'a>(
+                    op: &'a crate::sql::planner::PhysicalOperator<'a>,
+                ) -> Option<&'a crate::sql::ast::Expr<'a>> {
+                    use crate::sql::planner::PhysicalOperator;
+                    match op {
+                        PhysicalOperator::FilterExec(f) => Some(f.predicate),
+                        PhysicalOperator::ProjectExec(p) => find_filter_for_join(p.input),
+                        PhysicalOperator::LimitExec(l) => find_filter_for_join(l.input),
+                        PhysicalOperator::SortExec(s) => find_filter_for_join(s.input),
+                        PhysicalOperator::HashAggregate(a) => find_filter_for_join(a.input),
+                        _ => None,
+                    }
+                }
+
+                let where_predicate = find_filter_for_join(physical_plan.root).map(|expr| {
+                    crate::sql::predicate::CompiledPredicate::new(expr, join_column_map.clone())
+                });
+
                 let key_indices: Vec<(usize, usize)> = join_keys
                     .iter()
                     .filter_map(|(left_expr, right_expr)| {
@@ -1911,44 +1938,319 @@ impl Database {
                 let mut skipped = 0usize;
                 let mut seen: std::collections::HashSet<Vec<u64>> =
                     std::collections::HashSet::new();
+                let mut left_matched: Vec<bool> = vec![false; left_rows.len()];
+                let mut right_matched: Vec<bool> = vec![false; right_rows.len()];
+                let left_col_count = if let Some(subq) = left_subq {
+                    subq.output_schema.columns.len()
+                } else if let Some(table_name) = left_table_name {
+                    catalog.resolve_table(table_name).map(|t| t.columns().len()).unwrap_or(0)
+                } else {
+                    0
+                };
 
-                'outer: for left_row in &left_rows {
-                    let mut matched = false;
-                    for right_row in &right_rows {
-                        let mut combined: Vec<OwnedValue> = left_row.clone();
-                        combined.extend(right_row.clone());
-
-                        let should_include = if let Some(ref pred) = condition_predicate {
-                            let values: Vec<Value<'_>> =
-                                combined.iter().map(|v| v.to_value()).collect();
-                            let row_ref = ExecutorRow::new(&values);
-                            pred.evaluate(&row_ref)
-                        } else if !key_indices.is_empty() {
-                            key_indices.iter().all(|(left_idx, right_idx)| {
-                                combined.get(*left_idx) == combined.get(*right_idx)
-                            })
-                        } else {
-                            true
-                        };
-
-                        if should_include {
-                            matched = true;
-
-                            let output_columns = physical_plan.output_schema.columns;
-                            let owned: Vec<OwnedValue> = output_columns
+                let output_columns = physical_plan.output_schema.columns;
+                let output_source_indices: Vec<(usize, crate::types::DataType)> = {
+                    let mut name_occurrence_count: hashbrown::HashMap<String, usize> =
+                        hashbrown::HashMap::new();
+                    output_columns
+                        .iter()
+                        .map(|col| {
+                            let col_name = col.name.to_lowercase();
+                            let occurrence = *name_occurrence_count.get(&col_name).unwrap_or(&0);
+                            *name_occurrence_count.entry(col_name.clone()).or_insert(0) += 1;
+                            let source_idx = join_column_map
                                 .iter()
-                                .map(|col| {
-                                    let col_name = col.name.to_lowercase();
-                                    let source_idx = join_column_map
+                                .filter(|(name, _)| name == &col_name)
+                                .nth(occurrence)
+                                .map(|(_, idx)| *idx)
+                                .unwrap_or(0);
+                            (source_idx, col.data_type)
+                        })
+                        .collect()
+                };
+
+                fn hash_join_key(row: &[OwnedValue], key_indices: &[usize]) -> u64 {
+                    use std::hash::{Hash, Hasher};
+                    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                    for &idx in key_indices {
+                        if let Some(val) = row.get(idx) {
+                            match val {
+                                OwnedValue::Null => 0u8.hash(&mut hasher),
+                                OwnedValue::Bool(b) => b.hash(&mut hasher),
+                                OwnedValue::Int(i) => i.hash(&mut hasher),
+                                OwnedValue::Float(f) => f.to_bits().hash(&mut hasher),
+                                OwnedValue::Text(s) => s.hash(&mut hasher),
+                                OwnedValue::Blob(b) => b.hash(&mut hasher),
+                                OwnedValue::Vector(v) => {
+                                    for f in v {
+                                        f.to_bits().hash(&mut hasher);
+                                    }
+                                }
+                                OwnedValue::Date(d) => d.hash(&mut hasher),
+                                OwnedValue::Time(t) => t.hash(&mut hasher),
+                                OwnedValue::Timestamp(ts) => ts.hash(&mut hasher),
+                                OwnedValue::TimestampTz(ts, tz) => {
+                                    ts.hash(&mut hasher);
+                                    tz.hash(&mut hasher);
+                                }
+                                OwnedValue::Interval(a, b, c) => {
+                                    a.hash(&mut hasher);
+                                    b.hash(&mut hasher);
+                                    c.hash(&mut hasher);
+                                }
+                                OwnedValue::Uuid(u) => u.hash(&mut hasher),
+                                OwnedValue::Inet4(addr) => addr.hash(&mut hasher),
+                                OwnedValue::Inet6(addr) => addr.hash(&mut hasher),
+                                OwnedValue::MacAddr(m) => m.hash(&mut hasher),
+                                OwnedValue::Jsonb(j) => j.hash(&mut hasher),
+                                OwnedValue::Decimal(d, scale) => {
+                                    d.hash(&mut hasher);
+                                    scale.hash(&mut hasher);
+                                }
+                                OwnedValue::Point(x, y) => {
+                                    x.to_bits().hash(&mut hasher);
+                                    y.to_bits().hash(&mut hasher);
+                                }
+                                OwnedValue::Box(p1, p2) => {
+                                    p1.0.to_bits().hash(&mut hasher);
+                                    p1.1.to_bits().hash(&mut hasher);
+                                    p2.0.to_bits().hash(&mut hasher);
+                                    p2.1.to_bits().hash(&mut hasher);
+                                }
+                                OwnedValue::Circle(center, radius) => {
+                                    center.0.to_bits().hash(&mut hasher);
+                                    center.1.to_bits().hash(&mut hasher);
+                                    radius.to_bits().hash(&mut hasher);
+                                }
+                                OwnedValue::Enum(a, b) => {
+                                    a.hash(&mut hasher);
+                                    b.hash(&mut hasher);
+                                }
+                                OwnedValue::ToastPointer(p) => p.hash(&mut hasher),
+                            }
+                        }
+                    }
+                    hasher.finish()
+                }
+
+                fn has_null_key(row: &[OwnedValue], key_indices: &[usize]) -> bool {
+                    key_indices.iter().any(|&idx| {
+                        row.get(idx).is_none_or(|v| matches!(v, OwnedValue::Null))
+                    })
+                }
+
+                let use_hash_join = !key_indices.is_empty() && condition_predicate.is_none();
+
+                let left_key_indices: Vec<usize> = key_indices.iter().map(|(l, _)| *l).collect();
+                let right_key_indices: Vec<usize> = key_indices
+                    .iter()
+                    .map(|(_, r)| *r - left_col_count)
+                    .collect();
+
+                let mut hash_table: hashbrown::HashMap<u64, smallvec::SmallVec<[usize; 4]>> =
+                    hashbrown::HashMap::with_capacity(left_rows.len());
+
+                if use_hash_join {
+                    for (left_idx, left_row) in left_rows.iter().enumerate() {
+                        if has_null_key(left_row, &left_key_indices) {
+                            continue;
+                        }
+                        let hash = hash_join_key(left_row, &left_key_indices);
+                        hash_table
+                            .entry(hash)
+                            .or_insert_with(smallvec::SmallVec::new)
+                            .push(left_idx);
+                    }
+                }
+
+                let mut combined_buf: smallvec::SmallVec<[OwnedValue; 16]> =
+                    smallvec::SmallVec::new();
+
+                'outer: {
+                    if use_hash_join {
+                        for (right_idx, right_row) in right_rows.iter().enumerate() {
+                            if has_null_key(right_row, &right_key_indices) {
+                                continue;
+                            }
+                            let hash = hash_join_key(right_row, &right_key_indices);
+
+                            if let Some(left_indices) = hash_table.get(&hash) {
+                                for &left_idx in left_indices {
+                                    let left_row = &left_rows[left_idx];
+
+                                    let keys_match = left_key_indices
                                         .iter()
-                                        .find(|(name, _)| name == &col_name)
-                                        .map(|(_, idx)| *idx)
-                                        .unwrap_or(0);
-                                    let val = combined
-                                        .get(source_idx)
+                                        .zip(right_key_indices.iter())
+                                        .all(|(&li, &ri)| {
+                                            left_row.get(li) == right_row.get(ri)
+                                        });
+
+                                    if !keys_match {
+                                        continue;
+                                    }
+
+                                    combined_buf.clear();
+                                    combined_buf.extend(left_row.iter().cloned());
+                                    combined_buf.extend(right_row.iter().cloned());
+
+                                    let passes_where = if let Some(ref pred) = where_predicate {
+                                        let values: smallvec::SmallVec<[Value<'_>; 16]> =
+                                            combined_buf.iter().map(|v| v.to_value()).collect();
+                                        let row_ref = ExecutorRow::new(&values);
+                                        pred.evaluate(&row_ref)
+                                    } else {
+                                        true
+                                    };
+
+                                    if !passes_where {
+                                        continue;
+                                    }
+
+                                    left_matched[left_idx] = true;
+                                    right_matched[right_idx] = true;
+
+                                    let owned: Vec<OwnedValue> = output_source_indices
+                                        .iter()
+                                        .map(|(source_idx, data_type)| {
+                                            let val = combined_buf
+                                                .get(*source_idx)
+                                                .cloned()
+                                                .unwrap_or(OwnedValue::Null);
+                                            convert_value_with_type(&val.to_value(), *data_type)
+                                        })
+                                        .collect();
+
+                                    if is_distinct {
+                                        let key: Vec<u64> = owned
+                                            .iter()
+                                            .map(|v| {
+                                                use std::hash::{Hash, Hasher};
+                                                let mut hasher =
+                                                    std::collections::hash_map::DefaultHasher::new();
+                                                format!("{:?}", v).hash(&mut hasher);
+                                                hasher.finish()
+                                            })
+                                            .collect();
+                                        if !seen.insert(key) {
+                                            continue;
+                                        }
+                                    }
+
+                                    if skipped < offset {
+                                        skipped += 1;
+                                        continue;
+                                    }
+
+                                    result_rows.push(Row::new(owned));
+
+                                    if let Some(lim) = limit {
+                                        if result_rows.len() >= lim {
+                                            break 'outer;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    } else {
+                        for (left_idx, left_row) in left_rows.iter().enumerate() {
+                            for (right_idx, right_row) in right_rows.iter().enumerate() {
+                                combined_buf.clear();
+                                combined_buf.extend(left_row.iter().cloned());
+                                combined_buf.extend(right_row.iter().cloned());
+
+                                let should_include = if let Some(ref pred) = condition_predicate {
+                                    let values: smallvec::SmallVec<[Value<'_>; 16]> =
+                                        combined_buf.iter().map(|v| v.to_value()).collect();
+                                    let row_ref = ExecutorRow::new(&values);
+                                    pred.evaluate(&row_ref)
+                                } else {
+                                    true
+                                };
+
+                                if !should_include {
+                                    continue;
+                                }
+
+                                let passes_where = if let Some(ref pred) = where_predicate {
+                                    let values: smallvec::SmallVec<[Value<'_>; 16]> =
+                                        combined_buf.iter().map(|v| v.to_value()).collect();
+                                    let row_ref = ExecutorRow::new(&values);
+                                    pred.evaluate(&row_ref)
+                                } else {
+                                    true
+                                };
+
+                                if !passes_where {
+                                    continue;
+                                }
+
+                                left_matched[left_idx] = true;
+                                right_matched[right_idx] = true;
+
+                                let owned: Vec<OwnedValue> = output_source_indices
+                                    .iter()
+                                    .map(|(source_idx, data_type)| {
+                                        let val = combined_buf
+                                            .get(*source_idx)
+                                            .cloned()
+                                            .unwrap_or(OwnedValue::Null);
+                                        convert_value_with_type(&val.to_value(), *data_type)
+                                    })
+                                    .collect();
+
+                                if is_distinct {
+                                    let key: Vec<u64> = owned
+                                        .iter()
+                                        .map(|v| {
+                                            use std::hash::{Hash, Hasher};
+                                            let mut hasher =
+                                                std::collections::hash_map::DefaultHasher::new();
+                                            format!("{:?}", v).hash(&mut hasher);
+                                            hasher.finish()
+                                        })
+                                        .collect();
+                                    if !seen.insert(key) {
+                                        continue;
+                                    }
+                                }
+
+                                if skipped < offset {
+                                    skipped += 1;
+                                    continue;
+                                }
+
+                                result_rows.push(Row::new(owned));
+
+                                if let Some(lim) = limit {
+                                    if result_rows.len() >= lim {
+                                        break 'outer;
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    if matches!(
+                        join_type,
+                        crate::sql::ast::JoinType::Left | crate::sql::ast::JoinType::Full
+                    ) {
+                        for (left_idx, left_row) in left_rows.iter().enumerate() {
+                            if left_matched[left_idx] {
+                                continue;
+                            }
+
+                            combined_buf.clear();
+                            combined_buf.extend(left_row.iter().cloned());
+                            combined_buf.extend(std::iter::repeat_n(OwnedValue::Null, right_col_count));
+
+                            let owned: Vec<OwnedValue> = output_source_indices
+                                .iter()
+                                .map(|(source_idx, data_type)| {
+                                    let val = combined_buf
+                                        .get(*source_idx)
                                         .cloned()
                                         .unwrap_or(OwnedValue::Null);
-                                    convert_value_with_type(&val.to_value(), col.data_type)
+                                    convert_value_with_type(&val.to_value(), *data_type)
                                 })
                                 .collect();
 
@@ -1982,22 +2284,35 @@ impl Database {
                             }
                         }
                     }
-                    if !matched
-                        && matches!(
-                            join_type,
-                            crate::sql::ast::JoinType::Left | crate::sql::ast::JoinType::Full
-                        )
-                    {
-                        let mut combined: Vec<OwnedValue> = left_row.clone();
-                        combined.extend(std::iter::repeat_n(OwnedValue::Null, right_col_count));
+                }
+
+                if matches!(
+                    join_type,
+                    crate::sql::ast::JoinType::Right | crate::sql::ast::JoinType::Full
+                ) {
+                    for (right_idx, right_row) in right_rows.iter().enumerate() {
+                        if right_matched[right_idx] {
+                            continue;
+                        }
+
+                        let mut combined: Vec<OwnedValue> =
+                            std::iter::repeat_n(OwnedValue::Null, left_col_count).collect();
+                        combined.extend(right_row.clone());
+
                         let output_columns = physical_plan.output_schema.columns;
+                        let mut name_occurrence_count: std::collections::HashMap<String, usize> =
+                            std::collections::HashMap::new();
                         let owned: Vec<OwnedValue> = output_columns
                             .iter()
                             .map(|col| {
                                 let col_name = col.name.to_lowercase();
+                                let occurrence =
+                                    *name_occurrence_count.get(&col_name).unwrap_or(&0);
+                                *name_occurrence_count.entry(col_name.clone()).or_insert(0) += 1;
                                 let source_idx = join_column_map
                                     .iter()
-                                    .find(|(name, _)| name == &col_name)
+                                    .filter(|(name, _)| name == &col_name)
+                                    .nth(occurrence)
                                     .map(|(_, idx)| *idx)
                                     .unwrap_or(0);
                                 let val = combined
@@ -2033,11 +2348,167 @@ impl Database {
 
                         if let Some(lim) = limit {
                             if result_rows.len() >= lim {
-                                break 'outer;
+                                break;
                             }
                         }
                     }
                 }
+
+                fn find_hash_aggregate<'a>(
+                    op: &'a crate::sql::planner::PhysicalOperator<'a>,
+                ) -> Option<&'a crate::sql::planner::PhysicalHashAggregate<'a>> {
+                    use crate::sql::planner::PhysicalOperator;
+                    match op {
+                        PhysicalOperator::HashAggregate(agg) => Some(agg),
+                        PhysicalOperator::ProjectExec(p) => find_hash_aggregate(p.input),
+                        PhysicalOperator::LimitExec(l) => find_hash_aggregate(l.input),
+                        PhysicalOperator::SortExec(s) => find_hash_aggregate(s.input),
+                        PhysicalOperator::FilterExec(f) => find_hash_aggregate(f.input),
+                        _ => None,
+                    }
+                }
+
+                if let Some(hash_agg) = find_hash_aggregate(physical_plan.root) {
+                    use std::collections::HashMap;
+
+                    let group_by_indices: Vec<usize> = hash_agg
+                        .group_by
+                        .iter()
+                        .filter_map(|expr| {
+                            if let crate::sql::ast::Expr::Column(col) = expr {
+                                let col_name = col.column.to_lowercase();
+                                let qualified =
+                                    col.table.map(|t| format!("{}.{}", t, col.column).to_lowercase());
+                                qualified
+                                    .as_ref()
+                                    .and_then(|q| {
+                                        join_column_map
+                                            .iter()
+                                            .find(|(name, _)| name == q)
+                                            .map(|(_, idx)| *idx)
+                                    })
+                                    .or_else(|| {
+                                        join_column_map
+                                            .iter()
+                                            .find(|(name, _)| name == &col_name)
+                                            .map(|(_, idx)| *idx)
+                                    })
+                            } else {
+                                None
+                            }
+                        })
+                        .collect();
+
+                    let mut groups: HashMap<Vec<u64>, (Vec<OwnedValue>, Vec<(i64, f64)>)> =
+                        HashMap::new();
+
+                    for row in &result_rows {
+                        let group_key: Vec<u64> = group_by_indices
+                            .iter()
+                            .map(|&idx| {
+                                use std::hash::{Hash, Hasher};
+                                let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                                if let Some(val) = row.values.get(idx) {
+                                    format!("{:?}", val).hash(&mut hasher);
+                                }
+                                hasher.finish()
+                            })
+                            .collect();
+
+                        let group_vals: Vec<OwnedValue> = group_by_indices
+                            .iter()
+                            .filter_map(|&idx| row.values.get(idx).cloned())
+                            .collect();
+
+                        let entry = groups
+                            .entry(group_key)
+                            .or_insert_with(|| (group_vals, vec![(0, 0.0); hash_agg.aggregates.len()]));
+
+                        for (agg_idx, agg_expr) in hash_agg.aggregates.iter().enumerate() {
+                            use crate::sql::planner::AggregateFunction;
+                            match agg_expr.function {
+                                AggregateFunction::Count => {
+                                    entry.1[agg_idx].0 += 1;
+                                }
+                                AggregateFunction::Sum => {
+                                    if let Some(arg) = agg_expr.argument {
+                                        if let crate::sql::ast::Expr::Column(col) = arg {
+                                            let col_name = col.column.to_lowercase();
+                                            let qualified = col
+                                                .table
+                                                .map(|t| format!("{}.{}", t, col.column).to_lowercase());
+                                            let arg_idx = qualified
+                                                .as_ref()
+                                                .and_then(|q| {
+                                                    join_column_map
+                                                        .iter()
+                                                        .find(|(name, _)| name == q)
+                                                        .map(|(_, idx)| *idx)
+                                                })
+                                                .or_else(|| {
+                                                    join_column_map
+                                                        .iter()
+                                                        .find(|(name, _)| name == &col_name)
+                                                        .map(|(_, idx)| *idx)
+                                                });
+                                            if let Some(idx) = arg_idx {
+                                                if let Some(val) = row.values.get(idx) {
+                                                    match val {
+                                                        OwnedValue::Int(i) => {
+                                                            entry.1[agg_idx].1 += *i as f64
+                                                        }
+                                                        OwnedValue::Float(f) => {
+                                                            entry.1[agg_idx].1 += *f
+                                                        }
+                                                        _ => {}
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+
+                    let mut aggregated_rows: Vec<Row> = groups
+                        .into_values()
+                        .map(|(group_vals, agg_states)| {
+                            let mut values = group_vals;
+                            for (agg_idx, agg_expr) in hash_agg.aggregates.iter().enumerate() {
+                                use crate::sql::planner::AggregateFunction;
+                                let agg_val = match agg_expr.function {
+                                    AggregateFunction::Count => OwnedValue::Int(agg_states[agg_idx].0),
+                                    AggregateFunction::Sum => OwnedValue::Float(agg_states[agg_idx].1),
+                                    _ => OwnedValue::Null,
+                                };
+                                values.push(agg_val);
+                            }
+                            Row::new(values)
+                        })
+                        .collect();
+
+                    aggregated_rows.sort_by(|a, b| {
+                        for (i, _) in group_by_indices.iter().enumerate() {
+                            if i < a.values.len() && i < b.values.len() {
+                                match (&a.values[i], &b.values[i]) {
+                                    (OwnedValue::Int(a_val), OwnedValue::Int(b_val)) => {
+                                        match a_val.cmp(b_val) {
+                                            std::cmp::Ordering::Equal => continue,
+                                            other => return other,
+                                        }
+                                    }
+                                    _ => continue,
+                                }
+                            }
+                        }
+                        std::cmp::Ordering::Equal
+                    });
+
+                    return Ok((column_names, aggregated_rows));
+                }
+
                 result_rows
             }
             Some(PlanSource::SetOp(_set_op)) => {
@@ -2943,8 +3414,32 @@ impl Database {
                     value: Some(mode_str.to_string()),
                 })
             }
+            "JOIN_MEMORY_BUDGET" => {
+                if let Some(ref val) = value {
+                    let budget: usize = val.parse().map_err(|_| {
+                        eyre::eyre!(
+                            "invalid PRAGMA join_memory_budget value: {} (use a number in bytes)",
+                            val
+                        )
+                    })?;
+                    self.shared
+                        .join_memory_budget
+                        .store(budget, Ordering::Release);
+                }
+                let current = self.shared.join_memory_budget.load(Ordering::Acquire);
+                Ok(ExecuteResult::Pragma {
+                    name: name.clone(),
+                    value: Some(current.to_string()),
+                })
+            }
             _ => bail!("unknown PRAGMA: {}", name),
         }
+    }
+
+    pub fn join_memory_budget(&self) -> usize {
+        self.shared
+            .join_memory_budget
+            .load(std::sync::atomic::Ordering::Acquire)
     }
 
     pub(crate) fn evaluate_check_expression(
