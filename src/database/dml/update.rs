@@ -152,6 +152,20 @@ impl Database {
             })
             .collect();
 
+        let hnsw_indexes: Vec<(String, usize)> = table_def
+            .indexes()
+            .iter()
+            .filter(|idx| idx.index_type() == IndexType::Hnsw)
+            .filter_map(|idx| {
+                let cols = idx.columns();
+                let col_name = cols.first()?;
+                let col_idx = columns
+                    .iter()
+                    .position(|c| c.name().eq_ignore_ascii_case(col_name))?;
+                Some((idx.name().to_string(), col_idx))
+            })
+            .collect();
+
         let unique_columns: Vec<(usize, String, bool)> = columns
             .iter()
             .enumerate()
@@ -293,7 +307,7 @@ impl Database {
 
         let column_types: Vec<crate::records::types::DataType> =
             columns.iter().map(|c| c.data_type()).collect();
-        let decoder = crate::sql::decoder::SimpleDecoder::new(column_types);
+        let decoder = crate::sql::decoder::SimpleDecoder::new(column_types.clone());
 
         let root_page = 1u32;
         let btree = BTree::new(&mut *storage, root_page)?;
@@ -401,7 +415,7 @@ impl Database {
             let mut param_idx = 0;
             for (col_idx, value_expr) in &assignment_indices {
                 let val =
-                    Self::eval_expr_with_params(value_expr, None, Some(params), &mut param_idx)?;
+                    Self::eval_expr_with_params(value_expr, column_types.get(*col_idx), Some(params), &mut param_idx)?;
                 precomputed_assignments.push((*col_idx, val));
             }
             set_param_count = param_idx;
@@ -936,6 +950,30 @@ impl Database {
                                 let row_id_bytes = (*pk_val as u64).to_be_bytes();
                                 let _ = index_btree.insert(&key_buf, &row_id_bytes);
                             }
+                        }
+                    }
+                }
+            }
+        }
+
+        for (index_name, col_idx) in &hnsw_indexes {
+            if !modified_col_indices.contains(col_idx) {
+                continue;
+            }
+            if file_manager.hnsw_exists(schema_name, table_name, index_name) {
+                let hnsw = self.get_or_create_hnsw_index(schema_name, table_name, index_name)?;
+                let mut hnsw_guard = hnsw.write();
+
+                for (row_key, _old_value, new_row_values, _old_row_values, _old_toast) in
+                    &rows_to_update
+                {
+                    if row_key.len() == 8 {
+                        let row_id = u64::from_be_bytes(row_key[..8].try_into().unwrap());
+                        let _ = hnsw_guard.delete_by_row_id(row_id);
+
+                        if let Some(OwnedValue::Vector(vec)) = new_row_values.get(*col_idx) {
+                            let random = Self::generate_random_for_hnsw(row_id);
+                            let _ = hnsw_guard.insert(row_id, vec, random);
                         }
                     }
                 }

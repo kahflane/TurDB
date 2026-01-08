@@ -18,7 +18,7 @@ pub struct LimitState<'a, S: RowSource> {
 
 pub struct SortState<'a, S: RowSource> {
     pub child: Box<DynamicExecutor<'a, S>>,
-    pub sort_keys: Vec<SortKey>,
+    pub sort_keys: Vec<SortKey<'a>>,
     pub arena: &'a Bump,
     pub rows: Vec<Vec<Value<'static>>>,
     pub iter_idx: usize,

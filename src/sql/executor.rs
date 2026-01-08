@@ -91,6 +91,172 @@ use eyre::Result;
 use smallvec::SmallVec;
 use std::borrow::Cow;
 
+fn get_sort_value_for_key<'a>(row: &[Value<'static>], key: &SortKey<'a>) -> Value<'static> {
+    match &key.key_type {
+        SortKeyType::Column(idx) => row.get(*idx).cloned().unwrap_or(Value::Null),
+        SortKeyType::Expression { expr, column_map } => {
+            eval_sort_expr_standalone(expr, row, column_map)
+        }
+    }
+}
+
+fn eval_sort_expr_standalone(
+    expr: &crate::sql::ast::Expr<'_>,
+    row: &[Value<'static>],
+    column_map: &[(String, usize)],
+) -> Value<'static> {
+    use crate::sql::ast::{Expr, Literal};
+
+    match expr {
+        Expr::Column(col_ref) => {
+            let lookup_name = if let Some(table) = col_ref.table {
+                format!("{}.{}", table, col_ref.column)
+            } else {
+                col_ref.column.to_string()
+            };
+            let col_idx = column_map
+                .iter()
+                .find(|(name, _)| name.eq_ignore_ascii_case(&lookup_name))
+                .or_else(|| {
+                    column_map
+                        .iter()
+                        .find(|(name, _)| name.eq_ignore_ascii_case(col_ref.column))
+                })
+                .map(|(_, idx)| *idx);
+            col_idx
+                .and_then(|idx| row.get(idx).cloned())
+                .unwrap_or(Value::Null)
+        }
+        Expr::Literal(lit) => match lit {
+            Literal::Integer(s) => s.parse::<i64>().map(Value::Int).unwrap_or(Value::Null),
+            Literal::Float(s) => s.parse::<f64>().map(Value::Float).unwrap_or(Value::Null),
+            Literal::String(s) => Value::Text(Cow::Owned(s.to_string())),
+            Literal::Null => Value::Null,
+            Literal::Boolean(b) => Value::Int(if *b { 1 } else { 0 }),
+            Literal::HexNumber(s) => i64::from_str_radix(s.trim_start_matches("0x").trim_start_matches("0X"), 16)
+                .map(Value::Int)
+                .unwrap_or(Value::Null),
+            Literal::BinaryNumber(s) => i64::from_str_radix(s.trim_start_matches("0b").trim_start_matches("0B"), 2)
+                .map(Value::Int)
+                .unwrap_or(Value::Null),
+        },
+        Expr::BinaryOp { left, op, right } => {
+            let left_val = eval_sort_expr_standalone(left, row, column_map);
+            let right_val = eval_sort_expr_standalone(right, row, column_map);
+            eval_binary_op_standalone(&left_val, op, &right_val)
+        }
+        Expr::Array(elements) => {
+            let vals: Vec<f32> = elements
+                .iter()
+                .filter_map(|e| {
+                    let v = eval_sort_expr_standalone(e, row, column_map);
+                    match v {
+                        Value::Float(f) => Some(f as f32),
+                        Value::Int(i) => Some(i as f32),
+                        _ => None,
+                    }
+                })
+                .collect();
+            Value::Vector(Cow::Owned(vals))
+        }
+        _ => Value::Null,
+    }
+}
+
+fn eval_binary_op_standalone(
+    left: &Value<'static>,
+    op: &crate::sql::ast::BinaryOperator,
+    right: &Value<'static>,
+) -> Value<'static> {
+    use crate::sql::ast::BinaryOperator;
+
+    match op {
+        BinaryOperator::VectorL2Distance => {
+            let left_vec = value_to_vec_standalone(left);
+            let right_vec = value_to_vec_standalone(right);
+            if let (Some(l), Some(r)) = (left_vec, right_vec) {
+                if l.len() == r.len() {
+                    let dist: f64 = l
+                        .iter()
+                        .zip(r.iter())
+                        .map(|(a, b)| ((a - b) as f64).powi(2))
+                        .sum::<f64>()
+                        .sqrt();
+                    return Value::Float(dist);
+                }
+            }
+            Value::Null
+        }
+        BinaryOperator::VectorCosineDistance => {
+            let left_vec = value_to_vec_standalone(left);
+            let right_vec = value_to_vec_standalone(right);
+            if let (Some(l), Some(r)) = (left_vec, right_vec) {
+                if l.len() == r.len() {
+                    let dot: f64 = l
+                        .iter()
+                        .zip(r.iter())
+                        .map(|(a, b)| (*a as f64) * (*b as f64))
+                        .sum();
+                    let mag_l: f64 = l.iter().map(|x| (*x as f64).powi(2)).sum::<f64>().sqrt();
+                    let mag_r: f64 = r.iter().map(|x| (*x as f64).powi(2)).sum::<f64>().sqrt();
+                    if mag_l > 0.0 && mag_r > 0.0 {
+                        let cosine = dot / (mag_l * mag_r);
+                        return Value::Float(1.0 - cosine);
+                    }
+                }
+            }
+            Value::Null
+        }
+        BinaryOperator::Plus => match (left, right) {
+            (Value::Int(a), Value::Int(b)) => Value::Int(a + b),
+            (Value::Float(a), Value::Float(b)) => Value::Float(a + b),
+            (Value::Int(a), Value::Float(b)) => Value::Float(*a as f64 + b),
+            (Value::Float(a), Value::Int(b)) => Value::Float(a + *b as f64),
+            _ => Value::Null,
+        },
+        BinaryOperator::Minus => match (left, right) {
+            (Value::Int(a), Value::Int(b)) => Value::Int(a - b),
+            (Value::Float(a), Value::Float(b)) => Value::Float(a - b),
+            (Value::Int(a), Value::Float(b)) => Value::Float(*a as f64 - b),
+            (Value::Float(a), Value::Int(b)) => Value::Float(a - *b as f64),
+            _ => Value::Null,
+        },
+        BinaryOperator::Multiply => match (left, right) {
+            (Value::Int(a), Value::Int(b)) => Value::Int(a * b),
+            (Value::Float(a), Value::Float(b)) => Value::Float(a * b),
+            (Value::Int(a), Value::Float(b)) => Value::Float(*a as f64 * b),
+            (Value::Float(a), Value::Int(b)) => Value::Float(a * *b as f64),
+            _ => Value::Null,
+        },
+        BinaryOperator::Divide => match (left, right) {
+            (Value::Int(a), Value::Int(b)) if *b != 0 => Value::Int(a / b),
+            (Value::Float(a), Value::Float(b)) if *b != 0.0 => Value::Float(a / b),
+            (Value::Int(a), Value::Float(b)) if *b != 0.0 => Value::Float(*a as f64 / b),
+            (Value::Float(a), Value::Int(b)) if *b != 0 => Value::Float(a / *b as f64),
+            _ => Value::Null,
+        },
+        _ => Value::Null,
+    }
+}
+
+fn value_to_vec_standalone(val: &Value<'static>) -> Option<Vec<f32>> {
+    match val {
+        Value::Vector(v) => Some(v.to_vec()),
+        Value::Text(s) => {
+            let trimmed = s.trim();
+            if trimmed.starts_with('[') && trimmed.ends_with(']') {
+                let inner = &trimmed[1..trimmed.len() - 1];
+                let parsed: Result<Vec<f32>, _> =
+                    inner.split(',').map(|x| x.trim().parse::<f32>()).collect();
+                parsed.ok()
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
 pub struct ExecutorRow<'a> {
     pub values: &'a [Value<'a>],
 }
@@ -1295,9 +1461,38 @@ where
 }
 
 #[derive(Debug, Clone)]
-pub struct SortKey {
-    pub column: usize,
+pub enum SortKeyType<'a> {
+    Column(usize),
+    Expression {
+        expr: &'a crate::sql::ast::Expr<'a>,
+        column_map: Vec<(String, usize)>,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub struct SortKey<'a> {
+    pub key_type: SortKeyType<'a>,
     pub ascending: bool,
+}
+
+impl<'a> SortKey<'a> {
+    pub fn column(idx: usize, ascending: bool) -> Self {
+        Self {
+            key_type: SortKeyType::Column(idx),
+            ascending,
+        }
+    }
+
+    pub fn expression(
+        expr: &'a crate::sql::ast::Expr<'a>,
+        column_map: Vec<(String, usize)>,
+        ascending: bool,
+    ) -> Self {
+        Self {
+            key_type: SortKeyType::Expression { expr, column_map },
+            ascending,
+        }
+    }
 }
 
 pub struct SortExecutor<'a, E>
@@ -1305,7 +1500,7 @@ where
     E: Executor<'a>,
 {
     child: E,
-    sort_keys: Vec<SortKey>,
+    sort_keys: Vec<SortKey<'a>>,
     arena: &'a Bump,
     rows: Vec<Vec<Value<'static>>>,
     sorted_iter: Option<std::vec::IntoIter<Vec<Value<'static>>>>,
@@ -1316,7 +1511,7 @@ impl<'a, E> SortExecutor<'a, E>
 where
     E: Executor<'a>,
 {
-    pub fn new(child: E, sort_keys: Vec<SortKey>, arena: &'a Bump) -> Self {
+    pub fn new(child: E, sort_keys: Vec<SortKey<'a>>, arena: &'a Bump) -> Self {
         Self {
             child,
             sort_keys,
@@ -1338,6 +1533,172 @@ where
             (Value::Text(a), Value::Text(b)) => a.cmp(b),
             (Value::Blob(a), Value::Blob(b)) => a.cmp(b),
             _ => Ordering::Equal,
+        }
+    }
+
+    fn get_sort_value(row: &[Value<'static>], key: &SortKey<'a>) -> Value<'static> {
+        match &key.key_type {
+            SortKeyType::Column(idx) => row.get(*idx).cloned().unwrap_or(Value::Null),
+            SortKeyType::Expression { expr, column_map } => {
+                Self::eval_sort_expr(expr, row, column_map)
+            }
+        }
+    }
+
+    fn eval_sort_expr(
+        expr: &crate::sql::ast::Expr<'_>,
+        row: &[Value<'static>],
+        column_map: &[(String, usize)],
+    ) -> Value<'static> {
+        use crate::sql::ast::{Expr, Literal};
+
+        match expr {
+            Expr::Column(col_ref) => {
+                let lookup_name = if let Some(table) = col_ref.table {
+                    format!("{}.{}", table, col_ref.column)
+                } else {
+                    col_ref.column.to_string()
+                };
+                let col_idx = column_map
+                    .iter()
+                    .find(|(name, _)| name.eq_ignore_ascii_case(&lookup_name))
+                    .or_else(|| {
+                        column_map
+                            .iter()
+                            .find(|(name, _)| name.eq_ignore_ascii_case(col_ref.column))
+                    })
+                    .map(|(_, idx)| *idx);
+                col_idx
+                    .and_then(|idx| row.get(idx).cloned())
+                    .unwrap_or(Value::Null)
+            }
+            Expr::Literal(lit) => match lit {
+                Literal::Integer(s) => s
+                    .parse::<i64>()
+                    .map(Value::Int)
+                    .unwrap_or(Value::Null),
+                Literal::Float(s) => s
+                    .parse::<f64>()
+                    .map(Value::Float)
+                    .unwrap_or(Value::Null),
+                Literal::String(s) => Value::Text(Cow::Owned(s.to_string())),
+                Literal::Null => Value::Null,
+                Literal::Boolean(b) => Value::Int(if *b { 1 } else { 0 }),
+                Literal::HexNumber(s) => i64::from_str_radix(s.trim_start_matches("0x").trim_start_matches("0X"), 16)
+                    .map(Value::Int)
+                    .unwrap_or(Value::Null),
+                Literal::BinaryNumber(s) => i64::from_str_radix(s.trim_start_matches("0b").trim_start_matches("0B"), 2)
+                    .map(Value::Int)
+                    .unwrap_or(Value::Null),
+            },
+            Expr::BinaryOp { left, op, right } => {
+                let left_val = Self::eval_sort_expr(left, row, column_map);
+                let right_val = Self::eval_sort_expr(right, row, column_map);
+                Self::eval_binary_op(&left_val, op, &right_val)
+            }
+            Expr::Array(elements) => {
+                let vals: Vec<f32> = elements
+                    .iter()
+                    .filter_map(|e| {
+                        let v = Self::eval_sort_expr(e, row, column_map);
+                        match v {
+                            Value::Float(f) => Some(f as f32),
+                            Value::Int(i) => Some(i as f32),
+                            _ => None,
+                        }
+                    })
+                    .collect();
+                Value::Vector(Cow::Owned(vals))
+            }
+            _ => Value::Null,
+        }
+    }
+
+    fn eval_binary_op(left: &Value<'static>, op: &crate::sql::ast::BinaryOperator, right: &Value<'static>) -> Value<'static> {
+        use crate::sql::ast::BinaryOperator;
+
+        match op {
+            BinaryOperator::VectorL2Distance => {
+                let left_vec = Self::value_to_vec(left);
+                let right_vec = Self::value_to_vec(right);
+                if let (Some(l), Some(r)) = (left_vec, right_vec) {
+                    if l.len() == r.len() {
+                        let dist: f64 = l
+                            .iter()
+                            .zip(r.iter())
+                            .map(|(a, b)| ((a - b) as f64).powi(2))
+                            .sum::<f64>()
+                            .sqrt();
+                        return Value::Float(dist);
+                    }
+                }
+                Value::Null
+            }
+            BinaryOperator::VectorCosineDistance => {
+                let left_vec = Self::value_to_vec(left);
+                let right_vec = Self::value_to_vec(right);
+                if let (Some(l), Some(r)) = (left_vec, right_vec) {
+                    if l.len() == r.len() {
+                        let dot: f64 = l.iter().zip(r.iter()).map(|(a, b)| (*a as f64) * (*b as f64)).sum();
+                        let mag_l: f64 = l.iter().map(|x| (*x as f64).powi(2)).sum::<f64>().sqrt();
+                        let mag_r: f64 = r.iter().map(|x| (*x as f64).powi(2)).sum::<f64>().sqrt();
+                        if mag_l > 0.0 && mag_r > 0.0 {
+                            let cosine = dot / (mag_l * mag_r);
+                            return Value::Float(1.0 - cosine);
+                        }
+                    }
+                }
+                Value::Null
+            }
+            BinaryOperator::Plus => match (left, right) {
+                (Value::Int(a), Value::Int(b)) => Value::Int(a + b),
+                (Value::Float(a), Value::Float(b)) => Value::Float(a + b),
+                (Value::Int(a), Value::Float(b)) => Value::Float(*a as f64 + b),
+                (Value::Float(a), Value::Int(b)) => Value::Float(a + *b as f64),
+                _ => Value::Null,
+            },
+            BinaryOperator::Minus => match (left, right) {
+                (Value::Int(a), Value::Int(b)) => Value::Int(a - b),
+                (Value::Float(a), Value::Float(b)) => Value::Float(a - b),
+                (Value::Int(a), Value::Float(b)) => Value::Float(*a as f64 - b),
+                (Value::Float(a), Value::Int(b)) => Value::Float(a - *b as f64),
+                _ => Value::Null,
+            },
+            BinaryOperator::Multiply => match (left, right) {
+                (Value::Int(a), Value::Int(b)) => Value::Int(a * b),
+                (Value::Float(a), Value::Float(b)) => Value::Float(a * b),
+                (Value::Int(a), Value::Float(b)) => Value::Float(*a as f64 * b),
+                (Value::Float(a), Value::Int(b)) => Value::Float(a * *b as f64),
+                _ => Value::Null,
+            },
+            BinaryOperator::Divide => match (left, right) {
+                (Value::Int(a), Value::Int(b)) if *b != 0 => Value::Int(a / b),
+                (Value::Float(a), Value::Float(b)) if *b != 0.0 => Value::Float(a / b),
+                (Value::Int(a), Value::Float(b)) if *b != 0.0 => Value::Float(*a as f64 / b),
+                (Value::Float(a), Value::Int(b)) if *b != 0 => Value::Float(a / *b as f64),
+                _ => Value::Null,
+            },
+            _ => Value::Null,
+        }
+    }
+
+    fn value_to_vec(val: &Value<'static>) -> Option<Vec<f32>> {
+        match val {
+            Value::Vector(v) => Some(v.to_vec()),
+            Value::Text(s) => {
+                let trimmed = s.trim();
+                if trimmed.starts_with('[') && trimmed.ends_with(']') {
+                    let inner = &trimmed[1..trimmed.len() - 1];
+                    let parsed: Result<Vec<f32>, _> = inner
+                        .split(',')
+                        .map(|x| x.trim().parse::<f32>())
+                        .collect();
+                    parsed.ok()
+                } else {
+                    None
+                }
+            }
+            _ => None,
         }
     }
 }
@@ -1364,9 +1725,9 @@ where
             let sort_keys = &self.sort_keys;
             self.rows.sort_by(|a, b| {
                 for key in sort_keys {
-                    let a_val = a.get(key.column).unwrap_or(&Value::Null);
-                    let b_val = b.get(key.column).unwrap_or(&Value::Null);
-                    let cmp = Self::compare_values(a_val, b_val);
+                    let a_val = Self::get_sort_value(a, key);
+                    let b_val = Self::get_sort_value(b, key);
+                    let cmp = Self::compare_values(&a_val, &b_val);
                     if cmp != std::cmp::Ordering::Equal {
                         return if key.ascending { cmp } else { cmp.reverse() };
                     }
@@ -1680,9 +2041,9 @@ impl<'a, S: RowSource> Executor<'a> for DynamicExecutor<'a, S> {
                     let sort_keys = &state.sort_keys;
                     state.rows.sort_by(|a, b| {
                         for key in sort_keys.iter() {
-                            let a_val = a.get(key.column).unwrap_or(&Value::Null);
-                            let b_val = b.get(key.column).unwrap_or(&Value::Null);
-                            let cmp = compare_values_for_sort(a_val, b_val);
+                            let a_val = get_sort_value_for_key(a, key);
+                            let b_val = get_sort_value_for_key(b, key);
+                            let cmp = compare_values_for_sort(&a_val, &b_val);
                             if cmp != std::cmp::Ordering::Equal {
                                 return if key.ascending { cmp } else { cmp.reverse() };
                             }

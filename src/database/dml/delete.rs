@@ -143,6 +143,13 @@ impl Database {
             })
             .collect();
 
+        let hnsw_indexes: Vec<String> = table_def
+            .indexes()
+            .iter()
+            .filter(|idx| idx.index_type() == IndexType::Hnsw)
+            .map(|idx| idx.name().to_string())
+            .collect();
+
         let unique_columns: Vec<(usize, String, bool)> = columns
             .iter()
             .enumerate()
@@ -585,6 +592,20 @@ impl Database {
                             }
                         }
                         let _ = index_btree.delete(&key_buf);
+                    }
+                }
+            }
+        }
+
+        for index_name in &hnsw_indexes {
+            if file_manager.hnsw_exists(schema_name, table_name, index_name) {
+                let hnsw = self.get_or_create_hnsw_index(schema_name, table_name, index_name)?;
+                let mut hnsw_guard = hnsw.write();
+
+                for (row_key, _old_value, _row_values) in &rows_to_delete {
+                    if row_key.len() == 8 {
+                        let row_id = u64::from_be_bytes(row_key[..8].try_into().unwrap());
+                        let _ = hnsw_guard.delete_by_row_id(row_id);
                     }
                 }
             }

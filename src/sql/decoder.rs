@@ -230,7 +230,7 @@ impl SimpleDecoder {
                     }
                 }
                 DataType::Uuid => Value::Uuid(*view.get_uuid(idx)?),
-                DataType::Vector => Value::Vector(Cow::Owned(view.get_vector(idx)?.to_vec())),
+                DataType::Vector => Value::Vector(Cow::Owned(view.get_vector_copy(idx)?)),
                 DataType::Jsonb => {
                     let jsonb_view = view.get_jsonb(idx)?;
                     Value::Jsonb(Cow::Owned(jsonb_view.data().to_vec()))

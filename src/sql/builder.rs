@@ -214,22 +214,80 @@ impl<'a> ExecutorBuilder<'a> {
                 }))
             }
             PhysicalOperator::SortExec(sort) => {
+                use crate::sql::planner::PhysicalOperator as POp;
+
+                let needs_full_columns = sort.order_by.iter().any(|key| {
+                    !matches!(key.expr, crate::sql::ast::Expr::Column(_))
+                });
+
+                if needs_full_columns {
+                    if let POp::ProjectExec(project) = sort.input {
+                        let full_column_map = self.compute_input_column_map(project.input);
+                        let child = self.build_operator(project.input, source, column_map)?;
+
+                        let sort_keys: Vec<SortKey<'a>> = sort
+                            .order_by
+                            .iter()
+                            .map(|key| {
+                                if let crate::sql::ast::Expr::Column(col) = key.expr {
+                                    if let Some((_, idx)) = full_column_map
+                                        .iter()
+                                        .find(|(n, _)| n.eq_ignore_ascii_case(col.column))
+                                    {
+                                        return SortKey::column(*idx, key.ascending);
+                                    }
+                                }
+                                SortKey::expression(key.expr, full_column_map.clone(), key.ascending)
+                            })
+                            .collect();
+
+                        let sorted = DynamicExecutor::Sort(SortState {
+                            child: Box::new(child),
+                            sort_keys,
+                            arena: self.ctx.arena,
+                            rows: Vec::new(),
+                            iter_idx: 0,
+                            sorted: false,
+                        });
+
+                        let projections: Vec<usize> = project
+                            .expressions
+                            .iter()
+                            .filter_map(|expr| {
+                                if let crate::sql::ast::Expr::Column(col) = expr {
+                                    full_column_map
+                                        .iter()
+                                        .find(|(n, _)| n.eq_ignore_ascii_case(col.column))
+                                        .map(|(_, idx)| *idx)
+                                } else {
+                                    None
+                                }
+                            })
+                            .collect();
+
+                        return Ok(DynamicExecutor::Project(
+                            Box::new(sorted),
+                            projections,
+                            self.ctx.arena,
+                        ));
+                    }
+                }
+
+                let input_column_map = self.compute_input_column_map(sort.input);
                 let child = self.build_operator(sort.input, source, column_map)?;
-                let sort_keys: Vec<SortKey> = sort
+                let sort_keys: Vec<SortKey<'a>> = sort
                     .order_by
                     .iter()
-                    .filter_map(|key| {
+                    .map(|key| {
                         if let crate::sql::ast::Expr::Column(col) = key.expr {
-                            column_map
+                            if let Some((_, idx)) = input_column_map
                                 .iter()
                                 .find(|(n, _)| n.eq_ignore_ascii_case(col.column))
-                                .map(|(_, idx)| SortKey {
-                                    column: *idx,
-                                    ascending: key.ascending,
-                                })
-                        } else {
-                            None
+                            {
+                                return SortKey::column(*idx, key.ascending);
+                            }
                         }
+                        SortKey::expression(key.expr, input_column_map.clone(), key.ascending)
                     })
                     .collect();
                 Ok(DynamicExecutor::Sort(SortState {

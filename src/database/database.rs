@@ -17,7 +17,8 @@ use crate::sql::planner::Planner;
 
 use crate::sql::Parser;
 use crate::storage::{
-    FileManager, TableFileHeader, Wal, WalStoragePerTable, CATALOG_FILE_NAME, DEFAULT_SCHEMA,
+    FileKey, FileManager, TableFileHeader, Wal, WalStoragePerTable, CATALOG_FILE_NAME,
+    DEFAULT_SCHEMA,
 };
 use crate::types::{create_record_schema, DataType, OwnedValue, Value};
 use bumpalo::Bump;
@@ -52,6 +53,9 @@ pub(crate) struct SharedDatabase {
     pub(crate) page_locks: super::page_locks::PageLockManager,
     /// Memory budget for Grace Hash Join spill-to-disk (default: 256KB)
     pub(crate) join_memory_budget: std::sync::atomic::AtomicUsize,
+    /// Cached HNSW indexes for vector operations
+    pub(crate) hnsw_indexes:
+        RwLock<hashbrown::HashMap<FileKey, Arc<RwLock<crate::hnsw::PersistentHnswIndex>>>>,
 }
 
 pub struct Database {
@@ -178,6 +182,7 @@ impl Database {
             group_commit_queue: super::group_commit::GroupCommitQueue::with_default_config(),
             page_locks: super::page_locks::PageLockManager::new(),
             join_memory_budget: std::sync::atomic::AtomicUsize::new(10 * 1024 * 1024),
+            hnsw_indexes: RwLock::new(hashbrown::HashMap::new()),
         });
 
         let db = Self {
@@ -247,6 +252,7 @@ impl Database {
             group_commit_queue: super::group_commit::GroupCommitQueue::with_default_config(),
             page_locks: super::page_locks::PageLockManager::new(),
             join_memory_budget: std::sync::atomic::AtomicUsize::new(10 * 1024 * 1024),
+            hnsw_indexes: RwLock::new(hashbrown::HashMap::new()),
         });
 
         Ok(Self {
@@ -962,6 +968,21 @@ impl Database {
             }
         }
 
+        fn has_order_by_expression<'a>(op: &'a crate::sql::planner::PhysicalOperator<'a>) -> bool {
+            use crate::sql::ast::Expr;
+            use crate::sql::planner::PhysicalOperator;
+            match op {
+                PhysicalOperator::SortExec(sort) => {
+                    sort.order_by.iter().any(|key| !matches!(key.expr, Expr::Column(_)))
+                }
+                PhysicalOperator::ProjectExec(project) => has_order_by_expression(project.input),
+                PhysicalOperator::LimitExec(limit) => has_order_by_expression(limit.input),
+                PhysicalOperator::FilterExec(filter) => has_order_by_expression(filter.input),
+                PhysicalOperator::WindowExec(window) => has_order_by_expression(window.input),
+                _ => false,
+            }
+        }
+
         fn find_limit<'a>(
             op: &'a crate::sql::planner::PhysicalOperator<'a>,
         ) -> Option<(Option<u64>, Option<u64>)> {
@@ -1225,7 +1246,8 @@ impl Database {
                 let plan_has_filter = has_filter(physical_plan.root);
                 let plan_has_aggregate = has_aggregate(physical_plan.root);
                 let plan_has_window = has_window(physical_plan.root);
-                let needs_all_columns = plan_has_filter || plan_has_aggregate || plan_has_window;
+                let plan_has_order_by_expr = has_order_by_expression(physical_plan.root);
+                let needs_all_columns = plan_has_filter || plan_has_aggregate || plan_has_window || plan_has_order_by_expr;
                 let projections = if needs_all_columns {
                     None
                 } else {
@@ -3664,6 +3686,56 @@ impl Database {
         }
 
         Ok(stats.row_count)
+    }
+
+    pub(crate) fn get_or_create_hnsw_index(
+        &self,
+        schema: &str,
+        table: &str,
+        index_name: &str,
+    ) -> Result<Arc<RwLock<crate::hnsw::PersistentHnswIndex>>> {
+        let key = FileKey::Hnsw {
+            schema: schema.to_string(),
+            table: table.to_string(),
+            index_name: index_name.to_string(),
+        };
+
+        {
+            let cache = self.shared.hnsw_indexes.read();
+            if let Some(index) = cache.get(&key) {
+                return Ok(Arc::clone(index));
+            }
+        }
+
+        let file_manager_guard = self.shared.file_manager.read();
+        let file_manager = file_manager_guard
+            .as_ref()
+            .ok_or_else(|| eyre::eyre!("file manager not initialized"))?;
+
+        let hnsw_path = file_manager
+            .base_path()
+            .join(schema)
+            .join(format!("{}_{}.hnsw", table, index_name));
+
+        ensure!(
+            hnsw_path.exists(),
+            "HNSW index file does not exist: {}",
+            hnsw_path.display()
+        );
+
+        drop(file_manager_guard);
+
+        let index = crate::hnsw::PersistentHnswIndex::open(&hnsw_path)
+            .wrap_err_with(|| format!("failed to open HNSW index at {}", hnsw_path.display()))?;
+
+        let index_arc = Arc::new(RwLock::new(index));
+
+        {
+            let mut cache = self.shared.hnsw_indexes.write();
+            cache.insert(key, Arc::clone(&index_arc));
+        }
+
+        Ok(index_arc)
     }
 }
 

@@ -98,7 +98,7 @@ use crate::database::dml::mvcc_helpers::{wrap_record_for_insert, wrap_record_int
 use crate::database::row::Row;
 use crate::database::{Database, ExecuteResult};
 use crate::mvcc::WriteEntry;
-use crate::schema::table::Constraint;
+use crate::schema::table::{Constraint, IndexType};
 use crate::storage::{TableFileHeader, WalStoragePerTable, DEFAULT_SCHEMA};
 use crate::types::{create_record_schema, OwnedValue};
 use bumpalo::Bump;
@@ -248,6 +248,20 @@ impl Database {
                     );
                     Some((col_indices, key))
                 }
+            })
+            .collect();
+
+        let hnsw_indexes: Vec<(String, usize)> = table_def
+            .indexes()
+            .iter()
+            .filter(|idx| idx.index_type() == IndexType::Hnsw)
+            .filter_map(|idx| {
+                let cols = idx.columns();
+                let col_name = cols.first()?;
+                let col_idx = columns
+                    .iter()
+                    .position(|c| c.name().eq_ignore_ascii_case(col_name))?;
+                Some((idx.name().to_string(), col_idx))
             })
             .collect();
 
@@ -1020,6 +1034,15 @@ impl Database {
                 }
             }
 
+            for (index_name, col_idx) in &hnsw_indexes {
+                if let Some(OwnedValue::Vector(vec)) = values.get(*col_idx) {
+                    let hnsw = self.get_or_create_hnsw_index(schema_name, table_name, index_name)?;
+                    let mut hnsw_guard = hnsw.write();
+                    let random = Self::generate_random_for_hnsw(row_id);
+                    hnsw_guard.insert(row_id, vec, random)?;
+                }
+            }
+
             count += 1;
 
             if let Some(ref mut rows) = returned_rows {
@@ -1145,5 +1168,18 @@ impl Database {
             ref_cursor.advance()?;
         }
         Ok(false)
+    }
+
+    pub(crate) fn generate_random_for_hnsw(row_id: u64) -> f64 {
+        use std::time::SystemTime;
+        let nanos = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0) as u64;
+        let mut state = nanos ^ row_id;
+        state ^= state >> 12;
+        state ^= state << 25;
+        state ^= state >> 27;
+        (state.wrapping_mul(0x2545F4914F6CDD1D) as f64) / (u64::MAX as f64)
     }
 }
