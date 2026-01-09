@@ -783,7 +783,7 @@ impl<'a> Planner<'a> {
                 for order_item in select.order_by.iter() {
                     let is_alias = if let crate::sql::ast::Expr::Column(col_ref) = order_item.expr {
                         col_ref.table.is_none()
-                            && aliases.iter().any(|a| *a == Some(col_ref.column))
+                            && aliases.contains(&Some(col_ref.column))
                     } else {
                         false
                     };
@@ -2302,8 +2302,8 @@ impl<'a> Planner<'a> {
             if idx.index_type() != crate::schema::IndexType::BTree {
                 return false;
             }
-            let cols = idx.columns();
-            cols.first()
+            idx.columns()
+                .next()
                 .map(|first_col| first_col.eq_ignore_ascii_case(col_name))
                 .unwrap_or(false)
         })?;
@@ -2312,9 +2312,10 @@ impl<'a> Planner<'a> {
 
         let index_name = self.arena.alloc_str(matching_index.name());
         let table_def_alloc = self.arena.alloc(table_def.clone());
-        let index_columns: Vec<String> = matching_index.columns();
+        let _index_columns: Vec<String> = matching_index.columns().map(|s| s.to_string()).collect();
 
-        let residual = self.compute_residual_filter(filter.predicate, &index_columns);
+        let covered_columns = vec![col_name.to_string()];
+        let residual = self.compute_residual_filter(filter.predicate, &covered_columns);
 
         let index_scan = self.arena.alloc(PhysicalOperator::SecondaryIndexScan(
             PhysicalSecondaryIndexScan {
@@ -2453,8 +2454,8 @@ impl<'a> Planner<'a> {
             if idx.has_expressions() || idx.is_partial() {
                 return false;
             }
-            let cols = idx.columns();
-            cols.first()
+            idx.columns()
+                .next()
                 .map(|first_col| first_col.eq_ignore_ascii_case(col_name))
                 .unwrap_or(false)
         });
@@ -2616,12 +2617,9 @@ impl<'a> Planner<'a> {
             .indexes()
             .iter()
             .filter(|idx| {
-                if idx.columns().is_empty() {
-                    return false;
-                }
                 idx.columns()
-                    .first()
-                    .map(|first_col| filter_columns.contains(&first_col.as_str()))
+                    .next()
+                    .map(|first_col| filter_columns.contains(&first_col))
                     .unwrap_or(false)
             })
             .collect()
@@ -2637,13 +2635,10 @@ impl<'a> Planner<'a> {
             .indexes()
             .iter()
             .filter(|idx| {
-                if idx.columns().is_empty() {
-                    return false;
-                }
                 let column_matches = idx
                     .columns()
-                    .first()
-                    .map(|first_col| filter_columns.contains(&first_col.as_str()))
+                    .next()
+                    .map(|first_col| filter_columns.contains(&first_col))
                     .unwrap_or(false);
 
                 if !column_matches {
@@ -2711,8 +2706,7 @@ impl<'a> Planner<'a> {
 
         let matched_columns: usize = index
             .columns()
-            .iter()
-            .filter(|c| filter_columns.contains(&c.as_str()))
+            .filter(|c| filter_columns.contains(c))
             .count();
 
         let selectivity = self.estimate_index_selectivity(index, matched_columns);
@@ -2743,7 +2737,7 @@ impl<'a> Planner<'a> {
             return 1.0;
         }
 
-        if index.is_unique() && matched_columns >= index.columns().len() {
+        if index.is_unique() && matched_columns >= index.columns().count() {
             return UNIQUE_SELECTIVITY;
         }
 

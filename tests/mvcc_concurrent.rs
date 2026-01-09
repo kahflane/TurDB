@@ -480,6 +480,8 @@ fn concurrent_import_small_tables() {
     assert!(total_imported_rows > 0, "No rows were imported");
 
     println!("\n=== MVCC Concurrent Import Test PASSED ===\n");
+
+    let _ = db.close();
 }
 
 fn import_table_fast(

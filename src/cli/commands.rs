@@ -252,7 +252,7 @@ fn list_indexes(db: &Database, args: &[&str]) -> CommandResult {
 
 fn format_index(table_name: &str, idx: &IndexDef) -> String {
     let unique = if idx.is_unique() { "UNIQUE " } else { "" };
-    let columns = idx.columns();
+    let columns: Vec<&str> = idx.columns().collect();
     format!(
         "{}INDEX {} ON {} ({})",
         unique,

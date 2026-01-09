@@ -1905,7 +1905,7 @@ impl<'a, S: RowSource> Executor<'a> for DynamicExecutor<'a, S> {
                 if state.use_spill {
                     state.left_spiller.as_mut().unwrap().start_read(0)?;
                     while let Some(row) = state.left_spiller.as_mut().unwrap().read_next()? {
-                        let owned: Vec<Value<'static>> = row.iter().cloned().collect();
+                        let owned: Vec<Value<'static>> = row.to_vec();
                         let hash = hash_keys_static(&owned, &state.left_key_indices);
                         let idx = state.partition_build_rows.len();
                         state
@@ -2189,7 +2189,7 @@ impl<'a, S: RowSource> Executor<'a> for DynamicExecutor<'a, S> {
                         while let Some(row) =
                             state.left_spiller.as_mut().unwrap().read_next()?
                         {
-                            let owned: Vec<Value<'static>> = row.iter().cloned().collect();
+                            let owned: Vec<Value<'static>> = row.to_vec();
                             state.partition_build_rows.push(owned);
                         }
                         state.build_matched[partition] =
@@ -2350,7 +2350,7 @@ impl<'a, S: RowSource> Executor<'a> for DynamicExecutor<'a, S> {
                     let partition = state.current_partition;
                     state.left_spiller.as_mut().unwrap().start_read(partition)?;
                     while let Some(row) = state.left_spiller.as_mut().unwrap().read_next()? {
-                        let owned: Vec<Value<'static>> = row.iter().cloned().collect();
+                        let owned: Vec<Value<'static>> = row.to_vec();
                         state.partition_build_rows.push(owned);
                     }
                     state.build_matched[partition] =

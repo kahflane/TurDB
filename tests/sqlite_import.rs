@@ -680,6 +680,7 @@ fn import_small_tables() {
         "DatasetVersions",
         "ForumMessages",
         "ForumMessageVotes",
+        "Episodes"
     ];
 
     let sqlite_conn = Connection::open(SQLITE_DB_PATH).expect("Failed to open SQLite DB");
@@ -741,4 +742,5 @@ fn import_small_tables() {
         toast_count,
         verify_start.elapsed().as_secs_f64()
     );
+    let _ = db.close();
 }

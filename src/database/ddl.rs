@@ -745,7 +745,6 @@ impl Database {
                 .iter()
                 .filter(|idx| {
                     idx.columns()
-                        .iter()
                         .any(|c| c.eq_ignore_ascii_case(column_name))
                 })
                 .map(|idx| idx.name().to_string())

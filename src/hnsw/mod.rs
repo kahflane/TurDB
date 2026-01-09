@@ -1028,7 +1028,7 @@ impl PersistentHnswIndex {
         let entry_distance = if entry_vector.is_empty() {
             f32::INFINITY
         } else {
-            distance::euclidean_squared_scalar(vector, &entry_vector)
+            distance::euclidean_squared(vector, &entry_vector)
         };
 
         let mut insert_ctx = operations::InsertContext::new(target_level);
@@ -1043,7 +1043,7 @@ impl PersistentHnswIndex {
         let compute_distance = |n: NodeId| {
             let node_row_id = self.read_node(n).map(|node| node.row_id()).unwrap_or(0);
             get_existing_vector(node_row_id)
-                .map(|v| distance::euclidean_squared_scalar(vector, &v))
+                .map(|v| distance::euclidean_squared(vector, &v))
                 .unwrap_or(f32::INFINITY)
         };
 
@@ -1115,7 +1115,7 @@ impl PersistentHnswIndex {
             };
             let row_id = node.row_id();
             match get_vector(row_id) {
-                Some(v) => distance::euclidean_squared_scalar(query, &v),
+                Some(v) => distance::euclidean_squared(query, &v),
                 None => f32::INFINITY,
             }
         };
@@ -1203,7 +1203,7 @@ impl PersistentHnswIndex {
             };
             let row_id = node.row_id();
             match get_vector(row_id) {
-                Some(v) => distance::euclidean_squared_scalar(query, &v),
+                Some(v) => distance::euclidean_squared(query, &v),
                 None => f32::INFINITY,
             }
         };

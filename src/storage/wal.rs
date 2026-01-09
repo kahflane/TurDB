@@ -935,7 +935,7 @@ mod tests {
             std::fs::remove_dir_all(&wal_dir).ok();
         }
 
-        let mut wal = Wal::create(&wal_dir).expect("should create WAL");
+        let wal = Wal::create(&wal_dir).expect("should create WAL");
 
         let page_data = vec![42u8; PAGE_SIZE];
 
@@ -956,7 +956,7 @@ mod tests {
             std::fs::remove_dir_all(&wal_dir).ok();
         }
 
-        let mut wal = Wal::create(&wal_dir).expect("should create WAL");
+        let wal = Wal::create(&wal_dir).expect("should create WAL");
 
         let page_data = vec![99u8; PAGE_SIZE];
 
@@ -980,7 +980,7 @@ mod tests {
             std::fs::remove_dir_all(&temp_dir).ok();
         }
 
-        let mut wal = Wal::create(&wal_dir).expect("should create WAL");
+        let wal = Wal::create(&wal_dir).expect("should create WAL");
 
         let page_data = vec![77u8; PAGE_SIZE];
         let file_id = 0xDEADBEEF_12345678u64;
@@ -1092,7 +1092,7 @@ mod tests {
             std::fs::remove_dir_all(&wal_dir).ok();
         }
 
-        let mut wal = Wal::create(&wal_dir).expect("should create WAL");
+        let wal = Wal::create(&wal_dir).expect("should create WAL");
 
         let page_data = vec![42u8; PAGE_SIZE];
 
@@ -1124,7 +1124,7 @@ mod tests {
             std::fs::remove_dir_all(&wal_dir).ok();
         }
 
-        let mut wal = Wal::create(&wal_dir).expect("should create WAL");
+        let wal = Wal::create(&wal_dir).expect("should create WAL");
 
         let page_data = vec![99u8; PAGE_SIZE];
 
@@ -1152,7 +1152,7 @@ mod tests {
             std::fs::remove_dir_all(&wal_dir).ok();
         }
 
-        let mut wal = Wal::create(&wal_dir).expect("should create WAL");
+        let wal = Wal::create(&wal_dir).expect("should create WAL");
 
         for i in 0..3 {
             let page_data = vec![i as u8; PAGE_SIZE];
@@ -1187,7 +1187,7 @@ mod tests {
 
         let mut storage = MmapStorage::create(&db_path, 10).expect("should create storage");
 
-        let mut wal = Wal::create(&wal_dir).expect("should create WAL");
+        let wal = Wal::create(&wal_dir).expect("should create WAL");
 
         let page_data_0 = vec![100u8; PAGE_SIZE];
         wal.write_frame(0, 10, &page_data_0)
@@ -1199,7 +1199,7 @@ mod tests {
 
         drop(wal);
 
-        let mut wal_recovered = Wal::open(&wal_dir).expect("should open WAL");
+        let wal_recovered = Wal::open(&wal_dir).expect("should open WAL");
         let frames_applied = wal_recovered.recover(&mut storage).expect("should recover");
 
         assert_eq!(frames_applied, 2);
@@ -1230,7 +1230,7 @@ mod tests {
 
         let mut storage = MmapStorage::create(&db_path, 5).expect("should create storage");
 
-        let mut wal = Wal::open(&wal_dir).expect("should open WAL");
+        let wal = Wal::open(&wal_dir).expect("should open WAL");
         let frames_applied = wal.recover(&mut storage).expect("should recover");
 
         assert_eq!(frames_applied, 0);
@@ -1253,7 +1253,7 @@ mod tests {
 
         let mut storage = MmapStorage::create(&db_path, 10).expect("should create storage");
 
-        let mut wal = Wal::create(&wal_dir).expect("should create WAL");
+        let wal = Wal::create(&wal_dir).expect("should create WAL");
 
         let page_data_1 = vec![10u8; PAGE_SIZE];
         wal.write_frame(3, 10, &page_data_1)
@@ -1269,7 +1269,7 @@ mod tests {
 
         drop(wal);
 
-        let mut wal_recovered = Wal::open(&wal_dir).expect("should open WAL");
+        let wal_recovered = Wal::open(&wal_dir).expect("should open WAL");
         let frames_applied = wal_recovered.recover(&mut storage).expect("should recover");
 
         assert_eq!(frames_applied, 3);
@@ -1292,7 +1292,7 @@ mod tests {
             std::fs::remove_dir_all(&temp_dir).ok();
         }
 
-        let mut wal = Wal::create(&wal_dir).expect("should create WAL");
+        let wal = Wal::create(&wal_dir).expect("should create WAL");
 
         let page_data = vec![42u8; PAGE_SIZE];
         wal.write_frame(1, 1, &page_data)
@@ -1322,7 +1322,7 @@ mod tests {
 
         let mut storage = MmapStorage::create(&db_path, 10).expect("should create storage");
 
-        let mut wal = Wal::create(&wal_dir).expect("should create WAL");
+        let wal = Wal::create(&wal_dir).expect("should create WAL");
 
         let page_data_0 = vec![111u8; PAGE_SIZE];
         wal.write_frame(0, 10, &page_data_0)
@@ -1360,7 +1360,7 @@ mod tests {
             std::fs::remove_dir_all(&temp_dir).ok();
         }
 
-        let mut wal = Wal::create(&wal_dir).expect("should create WAL");
+        let wal = Wal::create(&wal_dir).expect("should create WAL");
 
         assert!(!wal.needs_checkpoint(1000));
 
@@ -1404,7 +1404,7 @@ mod tests {
             std::fs::remove_dir_all(&temp_dir).ok();
         }
 
-        let mut wal = Wal::create(&wal_dir).expect("should create WAL");
+        let wal = Wal::create(&wal_dir).expect("should create WAL");
 
         let page_data = vec![123u8; PAGE_SIZE];
         wal.write_frame(5, 10, &page_data)
@@ -1432,7 +1432,7 @@ mod tests {
             std::fs::remove_dir_all(&temp_dir).ok();
         }
 
-        let mut wal = Wal::create(&wal_dir).expect("should create WAL");
+        let wal = Wal::create(&wal_dir).expect("should create WAL");
 
         let page_data_1 = vec![10u8; PAGE_SIZE];
         wal.write_frame(3, 10, &page_data_1)
@@ -1471,7 +1471,7 @@ mod tests {
 
         let mut storage = MmapStorage::create(&db_path, 10).expect("should create storage");
 
-        let mut wal = Wal::create(&wal_dir).expect("should create WAL");
+        let wal = Wal::create(&wal_dir).expect("should create WAL");
 
         let page_data = vec![77u8; PAGE_SIZE];
         wal.write_frame(2, 10, &page_data)
@@ -1552,7 +1552,7 @@ mod tests {
         let temp_dir = tempdir().expect("failed to create temp dir");
         let wal_dir = temp_dir.path().join("wal");
 
-        let mut wal = Wal::create(&wal_dir).expect("should create WAL");
+        let wal = Wal::create(&wal_dir).expect("should create WAL");
 
         for i in 0..10 {
             let page_data = vec![i as u8; PAGE_SIZE];
@@ -1573,7 +1573,7 @@ mod tests {
         let temp_dir = tempdir().expect("failed to create temp dir");
         let wal_dir = temp_dir.path().join("wal");
 
-        let mut wal = Wal::create(&wal_dir).expect("should create WAL");
+        let wal = Wal::create(&wal_dir).expect("should create WAL");
 
         let frames_needed = (MAX_SEGMENT_SIZE / (WAL_FRAME_HEADER_SIZE + PAGE_SIZE) as u64) + 1;
 
@@ -1596,7 +1596,7 @@ mod tests {
         let temp_dir = tempdir().expect("failed to create temp dir");
         let wal_dir = temp_dir.path().join("wal");
 
-        let mut wal = Wal::create(&wal_dir).expect("should create WAL");
+        let wal = Wal::create(&wal_dir).expect("should create WAL");
 
         let page_data = vec![42u8; PAGE_SIZE];
         wal.write_frame(1, 100, &page_data)
@@ -1621,7 +1621,7 @@ mod tests {
         let temp_dir = tempdir().expect("failed to create temp dir");
         let wal_dir = temp_dir.path().join("wal");
 
-        let mut wal = Wal::create(&wal_dir).expect("should create WAL");
+        let wal = Wal::create(&wal_dir).expect("should create WAL");
 
         let page_data = vec![42u8; PAGE_SIZE];
         wal.write_frame(1, 100, &page_data)
@@ -1655,7 +1655,7 @@ mod tests {
         let temp_dir = tempdir().expect("failed to create temp dir");
         let wal_dir = temp_dir.path().join("wal");
 
-        let mut wal = Wal::create(&wal_dir).expect("should create WAL");
+        let wal = Wal::create(&wal_dir).expect("should create WAL");
 
         let page_data = vec![42u8; PAGE_SIZE];
         wal.write_frame(1, 100, &page_data)
@@ -1678,7 +1678,7 @@ mod tests {
         let temp_dir = tempdir().expect("failed to create temp dir");
         let wal_dir = temp_dir.path().join("wal");
 
-        let mut wal = Wal::create(&wal_dir).expect("should create WAL");
+        let wal = Wal::create(&wal_dir).expect("should create WAL");
 
         let frames_needed = (MAX_SEGMENT_SIZE / (WAL_FRAME_HEADER_SIZE + PAGE_SIZE) as u64) + 10;
 
@@ -1715,7 +1715,7 @@ mod tests {
         let db_path = temp_dir.path().join("test.db");
 
         let mut storage = MmapStorage::create(&db_path, 4).expect("should create storage");
-        let mut wal = Wal::create(&wal_dir).expect("should create WAL");
+        let wal = Wal::create(&wal_dir).expect("should create WAL");
 
         let frames_needed = (MAX_SEGMENT_SIZE / (WAL_FRAME_HEADER_SIZE + PAGE_SIZE) as u64) + 10;
 

@@ -531,7 +531,7 @@ mod tests {
 
         drop(wal);
 
-        let mut wal = Wal::open(&wal_dir).expect("should reopen WAL");
+        let wal = Wal::open(&wal_dir).expect("should reopen WAL");
         let mut new_storage1 = MmapStorage::create(&db_path1, 10).expect("should create storage1");
         let mut new_storage2 = MmapStorage::create(&db_path2, 10).expect("should create storage2");
 
@@ -579,7 +579,7 @@ mod tests {
 
         {
             let mut storage = MmapStorage::create(&db_path, 10).expect("should create new storage");
-            let mut wal = Wal::open(&wal_dir).expect("should open WAL");
+            let wal = Wal::open(&wal_dir).expect("should open WAL");
 
             let frames_recovered = wal.recover(&mut storage).expect("should recover from WAL");
 

@@ -92,26 +92,23 @@ use std::borrow::Cow;
 
 mod discriminant {
     pub const NULL: u8 = 0x01;
-    pub const FALSE: u8 = 0x02;
-    pub const TRUE: u8 = 0x03;
+
 
     pub const NEG_INFINITY: u8 = 0x10;
-    pub const NEG_BIG_INT: u8 = 0x11;
+
     pub const NEG_INT: u8 = 0x12;
     pub const NEG_FLOAT: u8 = 0x13;
     pub const ZERO: u8 = 0x14;
     pub const POS_FLOAT: u8 = 0x15;
     pub const POS_INT: u8 = 0x16;
-    pub const POS_BIG_INT: u8 = 0x17;
+
     pub const POS_INFINITY: u8 = 0x18;
     pub const NAN: u8 = 0x19;
 
     pub const TEXT: u8 = 0x20;
     pub const BLOB: u8 = 0x21;
 
-    pub const DATE: u8 = 0x30;
-    pub const TIME: u8 = 0x31;
-    pub const TIMESTAMP: u8 = 0x32;
+
     pub const TIMESTAMPTZ: u8 = 0x33;
     pub const INTERVAL: u8 = 0x34;
 
@@ -122,12 +119,9 @@ mod discriminant {
 
     pub const JSONB: u8 = 0x50;
 
-    pub const ARRAY: u8 = 0x60;
-    pub const TUPLE: u8 = 0x61;
-    pub const RANGE: u8 = 0x62;
+
     pub const ENUM: u8 = 0x63;
-    pub const COMPOSITE: u8 = 0x64;
-    pub const DOMAIN: u8 = 0x65;
+
 
     pub const VECTOR: u8 = 0x70;
 

@@ -204,7 +204,6 @@ impl Database {
             .filter_map(|idx| {
                 let col_indices: Vec<usize> = idx
                     .columns()
-                    .iter()
                     .filter_map(|col_name| {
                         columns
                             .iter()
@@ -231,7 +230,6 @@ impl Database {
             .filter_map(|idx| {
                 let col_indices: Vec<usize> = idx
                     .columns()
-                    .iter()
                     .filter_map(|col_name| {
                         columns
                             .iter()
@@ -256,8 +254,7 @@ impl Database {
             .iter()
             .filter(|idx| idx.index_type() == IndexType::Hnsw)
             .filter_map(|idx| {
-                let cols = idx.columns();
-                let col_name = cols.first()?;
+                let col_name = idx.columns().next()?;
                 let col_idx = columns
                     .iter()
                     .position(|c| c.name().eq_ignore_ascii_case(col_name))?;
@@ -276,7 +273,7 @@ impl Database {
                             .ok()
                             .and_then(|ref_table| {
                                 ref_table.indexes().iter().find(|idx_def| {
-                                    idx_def.columns().first().is_some_and(|first_col| {
+                                    idx_def.columns().next().is_some_and(|first_col| {
                                         first_col.eq_ignore_ascii_case(column)
                                     })
                                 })

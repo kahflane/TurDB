@@ -1,3 +1,42 @@
+//! # Database Module
+//!
+//! This module provides the central `Database` struct and `SharedDatabase` state
+//! that coordinates all components of TurDB (SQL engine, storage, catalog, etc.).
+//!
+//! ## key Components
+//!
+//! - **Database**: The public API handle. Cloneable and thread-safe.
+//! - **SharedDatabase**: Internal state shared across all `Database` handles.
+//! - **Catalog**: Manages schema metadata (tables, columns, indexes).
+//! - **FileManager**: Manages B-Tree storage files.
+//! - **Wal**: Write-Ahead Log for durability and atomic commits.
+//!
+//! ## Concurrency Model
+//!
+//! The database uses a hybrid concurrency model:
+//! - **MVCC**: Multi-Version Concurrency Control for reader-writer isolation.
+//! - **Sharded Read/Write Locks**: For reducing contention on hot structures.
+//! - **Page-Level Locking**: For granular write access to B-Tree pages.
+//!
+//! ## Query Execution
+//!
+//! Queries are processed in stages:
+//! 1. **Parse**: SQL -> AST
+//! 2. **Plan**: AST -> Logical Plan -> Physical Plan
+//! 3. **Execute**: Physical Plan -> Volcano-style Iterator -> Results
+//!
+//! ## Example
+//!
+//! ```rust
+//! # use turdb::Database;
+//! # use tempfile::tempdir;
+//! # let dir = tempdir().unwrap();
+//! # let path = dir.path().join("mydb");
+//! let db = Database::create(&path).unwrap();
+//! db.execute("CREATE TABLE foo (id int)").unwrap();
+//! db.execute("INSERT INTO foo VALUES (1)").unwrap();
+//! ```
+
 use crate::database::convert::convert_value_with_type;
 use crate::database::dirty_tracker::ShardedDirtyTracker;
 use crate::database::row::Row;
@@ -38,7 +77,7 @@ pub(crate) struct SharedDatabase {
     pub(crate) catalog: RwLock<Option<Catalog>>,
     pub(crate) wal: Mutex<Option<Wal>>,
     pub(crate) wal_dir: PathBuf,
-    pub(crate) partition_dir: PathBuf,
+
     pub(crate) next_row_id: std::sync::atomic::AtomicU64,
     pub(crate) next_table_id: std::sync::atomic::AtomicU64,
     pub(crate) next_index_id: std::sync::atomic::AtomicU64,
@@ -147,7 +186,7 @@ impl Database {
         let next_index_id = header.next_index_id();
 
         let wal_dir = path.join("wal");
-        let partition_dir = path.join("partition");
+
 
         let max_segment = Wal::find_latest_segment(&wal_dir).unwrap_or(1);
         let mut wal_size_bytes = 0;
@@ -170,7 +209,7 @@ impl Database {
             catalog: RwLock::new(None),
             wal: Mutex::new(None),
             wal_dir,
-            partition_dir,
+
             next_row_id: AtomicU64::new(1),
             next_table_id: AtomicU64::new(next_table_id),
             next_index_id: AtomicU64::new(next_index_id),
@@ -232,7 +271,7 @@ impl Database {
             .wrap_err("failed to write database header")?;
 
         let wal_dir = path.join("wal");
-        let partition_dir = path.join("partition");
+
 
         let shared = Arc::new(SharedDatabase {
             path,
@@ -240,7 +279,7 @@ impl Database {
             catalog: RwLock::new(None),
             wal: Mutex::new(None),
             wal_dir,
-            partition_dir,
+
             next_row_id: AtomicU64::new(1),
             next_table_id: AtomicU64::new(1),
             next_index_id: AtomicU64::new(1),
@@ -992,6 +1031,20 @@ impl Database {
                 PhysicalOperator::ProjectExec(project) => find_limit(project.input),
                 PhysicalOperator::FilterExec(filter) => find_limit(filter.input),
                 PhysicalOperator::SortExec(sort) => find_limit(sort.input),
+                _ => None,
+            }
+        }
+
+        fn find_sort_exec<'a>(
+            op: &'a crate::sql::planner::PhysicalOperator<'a>,
+        ) -> Option<&'a crate::sql::planner::PhysicalSortExec<'a>> {
+            use crate::sql::planner::PhysicalOperator;
+            match op {
+                PhysicalOperator::SortExec(sort) => Some(sort),
+                PhysicalOperator::ProjectExec(project) => find_sort_exec(project.input),
+                PhysicalOperator::LimitExec(limit) => find_sort_exec(limit.input),
+                PhysicalOperator::FilterExec(filter) => find_sort_exec(filter.input),
+                PhysicalOperator::WindowExec(window) => find_sort_exec(window.input),
                 _ => None,
             }
         }
@@ -1892,61 +1945,61 @@ impl Database {
                     }
                 }
 
+                let left_col_count = if let Some(subq) = left_subq {
+                    subq.output_schema.columns.len()
+                } else if let Some(table_name) = left_table_name {
+                    catalog.resolve_table(table_name).map(|t| t.columns().len()).unwrap_or(0)
+                } else {
+                    0
+                };
+
                 let where_predicate = find_filter_for_join(physical_plan.root).map(|expr| {
                     crate::sql::predicate::CompiledPredicate::new(expr, join_column_map.clone())
                 });
 
                 let key_indices: Vec<(usize, usize)> = join_keys
                     .iter()
-                    .filter_map(|(left_expr, right_expr)| {
+                    .filter_map(|(expr_a, expr_b)| {
                         use crate::sql::ast::Expr;
 
-                        let left_idx = if let Expr::Column(col) = left_expr {
-                            let qualified = col
-                                .table
-                                .map(|t| format!("{}.{}", t, col.column).to_lowercase());
-                            qualified
-                                .as_ref()
-                                .and_then(|q| {
-                                    join_column_map
-                                        .iter()
-                                        .find(|(name, _)| name == q)
-                                        .map(|(_, idx)| *idx)
-                                })
-                                .or_else(|| {
-                                    join_column_map
-                                        .iter()
-                                        .find(|(name, _)| name.eq_ignore_ascii_case(col.column))
-                                        .map(|(_, idx)| *idx)
-                                })
-                        } else {
-                            None
-                        };
+                        fn find_column_idx(
+                            expr: &Expr,
+                            column_map: &[(String, usize)],
+                        ) -> Option<usize> {
+                            if let Expr::Column(col) = expr {
+                                let qualified = col
+                                    .table
+                                    .map(|t| format!("{}.{}", t, col.column).to_lowercase());
+                                qualified
+                                    .as_ref()
+                                    .and_then(|q| {
+                                        column_map
+                                            .iter()
+                                            .find(|(name, _)| name == q)
+                                            .map(|(_, idx)| *idx)
+                                    })
+                                    .or_else(|| {
+                                        column_map
+                                            .iter()
+                                            .find(|(name, _)| {
+                                                name.eq_ignore_ascii_case(col.column)
+                                            })
+                                            .map(|(_, idx)| *idx)
+                                    })
+                            } else {
+                                None
+                            }
+                        }
 
-                        let right_idx = if let Expr::Column(col) = right_expr {
-                            let qualified = col
-                                .table
-                                .map(|t| format!("{}.{}", t, col.column).to_lowercase());
-                            qualified
-                                .as_ref()
-                                .and_then(|q| {
-                                    join_column_map
-                                        .iter()
-                                        .find(|(name, _)| name == q)
-                                        .map(|(_, idx)| *idx)
-                                })
-                                .or_else(|| {
-                                    join_column_map
-                                        .iter()
-                                        .find(|(name, _)| name.eq_ignore_ascii_case(col.column))
-                                        .map(|(_, idx)| *idx)
-                                })
-                        } else {
-                            None
-                        };
+                        let idx_a = find_column_idx(expr_a, &join_column_map)?;
+                        let idx_b = find_column_idx(expr_b, &join_column_map)?;
 
-                        match (left_idx, right_idx) {
-                            (Some(l), Some(r)) => Some((l, r)),
+                        let a_is_left = idx_a < left_col_count;
+                        let b_is_left = idx_b < left_col_count;
+
+                        match (a_is_left, b_is_left) {
+                            (true, false) => Some((idx_a, idx_b)),
+                            (false, true) => Some((idx_b, idx_a)),
                             _ => None,
                         }
                     })
@@ -1962,13 +2015,6 @@ impl Database {
                     std::collections::HashSet::new();
                 let mut left_matched: Vec<bool> = vec![false; left_rows.len()];
                 let mut right_matched: Vec<bool> = vec![false; right_rows.len()];
-                let left_col_count = if let Some(subq) = left_subq {
-                    subq.output_schema.columns.len()
-                } else if let Some(table_name) = left_table_name {
-                    catalog.resolve_table(table_name).map(|t| t.columns().len()).unwrap_or(0)
-                } else {
-                    0
-                };
 
                 let output_columns = physical_plan.output_schema.columns;
                 let output_source_indices: Vec<(usize, crate::types::DataType)> = {
@@ -2078,10 +2124,7 @@ impl Database {
                             continue;
                         }
                         let hash = hash_join_key(left_row, &left_key_indices);
-                        hash_table
-                            .entry(hash)
-                            .or_insert_with(smallvec::SmallVec::new)
-                            .push(left_idx);
+                        hash_table.entry(hash).or_default().push(left_idx);
                     }
                 }
 
@@ -2453,37 +2496,35 @@ impl Database {
                                     entry.1[agg_idx].0 += 1;
                                 }
                                 AggregateFunction::Sum => {
-                                    if let Some(arg) = agg_expr.argument {
-                                        if let crate::sql::ast::Expr::Column(col) = arg {
-                                            let col_name = col.column.to_lowercase();
-                                            let qualified = col
-                                                .table
-                                                .map(|t| format!("{}.{}", t, col.column).to_lowercase());
-                                            let arg_idx = qualified
-                                                .as_ref()
-                                                .and_then(|q| {
-                                                    join_column_map
-                                                        .iter()
-                                                        .find(|(name, _)| name == q)
-                                                        .map(|(_, idx)| *idx)
-                                                })
-                                                .or_else(|| {
-                                                    join_column_map
-                                                        .iter()
-                                                        .find(|(name, _)| name == &col_name)
-                                                        .map(|(_, idx)| *idx)
-                                                });
-                                            if let Some(idx) = arg_idx {
-                                                if let Some(val) = row.values.get(idx) {
-                                                    match val {
-                                                        OwnedValue::Int(i) => {
-                                                            entry.1[agg_idx].1 += *i as f64
-                                                        }
-                                                        OwnedValue::Float(f) => {
-                                                            entry.1[agg_idx].1 += *f
-                                                        }
-                                                        _ => {}
+                                    if let Some(crate::sql::ast::Expr::Column(col)) = agg_expr.argument {
+                                        let col_name = col.column.to_lowercase();
+                                        let qualified = col
+                                            .table
+                                            .map(|t| format!("{}.{}", t, col.column).to_lowercase());
+                                        let arg_idx = qualified
+                                            .as_ref()
+                                            .and_then(|q| {
+                                                join_column_map
+                                                    .iter()
+                                                    .find(|(name, _)| name == q)
+                                                    .map(|(_, idx)| *idx)
+                                            })
+                                            .or_else(|| {
+                                                join_column_map
+                                                    .iter()
+                                                    .find(|(name, _)| name == &col_name)
+                                                    .map(|(_, idx)| *idx)
+                                            });
+                                        if let Some(idx) = arg_idx {
+                                            if let Some(val) = row.values.get(idx) {
+                                                match val {
+                                                    OwnedValue::Int(i) => {
+                                                        entry.1[agg_idx].1 += *i as f64
                                                     }
+                                                    OwnedValue::Float(f) => {
+                                                        entry.1[agg_idx].1 += *f
+                                                    }
+                                                    _ => {}
                                                 }
                                             }
                                         }
@@ -2529,6 +2570,93 @@ impl Database {
                     });
 
                     return Ok((column_names, aggregated_rows));
+                }
+
+                fn compare_owned_values(a: &OwnedValue, b: &OwnedValue) -> std::cmp::Ordering {
+                    match (a, b) {
+                        (OwnedValue::Null, OwnedValue::Null) => std::cmp::Ordering::Equal,
+                        (OwnedValue::Null, _) => std::cmp::Ordering::Less,
+                        (_, OwnedValue::Null) => std::cmp::Ordering::Greater,
+                        (OwnedValue::Int(a), OwnedValue::Int(b)) => a.cmp(b),
+                        (OwnedValue::Float(a), OwnedValue::Float(b)) => {
+                            a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)
+                        }
+                        (OwnedValue::Int(a), OwnedValue::Float(b)) => {
+                            (*a as f64).partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)
+                        }
+                        (OwnedValue::Float(a), OwnedValue::Int(b)) => {
+                            a.partial_cmp(&(*b as f64)).unwrap_or(std::cmp::Ordering::Equal)
+                        }
+                        (OwnedValue::Text(a), OwnedValue::Text(b)) => a.cmp(b),
+                        (OwnedValue::Bool(a), OwnedValue::Bool(b)) => a.cmp(b),
+                        (OwnedValue::Blob(a), OwnedValue::Blob(b)) => a.cmp(b),
+                        (OwnedValue::Date(a), OwnedValue::Date(b)) => a.cmp(b),
+                        (OwnedValue::Time(a), OwnedValue::Time(b)) => a.cmp(b),
+                        (OwnedValue::Timestamp(a), OwnedValue::Timestamp(b)) => a.cmp(b),
+                        _ => std::cmp::Ordering::Equal,
+                    }
+                }
+
+                if let Some(sort_exec) = find_sort_exec(physical_plan.root) {
+                    if !sort_exec.order_by.is_empty() {
+                        let output_column_map: Vec<(String, usize)> = output_columns
+                            .iter()
+                            .enumerate()
+                            .map(|(idx, col)| (col.name.to_lowercase(), idx))
+                            .collect();
+
+                        let mut extended_output_map: Vec<(String, usize)> = output_column_map.clone();
+                        for (name, idx) in &output_column_map {
+                            if let Some((_full_name, join_idx)) = join_column_map.iter().find(|(n, _)| n == name) {
+                                for (alias_name, alias_join_idx) in &join_column_map {
+                                    if *alias_join_idx == *join_idx && alias_name != name {
+                                        extended_output_map.push((alias_name.clone(), *idx));
+                                    }
+                                }
+                            }
+                        }
+
+                        let sort_key_indices: Vec<(usize, bool)> = sort_exec
+                            .order_by
+                            .iter()
+                            .filter_map(|key| {
+                                if let crate::sql::ast::Expr::Column(col) = key.expr {
+                                    let col_name = col.column.to_lowercase();
+                                    let qualified = col
+                                        .table
+                                        .map(|t| format!("{}.{}", t, col.column).to_lowercase());
+                                    let idx = qualified
+                                        .as_ref()
+                                        .and_then(|q| {
+                                            extended_output_map.iter().find(|(n, _)| n == q).map(|(_, i)| *i)
+                                        })
+                                        .or_else(|| {
+                                            extended_output_map
+                                                .iter()
+                                                .find(|(n, _)| n == &col_name)
+                                                .map(|(_, i)| *i)
+                                        });
+                                    idx.map(|i| (i, key.ascending))
+                                } else {
+                                    None
+                                }
+                            })
+                            .collect();
+
+                        if !sort_key_indices.is_empty() {
+                            result_rows.sort_by(|a, b| {
+                                for &(idx, ascending) in &sort_key_indices {
+                                    if idx < a.values.len() && idx < b.values.len() {
+                                        let cmp = compare_owned_values(&a.values[idx], &b.values[idx]);
+                                        if cmp != std::cmp::Ordering::Equal {
+                                            return if ascending { cmp } else { cmp.reverse() };
+                                        }
+                                    }
+                                }
+                                std::cmp::Ordering::Equal
+                            });
+                        }
+                    }
                 }
 
                 result_rows
@@ -3115,7 +3243,6 @@ impl Database {
 
                         let col_indices: Vec<usize> = idx_def
                             .columns()
-                            .iter()
                             .filter_map(|cname| {
                                 table_def
                                     .columns()
@@ -3623,9 +3750,17 @@ impl Database {
     }
 
     pub fn close(&self) -> Result<CheckpointInfo> {
+        // Check if already closed
+        if self.is_closed() {
+            bail!("database already closed");
+        }
+
         self.abort_active_transaction();
 
         let _ = self.checkpoint();
+
+        // Mark as closed
+        self.shared.closed.store(true, std::sync::atomic::Ordering::Release);
 
         Ok(CheckpointInfo {
             frames_checkpointed: 0,

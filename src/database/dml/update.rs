@@ -145,7 +145,6 @@ impl Database {
             .map(|idx| {
                 let col_indices: Vec<usize> = idx
                     .columns()
-                    .iter()
                     .filter_map(|col_name| columns.iter().position(|c| c.name() == col_name))
                     .collect();
                 (idx.name().to_string(), col_indices)
@@ -157,8 +156,7 @@ impl Database {
             .iter()
             .filter(|idx| idx.index_type() == IndexType::Hnsw)
             .filter_map(|idx| {
-                let cols = idx.columns();
-                let col_name = cols.first()?;
+                let col_name = idx.columns().next()?;
                 let col_idx = columns
                     .iter()
                     .position(|c| c.name().eq_ignore_ascii_case(col_name))?;

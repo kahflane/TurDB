@@ -305,10 +305,11 @@ impl CatalogPersistence {
         buf.extend((name_bytes.len() as u16).to_le_bytes());
         buf.extend(name_bytes);
 
-        let column_count = index.columns().len() as u16;
+        let columns: Vec<&str> = index.columns().collect();
+        let column_count = columns.len() as u16;
         buf.extend(column_count.to_le_bytes());
 
-        for col_name in index.columns() {
+        for col_name in columns {
             let col_bytes = col_name.as_bytes();
             buf.extend((col_bytes.len() as u16).to_le_bytes());
             buf.extend(col_bytes);

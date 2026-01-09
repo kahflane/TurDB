@@ -197,12 +197,224 @@ pub unsafe fn euclidean_neon(a: &[f32], b: &[f32]) -> f32 {
     euclidean_squared_neon(a, b).sqrt()
 }
 
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2", enable = "fma")]
+pub unsafe fn dot_product_avx2(a: &[f32], b: &[f32]) -> f32 {
+    use std::arch::x86_64::*;
+
+    let n = a.len();
+    let mut i = 0;
+    let mut sum = _mm256_setzero_ps();
+
+    while i + 8 <= n {
+        let va = _mm256_loadu_ps(a.as_ptr().add(i));
+        let vb = _mm256_loadu_ps(b.as_ptr().add(i));
+        sum = _mm256_fmadd_ps(va, vb, sum);
+        i += 8;
+    }
+
+    let mut result = horizontal_sum_avx2(sum);
+
+    while i < n {
+        result += a[i] * b[i];
+        i += 1;
+    }
+
+    result
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2", enable = "fma")]
+pub unsafe fn inner_product_avx2(a: &[f32], b: &[f32]) -> f32 {
+    -dot_product_avx2(a, b)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2", enable = "fma")]
+pub unsafe fn cosine_avx2(a: &[f32], b: &[f32]) -> f32 {
+    use std::arch::x86_64::*;
+
+    let n = a.len();
+    let mut i = 0;
+    let mut dot_sum = _mm256_setzero_ps();
+    let mut norm_a_sum = _mm256_setzero_ps();
+    let mut norm_b_sum = _mm256_setzero_ps();
+
+    while i + 8 <= n {
+        let va = _mm256_loadu_ps(a.as_ptr().add(i));
+        let vb = _mm256_loadu_ps(b.as_ptr().add(i));
+        dot_sum = _mm256_fmadd_ps(va, vb, dot_sum);
+        norm_a_sum = _mm256_fmadd_ps(va, va, norm_a_sum);
+        norm_b_sum = _mm256_fmadd_ps(vb, vb, norm_b_sum);
+        i += 8;
+    }
+
+    let mut dot = horizontal_sum_avx2(dot_sum);
+    let mut norm_a = horizontal_sum_avx2(norm_a_sum);
+    let mut norm_b = horizontal_sum_avx2(norm_b_sum);
+
+    while i < n {
+        dot += a[i] * b[i];
+        norm_a += a[i] * a[i];
+        norm_b += b[i] * b[i];
+        i += 1;
+    }
+
+    let norm_product = (norm_a * norm_b).sqrt();
+    if norm_product == 0.0 {
+        return 1.0;
+    }
+
+    1.0 - (dot / norm_product)
+}
+
+#[cfg(target_arch = "aarch64")]
+pub unsafe fn dot_product_neon(a: &[f32], b: &[f32]) -> f32 {
+    use std::arch::aarch64::*;
+
+    let n = a.len();
+    let mut i = 0;
+    let mut sum = vdupq_n_f32(0.0);
+
+    while i + 4 <= n {
+        let va = vld1q_f32(a.as_ptr().add(i));
+        let vb = vld1q_f32(b.as_ptr().add(i));
+        sum = vfmaq_f32(sum, va, vb);
+        i += 4;
+    }
+
+    let mut result = vaddvq_f32(sum);
+
+    while i < n {
+        result += a[i] * b[i];
+        i += 1;
+    }
+
+    result
+}
+
+#[cfg(target_arch = "aarch64")]
+pub unsafe fn inner_product_neon(a: &[f32], b: &[f32]) -> f32 {
+    -dot_product_neon(a, b)
+}
+
+#[cfg(target_arch = "aarch64")]
+pub unsafe fn cosine_neon(a: &[f32], b: &[f32]) -> f32 {
+    use std::arch::aarch64::*;
+
+    let n = a.len();
+    let mut i = 0;
+    let mut dot_sum = vdupq_n_f32(0.0);
+    let mut norm_a_sum = vdupq_n_f32(0.0);
+    let mut norm_b_sum = vdupq_n_f32(0.0);
+
+    while i + 4 <= n {
+        let va = vld1q_f32(a.as_ptr().add(i));
+        let vb = vld1q_f32(b.as_ptr().add(i));
+        dot_sum = vfmaq_f32(dot_sum, va, vb);
+        norm_a_sum = vfmaq_f32(norm_a_sum, va, va);
+        norm_b_sum = vfmaq_f32(norm_b_sum, vb, vb);
+        i += 4;
+    }
+
+    let mut dot = vaddvq_f32(dot_sum);
+    let mut norm_a = vaddvq_f32(norm_a_sum);
+    let mut norm_b = vaddvq_f32(norm_b_sum);
+
+    while i < n {
+        dot += a[i] * b[i];
+        norm_a += a[i] * a[i];
+        norm_b += b[i] * b[i];
+        i += 1;
+    }
+
+    let norm_product = (norm_a * norm_b).sqrt();
+    if norm_product == 0.0 {
+        return 1.0;
+    }
+
+    1.0 - (dot / norm_product)
+}
+
 pub type DistanceFn = fn(&[f32], &[f32]) -> f32;
+
+fn euclidean_squared_dispatch(a: &[f32], b: &[f32]) -> f32 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+            return unsafe { euclidean_squared_avx2(a, b) };
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    {
+        unsafe { euclidean_squared_neon(a, b) }
+    }
+
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    {
+        euclidean_squared_scalar(a, b)
+    }
+}
+
+fn euclidean_dispatch(a: &[f32], b: &[f32]) -> f32 {
+    euclidean_squared_dispatch(a, b).sqrt()
+}
+
+fn cosine_dispatch(a: &[f32], b: &[f32]) -> f32 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+            return unsafe { cosine_avx2(a, b) };
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    {
+        unsafe { cosine_neon(a, b) }
+    }
+
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    {
+        cosine_scalar(a, b)
+    }
+}
+
+fn inner_product_dispatch(a: &[f32], b: &[f32]) -> f32 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+            return unsafe { inner_product_avx2(a, b) };
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    {
+        unsafe { inner_product_neon(a, b) }
+    }
+
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    {
+        inner_product_scalar(a, b)
+    }
+}
 
 pub fn select_distance_fn(metric: super::DistanceFunction) -> DistanceFn {
     match metric {
-        super::DistanceFunction::L2 => euclidean_scalar,
-        super::DistanceFunction::Cosine => cosine_scalar,
-        super::DistanceFunction::InnerProduct => inner_product_scalar,
+        super::DistanceFunction::L2 => euclidean_dispatch,
+        super::DistanceFunction::Cosine => cosine_dispatch,
+        super::DistanceFunction::InnerProduct => inner_product_dispatch,
     }
+}
+
+pub fn select_squared_distance_fn(metric: super::DistanceFunction) -> DistanceFn {
+    match metric {
+        super::DistanceFunction::L2 => euclidean_squared_dispatch,
+        super::DistanceFunction::Cosine => cosine_dispatch,
+        super::DistanceFunction::InnerProduct => inner_product_dispatch,
+    }
+}
+
+pub fn euclidean_squared(a: &[f32], b: &[f32]) -> f32 {
+    euclidean_squared_dispatch(a, b)
 }

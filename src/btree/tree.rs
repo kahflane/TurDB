@@ -723,7 +723,6 @@ impl<'a, S: Storage> BTree<'a, S> {
         if cell_count > 0 {
             let last_key = leaf.key_at(cell_count - 1)?;
             if key <= last_key {
-                eprintln!("REJECT FP");
                 return Ok(false);
             }
         }
@@ -1104,27 +1103,27 @@ impl<'a, S: Storage> BTree<'a, S> {
         let page_no = handle.page_no;
         let cell_index = handle.cell_index;
 
-        let old_value = {
+        let old_value_len = {
             let page_data = self.storage.page(page_no)?;
             let leaf = LeafNode::from_page(page_data)?;
-            leaf.value_at(cell_index)?.to_vec()
+            leaf.value_len_at(cell_index)?
         };
 
-        if new_value.len() == old_value.len() {
+        if new_value.len() == old_value_len {
             let page_data = self.storage.page_mut(page_no)?;
             let mut leaf = LeafNodeMut::from_page(page_data)?;
             leaf.update_cell_value_in_place(cell_index, new_value)?;
             Ok(true)
-        } else if new_value.len() < old_value.len() {
+        } else if new_value.len() < old_value_len {
             let page_data = self.storage.page_mut(page_no)?;
             let mut leaf = LeafNodeMut::from_page(page_data)?;
             leaf.update_cell_value_shrink(cell_index, new_value)?;
             Ok(true)
         } else {
             let value_len_size = varint_len(new_value.len() as u64);
-            let old_value_len_size = varint_len(old_value.len() as u64);
+            let old_value_len_size = varint_len(old_value_len as u64);
             let size_increase = (new_value.len() + value_len_size)
-                .saturating_sub(old_value.len() + old_value_len_size);
+                .saturating_sub(old_value_len + old_value_len_size);
 
             let page_data = self.storage.page(page_no)?;
             let leaf = LeafNode::from_page(page_data)?;

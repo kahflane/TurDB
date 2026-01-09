@@ -284,6 +284,22 @@ impl<'a> LeafNode<'a> {
         Ok(&self.data[value_data_start..value_data_start + value_len as usize])
     }
 
+    pub fn value_len_at(&self, index: usize) -> Result<usize> {
+        let slot = self.slot_at(index)?;
+        let cell_offset = slot.offset() as usize;
+        let key_len = slot.key_len() as usize;
+        let value_start = cell_offset + key_len;
+
+        ensure!(
+            value_start < PAGE_SIZE,
+            "value_len offset beyond page: {}",
+            value_start
+        );
+
+        let (value_len, _) = decode_varint(&self.data[value_start..])?;
+        Ok(value_len as usize)
+    }
+
     pub fn find_key(&self, key: &[u8]) -> SearchResult {
         super::simd_scan::find_key_simd(self.data, key, self.cell_count() as usize)
     }
@@ -673,7 +689,7 @@ impl<'a> LeafNodeMut<'a> {
 #[cfg(test)]
 mod reproduction_test {
     use super::*;
-    use crate::storage::{PageHeader, PageType, PAGE_SIZE};
+    use crate::storage::PAGE_SIZE;
 
     #[test]
     fn test_many_keys_insertion() -> Result<()> {

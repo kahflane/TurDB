@@ -536,7 +536,6 @@ impl Database {
             .map(|idx| {
                 let col_indices: Vec<usize> = idx
                     .columns()
-                    .iter()
                     .filter_map(|col_name| columns.iter().position(|c| c.name() == col_name))
                     .collect();
                 (idx.name().to_string(), col_indices)

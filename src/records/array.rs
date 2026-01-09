@@ -116,16 +116,7 @@ impl<'a> ArrayView<'a> {
     }
 
     pub fn elem_type(&self) -> DataType {
-        // SAFETY: DataType is a #[repr(u8)] enum. The byte at data[4] is the element
-        // type field written by ArrayBuilder, which only writes valid DataType
-        // discriminants. ArrayView::new() validates the array header format, ensuring
-        // the data came from a valid ArrayBuilder serialization. Transmuting an invalid
-        // byte would be UB, so this relies on the invariant that:
-        // 1. ArrayBuilder only writes valid discriminant values
-        // 2. ArrayView is only created from data produced by ArrayBuilder
-        // 3. The underlying storage is not corrupted
-        // TODO: Consider using TryFrom<u8> for defense-in-depth against corruption
-        unsafe { std::mem::transmute(self.data[4]) }
+        DataType::try_from(self.data[4]).expect("corrupted array: invalid type byte")
     }
 
     #[allow(dead_code)]

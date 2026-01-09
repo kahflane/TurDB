@@ -74,19 +74,14 @@ pub enum IndexType {
     Hnsw,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ReferentialAction {
     Cascade,
     Restrict,
+    #[default]
     NoAction,
     SetNull,
     SetDefault,
-}
-
-impl Default for ReferentialAction {
-    fn default() -> Self {
-        ReferentialAction::NoAction
-    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -278,11 +273,8 @@ impl IndexDef {
         &self.name
     }
 
-    pub fn columns(&self) -> Vec<String> {
-        self.column_defs
-            .iter()
-            .filter_map(|cd| cd.as_column().map(|s| s.to_string()))
-            .collect()
+    pub fn columns(&self) -> impl Iterator<Item = &str> + '_ {
+        self.column_defs.iter().filter_map(|cd| cd.as_column())
     }
 
     pub fn column_defs(&self) -> &[IndexColumnDef] {
