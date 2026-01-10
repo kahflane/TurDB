@@ -51,11 +51,10 @@
 
 use crate::database::{Database, ExecuteResult};
 use crate::schema::ColumnDef as SchemaColumnDef;
-use crate::storage::{TableFileHeader, DEFAULT_SCHEMA};
+use crate::storage::{IndexFileHeader, TableFileHeader, DEFAULT_SCHEMA};
 use crate::types::{create_record_schema, OwnedValue};
 use bumpalo::Bump;
 use eyre::{bail, Result, WrapErr};
-use smallvec::SmallVec;
 
 impl Database {
     pub(crate) fn execute_create_table(
@@ -353,8 +352,8 @@ impl Database {
     ) -> Result<ExecuteResult> {
         use crate::btree::BTree;
         use crate::records::RecordView;
-        use crate::schema::IndexColumnDef;
-        use crate::sql::ast::Expr;
+        use crate::schema::{IndexColumnDef, SortDirection};
+        use crate::sql::ast::{Expr, OrderDirection};
 
         self.ensure_catalog()?;
         self.ensure_file_manager()?;
@@ -367,11 +366,16 @@ impl Database {
             .columns
             .iter()
             .map(|c| {
-                if let Expr::Column(ref col) = c.expr {
-                    IndexColumnDef::Column(col.column.to_string())
+                let direction = match c.direction {
+                    Some(OrderDirection::Desc) => SortDirection::Desc,
+                    Some(OrderDirection::Asc) | None => SortDirection::Asc,
+                };
+                let base = if let Expr::Column(ref col) = c.expr {
+                    IndexColumnDef::column(col.column.to_string())
                 } else {
-                    IndexColumnDef::Expression(Self::format_expr(c.expr))
-                }
+                    IndexColumnDef::expression(Self::format_expr(c.expr))
+                };
+                base.with_direction(direction)
             })
             .collect();
         let key_column_count = column_defs.len() as u32;
@@ -444,16 +448,29 @@ impl Database {
         }
 
         if can_populate {
-            let root_page = 1u32;
+            let index_root_page = 1u32;
+            let is_unique = create.unique;
 
-            let index_entries: Vec<(SmallVec<[u8; 64]>, u64)> = {
-                let table_storage_arc = file_manager.table_data_mut(schema_name, table_name)?;
-                let mut table_storage = table_storage_arc.write();
-                let table_btree = BTree::new(&mut *table_storage, root_page)?;
-                let mut cursor = table_btree.cursor_first()?;
+            let table_storage_arc = file_manager.table_data_mut(schema_name, table_name)?;
+            let index_storage_arc =
+                file_manager.index_data_mut(schema_name, table_name, index_name)?;
 
-                let mut entries = Vec::new();
-                let mut key_buf: SmallVec<[u8; 64]> = SmallVec::new();
+            {
+                let table_storage = table_storage_arc.read();
+                let mut index_storage = index_storage_arc.write();
+
+                let table_root_page = {
+                    let page = table_storage.page(0)?;
+                    let header = TableFileHeader::from_bytes(page)?;
+                    header.root_page()
+                };
+
+                let table_reader =
+                    crate::btree::BTreeReader::new(&*table_storage, table_root_page)?;
+
+                let mut key_buffer: Vec<u8> = Vec::new();
+                let mut entries: Vec<(u32, u16, [u8; 8])> = Vec::new();
+                let mut cursor = table_reader.cursor_first()?;
 
                 if cursor.valid() {
                     loop {
@@ -469,7 +486,7 @@ impl Database {
 
                         let record = RecordView::new(user_data, &schema)?;
 
-                        key_buf.clear();
+                        let key_start = key_buffer.len() as u32;
                         let mut all_non_null = true;
                         for &col_idx in &index_col_indices {
                             let col_def = &columns[col_idx];
@@ -480,13 +497,19 @@ impl Database {
                             )?;
                             if value.is_null() {
                                 all_non_null = false;
+                                key_buffer.truncate(key_start as usize);
                                 break;
                             }
-                            Self::encode_value_as_key(&value, &mut key_buf);
+                            Self::encode_value_as_key(&value, &mut key_buffer);
                         }
 
                         if all_non_null {
-                            entries.push((key_buf.clone(), row_id));
+                            let row_id_bytes = row_id.to_be_bytes();
+                            if !is_unique {
+                                key_buffer.extend_from_slice(&row_id_bytes);
+                            }
+                            let key_len = (key_buffer.len() as u32 - key_start) as u16;
+                            entries.push((key_start, key_len, row_id_bytes));
                         }
 
                         if !cursor.advance()? {
@@ -494,19 +517,30 @@ impl Database {
                         }
                     }
                 }
-                entries
-            };
 
-            for (mut key_buf, row_id) in index_entries {
-                let row_id_bytes = row_id.to_be_bytes();
-                if !create.unique {
-                    key_buf.extend_from_slice(&row_id_bytes);
+                drop(table_storage);
+
+                entries.sort_unstable_by(|a, b| {
+                    let key_a = &key_buffer[a.0 as usize..(a.0 as usize + a.1 as usize)];
+                    let key_b = &key_buffer[b.0 as usize..(b.0 as usize + b.1 as usize)];
+                    key_a.cmp(key_b)
+                });
+
+                let mut index_btree = BTree::new(&mut *index_storage, index_root_page)?;
+
+                for (offset, len, row_id_bytes) in &entries {
+                    let key = &key_buffer[*offset as usize..(*offset as usize + *len as usize)];
+                    index_btree.insert_append(key, row_id_bytes)?;
                 }
-                let index_storage_arc =
-                    file_manager.index_data_mut(schema_name, table_name, index_name)?;
-                let mut index_storage = index_storage_arc.write();
-                let mut index_btree = BTree::new(&mut *index_storage, root_page)?;
-                index_btree.insert(&key_buf, &row_id_bytes)?;
+
+                let final_root = index_btree.root_page();
+                if final_root != index_root_page {
+                    let page = index_storage.page_mut(0)?;
+                    let header = IndexFileHeader::from_bytes_mut(page)?;
+                    header.set_root_page(final_root);
+                }
+
+                index_storage.sync()?;
             }
         }
 
@@ -947,21 +981,51 @@ impl Database {
         drop_stmt: &crate::sql::ast::DropStmt<'_>,
     ) -> Result<ExecuteResult> {
         self.ensure_catalog()?;
+        self.ensure_file_manager()?;
 
-        let mut catalog_guard = self.shared.catalog.write();
-        let catalog = catalog_guard.as_mut().unwrap();
+        let mut indexes_to_drop: Vec<(String, String, String)> = Vec::new();
 
-        for index_ref in drop_stmt.names.iter() {
-            let index_name = index_ref.name;
+        {
+            let catalog_guard = self.shared.catalog.read();
+            let catalog = catalog_guard.as_ref().unwrap();
 
-            if catalog.find_index(index_name).is_some() {
-                catalog.remove_index(index_name)?;
-            } else if !drop_stmt.if_exists {
-                bail!("index '{}' not found", index_name);
+            for index_ref in drop_stmt.names.iter() {
+                let index_name = index_ref.name;
+
+                if let Some((schema_name, table_name, _)) = catalog.find_index(index_name) {
+                    indexes_to_drop.push((
+                        schema_name.to_string(),
+                        table_name.to_string(),
+                        index_name.to_string(),
+                    ));
+                } else if !drop_stmt.if_exists {
+                    bail!("index '{}' not found", index_name);
+                }
             }
         }
 
-        drop(catalog_guard);
+        if indexes_to_drop.is_empty() {
+            return Ok(ExecuteResult::DropIndex { dropped: false });
+        }
+
+        {
+            let mut catalog_guard = self.shared.catalog.write();
+            let catalog = catalog_guard.as_mut().unwrap();
+
+            for (_, _, index_name) in &indexes_to_drop {
+                catalog.remove_index(index_name)?;
+            }
+        }
+
+        {
+            let mut file_manager_guard = self.shared.file_manager.write();
+            let file_manager = file_manager_guard.as_mut().unwrap();
+
+            for (schema_name, table_name, index_name) in &indexes_to_drop {
+                file_manager.drop_index(schema_name, table_name, index_name)?;
+            }
+        }
+
         self.save_catalog()?;
 
         Ok(ExecuteResult::DropIndex { dropped: true })

@@ -929,6 +929,7 @@ impl Database {
                 PhysicalOperator::ProjectExec(project) => find_plan_source(project.input),
                 PhysicalOperator::LimitExec(limit) => find_plan_source(limit.input),
                 PhysicalOperator::SortExec(sort) => find_plan_source(sort.input),
+                PhysicalOperator::TopKExec(topk) => find_plan_source(topk.input),
                 PhysicalOperator::HashAggregate(agg) => find_plan_source(agg.input),
                 PhysicalOperator::SortedAggregate(agg) => find_plan_source(agg.input),
                 PhysicalOperator::WindowExec(window) => find_plan_source(window.input),
@@ -1512,7 +1513,12 @@ impl Database {
                         })?;
                     let index_storage = index_storage_arc.read();
 
-                    let root_page = 1u32;
+                    let root_page = {
+                        use crate::storage::IndexFileHeader;
+                        let page = index_storage.page(0)?;
+                        let header = IndexFileHeader::from_bytes(page)?;
+                        header.root_page()
+                    };
                     let index_reader = BTreeReader::new(&index_storage, root_page)?;
 
                     let mut keys = Vec::new();
@@ -1578,10 +1584,17 @@ impl Database {
                             }
                         }
                         Some(ScanRange::FullScan) | None => {
+                            let scan_limit = scan.limit;
                             if scan.reverse {
                                 let mut cursor = index_reader.cursor_last()?;
                                 if cursor.valid() {
                                     loop {
+                                        if let Some(limit) = scan_limit {
+                                            if keys.len() >= limit {
+                                                break;
+                                            }
+                                        }
+
                                         let index_key = cursor.key()?;
                                         let row_id_bytes = if scan.is_unique_index {
                                             cursor.value()?
@@ -1603,6 +1616,12 @@ impl Database {
                                 let mut cursor = index_reader.cursor_first()?;
                                 if cursor.valid() {
                                     loop {
+                                        if let Some(limit) = scan_limit {
+                                            if keys.len() >= limit {
+                                                break;
+                                            }
+                                        }
+
                                         let index_key = cursor.key()?;
                                         let row_id_bytes = if scan.is_unique_index {
                                             cursor.value()?
@@ -1640,7 +1659,12 @@ impl Database {
                         })?;
                     let table_storage = table_storage_arc.read();
 
-                    let root_page = 1u32;
+                    let root_page = {
+                        use crate::storage::TableFileHeader;
+                        let page = table_storage.page(0)?;
+                        let header = TableFileHeader::from_bytes(page)?;
+                        header.root_page()
+                    };
                     let table_reader = BTreeReader::new(&table_storage, root_page)?;
 
                     for row_key in &row_keys {
@@ -3454,8 +3478,60 @@ impl Database {
             Statement::Truncate(truncate) => self.execute_truncate(truncate),
             Statement::AlterTable(alter) => self.execute_alter_table(alter),
             Statement::Set(set) => self.execute_set(set),
+            Statement::Explain(explain) => self.execute_explain(explain, arena),
             _ => bail!("unsupported statement type"),
         }
+    }
+
+    fn execute_explain(
+        &self,
+        explain: &crate::sql::ast::ExplainStmt<'_>,
+        arena: &Bump,
+    ) -> Result<ExecuteResult> {
+        self.ensure_catalog()?;
+
+        let catalog_guard = self.shared.catalog.read();
+        let catalog = catalog_guard.as_ref().unwrap();
+        let planner = Planner::new(catalog, arena);
+        let physical_plan = planner
+            .create_physical_plan(explain.statement)
+            .wrap_err("failed to create query plan for EXPLAIN")?;
+
+        let mut plan_text = physical_plan.explain();
+
+        if explain.verbose {
+            if let crate::sql::ast::Statement::Select(select) = explain.statement {
+                if let Some(from_clause) = select.from {
+                    let table_name = match from_clause {
+                        crate::sql::ast::FromClause::Table(table_ref) => Some(table_ref.name),
+                        _ => None,
+                    };
+                    if let Some(table_name) = table_name {
+                        if let Ok(table_def) = catalog.resolve_table(table_name) {
+                            plan_text.push_str("\nTable Info:\n");
+                            plan_text.push_str(&format!("  Table: {}\n", table_name));
+                            plan_text.push_str("  Indexes:\n");
+                            for idx in table_def.indexes() {
+                                let cols: Vec<_> = idx.columns().collect();
+                                plan_text.push_str(&format!(
+                                    "    - {} (columns: {:?}, unique: {}, partial: {}, expressions: {})\n",
+                                    idx.name(),
+                                    cols,
+                                    idx.is_unique(),
+                                    idx.is_partial(),
+                                    idx.has_expressions()
+                                ));
+                            }
+                            if table_def.indexes().is_empty() {
+                                plan_text.push_str("    (no indexes)\n");
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(ExecuteResult::Explain { plan: plan_text })
     }
 
     fn execute_set(&self, set: &crate::sql::ast::SetStmt<'_>) -> Result<ExecuteResult> {

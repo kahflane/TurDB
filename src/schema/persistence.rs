@@ -295,6 +295,8 @@ impl CatalogPersistence {
     }
 
     fn serialize_index(index: &IndexDef, buf: &mut Vec<u8>) -> Result<()> {
+        use crate::schema::SortDirection;
+
         let name_bytes = index.name().as_bytes();
         ensure!(
             name_bytes.len() <= u16::MAX as usize,
@@ -305,14 +307,19 @@ impl CatalogPersistence {
         buf.extend((name_bytes.len() as u16).to_le_bytes());
         buf.extend(name_bytes);
 
-        let columns: Vec<&str> = index.columns().collect();
-        let column_count = columns.len() as u16;
+        let column_defs = index.column_defs();
+        let column_count = column_defs.len() as u16;
         buf.extend(column_count.to_le_bytes());
 
-        for col_name in columns {
+        for col_def in column_defs {
+            let col_name = col_def.as_column().unwrap_or("");
             let col_bytes = col_name.as_bytes();
             buf.extend((col_bytes.len() as u16).to_le_bytes());
             buf.extend(col_bytes);
+            buf.push(match col_def.direction {
+                SortDirection::Asc => 0,
+                SortDirection::Desc => 1,
+            });
         }
 
         buf.push(if index.is_unique() { 1 } else { 0 });
@@ -722,6 +729,8 @@ impl CatalogPersistence {
     }
 
     fn deserialize_index(bytes: &[u8], mut pos: usize) -> Result<(IndexDef, usize)> {
+        use crate::schema::{IndexColumnDef, SortDirection};
+
         ensure!(
             pos + 2 <= bytes.len(),
             "unexpected end of data reading index name length"
@@ -745,7 +754,7 @@ impl CatalogPersistence {
         let column_count = u16::from_le_bytes([bytes[pos], bytes[pos + 1]]) as usize;
         pos += 2;
 
-        let mut columns = Vec::new();
+        let mut column_defs = Vec::new();
         for _ in 0..column_count {
             ensure!(
                 pos + 2 <= bytes.len(),
@@ -763,7 +772,18 @@ impl CatalogPersistence {
                 .to_string();
             pos += col_name_len;
 
-            columns.push(col_name);
+            ensure!(
+                pos < bytes.len(),
+                "unexpected end of data reading index column direction"
+            );
+            let direction = match bytes[pos] {
+                0 => SortDirection::Asc,
+                1 => SortDirection::Desc,
+                _ => SortDirection::Asc,
+            };
+            pos += 1;
+
+            column_defs.push(IndexColumnDef::column(col_name).with_direction(direction));
         }
 
         ensure!(
@@ -784,7 +804,10 @@ impl CatalogPersistence {
         };
         pos += 1;
 
-        Ok((IndexDef::new(name, columns, is_unique, index_type), pos))
+        Ok((
+            IndexDef::new_expression(name, column_defs, is_unique, index_type),
+            pos,
+        ))
     }
 
     pub fn save(catalog: &Catalog, path: &Path) -> Result<()> {

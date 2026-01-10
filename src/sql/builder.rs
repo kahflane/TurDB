@@ -7,7 +7,7 @@ use crate::sql::executor::{
 use crate::sql::predicate::CompiledPredicate;
 use crate::sql::state::{
     GraceHashJoinState, HashAggregateState, IndexScanState, LimitState, NestedLoopJoinState,
-    SortState, WindowState,
+    SortState, TopKState, WindowState,
 };
 
 pub struct ExecutorBuilder<'a> {
@@ -297,6 +297,36 @@ impl<'a> ExecutorBuilder<'a> {
                     rows: Vec::new(),
                     iter_idx: 0,
                     sorted: false,
+                }))
+            }
+            PhysicalOperator::TopKExec(topk) => {
+                let input_column_map = self.compute_input_column_map(topk.input);
+                let child = self.build_operator(topk.input, source, column_map)?;
+                let sort_keys: Vec<SortKey<'a>> = topk
+                    .order_by
+                    .iter()
+                    .map(|key| {
+                        if let crate::sql::ast::Expr::Column(col) = key.expr {
+                            if let Some((_, idx)) = input_column_map
+                                .iter()
+                                .find(|(n, _)| n.eq_ignore_ascii_case(col.column))
+                            {
+                                return SortKey::column(*idx, key.ascending);
+                            }
+                        }
+                        SortKey::expression(key.expr, input_column_map.clone(), key.ascending)
+                    })
+                    .collect();
+                Ok(DynamicExecutor::TopK(TopKState {
+                    child: Box::new(child),
+                    sort_keys,
+                    arena: self.ctx.arena,
+                    limit: topk.limit,
+                    offset: topk.offset.unwrap_or(0),
+                    heap: Vec::new(),
+                    result: Vec::new(),
+                    iter_idx: 0,
+                    computed: false,
                 }))
             }
             PhysicalOperator::IndexScan(_) => Ok(DynamicExecutor::TableScan(
@@ -590,6 +620,7 @@ impl<'a> ExecutorBuilder<'a> {
             }
             PhysicalOperator::SortExec(sort) => self.find_window_functions_in_input(sort.input),
             PhysicalOperator::LimitExec(limit) => self.find_window_functions_in_input(limit.input),
+            PhysicalOperator::TopKExec(topk) => self.find_window_functions_in_input(topk.input),
             _ => &[],
         }
     }
@@ -614,6 +645,9 @@ impl<'a> ExecutorBuilder<'a> {
             }
             PhysicalOperator::LimitExec(limit) => {
                 self.count_base_columns_before_window(limit.input, default)
+            }
+            PhysicalOperator::TopKExec(topk) => {
+                self.count_base_columns_before_window(topk.input, default)
             }
             _ => default,
         }
@@ -656,6 +690,7 @@ impl<'a> ExecutorBuilder<'a> {
             PhysicalOperator::FilterExec(filter) => self.get_aggregate_info(filter.input),
             PhysicalOperator::SortExec(sort) => self.get_aggregate_info(sort.input),
             PhysicalOperator::LimitExec(limit) => self.get_aggregate_info(limit.input),
+            PhysicalOperator::TopKExec(topk) => self.get_aggregate_info(topk.input),
             _ => None,
         }
     }
@@ -730,6 +765,7 @@ impl<'a> ExecutorBuilder<'a> {
             PhysicalOperator::FilterExec(filter) => self.compute_input_column_map(filter.input),
             PhysicalOperator::SortExec(sort) => self.compute_input_column_map(sort.input),
             PhysicalOperator::LimitExec(limit) => self.compute_input_column_map(limit.input),
+            PhysicalOperator::TopKExec(topk) => self.compute_input_column_map(topk.input),
             PhysicalOperator::ProjectExec(project) => project
                 .expressions
                 .iter()

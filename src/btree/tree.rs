@@ -304,19 +304,25 @@ impl<'a> BTreeReader<'a> {
         use crate::btree::leaf::SearchResult;
 
         let mut current_page = self.root_page;
-
         loop {
+
             let page_data = self.storage.page(current_page)?;
             let header = PageHeader::from_bytes(page_data)?;
 
             match header.page_type() {
                 PageType::BTreeLeaf => {
                     let leaf = LeafNode::from_page(page_data)?;
-                    match leaf.find_key(key) {
+                    let result = leaf.find_key(key);
+                    match result {
                         SearchResult::Found(idx) => {
                             return Ok(Some(leaf.value_at(idx)?));
                         }
-                        SearchResult::NotFound(_) => {
+                        SearchResult::NotFound(_idx) => {
+                            let next_leaf = leaf.next_leaf();
+                            if next_leaf != 0 {
+                                current_page = next_leaf;
+                                continue;
+                            }
                             return Ok(None);
                         }
                     }

@@ -78,7 +78,7 @@ use crate::sql::predicate::CompiledPredicate;
 use crate::sql::partition_spiller::PartitionSpiller;
 use crate::sql::state::{
     AggregateState, GraceHashJoinState, HashAggregateState, IndexScanState, LimitState,
-    NestedLoopJoinState, SortState, WindowState,
+    NestedLoopJoinState, SortState, TopKState, WindowState,
 };
 use crate::sql::util::{
     allocate_value_to_arena, clone_value_owned, clone_value_ref_to_arena, compare_values_for_sort,
@@ -1772,6 +1772,7 @@ pub enum DynamicExecutor<'a, S: RowSource> {
     ),
     Limit(LimitState<'a, S>),
     Sort(SortState<'a, S>),
+    TopK(TopKState<'a, S>),
     NestedLoopJoin(NestedLoopJoinState<'a, S>),
     GraceHashJoin(GraceHashJoinState<'a, S>),
     HashAggregate(HashAggregateState<'a, S>),
@@ -1799,6 +1800,13 @@ impl<'a, S: RowSource> Executor<'a> for DynamicExecutor<'a, S> {
                 state.rows.clear();
                 state.iter_idx = 0;
                 state.sorted = false;
+                state.child.open()
+            }
+            DynamicExecutor::TopK(state) => {
+                state.heap.clear();
+                state.result.clear();
+                state.iter_idx = 0;
+                state.computed = false;
                 state.child.open()
             }
             DynamicExecutor::NestedLoopJoin(state) => {
@@ -2056,6 +2064,151 @@ impl<'a, S: RowSource> Executor<'a> for DynamicExecutor<'a, S> {
 
                 if state.iter_idx < state.rows.len() {
                     let values = &state.rows[state.iter_idx];
+                    state.iter_idx += 1;
+                    let arena_values: Vec<Value<'a>> = values
+                        .iter()
+                        .map(|v| clone_value_ref_to_arena(v, state.arena))
+                        .collect();
+                    let allocated = state.arena.alloc_slice_fill_iter(arena_values);
+                    return Ok(Some(ExecutorRow::new(allocated)));
+                }
+                Ok(None)
+            }
+            DynamicExecutor::TopK(state) => {
+                if !state.computed {
+                    let heap_size = (state.limit + state.offset) as usize;
+                    let sort_keys = &state.sort_keys;
+
+                    while let Some(row) = state.child.next()? {
+                        let owned: Vec<Value<'static>> =
+                            row.values.iter().map(clone_value_owned).collect();
+
+                        if state.heap.len() < heap_size {
+                            state.heap.push(owned);
+                            if state.heap.len() == heap_size {
+                                state.heap.sort_by(|a, b| {
+                                    for key in sort_keys.iter() {
+                                        let a_val = get_sort_value_for_key(a, key);
+                                        let b_val = get_sort_value_for_key(b, key);
+                                        let cmp = compare_values_for_sort(&a_val, &b_val);
+                                        if cmp != std::cmp::Ordering::Equal {
+                                            return if key.ascending {
+                                                cmp.reverse()
+                                            } else {
+                                                cmp
+                                            };
+                                        }
+                                    }
+                                    std::cmp::Ordering::Equal
+                                });
+                            }
+                        } else {
+                            let boundary = &state.heap[0];
+                            let should_replace = {
+                                let mut result = std::cmp::Ordering::Equal;
+                                for key in sort_keys.iter() {
+                                    let new_val = get_sort_value_for_key(&owned, key);
+                                    let bound_val = get_sort_value_for_key(boundary, key);
+                                    let cmp = compare_values_for_sort(&new_val, &bound_val);
+                                    if cmp != std::cmp::Ordering::Equal {
+                                        result = if key.ascending { cmp } else { cmp.reverse() };
+                                        break;
+                                    }
+                                }
+                                result == std::cmp::Ordering::Less
+                            };
+
+                            if should_replace {
+                                state.heap[0] = owned;
+                                let heap_len = state.heap.len();
+                                let mut i = 0;
+                                loop {
+                                    let left = 2 * i + 1;
+                                    let right = 2 * i + 2;
+                                    let mut largest = i;
+
+                                    if left < heap_len {
+                                        let cmp = {
+                                            let mut result = std::cmp::Ordering::Equal;
+                                            for key in sort_keys.iter() {
+                                                let l_val =
+                                                    get_sort_value_for_key(&state.heap[left], key);
+                                                let lg_val =
+                                                    get_sort_value_for_key(&state.heap[largest], key);
+                                                let c = compare_values_for_sort(&l_val, &lg_val);
+                                                if c != std::cmp::Ordering::Equal {
+                                                    result = if key.ascending {
+                                                        c.reverse()
+                                                    } else {
+                                                        c
+                                                    };
+                                                    break;
+                                                }
+                                            }
+                                            result
+                                        };
+                                        if cmp == std::cmp::Ordering::Greater {
+                                            largest = left;
+                                        }
+                                    }
+
+                                    if right < heap_len {
+                                        let cmp = {
+                                            let mut result = std::cmp::Ordering::Equal;
+                                            for key in sort_keys.iter() {
+                                                let r_val =
+                                                    get_sort_value_for_key(&state.heap[right], key);
+                                                let lg_val =
+                                                    get_sort_value_for_key(&state.heap[largest], key);
+                                                let c = compare_values_for_sort(&r_val, &lg_val);
+                                                if c != std::cmp::Ordering::Equal {
+                                                    result = if key.ascending {
+                                                        c.reverse()
+                                                    } else {
+                                                        c
+                                                    };
+                                                    break;
+                                                }
+                                            }
+                                            result
+                                        };
+                                        if cmp == std::cmp::Ordering::Greater {
+                                            largest = right;
+                                        }
+                                    }
+
+                                    if largest == i {
+                                        break;
+                                    }
+                                    state.heap.swap(i, largest);
+                                    i = largest;
+                                }
+                            }
+                        }
+                    }
+
+                    state.heap.sort_by(|a, b| {
+                        for key in sort_keys.iter() {
+                            let a_val = get_sort_value_for_key(a, key);
+                            let b_val = get_sort_value_for_key(b, key);
+                            let cmp = compare_values_for_sort(&a_val, &b_val);
+                            if cmp != std::cmp::Ordering::Equal {
+                                return if key.ascending { cmp } else { cmp.reverse() };
+                            }
+                        }
+                        std::cmp::Ordering::Equal
+                    });
+
+                    let offset = state.offset as usize;
+                    let limit = state.limit as usize;
+                    let start = offset.min(state.heap.len());
+                    let end = (offset + limit).min(state.heap.len());
+                    state.result = state.heap.drain(start..end).collect();
+                    state.computed = true;
+                }
+
+                if state.iter_idx < state.result.len() {
+                    let values = &state.result[state.iter_idx];
                     state.iter_idx += 1;
                     let arena_values: Vec<Value<'a>> = values
                         .iter()
@@ -2483,6 +2636,7 @@ impl<'a, S: RowSource> Executor<'a> for DynamicExecutor<'a, S> {
             DynamicExecutor::ProjectExpr(child, _, _) => child.close(),
             DynamicExecutor::Limit(state) => state.child.close(),
             DynamicExecutor::Sort(state) => state.child.close(),
+            DynamicExecutor::TopK(state) => state.child.close(),
             DynamicExecutor::NestedLoopJoin(state) => state.left.close(),
             DynamicExecutor::GraceHashJoin(state) => {
                 if let Some(ref mut spiller) = state.left_spiller {

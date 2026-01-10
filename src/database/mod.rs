@@ -169,6 +169,9 @@ pub enum ExecuteResult {
     AlterTable {
         action: String,
     },
+    Explain {
+        plan: String,
+    },
 }
 
 #[derive(Debug, Clone)]

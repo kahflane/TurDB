@@ -191,33 +191,76 @@ impl ColumnDef {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SortDirection {
+    #[default]
+    Asc,
+    Desc,
+}
+
 #[derive(Debug, Clone, PartialEq)]
-pub enum IndexColumnDef {
+pub struct IndexColumnDef {
+    pub column_or_expr: IndexColumnKind,
+    pub direction: SortDirection,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum IndexColumnKind {
     Column(String),
     Expression(String),
 }
 
 impl IndexColumnDef {
+    pub fn column(name: impl Into<String>) -> Self {
+        Self {
+            column_or_expr: IndexColumnKind::Column(name.into()),
+            direction: SortDirection::Asc,
+        }
+    }
+
+    pub fn column_desc(name: impl Into<String>) -> Self {
+        Self {
+            column_or_expr: IndexColumnKind::Column(name.into()),
+            direction: SortDirection::Desc,
+        }
+    }
+
+    pub fn expression(expr: impl Into<String>) -> Self {
+        Self {
+            column_or_expr: IndexColumnKind::Expression(expr.into()),
+            direction: SortDirection::Asc,
+        }
+    }
+
+    pub fn with_direction(mut self, direction: SortDirection) -> Self {
+        self.direction = direction;
+        self
+    }
+
     pub fn is_column(&self) -> bool {
-        matches!(self, IndexColumnDef::Column(_))
+        matches!(self.column_or_expr, IndexColumnKind::Column(_))
     }
 
     pub fn is_expression(&self) -> bool {
-        matches!(self, IndexColumnDef::Expression(_))
+        matches!(self.column_or_expr, IndexColumnKind::Expression(_))
     }
 
     pub fn as_column(&self) -> Option<&str> {
-        match self {
-            IndexColumnDef::Column(c) => Some(c),
-            IndexColumnDef::Expression(_) => None,
+        match &self.column_or_expr {
+            IndexColumnKind::Column(c) => Some(c),
+            IndexColumnKind::Expression(_) => None,
         }
     }
 
     pub fn as_expression(&self) -> Option<&str> {
-        match self {
-            IndexColumnDef::Column(_) => None,
-            IndexColumnDef::Expression(e) => Some(e),
+        match &self.column_or_expr {
+            IndexColumnKind::Column(_) => None,
+            IndexColumnKind::Expression(e) => Some(e),
         }
+    }
+
+    pub fn is_desc(&self) -> bool {
+        self.direction == SortDirection::Desc
     }
 }
 
@@ -241,7 +284,7 @@ impl IndexDef {
             name: name.into(),
             column_defs: columns
                 .into_iter()
-                .map(|c| IndexColumnDef::Column(c.into()))
+                .map(|c| IndexColumnDef::column(c.into()))
                 .collect(),
             is_unique,
             index_type,

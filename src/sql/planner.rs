@@ -372,6 +372,7 @@ pub enum PhysicalOperator<'a> {
     SortedAggregate(PhysicalSortedAggregate<'a>),
     SortExec(PhysicalSortExec<'a>),
     LimitExec(PhysicalLimitExec<'a>),
+    TopKExec(PhysicalTopKExec<'a>),
     SubqueryExec(PhysicalSubqueryExec<'a>),
     SetOpExec(PhysicalSetOpExec<'a>),
     WindowExec(PhysicalWindowExec<'a>),
@@ -426,6 +427,7 @@ pub struct PhysicalSecondaryIndexScan<'a> {
     pub reverse: bool,
     pub is_unique_index: bool,
     pub key_range: Option<ScanRange<'a>>,
+    pub limit: Option<usize>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -502,6 +504,14 @@ pub struct PhysicalLimitExec<'a> {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub struct PhysicalTopKExec<'a> {
+    pub input: &'a PhysicalOperator<'a>,
+    pub order_by: &'a [SortKey<'a>],
+    pub limit: u64,
+    pub offset: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct PhysicalSubqueryExec<'a> {
     pub child_plan: &'a PhysicalOperator<'a>,
     pub alias: &'a str,
@@ -518,6 +528,105 @@ pub struct PhysicalWindowExec<'a> {
 pub struct PhysicalPlan<'a> {
     pub root: &'a PhysicalOperator<'a>,
     pub output_schema: OutputSchema<'a>,
+}
+
+impl<'a> PhysicalPlan<'a> {
+    pub fn explain(&self) -> String {
+        let mut output = String::new();
+        self.format_operator(self.root, 0, &mut output);
+        output
+    }
+
+    fn format_operator(&self, op: &PhysicalOperator<'a>, indent: usize, output: &mut String) {
+        use std::fmt::Write;
+        let prefix = "  ".repeat(indent);
+
+        match op {
+            PhysicalOperator::TableScan(scan) => {
+                let _ = writeln!(
+                    output,
+                    "{}-> TableScan on {} (reverse={})",
+                    prefix, scan.table, scan.reverse
+                );
+            }
+            PhysicalOperator::DualScan => {
+                let _ = writeln!(output, "{}-> DualScan", prefix);
+            }
+            PhysicalOperator::IndexScan(scan) => {
+                let _ = writeln!(
+                    output,
+                    "{}-> IndexScan on {} using {}",
+                    prefix, scan.table, scan.index_name
+                );
+            }
+            PhysicalOperator::SecondaryIndexScan(scan) => {
+                let _ = writeln!(
+                    output,
+                    "{}-> SecondaryIndexScan on {} using {} (reverse={}, limit={:?})",
+                    prefix, scan.table, scan.index_name, scan.reverse, scan.limit
+                );
+            }
+            PhysicalOperator::FilterExec(filter) => {
+                let _ = writeln!(output, "{}-> Filter", prefix);
+                self.format_operator(filter.input, indent + 1, output);
+            }
+            PhysicalOperator::ProjectExec(proj) => {
+                let _ = writeln!(output, "{}-> Project", prefix);
+                self.format_operator(proj.input, indent + 1, output);
+            }
+            PhysicalOperator::NestedLoopJoin(join) => {
+                let _ = writeln!(output, "{}-> NestedLoopJoin ({:?})", prefix, join.join_type);
+                self.format_operator(join.left, indent + 1, output);
+                self.format_operator(join.right, indent + 1, output);
+            }
+            PhysicalOperator::GraceHashJoin(join) => {
+                let _ = writeln!(output, "{}-> GraceHashJoin ({:?})", prefix, join.join_type);
+                self.format_operator(join.left, indent + 1, output);
+                self.format_operator(join.right, indent + 1, output);
+            }
+            PhysicalOperator::HashAggregate(agg) => {
+                let _ = writeln!(output, "{}-> HashAggregate", prefix);
+                self.format_operator(agg.input, indent + 1, output);
+            }
+            PhysicalOperator::SortedAggregate(agg) => {
+                let _ = writeln!(output, "{}-> SortedAggregate", prefix);
+                self.format_operator(agg.input, indent + 1, output);
+            }
+            PhysicalOperator::SortExec(sort) => {
+                let _ = writeln!(output, "{}-> Sort", prefix);
+                self.format_operator(sort.input, indent + 1, output);
+            }
+            PhysicalOperator::LimitExec(limit) => {
+                let _ = writeln!(
+                    output,
+                    "{}-> Limit (limit={:?}, offset={:?})",
+                    prefix, limit.limit, limit.offset
+                );
+                self.format_operator(limit.input, indent + 1, output);
+            }
+            PhysicalOperator::TopKExec(topk) => {
+                let _ = writeln!(
+                    output,
+                    "{}-> TopK (limit={}, offset={:?})",
+                    prefix, topk.limit, topk.offset
+                );
+                self.format_operator(topk.input, indent + 1, output);
+            }
+            PhysicalOperator::SubqueryExec(subq) => {
+                let _ = writeln!(output, "{}-> Subquery (alias={:?})", prefix, subq.alias);
+                self.format_operator(subq.child_plan, indent + 1, output);
+            }
+            PhysicalOperator::SetOpExec(set_op) => {
+                let _ = writeln!(output, "{}-> SetOp ({:?})", prefix, set_op.kind);
+                self.format_operator(set_op.left, indent + 1, output);
+                self.format_operator(set_op.right, indent + 1, output);
+            }
+            PhysicalOperator::WindowExec(window) => {
+                let _ = writeln!(output, "{}-> Window", prefix);
+                self.format_operator(window.input, indent + 1, output);
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1670,6 +1779,7 @@ impl<'a> Planner<'a> {
             PhysicalOperator::FilterExec(filter) => self.compute_output_schema(filter.input),
             PhysicalOperator::LimitExec(limit) => self.compute_output_schema(limit.input),
             PhysicalOperator::SortExec(sort) => self.compute_output_schema(sort.input),
+            PhysicalOperator::TopKExec(topk) => self.compute_output_schema(topk.input),
             PhysicalOperator::ProjectExec(project) => {
                 let input_schema = self.compute_output_schema(project.input)?;
 
@@ -2145,6 +2255,38 @@ impl<'a> Planner<'a> {
                 Ok(physical)
             }
             LogicalOperator::Limit(limit) => {
+                if let Some(limit_val) = limit.limit {
+                    if let LogicalOperator::Sort(sort) = limit.input {
+                        let effective_limit = (limit_val + limit.offset.unwrap_or(0)) as usize;
+                        if let Some(optimized) =
+                            self.try_optimize_sort_to_index_scan_with_limit(sort, Some(effective_limit))
+                        {
+                            if limit.offset.unwrap_or(0) > 0 {
+                                let physical = self
+                                    .arena
+                                    .alloc(PhysicalOperator::LimitExec(PhysicalLimitExec {
+                                        input: optimized,
+                                        limit: Some(limit_val),
+                                        offset: limit.offset,
+                                    }));
+                                return Ok(physical);
+                            }
+                            return Ok(optimized);
+                        }
+
+                        let sort_input = self.logical_to_physical(sort.input)?;
+                        let physical = self
+                            .arena
+                            .alloc(PhysicalOperator::TopKExec(PhysicalTopKExec {
+                                input: sort_input,
+                                order_by: sort.order_by,
+                                limit: limit_val,
+                                offset: limit.offset,
+                            }));
+                        return Ok(physical);
+                    }
+                }
+
                 let input = self.logical_to_physical(limit.input)?;
                 let physical = self
                     .arena
@@ -2326,6 +2468,7 @@ impl<'a> Planner<'a> {
                 reverse: false,
                 is_unique_index: matching_index.is_unique(),
                 key_range: Some(ScanRange::PrefixScan { prefix: key_bytes }),
+                limit: None,
             },
         ));
 
@@ -2377,6 +2520,14 @@ impl<'a> Planner<'a> {
     fn try_optimize_sort_to_index_scan(
         &self,
         sort: &LogicalSort<'a>,
+    ) -> Option<&'a PhysicalOperator<'a>> {
+        self.try_optimize_sort_to_index_scan_with_limit(sort, None)
+    }
+
+    fn try_optimize_sort_to_index_scan_with_limit(
+        &self,
+        sort: &LogicalSort<'a>,
+        limit: Option<usize>,
     ) -> Option<&'a PhysicalOperator<'a>> {
         if sort.order_by.len() != 1 {
             return None;
@@ -2473,6 +2624,7 @@ impl<'a> Planner<'a> {
                     reverse,
                     is_unique_index: idx.is_unique(),
                     key_range: None,
+                    limit,
                 },
             ));
 

@@ -25,6 +25,18 @@ pub struct SortState<'a, S: RowSource> {
     pub sorted: bool,
 }
 
+pub struct TopKState<'a, S: RowSource> {
+    pub child: Box<DynamicExecutor<'a, S>>,
+    pub sort_keys: Vec<SortKey<'a>>,
+    pub arena: &'a Bump,
+    pub limit: u64,
+    pub offset: u64,
+    pub heap: Vec<Vec<Value<'static>>>,
+    pub result: Vec<Vec<Value<'static>>>,
+    pub iter_idx: usize,
+    pub computed: bool,
+}
+
 pub struct HashAggregateState<'a, S: RowSource> {
     pub child: Box<DynamicExecutor<'a, S>>,
     pub group_by: Vec<usize>,

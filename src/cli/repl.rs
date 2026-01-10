@@ -351,6 +351,9 @@ impl Repl {
             ExecuteResult::Set { name, value } => {
                 println!("{} = {} ({})", name, value, format_duration(elapsed));
             }
+            ExecuteResult::Explain { plan } => {
+                println!("Query Plan:\n{}", plan);
+            }
         }
     }
 

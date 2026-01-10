@@ -254,6 +254,13 @@ impl<K: Clone + Eq + std::hash::Hash, V> LruFileCache<K, V> {
         self.map.is_empty()
     }
 
+    pub fn remove(&mut self, key: &K) -> Option<V> {
+        if let Some(pos) = self.order.iter().position(|k| k == key) {
+            self.order.remove(pos);
+        }
+        self.map.remove(key)
+    }
+
     fn touch(&mut self, key: &K) {
         if let Some(pos) = self.order.iter().position(|k| k == key) {
             let k = self.order.remove(pos);
@@ -561,6 +568,29 @@ impl FileManager {
     pub fn index_exists(&self, schema: &str, table: &str, index_name: &str) -> bool {
         let index_path = self.index_file_path(schema, table, index_name);
         index_path.exists()
+    }
+
+    pub fn drop_index(&mut self, schema: &str, table: &str, index_name: &str) -> Result<()> {
+        let index_path = self.index_file_path(schema, table, index_name);
+
+        if !index_path.exists() {
+            return Ok(());
+        }
+
+        let key = FileKey::Index {
+            schema: schema.to_string(),
+            table: table.to_string(),
+            index_name: index_name.to_string(),
+        };
+        if let Some(lock) = self.open_files.remove(&key) {
+            drop(lock);
+        }
+
+        fs::remove_file(&index_path).wrap_err_with(|| {
+            format!("failed to remove index file '{}'", index_path.display())
+        })?;
+
+        Ok(())
     }
 
     pub fn table_data(&mut self, schema: &str, table: &str) -> Result<Arc<RwLock<MmapStorage>>> {

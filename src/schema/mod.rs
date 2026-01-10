@@ -100,7 +100,8 @@ pub mod table;
 
 pub use catalog::Catalog;
 pub use table::{
-    ColumnDef, Constraint, IndexColumnDef, IndexDef, IndexType, ReferentialAction, TableDef,
+    ColumnDef, Constraint, IndexColumnDef, IndexColumnKind, IndexDef, IndexType,
+    ReferentialAction, SortDirection, TableDef,
 };
 
 pub type SchemaId = u32;
