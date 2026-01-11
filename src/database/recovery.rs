@@ -89,15 +89,8 @@ pub const FRAME_SIZE: usize = WAL_FRAME_HEADER_SIZE + PAGE_SIZE;
 #[derive(Debug, Clone)]
 pub struct RecoveryCostEstimate {
     pub frame_count: u32,
-    pub segment_count: u32,
     pub estimated_bytes: usize,
     pub wal_size_bytes: u64,
-}
-
-impl RecoveryCostEstimate {
-    pub fn is_empty(&self) -> bool {
-        self.frame_count == 0
-    }
 }
 
 impl Database {
@@ -241,7 +234,7 @@ impl Database {
                     format!("failed to open storage {:?} for WAL recovery", path)
                 })?;
 
-                storages.insert(table_id as u64, (path.clone(), storage));
+                storages.insert(table_id, (path.clone(), storage));
             }
         }
 
@@ -320,7 +313,6 @@ impl Database {
         if max_segment == 0 {
             return Ok(RecoveryCostEstimate {
                 frame_count: 0,
-                segment_count: 0,
                 estimated_bytes: 0,
                 wal_size_bytes: 0,
             });
@@ -339,7 +331,6 @@ impl Database {
 
         Ok(RecoveryCostEstimate {
             frame_count: estimated_frames as u32,
-            segment_count: max_segment as u32,
             estimated_bytes: estimated_frames as usize * 200,
             wal_size_bytes: total_size,
         })

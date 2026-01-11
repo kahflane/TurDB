@@ -371,8 +371,8 @@ impl Database {
 
             let table_count = catalog
                 .schemas()
-                .iter()
-                .map(|(_, schema)| schema.tables().len())
+                .values()
+                .map(|schema| schema.tables().len())
                 .sum::<usize>();
             let estimated_schema_memory = table_count * 1024;
             let _ = self
@@ -2177,6 +2177,7 @@ impl Database {
                         })
                         .collect();
 
+                    #[allow(clippy::type_complexity)]
                     let mut groups: HashMap<Vec<u64>, (Vec<OwnedValue>, Vec<(i64, f64)>)> =
                         HashMap::new();
 

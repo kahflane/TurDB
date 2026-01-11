@@ -705,7 +705,7 @@ mod tests {
         let test_rows: Vec<SmallVec<[Value<'static>; 16]>> = vec![
             smallvec::smallvec![Value::Null],
             smallvec::smallvec![Value::Int(-12345)],
-            smallvec::smallvec![Value::Float(3.14159)],
+            smallvec::smallvec![Value::Float(2.5)],
             smallvec::smallvec![Value::Text(Cow::Owned("hello world".to_string()))],
             smallvec::smallvec![Value::Blob(Cow::Owned(vec![1, 2, 3, 4, 5]))],
             smallvec::smallvec![Value::Uuid([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16])],

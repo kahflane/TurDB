@@ -203,6 +203,7 @@ impl Database {
             }
         }
 
+        #[allow(clippy::type_complexity)]
         let child_table_schemas: Vec<(
             String,
             String,

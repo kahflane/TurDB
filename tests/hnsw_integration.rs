@@ -271,7 +271,7 @@ mod hnsw_dml_integration_tests {
 
         assert_eq!(rows.len(), 3);
         if let OwnedValue::Int(id) = rows[0].values[0] {
-            assert!(id >= 8 && id <= 12, "Nearest should be around id=10, got {}", id);
+            assert!((8..=12).contains(&id), "Nearest should be around id=10, got {}", id);
         }
     }
 }

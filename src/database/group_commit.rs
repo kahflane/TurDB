@@ -32,6 +32,9 @@ use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
+/// Payload type for dirty pages: (table_id, page_id, data, db_size)
+pub type CommitPayload = SmallVec<[(u32, u32, Vec<u8>, u32); 4]>;
+
 /// Configuration for group commit behavior
 #[derive(Debug, Clone, Copy)]
 pub struct GroupCommitConfig {
@@ -79,7 +82,7 @@ pub struct PendingCommit {
     /// Unique batch ID for this commit
     pub batch_id: u64,
     /// Buffered dirty pages: (table_id, page_id, data)
-    pub payload: SmallVec<[(u32, u32, Vec<u8>, u32); 4]>,
+    pub payload: CommitPayload,
     /// Completion flag - set to true when WAL flush completes
     pub completed: AtomicBool,
     /// Error message if commit failed (empty string means success)
@@ -87,7 +90,7 @@ pub struct PendingCommit {
 }
 
 impl PendingCommit {
-    pub fn new(batch_id: u64, payload: SmallVec<[(u32, u32, Vec<u8>, u32); 4]>) -> Self {
+    pub fn new(batch_id: u64, payload: CommitPayload) -> Self {
         Self {
             batch_id,
             payload,
@@ -229,7 +232,7 @@ impl GroupCommitQueue {
     /// Returns the batch ID this commit was part of, or an error message
     pub fn submit_and_wait(
         &self,
-        payload: SmallVec<[(u32, u32, Vec<u8>, u32); 4]>,
+        payload: CommitPayload,
     ) -> Result<u64, String> {
         if !self.is_enabled() || payload.is_empty() {
             return Ok(0);
@@ -263,7 +266,7 @@ impl GroupCommitQueue {
     /// Submit a commit request without waiting (for async usage)
     pub fn submit_async(
         &self,
-        payload: SmallVec<[(u32, u32, Vec<u8>, u32); 4]>,
+        payload: CommitPayload,
     ) -> std::sync::Arc<PendingCommit> {
         let mut state = self.state.lock();
         let batch_id = state.next_batch_id;

@@ -164,12 +164,12 @@ pub unsafe fn simd_prefix_search_avx2(
         }
 
         let mut prefixes = [0i32; 8];
-        for i in 0..8 {
+        for (i, prefix) in prefixes.iter_mut().enumerate() {
             let slot_offset = LEAF_CONTENT_START + (batch_start + i) * SLOT_SIZE;
             let prefix_bytes: [u8; 4] = page_data[slot_offset..slot_offset + 4]
                 .try_into()
                 .unwrap_or([0; 4]);
-            prefixes[i] = u32::from_be_bytes(prefix_bytes) as i32;
+            *prefix = u32::from_be_bytes(prefix_bytes) as i32;
         }
 
         let batch = _mm256_loadu_si256(prefixes.as_ptr() as *const __m256i);
@@ -512,7 +512,8 @@ impl<'a> BatchSlotIterator<'a> {
 }
 
 impl<'a> Iterator for BatchSlotIterator<'a> {
-    type Item = (u32, u16, u16); // (prefix, offset, key_len)
+    // Item format: (prefix, offset, key_len)
+    type Item = (u32, u16, u16);
 
     fn next(&mut self) -> Option<Self::Item> {
         let result = self.current();
@@ -674,13 +675,15 @@ mod tests {
         // Setup: Indices 0..120 exist. Key at 120 is 240.
         // We want to insert 242.
 
-        let limit = 121; // include 240
+        // limit = 121 includes key 240
+        let limit = 121;
         let keys_slice = &keys[0..limit];
         let keys_refs: Vec<&[u8]> = keys_slice.iter().map(|k| k.as_slice()).collect();
 
         let page = create_test_page_with_keys(&keys_refs);
 
-        let target_key = &keys[limit]; // 242
+        // target_key = keys[121] = 242
+        let target_key = &keys[limit];
         println!("Target Key: {:?}", target_key);
 
         let result = find_key_simd(&page, target_key, keys_refs.len());
@@ -809,6 +812,7 @@ mod tests {
         let page = create_test_page_with_keys(&keys);
 
         let target_prefix_mid = 0x80000000u32;
+        // SAFETY: AVX2 is verified by test cfg, page is valid test data, keys.len() is in bounds
         let (left, right, _) =
             unsafe { simd_prefix_search_avx2(&page, target_prefix_mid, keys.len()) };
 

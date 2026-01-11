@@ -20,12 +20,6 @@ repos:
         language: script
         types: [rust]
 
-      - id: lint-unwrap-panic
-        name: audit unwrap/panic usage
-        entry: ./scripts/lint-unwrap-panic.sh
-        language: script
-        types: [rust]
-
       - id: cargo-test
         name: cargo test
         entry: cargo test

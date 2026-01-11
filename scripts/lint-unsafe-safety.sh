@@ -59,7 +59,7 @@ check_file() {
     local prev_lines=()
 
     while IFS= read -r line || [[ -n "$line" ]]; do
-        ((line_num++))
+        ((line_num++)) || true
 
         if [[ "$line" =~ ^[[:space:]]*unsafe[[:space:]]*\{ ]] || \
            [[ "$line" =~ ^[[:space:]]*unsafe[[:space:]]*impl ]] || \
@@ -68,7 +68,8 @@ check_file() {
 
             local has_safety=false
             for prev in "${prev_lines[@]}"; do
-                if [[ "$prev" =~ SAFETY:|Safety: ]]; then
+                # Match both regular comments (// SAFETY:) and doc comments (/// # Safety)
+                if [[ "$prev" =~ SAFETY:|Safety:|'# Safety' ]]; then
                     has_safety=true
                     break
                 fi
@@ -79,7 +80,7 @@ check_file() {
             fi
         fi
 
-        prev_lines=("${prev_lines[@]:(-10)}" "$line")
+        prev_lines+=("$line")
         if [[ ${#prev_lines[@]} -gt 10 ]]; then
             prev_lines=("${prev_lines[@]:1}")
         fi
@@ -116,9 +117,9 @@ main() {
         [[ -z "$file" ]] && continue
         [[ ! -f "$file" ]] && continue
 
-        ((checked++))
+        ((checked++)) || true
         if ! check_file "$file"; then
-            ((failed++))
+            ((failed++)) || true
         fi
     done <<< "$files"
 

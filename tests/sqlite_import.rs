@@ -51,6 +51,7 @@ fn sqlite_db_exists() -> bool {
     Path::new(SQLITE_DB_PATH).exists()
 }
 
+#[allow(dead_code)]
 struct MemorySnapshot {
     timestamp: Duration,
     // Budget tracking (internal pools)
@@ -679,18 +680,10 @@ impl TableImportStats {
     }
 }
 
+#[derive(Default)]
 struct ImportTableOptions<'a> {
     checkpoint_threshold: Option<u32>,
     memory_watcher: Option<&'a MemoryWatcher>,
-}
-
-impl Default for ImportTableOptions<'_> {
-    fn default() -> Self {
-        Self {
-            checkpoint_threshold: None,
-            memory_watcher: None,
-        }
-    }
 }
 
 fn import_table_with_options(
@@ -804,7 +797,7 @@ fn import_table_with_options(
                 }
 
                 // Commit every 10 batches to allow memory tracking to update
-                if batch_count % 10 == 0 {
+                if batch_count.is_multiple_of(10) {
                     turdb.execute("COMMIT")?;
 
                     // Update WAL frame count for memory watcher

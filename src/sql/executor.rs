@@ -1774,7 +1774,7 @@ pub enum DynamicExecutor<'a, S: RowSource> {
     Sort(SortState<'a, S>),
     TopK(TopKState<'a, S>),
     NestedLoopJoin(NestedLoopJoinState<'a, S>),
-    GraceHashJoin(GraceHashJoinState<'a, S>),
+    GraceHashJoin(Box<GraceHashJoinState<'a, S>>),
     HashSemiJoin(HashSemiJoinState<'a, S>),
     HashAntiJoin(HashAntiJoinState<'a, S>),
     HashAggregate(HashAggregateState<'a, S>),
@@ -2659,7 +2659,8 @@ impl<'a, S: RowSource> Executor<'a> for DynamicExecutor<'a, S> {
                         .map(|v| clone_value_ref_to_arena(v, state.arena))
                         .collect();
 
-                    const MAX_EXACT_INT: f64 = 9007199254740992.0; // 2^53
+                    // 2^53 - maximum exactly representable integer in f64
+                    const MAX_EXACT_INT: f64 = 9007199254740992.0;
 
                     for (idx, &wval) in window_vals.iter().enumerate() {
                         if wval.is_nan() {

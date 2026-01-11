@@ -597,7 +597,7 @@ mod tests {
         let row = vec![
             Value::Int(123),
             Value::Text(Cow::Owned("hello".to_string())),
-            Value::Float(3.14),
+            Value::Float(2.72),
             Value::Null,
             Value::Blob(Cow::Owned(vec![1, 2, 3, 4])),
         ];
@@ -615,7 +615,7 @@ mod tests {
             Value::Text(s) => assert_eq!(s.as_ref(), "hello"),
             _ => panic!("expected Text"),
         }
-        assert_eq!(out[2], Value::Float(3.14));
+        assert_eq!(out[2], Value::Float(2.72));
         assert_eq!(out[3], Value::Null);
         match &out[4] {
             Value::Blob(b) => assert_eq!(b.as_ref(), &[1, 2, 3, 4]),
@@ -655,7 +655,7 @@ mod tests {
 
     #[test]
     fn roundtrip_vector() {
-        let vec_data = vec![1.0f32, 2.5, -3.14, 0.0];
+        let vec_data = vec![1.0f32, 2.5, -2.72, 0.0];
         let row = vec![Value::Vector(Cow::Owned(vec_data.clone()))];
 
         let mut buf = Vec::new();
@@ -670,7 +670,7 @@ mod tests {
                 assert_eq!(v.len(), 4);
                 assert!((v[0] - 1.0).abs() < f32::EPSILON);
                 assert!((v[1] - 2.5).abs() < f32::EPSILON);
-                assert!((v[2] - (-3.14)).abs() < 0.001);
+                assert!((v[2] - (-2.72)).abs() < 0.001);
                 assert!((v[3] - 0.0).abs() < f32::EPSILON);
             }
             _ => panic!("expected Vector"),

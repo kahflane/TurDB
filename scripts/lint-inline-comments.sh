@@ -80,7 +80,7 @@ check_file() {
     fi
 
     while IFS= read -r line || [[ -n "$line" ]]; do
-        ((line_num++))
+        ((line_num++)) || true
 
         [[ -z "$line" ]] && continue
 
@@ -107,7 +107,7 @@ check_file() {
             [[ "$line" =~ https?:// ]] && continue
 
             [[ "$line" =~ //[[:space:]]*(SAFETY|Safety): ]] && continue
-            [[ "$line" =~ //[[:space:]]*(TODO|FIXME|HACK|XXX|NOTE|WARN): ]] && continue
+            [[ "$line" =~ //[[:space:]]*(TODO|FIXME|HACK|XXX|NOTE|WARN|INVARIANT): ]] && continue
 
             [[ "$line" =~ ///|//! ]] && continue
 
@@ -150,9 +150,9 @@ main() {
         [[ -z "$file" ]] && continue
         [[ ! -f "$file" ]] && continue
 
-        ((checked++))
+        ((checked++)) || true
         if ! check_file "$file"; then
-            ((failed++))
+            ((failed++)) || true
         fi
     done <<< "$files"
 

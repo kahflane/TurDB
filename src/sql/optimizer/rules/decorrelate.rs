@@ -364,6 +364,7 @@ impl SubqueryDecorrelationRule {
         }
     }
 
+    #[allow(clippy::wrong_self_convention)]
     fn from_clause_to_scan<'a>(
         &self,
         from: &'a FromClause<'a>,

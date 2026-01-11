@@ -273,8 +273,7 @@ fn test_pragma_wal_frame_count() {
     match result {
         turdb::ExecuteResult::Pragma { name, value } => {
             assert_eq!(name, "WAL_FRAME_COUNT");
-            let count: u32 = value.unwrap().parse().unwrap();
-            assert!(count >= 0);
+            let _count: u32 = value.unwrap().parse().unwrap();
         }
         _ => panic!("Expected Pragma result"),
     }
@@ -459,7 +458,7 @@ fn test_bulk_insert_with_auto_checkpoint() {
     let wal_entries: Vec<_> = std::fs::read_dir(&wal_dir)
         .unwrap()
         .filter_map(|e| e.ok())
-        .filter(|e| e.path().extension().map(|ext| ext == "").unwrap_or(false) == false)
+        .filter(|e| !e.path().extension().map(|ext| ext.is_empty()).unwrap_or(false))
         .collect();
 
     println!(
