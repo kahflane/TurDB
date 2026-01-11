@@ -83,6 +83,7 @@ pub mod constraints;
 pub mod database;
 pub mod encoding;
 pub mod hnsw;
+pub mod memory;
 pub mod mvcc;
 pub mod parsing;
 pub mod records;
@@ -90,9 +91,11 @@ pub mod schema;
 pub mod sql;
 pub mod storage;
 pub mod types;
-pub use database::{
-    BoundStatement, CheckpointInfo, Database, ExecuteResult, PreparedStatement, RecoveryInfo, Row,
-    get_timing_stats, reset_timing_stats, get_batch_timing_stats,
+pub use btree::{
+    get_fastpath_fail_stats, get_fastpath_stats, get_slowpath_stats, reset_fastpath_stats,
 };
-pub use btree::{get_fastpath_stats, reset_fastpath_stats, get_fastpath_fail_stats, get_slowpath_stats};
+pub use database::{
+    get_batch_timing_stats, get_timing_stats, reset_timing_stats, BoundStatement, CheckpointInfo,
+    Database, ExecuteResult, PreparedStatement, RecoveryInfo, Row,
+};
 pub use types::OwnedValue;

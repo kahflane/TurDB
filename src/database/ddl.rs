@@ -49,13 +49,13 @@
 //! This is done in batches (10,000 rows) to avoid holding locks too long.
 //! Related indexes are automatically dropped before the column is removed.
 
-use crate::database::{ExecuteResult, Database};
+use crate::database::{Database, ExecuteResult};
+use crate::memory::Pool;
 use crate::schema::ColumnDef as SchemaColumnDef;
-use crate::storage::{TableFileHeader, DEFAULT_SCHEMA};
+use crate::storage::{IndexFileHeader, TableFileHeader, DEFAULT_SCHEMA};
 use crate::types::{create_record_schema, OwnedValue};
 use bumpalo::Bump;
 use eyre::{bail, Result, WrapErr};
-use smallvec::SmallVec;
 
 impl Database {
     pub(crate) fn execute_create_table(
@@ -66,14 +66,11 @@ impl Database {
         self.ensure_catalog()?;
         self.ensure_file_manager()?;
 
-        let schema_name = create.schema.unwrap_or(DEFAULT_SCHEMA);
-        let table_name = create.name;
-
-        let mut file_manager_guard = self.shared.file_manager.write();
-        let file_manager = file_manager_guard.as_mut().unwrap();
-
         let mut catalog_guard = self.shared.catalog.write();
         let catalog = catalog_guard.as_mut().unwrap();
+
+        let schema_name = create.schema.unwrap_or(DEFAULT_SCHEMA);
+        let table_name = create.name;
 
         if catalog
             .get_schema(schema_name)
@@ -133,12 +130,15 @@ impl Database {
                         ColumnConstraint::References {
                             table,
                             column: ref_col,
-                            ..
+                            on_delete,
+                            on_update,
                         } => {
                             let fk_column = ref_col.unwrap_or(col.name);
                             column = column.with_constraint(SchemaConstraint::ForeignKey {
                                 table: table.to_string(),
                                 column: fk_column.to_string(),
+                                on_delete: Self::convert_referential_action(*on_delete),
+                                on_update: Self::convert_referential_action(*on_update),
                             });
                         }
                         ColumnConstraint::AutoIncrement => {
@@ -148,7 +148,10 @@ impl Database {
                     }
                 }
 
-                if matches!(col.data_type, SqlDataType::Serial | SqlDataType::BigSerial | SqlDataType::SmallSerial) {
+                if matches!(
+                    col.data_type,
+                    SqlDataType::Serial | SqlDataType::BigSerial | SqlDataType::SmallSerial
+                ) {
                     column = column.with_constraint(SchemaConstraint::AutoIncrement);
                     column = column.with_constraint(SchemaConstraint::NotNull);
                 }
@@ -161,11 +164,21 @@ impl Database {
         let table_id = self.allocate_table_id();
         catalog.create_table_with_id(schema_name, table_name, columns, table_id)?;
 
+        let estimated_table_memory = 1024 + (column_count as usize * 128);
+        let _ = self
+            .shared
+            .memory_budget
+            .allocate(Pool::Schema, estimated_table_memory);
+
+        drop(catalog_guard);
+
         self.shared.table_id_lookup.write().insert(
             table_id as u32,
             (schema_name.to_string(), table_name.to_string()),
         );
 
+        let mut file_manager_guard = self.shared.file_manager.write();
+        let file_manager = file_manager_guard.as_mut().unwrap();
         file_manager.create_table(schema_name, table_name, table_id, column_count)?;
 
         let storage_arc = file_manager.table_data_mut(schema_name, table_name)?;
@@ -173,11 +186,15 @@ impl Database {
         storage.grow(2)?;
         crate::btree::BTree::create(&mut *storage, 1)?;
 
-        let needs_toast = catalog
-            .get_schema(schema_name)
-            .and_then(|s| s.get_table(table_name))
-            .map(|t| t.columns().iter().any(|c| c.data_type().is_toastable()))
-            .unwrap_or(false);
+        let needs_toast = {
+            let catalog_guard = self.shared.catalog.read();
+            let catalog = catalog_guard.as_ref().unwrap();
+            catalog
+                .get_schema(schema_name)
+                .and_then(|s| s.get_table(table_name))
+                .map(|t| t.columns().iter().any(|c| c.data_type().is_toastable()))
+                .unwrap_or(false)
+        };
 
         if needs_toast {
             let toast_table_name = crate::storage::toast::toast_table_name(table_name);
@@ -194,6 +211,8 @@ impl Database {
                 (schema_name.to_string(), toast_table_name.clone()),
             );
 
+            let mut catalog_guard = self.shared.catalog.write();
+            let catalog = catalog_guard.as_mut().unwrap();
             if let Some(schema) = catalog.get_schema_mut(schema_name) {
                 if let Some(table) = schema.get_table(table_name) {
                     let mut table_clone = table.clone();
@@ -235,6 +254,8 @@ impl Database {
                 crate::schema::table::IndexType::BTree,
             );
 
+            let mut catalog_guard = self.shared.catalog.write();
+            let catalog = catalog_guard.as_mut().unwrap();
             if let Some(schema) = catalog.get_schema_mut(schema_name) {
                 if let Some(table) = schema.get_table(table_name) {
                     let table_with_index = table.clone().with_index(index_def);
@@ -243,9 +264,6 @@ impl Database {
                 }
             }
         }
-
-        drop(catalog_guard);
-        drop(file_manager_guard);
 
         self.save_catalog()?;
         self.save_meta()?;
@@ -341,8 +359,8 @@ impl Database {
     ) -> Result<ExecuteResult> {
         use crate::btree::BTree;
         use crate::records::RecordView;
-        use crate::schema::IndexColumnDef;
-        use crate::sql::ast::Expr;
+        use crate::schema::{IndexColumnDef, SortDirection};
+        use crate::sql::ast::{Expr, OrderDirection};
 
         self.ensure_catalog()?;
         self.ensure_file_manager()?;
@@ -355,11 +373,16 @@ impl Database {
             .columns
             .iter()
             .map(|c| {
-                if let Expr::Column(ref col) = c.expr {
-                    IndexColumnDef::Column(col.column.to_string())
+                let direction = match c.direction {
+                    Some(OrderDirection::Desc) => SortDirection::Desc,
+                    Some(OrderDirection::Asc) | None => SortDirection::Asc,
+                };
+                let base = if let Expr::Column(ref col) = c.expr {
+                    IndexColumnDef::column(col.column.to_string())
                 } else {
-                    IndexColumnDef::Expression(Self::format_expr(c.expr))
-                }
+                    IndexColumnDef::expression(Self::format_expr(c.expr))
+                };
+                base.with_direction(direction)
             })
             .collect();
         let key_column_count = column_defs.len() as u32;
@@ -424,23 +447,37 @@ impl Database {
         )?;
 
         {
-            let index_storage_arc = file_manager.index_data_mut(schema_name, table_name, index_name)?;
+            let index_storage_arc =
+                file_manager.index_data_mut(schema_name, table_name, index_name)?;
             let mut index_storage = index_storage_arc.write();
             index_storage.grow(2)?;
             BTree::create(&mut *index_storage, 1)?;
         }
 
         if can_populate {
-            let root_page = 1u32;
+            let index_root_page = 1u32;
+            let is_unique = create.unique;
 
-            let index_entries: Vec<(SmallVec<[u8; 64]>, u64)> = {
-                let table_storage_arc = file_manager.table_data_mut(schema_name, table_name)?;
-                let mut table_storage = table_storage_arc.write();
-                let table_btree = BTree::new(&mut *table_storage, root_page)?;
-                let mut cursor = table_btree.cursor_first()?;
+            let table_storage_arc = file_manager.table_data_mut(schema_name, table_name)?;
+            let index_storage_arc =
+                file_manager.index_data_mut(schema_name, table_name, index_name)?;
 
-                let mut entries = Vec::new();
-                let mut key_buf: SmallVec<[u8; 64]> = SmallVec::new();
+            {
+                let table_storage = table_storage_arc.read();
+                let mut index_storage = index_storage_arc.write();
+
+                let table_root_page = {
+                    let page = table_storage.page(0)?;
+                    let header = TableFileHeader::from_bytes(page)?;
+                    header.root_page()
+                };
+
+                let table_reader =
+                    crate::btree::BTreeReader::new(&*table_storage, table_root_page)?;
+
+                let mut key_buffer: Vec<u8> = Vec::new();
+                let mut entries: Vec<(u32, u16, [u8; 8])> = Vec::new();
+                let mut cursor = table_reader.cursor_first()?;
 
                 if cursor.valid() {
                     loop {
@@ -456,7 +493,7 @@ impl Database {
 
                         let record = RecordView::new(user_data, &schema)?;
 
-                        key_buf.clear();
+                        let key_start = key_buffer.len() as u32;
                         let mut all_non_null = true;
                         for &col_idx in &index_col_indices {
                             let col_def = &columns[col_idx];
@@ -467,13 +504,19 @@ impl Database {
                             )?;
                             if value.is_null() {
                                 all_non_null = false;
+                                key_buffer.truncate(key_start as usize);
                                 break;
                             }
-                            Self::encode_value_as_key(&value, &mut key_buf);
+                            Self::encode_value_as_key(&value, &mut key_buffer);
                         }
 
                         if all_non_null {
-                            entries.push((key_buf.clone(), row_id));
+                            let row_id_bytes = row_id.to_be_bytes();
+                            if !is_unique {
+                                key_buffer.extend_from_slice(&row_id_bytes);
+                            }
+                            let key_len = (key_buffer.len() as u32 - key_start) as u16;
+                            entries.push((key_start, key_len, row_id_bytes));
                         }
 
                         if !cursor.advance()? {
@@ -481,19 +524,30 @@ impl Database {
                         }
                     }
                 }
-                entries
-            };
 
-            for (mut key_buf, row_id) in index_entries {
-                let row_id_bytes = row_id.to_be_bytes();
-                if !create.unique {
-                    key_buf.extend_from_slice(&row_id_bytes);
+                drop(table_storage);
+
+                entries.sort_unstable_by(|a, b| {
+                    let key_a = &key_buffer[a.0 as usize..(a.0 as usize + a.1 as usize)];
+                    let key_b = &key_buffer[b.0 as usize..(b.0 as usize + b.1 as usize)];
+                    key_a.cmp(key_b)
+                });
+
+                let mut index_btree = BTree::new(&mut *index_storage, index_root_page)?;
+
+                for (offset, len, row_id_bytes) in &entries {
+                    let key = &key_buffer[*offset as usize..(*offset as usize + *len as usize)];
+                    index_btree.insert_append(key, row_id_bytes)?;
                 }
-                let index_storage_arc =
-                    file_manager.index_data_mut(schema_name, table_name, index_name)?;
-                let mut index_storage = index_storage_arc.write();
-                let mut index_btree = BTree::new(&mut *index_storage, root_page)?;
-                index_btree.insert(&key_buf, &row_id_bytes)?;
+
+                let final_root = index_btree.root_page();
+                if final_root != index_root_page {
+                    let page = index_storage.page_mut(0)?;
+                    let header = IndexFileHeader::from_bytes_mut(page)?;
+                    header.set_root_page(final_root);
+                }
+
+                index_storage.sync()?;
             }
         }
 
@@ -567,12 +621,17 @@ impl Database {
             let catalog_guard = self.shared.catalog.read();
             let catalog = catalog_guard.as_ref().unwrap();
             let table_def = catalog.resolve_table(table_name)?;
-            let indexes: Vec<String> = table_def.indexes().iter().map(|i| i.name().to_string()).collect();
+            let indexes: Vec<String> = table_def
+                .indexes()
+                .iter()
+                .map(|i| i.name().to_string())
+                .collect();
             drop(catalog_guard);
 
             for index_name in indexes {
                 if file_manager.index_exists(schema_name, table_name, &index_name) {
-                    let index_storage_arc = file_manager.index_data_mut(schema_name, table_name, &index_name)?;
+                    let index_storage_arc =
+                        file_manager.index_data_mut(schema_name, table_name, &index_name)?;
                     let mut index_storage = index_storage_arc.write();
                     let index_btree = BTree::new(&mut *index_storage, root_page)?;
                     let mut index_cursor = index_btree.cursor_first()?;
@@ -625,7 +684,11 @@ impl Database {
                         .get_schema_mut(schema_name)
                         .ok_or_else(|| eyre::eyre!("schema '{}' not found", schema_name))?;
                     if !schema.table_exists(table_name) {
-                        bail!("table '{}' not found in schema '{}'", table_name, schema_name);
+                        bail!(
+                            "table '{}' not found in schema '{}'",
+                            table_name,
+                            schema_name
+                        );
                     }
                     schema.rename_table(table_name, new_name);
                 }
@@ -639,7 +702,11 @@ impl Database {
                     .get_schema_mut(schema_name)
                     .ok_or_else(|| eyre::eyre!("schema '{}' not found", schema_name))?;
                 if !schema.table_exists(table_name) {
-                    bail!("table '{}' not found in schema '{}'", table_name, schema_name);
+                    bail!(
+                        "table '{}' not found in schema '{}'",
+                        table_name,
+                        schema_name
+                    );
                 }
                 let table = schema.get_table_mut(table_name).unwrap();
                 if !table.rename_column(old_name, new_name) {
@@ -654,7 +721,11 @@ impl Database {
                     .get_schema_mut(schema_name)
                     .ok_or_else(|| eyre::eyre!("schema '{}' not found", schema_name))?;
                 if !schema.table_exists(table_name) {
-                    bail!("table '{}' not found in schema '{}'", table_name, schema_name);
+                    bail!(
+                        "table '{}' not found in schema '{}'",
+                        table_name,
+                        schema_name
+                    );
                 }
                 let table = schema.get_table_mut(table_name).unwrap();
                 let column = Self::ast_column_to_schema_column(col_def)?;
@@ -662,15 +733,17 @@ impl Database {
                 table.add_column(column);
                 format!("added column '{}'", col_name)
             }
-            AlterTableAction::DropColumn { name, if_exists, .. } => {
-                self.migrate_table_drop_column(schema_name, table_name, name, *if_exists)?
-            }
+            AlterTableAction::DropColumn {
+                name, if_exists, ..
+            } => self.migrate_table_drop_column(schema_name, table_name, name, *if_exists)?,
             _ => bail!("ALTER TABLE action not yet supported"),
         };
 
         self.save_catalog()?;
 
-        Ok(ExecuteResult::AlterTable { action: action_desc })
+        Ok(ExecuteResult::AlterTable {
+            action: action_desc,
+        })
     }
 
     fn migrate_table_drop_column(
@@ -713,7 +786,6 @@ impl Database {
                 .iter()
                 .filter(|idx| {
                     idx.columns()
-                        .iter()
                         .any(|c| c.eq_ignore_ascii_case(column_name))
                 })
                 .map(|idx| idx.name().to_string())
@@ -916,21 +988,51 @@ impl Database {
         drop_stmt: &crate::sql::ast::DropStmt<'_>,
     ) -> Result<ExecuteResult> {
         self.ensure_catalog()?;
+        self.ensure_file_manager()?;
 
-        let mut catalog_guard = self.shared.catalog.write();
-        let catalog = catalog_guard.as_mut().unwrap();
+        let mut indexes_to_drop: Vec<(String, String, String)> = Vec::new();
 
-        for index_ref in drop_stmt.names.iter() {
-            let index_name = index_ref.name;
+        {
+            let catalog_guard = self.shared.catalog.read();
+            let catalog = catalog_guard.as_ref().unwrap();
 
-            if catalog.find_index(index_name).is_some() {
-                catalog.remove_index(index_name)?;
-            } else if !drop_stmt.if_exists {
-                bail!("index '{}' not found", index_name);
+            for index_ref in drop_stmt.names.iter() {
+                let index_name = index_ref.name;
+
+                if let Some((schema_name, table_name, _)) = catalog.find_index(index_name) {
+                    indexes_to_drop.push((
+                        schema_name.to_string(),
+                        table_name.to_string(),
+                        index_name.to_string(),
+                    ));
+                } else if !drop_stmt.if_exists {
+                    bail!("index '{}' not found", index_name);
+                }
             }
         }
 
-        drop(catalog_guard);
+        if indexes_to_drop.is_empty() {
+            return Ok(ExecuteResult::DropIndex { dropped: false });
+        }
+
+        {
+            let mut catalog_guard = self.shared.catalog.write();
+            let catalog = catalog_guard.as_mut().unwrap();
+
+            for (_, _, index_name) in &indexes_to_drop {
+                catalog.remove_index(index_name)?;
+            }
+        }
+
+        {
+            let mut file_manager_guard = self.shared.file_manager.write();
+            let file_manager = file_manager_guard.as_mut().unwrap();
+
+            for (schema_name, table_name, index_name) in &indexes_to_drop {
+                file_manager.drop_index(schema_name, table_name, index_name)?;
+            }
+        }
+
         self.save_catalog()?;
 
         Ok(ExecuteResult::DropIndex { dropped: true })

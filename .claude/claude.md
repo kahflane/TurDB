@@ -184,14 +184,37 @@ Regular Page (1+):          Page 0 (file header):
 +------------------+        +------------------+
 ```
 
-### 4. Memory Budget: 1MB Minimum
+### 4. Memory Budget: Hard Limits with Auto-Detection
 
-The database MUST be able to start and perform basic operations with only 1MB RAM but it can grow more if needed:
-- Page cache: 32 pages minimum (512KB)
-- Fixed overhead: Maximum 256KB
-- Working memory: Maximum 256KB
-- Lazy load all metadata
-- Stream large results instead of buffering
+TurDB uses a **hard memory budget** system suitable for embedded/IoT devices:
+
+**Default**: 25% of system RAM (minimum floor: 4MB)
+
+**Reserved Pool Allocation**:
+- Cache: 512 KB (guaranteed minimum for page cache)
+- Query: 256 KB (sort buffers, hash tables)
+- Recovery: 256 KB (WAL frame processing)
+- Schema: 128 KB (catalog metadata)
+- Shared: Remainder available for dynamic allocation
+
+**MemoryBudget API** (in `src/memory/budget.rs`):
+```rust
+let budget = MemoryBudget::auto_detect(); // 25% RAM, 4MB floor
+let budget = MemoryBudget::with_limit(16 * 1024 * 1024); // 16 MB
+
+budget.allocate(Pool::Cache, PAGE_SIZE)?; // Returns Err if exceeds
+budget.release(Pool::Cache, PAGE_SIZE);
+budget.can_allocate(Pool::Cache, bytes); // Check without committing
+```
+
+**PRAGMA Commands**:
+- `PRAGMA memory_budget` - Query total budget in bytes
+- `PRAGMA memory_stats` - Query per-pool usage
+- `PRAGMA wal_checkpoint` - Force checkpoint now
+- `PRAGMA wal_checkpoint_threshold` - Get/set auto-checkpoint frame count (default: 1000)
+- `PRAGMA wal_frame_count` - Query current WAL frame count
+
+**WAL Auto-Checkpoint**: Triggers at 1000 frames (~16MB) or on clean close
 
 ### 5. File-Per-Table Architecture (MySQL-Style)
 
@@ -1073,7 +1096,6 @@ fn test_1() { }  // Meaningless
 - Full CRUD cycles with real files (not mocks)
 - Crash recovery scenarios (kill process mid-operation)
 - Concurrent access patterns (multiple threads/processes)
-- Memory-constrained operation (1MB limit enforcement)
 
 ### Fuzz Testing
 

@@ -95,7 +95,14 @@ impl<'storage> MvccStreamingSource<'storage> {
         read_ts: TxnId,
         own_txn_id: TxnId,
     ) -> Result<Self> {
-        Self::from_btree_scan_with_projections(storage, root_page, column_types, None, read_ts, own_txn_id)
+        Self::from_btree_scan_with_projections(
+            storage,
+            root_page,
+            column_types,
+            None,
+            read_ts,
+            own_txn_id,
+        )
     }
 
     pub fn from_btree_scan_with_projections(
@@ -120,7 +127,13 @@ impl<'storage> MvccStreamingSource<'storage> {
             None => SimpleDecoder::new(column_types),
         };
 
-        Ok(Self::new(cursor, decoder, read_ts, own_txn_id, output_count))
+        Ok(Self::new(
+            cursor,
+            decoder,
+            read_ts,
+            own_txn_id,
+            output_count,
+        ))
     }
 
     fn is_visible(&self, raw_value: &[u8]) -> Result<bool> {
@@ -187,7 +200,8 @@ impl<'storage> RowSource for MvccStreamingSource<'storage> {
 
             let user_data = self.get_user_data(raw_value);
             self.row_buffer.clear();
-            self.decoder.decode_into(key, user_data, &mut self.row_buffer)?;
+            self.decoder
+                .decode_into(key, user_data, &mut self.row_buffer)?;
             return Ok(Some(std::mem::take(&mut self.row_buffer)));
         }
     }

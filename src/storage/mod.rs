@@ -96,9 +96,9 @@ mod wal_storage;
 
 pub use cache::{PageCache, PageKey, PageRef};
 pub use file_manager::{
-    FileKey, FileManager, LruFileCache, TableFiles, DEFAULT_MAX_OPEN_FILES, DEFAULT_SCHEMA,
-    HNSW_FILE_EXTENSION, HNSW_MAGIC, INDEX_FILE_EXTENSION, MIN_MAX_OPEN_FILES,
-    TABLE_FILE_EXTENSION, CATALOG_FILE_NAME
+    FileKey, FileManager, LruFileCache, TableFiles, CATALOG_FILE_NAME, DEFAULT_MAX_OPEN_FILES,
+    DEFAULT_SCHEMA, HNSW_FILE_EXTENSION, HNSW_MAGIC, INDEX_FILE_EXTENSION, MIN_MAX_OPEN_FILES,
+    TABLE_FILE_EXTENSION,
 };
 pub use freelist::{Freelist, TrunkHeader, TRUNK_HEADER_SIZE, TRUNK_MAX_ENTRIES};
 pub use headers::{
@@ -107,7 +107,7 @@ pub use headers::{
 };
 pub use mmap::MmapStorage;
 pub use page::{validate_page, PageHeader, PageType};
-pub use wal::{SyncMode, Wal, WalFrameHeader, WalSegment};
+pub use wal::{SyncMode, Wal, WalFrameHeader, WalSegment, WAL_FRAME_HEADER_SIZE, DEFAULT_CHECKPOINT_THRESHOLD};
 pub use wal_storage::{WalStorage, WalStoragePerTable};
 
 use eyre::{ensure, Result};
@@ -210,7 +210,6 @@ impl<S: Storage> Storage for parking_lot::RwLockWriteGuard<'_, S> {
         (**self).prefetch_pages(start_page, count)
     }
 }
-
 
 pub const PAGE_SIZE: usize = 16384;
 pub const PAGE_HEADER_SIZE: usize = 16;

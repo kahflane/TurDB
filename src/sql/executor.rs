@@ -75,9 +75,10 @@ use crate::sql::adapter::BTreeCursorAdapter;
 use crate::sql::ast::JoinType;
 use crate::sql::decoder::SimpleDecoder;
 use crate::sql::predicate::CompiledPredicate;
+use crate::sql::partition_spiller::PartitionSpiller;
 use crate::sql::state::{
-    AggregateState, GraceHashJoinState, HashAggregateState, IndexScanState, LimitState,
-    NestedLoopJoinState, SortState, WindowState,
+    AggregateState, GraceHashJoinState, HashAggregateState, HashAntiJoinState, HashSemiJoinState,
+    IndexScanState, LimitState, NestedLoopJoinState, SortState, TopKState, WindowState,
 };
 use crate::sql::util::{
     allocate_value_to_arena, clone_value_owned, clone_value_ref_to_arena, compare_values_for_sort,
@@ -89,6 +90,172 @@ use bumpalo::Bump;
 use eyre::Result;
 use smallvec::SmallVec;
 use std::borrow::Cow;
+
+fn get_sort_value_for_key<'a>(row: &[Value<'static>], key: &SortKey<'a>) -> Value<'static> {
+    match &key.key_type {
+        SortKeyType::Column(idx) => row.get(*idx).cloned().unwrap_or(Value::Null),
+        SortKeyType::Expression { expr, column_map } => {
+            eval_sort_expr_standalone(expr, row, column_map)
+        }
+    }
+}
+
+fn eval_sort_expr_standalone(
+    expr: &crate::sql::ast::Expr<'_>,
+    row: &[Value<'static>],
+    column_map: &[(String, usize)],
+) -> Value<'static> {
+    use crate::sql::ast::{Expr, Literal};
+
+    match expr {
+        Expr::Column(col_ref) => {
+            let lookup_name = if let Some(table) = col_ref.table {
+                format!("{}.{}", table, col_ref.column)
+            } else {
+                col_ref.column.to_string()
+            };
+            let col_idx = column_map
+                .iter()
+                .find(|(name, _)| name.eq_ignore_ascii_case(&lookup_name))
+                .or_else(|| {
+                    column_map
+                        .iter()
+                        .find(|(name, _)| name.eq_ignore_ascii_case(col_ref.column))
+                })
+                .map(|(_, idx)| *idx);
+            col_idx
+                .and_then(|idx| row.get(idx).cloned())
+                .unwrap_or(Value::Null)
+        }
+        Expr::Literal(lit) => match lit {
+            Literal::Integer(s) => s.parse::<i64>().map(Value::Int).unwrap_or(Value::Null),
+            Literal::Float(s) => s.parse::<f64>().map(Value::Float).unwrap_or(Value::Null),
+            Literal::String(s) => Value::Text(Cow::Owned(s.to_string())),
+            Literal::Null => Value::Null,
+            Literal::Boolean(b) => Value::Int(if *b { 1 } else { 0 }),
+            Literal::HexNumber(s) => i64::from_str_radix(s.trim_start_matches("0x").trim_start_matches("0X"), 16)
+                .map(Value::Int)
+                .unwrap_or(Value::Null),
+            Literal::BinaryNumber(s) => i64::from_str_radix(s.trim_start_matches("0b").trim_start_matches("0B"), 2)
+                .map(Value::Int)
+                .unwrap_or(Value::Null),
+        },
+        Expr::BinaryOp { left, op, right } => {
+            let left_val = eval_sort_expr_standalone(left, row, column_map);
+            let right_val = eval_sort_expr_standalone(right, row, column_map);
+            eval_binary_op_standalone(&left_val, op, &right_val)
+        }
+        Expr::Array(elements) => {
+            let vals: Vec<f32> = elements
+                .iter()
+                .filter_map(|e| {
+                    let v = eval_sort_expr_standalone(e, row, column_map);
+                    match v {
+                        Value::Float(f) => Some(f as f32),
+                        Value::Int(i) => Some(i as f32),
+                        _ => None,
+                    }
+                })
+                .collect();
+            Value::Vector(Cow::Owned(vals))
+        }
+        _ => Value::Null,
+    }
+}
+
+fn eval_binary_op_standalone(
+    left: &Value<'static>,
+    op: &crate::sql::ast::BinaryOperator,
+    right: &Value<'static>,
+) -> Value<'static> {
+    use crate::sql::ast::BinaryOperator;
+
+    match op {
+        BinaryOperator::VectorL2Distance => {
+            let left_vec = value_to_vec_standalone(left);
+            let right_vec = value_to_vec_standalone(right);
+            if let (Some(l), Some(r)) = (left_vec, right_vec) {
+                if l.len() == r.len() {
+                    let dist: f64 = l
+                        .iter()
+                        .zip(r.iter())
+                        .map(|(a, b)| ((a - b) as f64).powi(2))
+                        .sum::<f64>()
+                        .sqrt();
+                    return Value::Float(dist);
+                }
+            }
+            Value::Null
+        }
+        BinaryOperator::VectorCosineDistance => {
+            let left_vec = value_to_vec_standalone(left);
+            let right_vec = value_to_vec_standalone(right);
+            if let (Some(l), Some(r)) = (left_vec, right_vec) {
+                if l.len() == r.len() {
+                    let dot: f64 = l
+                        .iter()
+                        .zip(r.iter())
+                        .map(|(a, b)| (*a as f64) * (*b as f64))
+                        .sum();
+                    let mag_l: f64 = l.iter().map(|x| (*x as f64).powi(2)).sum::<f64>().sqrt();
+                    let mag_r: f64 = r.iter().map(|x| (*x as f64).powi(2)).sum::<f64>().sqrt();
+                    if mag_l > 0.0 && mag_r > 0.0 {
+                        let cosine = dot / (mag_l * mag_r);
+                        return Value::Float(1.0 - cosine);
+                    }
+                }
+            }
+            Value::Null
+        }
+        BinaryOperator::Plus => match (left, right) {
+            (Value::Int(a), Value::Int(b)) => Value::Int(a + b),
+            (Value::Float(a), Value::Float(b)) => Value::Float(a + b),
+            (Value::Int(a), Value::Float(b)) => Value::Float(*a as f64 + b),
+            (Value::Float(a), Value::Int(b)) => Value::Float(a + *b as f64),
+            _ => Value::Null,
+        },
+        BinaryOperator::Minus => match (left, right) {
+            (Value::Int(a), Value::Int(b)) => Value::Int(a - b),
+            (Value::Float(a), Value::Float(b)) => Value::Float(a - b),
+            (Value::Int(a), Value::Float(b)) => Value::Float(*a as f64 - b),
+            (Value::Float(a), Value::Int(b)) => Value::Float(a - *b as f64),
+            _ => Value::Null,
+        },
+        BinaryOperator::Multiply => match (left, right) {
+            (Value::Int(a), Value::Int(b)) => Value::Int(a * b),
+            (Value::Float(a), Value::Float(b)) => Value::Float(a * b),
+            (Value::Int(a), Value::Float(b)) => Value::Float(*a as f64 * b),
+            (Value::Float(a), Value::Int(b)) => Value::Float(a * *b as f64),
+            _ => Value::Null,
+        },
+        BinaryOperator::Divide => match (left, right) {
+            (Value::Int(a), Value::Int(b)) if *b != 0 => Value::Int(a / b),
+            (Value::Float(a), Value::Float(b)) if *b != 0.0 => Value::Float(a / b),
+            (Value::Int(a), Value::Float(b)) if *b != 0.0 => Value::Float(*a as f64 / b),
+            (Value::Float(a), Value::Int(b)) if *b != 0 => Value::Float(a / *b as f64),
+            _ => Value::Null,
+        },
+        _ => Value::Null,
+    }
+}
+
+fn value_to_vec_standalone(val: &Value<'static>) -> Option<Vec<f32>> {
+    match val {
+        Value::Vector(v) => Some(v.to_vec()),
+        Value::Text(s) => {
+            let trimmed = s.trim();
+            if trimmed.starts_with('[') && trimmed.ends_with(']') {
+                let inner = &trimmed[1..trimmed.len() - 1];
+                let parsed: Result<Vec<f32>, _> =
+                    inner.split(',').map(|x| x.trim().parse::<f32>()).collect();
+                parsed.ok()
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
 
 pub struct ExecutorRow<'a> {
     pub values: &'a [Value<'a>],
@@ -478,7 +645,8 @@ impl<'storage> RowSource for StreamingBTreeSource<'storage> {
             };
 
             self.row_buffer.clear();
-            self.decoder.decode_into(key, user_data, &mut self.row_buffer)?;
+            self.decoder
+                .decode_into(key, user_data, &mut self.row_buffer)?;
             return Ok(Some(std::mem::take(&mut self.row_buffer)));
         }
     }
@@ -571,7 +739,8 @@ impl<'storage> RowSource for ReverseBTreeSource<'storage> {
             };
 
             self.row_buffer.clear();
-            self.decoder.decode_into(key, user_data, &mut self.row_buffer)?;
+            self.decoder
+                .decode_into(key, user_data, &mut self.row_buffer)?;
             return Ok(Some(std::mem::take(&mut self.row_buffer)));
         }
     }
@@ -1292,9 +1461,38 @@ where
 }
 
 #[derive(Debug, Clone)]
-pub struct SortKey {
-    pub column: usize,
+pub enum SortKeyType<'a> {
+    Column(usize),
+    Expression {
+        expr: &'a crate::sql::ast::Expr<'a>,
+        column_map: Vec<(String, usize)>,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub struct SortKey<'a> {
+    pub key_type: SortKeyType<'a>,
     pub ascending: bool,
+}
+
+impl<'a> SortKey<'a> {
+    pub fn column(idx: usize, ascending: bool) -> Self {
+        Self {
+            key_type: SortKeyType::Column(idx),
+            ascending,
+        }
+    }
+
+    pub fn expression(
+        expr: &'a crate::sql::ast::Expr<'a>,
+        column_map: Vec<(String, usize)>,
+        ascending: bool,
+    ) -> Self {
+        Self {
+            key_type: SortKeyType::Expression { expr, column_map },
+            ascending,
+        }
+    }
 }
 
 pub struct SortExecutor<'a, E>
@@ -1302,7 +1500,7 @@ where
     E: Executor<'a>,
 {
     child: E,
-    sort_keys: Vec<SortKey>,
+    sort_keys: Vec<SortKey<'a>>,
     arena: &'a Bump,
     rows: Vec<Vec<Value<'static>>>,
     sorted_iter: Option<std::vec::IntoIter<Vec<Value<'static>>>>,
@@ -1313,7 +1511,7 @@ impl<'a, E> SortExecutor<'a, E>
 where
     E: Executor<'a>,
 {
-    pub fn new(child: E, sort_keys: Vec<SortKey>, arena: &'a Bump) -> Self {
+    pub fn new(child: E, sort_keys: Vec<SortKey<'a>>, arena: &'a Bump) -> Self {
         Self {
             child,
             sort_keys,
@@ -1335,6 +1533,172 @@ where
             (Value::Text(a), Value::Text(b)) => a.cmp(b),
             (Value::Blob(a), Value::Blob(b)) => a.cmp(b),
             _ => Ordering::Equal,
+        }
+    }
+
+    fn get_sort_value(row: &[Value<'static>], key: &SortKey<'a>) -> Value<'static> {
+        match &key.key_type {
+            SortKeyType::Column(idx) => row.get(*idx).cloned().unwrap_or(Value::Null),
+            SortKeyType::Expression { expr, column_map } => {
+                Self::eval_sort_expr(expr, row, column_map)
+            }
+        }
+    }
+
+    fn eval_sort_expr(
+        expr: &crate::sql::ast::Expr<'_>,
+        row: &[Value<'static>],
+        column_map: &[(String, usize)],
+    ) -> Value<'static> {
+        use crate::sql::ast::{Expr, Literal};
+
+        match expr {
+            Expr::Column(col_ref) => {
+                let lookup_name = if let Some(table) = col_ref.table {
+                    format!("{}.{}", table, col_ref.column)
+                } else {
+                    col_ref.column.to_string()
+                };
+                let col_idx = column_map
+                    .iter()
+                    .find(|(name, _)| name.eq_ignore_ascii_case(&lookup_name))
+                    .or_else(|| {
+                        column_map
+                            .iter()
+                            .find(|(name, _)| name.eq_ignore_ascii_case(col_ref.column))
+                    })
+                    .map(|(_, idx)| *idx);
+                col_idx
+                    .and_then(|idx| row.get(idx).cloned())
+                    .unwrap_or(Value::Null)
+            }
+            Expr::Literal(lit) => match lit {
+                Literal::Integer(s) => s
+                    .parse::<i64>()
+                    .map(Value::Int)
+                    .unwrap_or(Value::Null),
+                Literal::Float(s) => s
+                    .parse::<f64>()
+                    .map(Value::Float)
+                    .unwrap_or(Value::Null),
+                Literal::String(s) => Value::Text(Cow::Owned(s.to_string())),
+                Literal::Null => Value::Null,
+                Literal::Boolean(b) => Value::Int(if *b { 1 } else { 0 }),
+                Literal::HexNumber(s) => i64::from_str_radix(s.trim_start_matches("0x").trim_start_matches("0X"), 16)
+                    .map(Value::Int)
+                    .unwrap_or(Value::Null),
+                Literal::BinaryNumber(s) => i64::from_str_radix(s.trim_start_matches("0b").trim_start_matches("0B"), 2)
+                    .map(Value::Int)
+                    .unwrap_or(Value::Null),
+            },
+            Expr::BinaryOp { left, op, right } => {
+                let left_val = Self::eval_sort_expr(left, row, column_map);
+                let right_val = Self::eval_sort_expr(right, row, column_map);
+                Self::eval_binary_op(&left_val, op, &right_val)
+            }
+            Expr::Array(elements) => {
+                let vals: Vec<f32> = elements
+                    .iter()
+                    .filter_map(|e| {
+                        let v = Self::eval_sort_expr(e, row, column_map);
+                        match v {
+                            Value::Float(f) => Some(f as f32),
+                            Value::Int(i) => Some(i as f32),
+                            _ => None,
+                        }
+                    })
+                    .collect();
+                Value::Vector(Cow::Owned(vals))
+            }
+            _ => Value::Null,
+        }
+    }
+
+    fn eval_binary_op(left: &Value<'static>, op: &crate::sql::ast::BinaryOperator, right: &Value<'static>) -> Value<'static> {
+        use crate::sql::ast::BinaryOperator;
+
+        match op {
+            BinaryOperator::VectorL2Distance => {
+                let left_vec = Self::value_to_vec(left);
+                let right_vec = Self::value_to_vec(right);
+                if let (Some(l), Some(r)) = (left_vec, right_vec) {
+                    if l.len() == r.len() {
+                        let dist: f64 = l
+                            .iter()
+                            .zip(r.iter())
+                            .map(|(a, b)| ((a - b) as f64).powi(2))
+                            .sum::<f64>()
+                            .sqrt();
+                        return Value::Float(dist);
+                    }
+                }
+                Value::Null
+            }
+            BinaryOperator::VectorCosineDistance => {
+                let left_vec = Self::value_to_vec(left);
+                let right_vec = Self::value_to_vec(right);
+                if let (Some(l), Some(r)) = (left_vec, right_vec) {
+                    if l.len() == r.len() {
+                        let dot: f64 = l.iter().zip(r.iter()).map(|(a, b)| (*a as f64) * (*b as f64)).sum();
+                        let mag_l: f64 = l.iter().map(|x| (*x as f64).powi(2)).sum::<f64>().sqrt();
+                        let mag_r: f64 = r.iter().map(|x| (*x as f64).powi(2)).sum::<f64>().sqrt();
+                        if mag_l > 0.0 && mag_r > 0.0 {
+                            let cosine = dot / (mag_l * mag_r);
+                            return Value::Float(1.0 - cosine);
+                        }
+                    }
+                }
+                Value::Null
+            }
+            BinaryOperator::Plus => match (left, right) {
+                (Value::Int(a), Value::Int(b)) => Value::Int(a + b),
+                (Value::Float(a), Value::Float(b)) => Value::Float(a + b),
+                (Value::Int(a), Value::Float(b)) => Value::Float(*a as f64 + b),
+                (Value::Float(a), Value::Int(b)) => Value::Float(a + *b as f64),
+                _ => Value::Null,
+            },
+            BinaryOperator::Minus => match (left, right) {
+                (Value::Int(a), Value::Int(b)) => Value::Int(a - b),
+                (Value::Float(a), Value::Float(b)) => Value::Float(a - b),
+                (Value::Int(a), Value::Float(b)) => Value::Float(*a as f64 - b),
+                (Value::Float(a), Value::Int(b)) => Value::Float(a - *b as f64),
+                _ => Value::Null,
+            },
+            BinaryOperator::Multiply => match (left, right) {
+                (Value::Int(a), Value::Int(b)) => Value::Int(a * b),
+                (Value::Float(a), Value::Float(b)) => Value::Float(a * b),
+                (Value::Int(a), Value::Float(b)) => Value::Float(*a as f64 * b),
+                (Value::Float(a), Value::Int(b)) => Value::Float(a * *b as f64),
+                _ => Value::Null,
+            },
+            BinaryOperator::Divide => match (left, right) {
+                (Value::Int(a), Value::Int(b)) if *b != 0 => Value::Int(a / b),
+                (Value::Float(a), Value::Float(b)) if *b != 0.0 => Value::Float(a / b),
+                (Value::Int(a), Value::Float(b)) if *b != 0.0 => Value::Float(*a as f64 / b),
+                (Value::Float(a), Value::Int(b)) if *b != 0 => Value::Float(a / *b as f64),
+                _ => Value::Null,
+            },
+            _ => Value::Null,
+        }
+    }
+
+    fn value_to_vec(val: &Value<'static>) -> Option<Vec<f32>> {
+        match val {
+            Value::Vector(v) => Some(v.to_vec()),
+            Value::Text(s) => {
+                let trimmed = s.trim();
+                if trimmed.starts_with('[') && trimmed.ends_with(']') {
+                    let inner = &trimmed[1..trimmed.len() - 1];
+                    let parsed: Result<Vec<f32>, _> = inner
+                        .split(',')
+                        .map(|x| x.trim().parse::<f32>())
+                        .collect();
+                    parsed.ok()
+                } else {
+                    None
+                }
+            }
+            _ => None,
         }
     }
 }
@@ -1361,9 +1725,9 @@ where
             let sort_keys = &self.sort_keys;
             self.rows.sort_by(|a, b| {
                 for key in sort_keys {
-                    let a_val = a.get(key.column).unwrap_or(&Value::Null);
-                    let b_val = b.get(key.column).unwrap_or(&Value::Null);
-                    let cmp = Self::compare_values(a_val, b_val);
+                    let a_val = Self::get_sort_value(a, key);
+                    let b_val = Self::get_sort_value(b, key);
+                    let cmp = Self::compare_values(&a_val, &b_val);
                     if cmp != std::cmp::Ordering::Equal {
                         return if key.ascending { cmp } else { cmp.reverse() };
                     }
@@ -1408,8 +1772,11 @@ pub enum DynamicExecutor<'a, S: RowSource> {
     ),
     Limit(LimitState<'a, S>),
     Sort(SortState<'a, S>),
+    TopK(TopKState<'a, S>),
     NestedLoopJoin(NestedLoopJoinState<'a, S>),
     GraceHashJoin(GraceHashJoinState<'a, S>),
+    HashSemiJoin(HashSemiJoinState<'a, S>),
+    HashAntiJoin(HashAntiJoinState<'a, S>),
     HashAggregate(HashAggregateState<'a, S>),
     Window(WindowState<'a, S>),
 }
@@ -1437,6 +1804,13 @@ impl<'a, S: RowSource> Executor<'a> for DynamicExecutor<'a, S> {
                 state.sorted = false;
                 state.child.open()
             }
+            DynamicExecutor::TopK(state) => {
+                state.heap.clear();
+                state.result.clear();
+                state.iter_idx = 0;
+                state.computed = false;
+                state.child.open()
+            }
             DynamicExecutor::NestedLoopJoin(state) => {
                 state.left.open()?;
                 if !state.materialized {
@@ -1460,50 +1834,141 @@ impl<'a, S: RowSource> Executor<'a> for DynamicExecutor<'a, S> {
             }
             DynamicExecutor::GraceHashJoin(state) => {
                 if !state.partitioned {
-                    state.left.open()?;
-                    while let Some(row) = state.left.next()? {
-                        let hash = hash_keys(&row, &state.left_key_indices);
-                        let partition = (hash as usize) % state.num_partitions;
-                        let owned: Vec<Value<'static>> =
-                            row.values.iter().map(clone_value_owned).collect();
-                        state.left_partitions[partition].push(owned);
-                    }
-                    state.left.close()?;
+                    if state.use_spill {
+                        let spill_dir = state.spill_dir.clone().unwrap();
+                        std::fs::create_dir_all(&spill_dir).ok();
+                        state.left_spiller = Some(PartitionSpiller::new(
+                            spill_dir.clone(),
+                            state.num_partitions,
+                            state.memory_budget,
+                            state.query_id,
+                            'L',
+                        )?);
+                        state.right_spiller = Some(PartitionSpiller::new(
+                            spill_dir,
+                            state.num_partitions,
+                            state.memory_budget,
+                            state.query_id,
+                            'R',
+                        )?);
 
-                    state.right.open()?;
-                    while let Some(row) = state.right.next()? {
-                        let hash = hash_keys(&row, &state.right_key_indices);
-                        let partition = (hash as usize) % state.num_partitions;
-                        let owned: Vec<Value<'static>> =
-                            row.values.iter().map(clone_value_owned).collect();
-                        state.right_partitions[partition].push(owned);
+                        state.left.open()?;
+                        while let Some(row) = state.left.next()? {
+                            let hash = hash_keys(&row, &state.left_key_indices);
+                            let partition = (hash as usize) % state.num_partitions;
+                            let owned: SmallVec<[Value<'static>; 16]> =
+                                row.values.iter().map(clone_value_owned).collect();
+                            state
+                                .left_spiller
+                                .as_mut()
+                                .unwrap()
+                                .write_row(partition, owned)?;
+                        }
+                        state.left.close()?;
+
+                        state.right.open()?;
+                        while let Some(row) = state.right.next()? {
+                            let hash = hash_keys(&row, &state.right_key_indices);
+                            let partition = (hash as usize) % state.num_partitions;
+                            let owned: SmallVec<[Value<'static>; 16]> =
+                                row.values.iter().map(clone_value_owned).collect();
+                            state
+                                .right_spiller
+                                .as_mut()
+                                .unwrap()
+                                .write_row(partition, owned)?;
+                        }
+                        state.right.close()?;
+                    } else {
+                        state.left.open()?;
+                        while let Some(row) = state.left.next()? {
+                            let hash = hash_keys(&row, &state.left_key_indices);
+                            let partition = (hash as usize) % state.num_partitions;
+                            let owned: Vec<Value<'static>> =
+                                row.values.iter().map(clone_value_owned).collect();
+                            state.left_partitions[partition].push(owned);
+                        }
+                        state.left.close()?;
+
+                        state.right.open()?;
+                        while let Some(row) = state.right.next()? {
+                            let hash = hash_keys(&row, &state.right_key_indices);
+                            let partition = (hash as usize) % state.num_partitions;
+                            let owned: Vec<Value<'static>> =
+                                row.values.iter().map(clone_value_owned).collect();
+                            state.right_partitions[partition].push(owned);
+                        }
+                        state.right.close()?;
+
+                        for p in 0..state.num_partitions {
+                            state.build_matched[p] = vec![false; state.left_partitions[p].len()];
+                        }
                     }
-                    state.right.close()?;
                     state.partitioned = true;
-
-                    for p in 0..state.num_partitions {
-                        state.build_matched[p] = vec![false; state.left_partitions[p].len()];
-                    }
                 }
                 state.current_partition = 0;
                 state.current_probe_idx = 0;
                 state.current_match_idx = 0;
                 state.current_matches.clear();
                 state.partition_hash_table.clear();
-                state.partition_build_rows = std::mem::take(&mut state.left_partitions[0]);
-                for (idx, row) in state.partition_build_rows.iter().enumerate() {
-                    let hash = hash_keys_static(row, &state.left_key_indices);
-                    state
-                        .partition_hash_table
-                        .entry(hash)
-                        .or_insert_with(Vec::new)
-                        .push(idx);
+
+                if state.use_spill {
+                    state.left_spiller.as_mut().unwrap().start_read(0)?;
+                    while let Some(row) = state.left_spiller.as_mut().unwrap().read_next()? {
+                        let owned: Vec<Value<'static>> = row.to_vec();
+                        let hash = hash_keys_static(&owned, &state.left_key_indices);
+                        let idx = state.partition_build_rows.len();
+                        state
+                            .partition_hash_table
+                            .entry(hash)
+                            .or_insert_with(Vec::new)
+                            .push(idx);
+                        state.partition_build_rows.push(owned);
+                    }
+                    state.build_matched[0] = vec![false; state.partition_build_rows.len()];
+                    state.right_spiller.as_mut().unwrap().start_read(0)?;
+                } else {
+                    state.partition_build_rows = std::mem::take(&mut state.left_partitions[0]);
+                    for (idx, row) in state.partition_build_rows.iter().enumerate() {
+                        let hash = hash_keys_static(row, &state.left_key_indices);
+                        state
+                            .partition_hash_table
+                            .entry(hash)
+                            .or_insert_with(Vec::new)
+                            .push(idx);
+                    }
                 }
                 state.probe_row_matched = false;
                 state.emitting_unmatched_build = false;
                 state.unmatched_build_partition = 0;
                 state.unmatched_build_idx = 0;
                 Ok(())
+            }
+            DynamicExecutor::HashSemiJoin(state) => {
+                if !state.built {
+                    state.right.open()?;
+                    state.hash_table.clear();
+                    while let Some(row) = state.right.next()? {
+                        let hash = hash_keys(&row, &state.right_key_indices);
+                        state.hash_table.insert(hash);
+                    }
+                    state.right.close()?;
+                    state.built = true;
+                }
+                state.left.open()
+            }
+            DynamicExecutor::HashAntiJoin(state) => {
+                if !state.built {
+                    state.right.open()?;
+                    state.hash_table.clear();
+                    while let Some(row) = state.right.next()? {
+                        let hash = hash_keys(&row, &state.right_key_indices);
+                        state.hash_table.insert(hash);
+                    }
+                    state.right.close()?;
+                    state.built = true;
+                }
+                state.left.open()
             }
             DynamicExecutor::HashAggregate(state) => {
                 state.groups.clear();
@@ -1612,9 +2077,9 @@ impl<'a, S: RowSource> Executor<'a> for DynamicExecutor<'a, S> {
                     let sort_keys = &state.sort_keys;
                     state.rows.sort_by(|a, b| {
                         for key in sort_keys.iter() {
-                            let a_val = a.get(key.column).unwrap_or(&Value::Null);
-                            let b_val = b.get(key.column).unwrap_or(&Value::Null);
-                            let cmp = compare_values_for_sort(a_val, b_val);
+                            let a_val = get_sort_value_for_key(a, key);
+                            let b_val = get_sort_value_for_key(b, key);
+                            let cmp = compare_values_for_sort(&a_val, &b_val);
                             if cmp != std::cmp::Ordering::Equal {
                                 return if key.ascending { cmp } else { cmp.reverse() };
                             }
@@ -1627,6 +2092,151 @@ impl<'a, S: RowSource> Executor<'a> for DynamicExecutor<'a, S> {
 
                 if state.iter_idx < state.rows.len() {
                     let values = &state.rows[state.iter_idx];
+                    state.iter_idx += 1;
+                    let arena_values: Vec<Value<'a>> = values
+                        .iter()
+                        .map(|v| clone_value_ref_to_arena(v, state.arena))
+                        .collect();
+                    let allocated = state.arena.alloc_slice_fill_iter(arena_values);
+                    return Ok(Some(ExecutorRow::new(allocated)));
+                }
+                Ok(None)
+            }
+            DynamicExecutor::TopK(state) => {
+                if !state.computed {
+                    let heap_size = (state.limit + state.offset) as usize;
+                    let sort_keys = &state.sort_keys;
+
+                    while let Some(row) = state.child.next()? {
+                        let owned: Vec<Value<'static>> =
+                            row.values.iter().map(clone_value_owned).collect();
+
+                        if state.heap.len() < heap_size {
+                            state.heap.push(owned);
+                            if state.heap.len() == heap_size {
+                                state.heap.sort_by(|a, b| {
+                                    for key in sort_keys.iter() {
+                                        let a_val = get_sort_value_for_key(a, key);
+                                        let b_val = get_sort_value_for_key(b, key);
+                                        let cmp = compare_values_for_sort(&a_val, &b_val);
+                                        if cmp != std::cmp::Ordering::Equal {
+                                            return if key.ascending {
+                                                cmp.reverse()
+                                            } else {
+                                                cmp
+                                            };
+                                        }
+                                    }
+                                    std::cmp::Ordering::Equal
+                                });
+                            }
+                        } else {
+                            let boundary = &state.heap[0];
+                            let should_replace = {
+                                let mut result = std::cmp::Ordering::Equal;
+                                for key in sort_keys.iter() {
+                                    let new_val = get_sort_value_for_key(&owned, key);
+                                    let bound_val = get_sort_value_for_key(boundary, key);
+                                    let cmp = compare_values_for_sort(&new_val, &bound_val);
+                                    if cmp != std::cmp::Ordering::Equal {
+                                        result = if key.ascending { cmp } else { cmp.reverse() };
+                                        break;
+                                    }
+                                }
+                                result == std::cmp::Ordering::Less
+                            };
+
+                            if should_replace {
+                                state.heap[0] = owned;
+                                let heap_len = state.heap.len();
+                                let mut i = 0;
+                                loop {
+                                    let left = 2 * i + 1;
+                                    let right = 2 * i + 2;
+                                    let mut largest = i;
+
+                                    if left < heap_len {
+                                        let cmp = {
+                                            let mut result = std::cmp::Ordering::Equal;
+                                            for key in sort_keys.iter() {
+                                                let l_val =
+                                                    get_sort_value_for_key(&state.heap[left], key);
+                                                let lg_val =
+                                                    get_sort_value_for_key(&state.heap[largest], key);
+                                                let c = compare_values_for_sort(&l_val, &lg_val);
+                                                if c != std::cmp::Ordering::Equal {
+                                                    result = if key.ascending {
+                                                        c.reverse()
+                                                    } else {
+                                                        c
+                                                    };
+                                                    break;
+                                                }
+                                            }
+                                            result
+                                        };
+                                        if cmp == std::cmp::Ordering::Greater {
+                                            largest = left;
+                                        }
+                                    }
+
+                                    if right < heap_len {
+                                        let cmp = {
+                                            let mut result = std::cmp::Ordering::Equal;
+                                            for key in sort_keys.iter() {
+                                                let r_val =
+                                                    get_sort_value_for_key(&state.heap[right], key);
+                                                let lg_val =
+                                                    get_sort_value_for_key(&state.heap[largest], key);
+                                                let c = compare_values_for_sort(&r_val, &lg_val);
+                                                if c != std::cmp::Ordering::Equal {
+                                                    result = if key.ascending {
+                                                        c.reverse()
+                                                    } else {
+                                                        c
+                                                    };
+                                                    break;
+                                                }
+                                            }
+                                            result
+                                        };
+                                        if cmp == std::cmp::Ordering::Greater {
+                                            largest = right;
+                                        }
+                                    }
+
+                                    if largest == i {
+                                        break;
+                                    }
+                                    state.heap.swap(i, largest);
+                                    i = largest;
+                                }
+                            }
+                        }
+                    }
+
+                    state.heap.sort_by(|a, b| {
+                        for key in sort_keys.iter() {
+                            let a_val = get_sort_value_for_key(a, key);
+                            let b_val = get_sort_value_for_key(b, key);
+                            let cmp = compare_values_for_sort(&a_val, &b_val);
+                            if cmp != std::cmp::Ordering::Equal {
+                                return if key.ascending { cmp } else { cmp.reverse() };
+                            }
+                        }
+                        std::cmp::Ordering::Equal
+                    });
+
+                    let offset = state.offset as usize;
+                    let limit = state.limit as usize;
+                    let start = offset.min(state.heap.len());
+                    let end = (offset + limit).min(state.heap.len());
+                    state.result = state.heap.drain(start..end).collect();
+                    state.computed = true;
+                }
+
+                if state.iter_idx < state.result.len() {
+                    let values = &state.result[state.iter_idx];
                     state.iter_idx += 1;
                     let arena_values: Vec<Value<'a>> = values
                         .iter()
@@ -1753,8 +2363,28 @@ impl<'a, S: RowSource> Executor<'a> for DynamicExecutor<'a, S> {
                     }
 
                     state.partition_hash_table.clear();
-                    state.partition_build_rows =
-                        std::mem::take(&mut state.left_partitions[state.unmatched_build_partition]);
+                    state.partition_build_rows.clear();
+                    if state.use_spill {
+                        let partition = state.unmatched_build_partition;
+                        state.left_spiller.as_mut().unwrap().start_read(partition)?;
+                        while let Some(row) =
+                            state.left_spiller.as_mut().unwrap().read_next()?
+                        {
+                            let owned: Vec<Value<'static>> = row.to_vec();
+                            state.partition_build_rows.push(owned);
+                        }
+                        state.build_matched[partition] =
+                            vec![false; state.partition_build_rows.len()];
+                        state
+                            .right_spiller
+                            .as_mut()
+                            .unwrap()
+                            .start_read(partition)?;
+                    } else {
+                        state.partition_build_rows = std::mem::take(
+                            &mut state.left_partitions[state.unmatched_build_partition],
+                        );
+                    }
                     for (idx, row) in state.partition_build_rows.iter().enumerate() {
                         let hash = hash_keys_static(row, &state.left_key_indices);
                         state
@@ -1779,8 +2409,12 @@ impl<'a, S: RowSource> Executor<'a> for DynamicExecutor<'a, S> {
                         state.build_matched[state.current_partition][build_idx] = true;
                     }
                     let build_row = &state.partition_build_rows[build_idx];
-                    let probe_row = &state.right_partitions[state.current_partition]
-                        [state.current_probe_idx - 1];
+                    let probe_row: &[Value<'static>] = if state.use_spill {
+                        &state.probe_row_buf
+                    } else {
+                        &state.right_partitions[state.current_partition]
+                            [state.current_probe_idx - 1]
+                    };
 
                     let combined: Vec<Value<'a>> = build_row
                         .iter()
@@ -1795,8 +2429,12 @@ impl<'a, S: RowSource> Executor<'a> for DynamicExecutor<'a, S> {
                     && !state.probe_row_matched
                     && (state.join_type == JoinType::Right || state.join_type == JoinType::Full)
                 {
-                    let probe_row = &state.right_partitions[state.current_partition]
-                        [state.current_probe_idx - 1];
+                    let probe_row: &[Value<'static>] = if state.use_spill {
+                        &state.probe_row_buf
+                    } else {
+                        &state.right_partitions[state.current_partition]
+                            [state.current_probe_idx - 1]
+                    };
                     let mut combined: Vec<Value<'a>> =
                         (0..state.left_col_count).map(|_| Value::Null).collect();
                     combined.extend(
@@ -1809,9 +2447,28 @@ impl<'a, S: RowSource> Executor<'a> for DynamicExecutor<'a, S> {
                     return Ok(Some(ExecutorRow::new(allocated)));
                 }
 
-                if state.current_probe_idx < state.right_partitions[state.current_partition].len() {
-                    let probe_row =
-                        &state.right_partitions[state.current_partition][state.current_probe_idx];
+                let has_more_probe = if state.use_spill {
+                    match state.right_spiller.as_mut().unwrap().read_next()? {
+                        Some(row) => {
+                            state.probe_row_buf.clear();
+                            state.probe_row_buf.extend(row.iter().cloned());
+                            true
+                        }
+                        None => false,
+                    }
+                } else {
+                    state.current_probe_idx
+                        < state.right_partitions[state.current_partition].len()
+                };
+
+                if has_more_probe {
+                    let probe_row: &[Value<'static>] = if state.use_spill {
+                        &state.probe_row_buf
+                    } else {
+                        let row = &state.right_partitions[state.current_partition]
+                            [state.current_probe_idx];
+                        row.as_slice()
+                    };
                     state.current_probe_idx += 1;
                     state.probe_row_matched = false;
                     let hash = hash_keys_static(probe_row, &state.right_key_indices);
@@ -1839,8 +2496,12 @@ impl<'a, S: RowSource> Executor<'a> for DynamicExecutor<'a, S> {
                     && !state.probe_row_matched
                     && (state.join_type == JoinType::Right || state.join_type == JoinType::Full)
                 {
-                    let probe_row = &state.right_partitions[state.current_partition]
-                        [state.current_probe_idx - 1];
+                    let probe_row: &[Value<'static>] = if state.use_spill {
+                        &state.probe_row_buf
+                    } else {
+                        &state.right_partitions[state.current_partition]
+                            [state.current_probe_idx - 1]
+                    };
                     let mut combined: Vec<Value<'a>> =
                         (0..state.left_col_count).map(|_| Value::Null).collect();
                     combined.extend(
@@ -1865,8 +2526,21 @@ impl<'a, S: RowSource> Executor<'a> for DynamicExecutor<'a, S> {
                 }
 
                 state.partition_hash_table.clear();
-                state.partition_build_rows =
-                    std::mem::take(&mut state.left_partitions[state.current_partition]);
+                state.partition_build_rows.clear();
+                if state.use_spill {
+                    let partition = state.current_partition;
+                    state.left_spiller.as_mut().unwrap().start_read(partition)?;
+                    while let Some(row) = state.left_spiller.as_mut().unwrap().read_next()? {
+                        let owned: Vec<Value<'static>> = row.to_vec();
+                        state.partition_build_rows.push(owned);
+                    }
+                    state.build_matched[partition] =
+                        vec![false; state.partition_build_rows.len()];
+                    state.right_spiller.as_mut().unwrap().start_read(partition)?;
+                } else {
+                    state.partition_build_rows =
+                        std::mem::take(&mut state.left_partitions[state.current_partition]);
+                }
                 for (idx, row) in state.partition_build_rows.iter().enumerate() {
                     let hash = hash_keys_static(row, &state.left_key_indices);
                     state
@@ -1879,6 +2553,42 @@ impl<'a, S: RowSource> Executor<'a> for DynamicExecutor<'a, S> {
                 state.current_match_idx = 0;
                 state.current_matches.clear();
                 state.probe_row_matched = false;
+            },
+            DynamicExecutor::HashSemiJoin(state) => loop {
+                match state.left.next()? {
+                    Some(row) => {
+                        let hash = hash_keys(&row, &state.left_key_indices);
+                        if state.hash_table.contains(&hash) {
+                            let left_values: Vec<Value<'a>> = row
+                                .values
+                                .iter()
+                                .take(state.left_col_count)
+                                .map(|v| clone_value_ref_to_arena(v, state.arena))
+                                .collect();
+                            let allocated = state.arena.alloc_slice_fill_iter(left_values);
+                            return Ok(Some(ExecutorRow::new(allocated)));
+                        }
+                    }
+                    None => return Ok(None),
+                }
+            },
+            DynamicExecutor::HashAntiJoin(state) => loop {
+                match state.left.next()? {
+                    Some(row) => {
+                        let hash = hash_keys(&row, &state.left_key_indices);
+                        if !state.hash_table.contains(&hash) {
+                            let left_values: Vec<Value<'a>> = row
+                                .values
+                                .iter()
+                                .take(state.left_col_count)
+                                .map(|v| clone_value_ref_to_arena(v, state.arena))
+                                .collect();
+                            let allocated = state.arena.alloc_slice_fill_iter(left_values);
+                            return Ok(Some(ExecutorRow::new(allocated)));
+                        }
+                    }
+                    None => return Ok(None),
+                }
             },
             DynamicExecutor::HashAggregate(state) => {
                 if !state.computed {
@@ -1990,8 +2700,19 @@ impl<'a, S: RowSource> Executor<'a> for DynamicExecutor<'a, S> {
             DynamicExecutor::ProjectExpr(child, _, _) => child.close(),
             DynamicExecutor::Limit(state) => state.child.close(),
             DynamicExecutor::Sort(state) => state.child.close(),
+            DynamicExecutor::TopK(state) => state.child.close(),
             DynamicExecutor::NestedLoopJoin(state) => state.left.close(),
-            DynamicExecutor::GraceHashJoin(_) => Ok(()),
+            DynamicExecutor::GraceHashJoin(state) => {
+                if let Some(ref mut spiller) = state.left_spiller {
+                    spiller.cleanup()?;
+                }
+                if let Some(ref mut spiller) = state.right_spiller {
+                    spiller.cleanup()?;
+                }
+                Ok(())
+            }
+            DynamicExecutor::HashSemiJoin(state) => state.left.close(),
+            DynamicExecutor::HashAntiJoin(state) => state.left.close(),
             DynamicExecutor::HashAggregate(state) => state.child.close(),
             DynamicExecutor::Window(state) => state.child.close(),
         }

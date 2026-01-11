@@ -113,7 +113,13 @@ fn eval_sign<'a>(args: &[Option<Value<'a>>]) -> Option<Value<'a>> {
     match args.first()?.as_ref()? {
         Value::Int(n) => Some(Value::Int(n.signum())),
         Value::Float(f) => {
-            let sign = if *f > 0.0 { 1 } else if *f < 0.0 { -1 } else { 0 };
+            let sign = if *f > 0.0 {
+                1
+            } else if *f < 0.0 {
+                -1
+            } else {
+                0
+            };
             Some(Value::Int(sign))
         }
         Value::Null => Some(Value::Null),
@@ -124,22 +130,22 @@ fn eval_sign<'a>(args: &[Option<Value<'a>>]) -> Option<Value<'a>> {
 fn eval_mod<'a>(args: &[Option<Value<'a>>]) -> Option<Value<'a>> {
     let a = get_float(args.first()?)?;
     let b = get_float(args.get(1)?)?;
-    
+
     if b == 0.0 {
         return Some(Value::Null);
     }
-    
+
     Some(Value::Float(a % b))
 }
 
 fn eval_div<'a>(args: &[Option<Value<'a>>]) -> Option<Value<'a>> {
     let a = get_int(args.first()?)?;
     let b = get_int(args.get(1)?)?;
-    
+
     if b == 0 {
         return Some(Value::Null);
     }
-    
+
     Some(Value::Int(a / b))
 }
 
@@ -164,10 +170,10 @@ fn eval_floor<'a>(args: &[Option<Value<'a>>]) -> Option<Value<'a>> {
 fn eval_round<'a>(args: &[Option<Value<'a>>]) -> Option<Value<'a>> {
     let val = get_float(args.first()?)?;
     let decimals = args.get(1).and_then(get_int).unwrap_or(0);
-    
+
     let multiplier = 10_f64.powi(decimals as i32);
     let rounded = (val * multiplier).round() / multiplier;
-    
+
     if decimals <= 0 {
         Some(Value::Int(rounded as i64))
     } else {
@@ -178,10 +184,10 @@ fn eval_round<'a>(args: &[Option<Value<'a>>]) -> Option<Value<'a>> {
 fn eval_truncate<'a>(args: &[Option<Value<'a>>]) -> Option<Value<'a>> {
     let val = get_float(args.first()?)?;
     let decimals = args.get(1).and_then(get_int).unwrap_or(0);
-    
+
     let multiplier = 10_f64.powi(decimals as i32);
     let truncated = (val * multiplier).trunc() / multiplier;
-    
+
     if decimals <= 0 {
         Some(Value::Int(truncated as i64))
     } else {
@@ -224,14 +230,14 @@ fn eval_log<'a>(args: &[Option<Value<'a>>]) -> Option<Value<'a>> {
         }
         return Some(Value::Float(val.ln()));
     }
-    
+
     let base = get_float(args.first()?)?;
     let val = get_float(args.get(1)?)?;
-    
+
     if base <= 0.0 || base == 1.0 || val <= 0.0 {
         return Some(Value::Null);
     }
-    
+
     Some(Value::Float(val.log(base)))
 }
 
@@ -314,7 +320,7 @@ fn eval_radians<'a>(args: &[Option<Value<'a>>]) -> Option<Value<'a>> {
 
 fn eval_rand<'a>(args: &[Option<Value<'a>>]) -> Option<Value<'a>> {
     let seed = args.first().and_then(get_int);
-    
+
     let random = match seed {
         Some(s) => {
             let mut state = s as u64;
@@ -336,7 +342,7 @@ fn eval_rand<'a>(args: &[Option<Value<'a>>]) -> Option<Value<'a>> {
             (state.wrapping_mul(0x2545F4914F6CDD1D) as f64) / (u64::MAX as f64)
         }
     };
-    
+
     Some(Value::Float(random))
 }
 
@@ -344,12 +350,12 @@ fn eval_greatest<'a>(args: &[Option<Value<'a>>]) -> Option<Value<'a>> {
     if args.is_empty() {
         return Some(Value::Null);
     }
-    
+
     let mut max_int: Option<i64> = None;
     let mut max_float: Option<f64> = None;
     let mut max_text: Option<Cow<'a, str>> = None;
     let mut has_null = false;
-    
+
     for arg in args {
         match arg.as_ref() {
             Some(Value::Int(n)) => {
@@ -359,7 +365,13 @@ fn eval_greatest<'a>(args: &[Option<Value<'a>>]) -> Option<Value<'a>> {
                 max_float = Some(max_float.map_or(*f, |m| m.max(*f)));
             }
             Some(Value::Text(s)) => {
-                max_text = Some(max_text.map_or(s.clone(), |m| if s.as_ref() > m.as_ref() { s.clone() } else { m }));
+                max_text = Some(max_text.map_or(s.clone(), |m| {
+                    if s.as_ref() > m.as_ref() {
+                        s.clone()
+                    } else {
+                        m
+                    }
+                }));
             }
             Some(Value::Null) | None => {
                 has_null = true;
@@ -367,15 +379,15 @@ fn eval_greatest<'a>(args: &[Option<Value<'a>>]) -> Option<Value<'a>> {
             _ => {}
         }
     }
-    
+
     if has_null && max_int.is_none() && max_float.is_none() && max_text.is_none() {
         return Some(Value::Null);
     }
-    
+
     if let Some(t) = max_text {
         return Some(Value::Text(t));
     }
-    
+
     match (max_int, max_float) {
         (Some(i), Some(f)) => {
             if (i as f64) > f {
@@ -394,12 +406,12 @@ fn eval_least<'a>(args: &[Option<Value<'a>>]) -> Option<Value<'a>> {
     if args.is_empty() {
         return Some(Value::Null);
     }
-    
+
     let mut min_int: Option<i64> = None;
     let mut min_float: Option<f64> = None;
     let mut min_text: Option<Cow<'a, str>> = None;
     let mut has_null = false;
-    
+
     for arg in args {
         match arg.as_ref() {
             Some(Value::Int(n)) => {
@@ -409,7 +421,13 @@ fn eval_least<'a>(args: &[Option<Value<'a>>]) -> Option<Value<'a>> {
                 min_float = Some(min_float.map_or(*f, |m| m.min(*f)));
             }
             Some(Value::Text(s)) => {
-                min_text = Some(min_text.map_or(s.clone(), |m| if s.as_ref() < m.as_ref() { s.clone() } else { m }));
+                min_text = Some(min_text.map_or(s.clone(), |m| {
+                    if s.as_ref() < m.as_ref() {
+                        s.clone()
+                    } else {
+                        m
+                    }
+                }));
             }
             Some(Value::Null) | None => {
                 has_null = true;
@@ -417,15 +435,15 @@ fn eval_least<'a>(args: &[Option<Value<'a>>]) -> Option<Value<'a>> {
             _ => {}
         }
     }
-    
+
     if has_null && min_int.is_none() && min_float.is_none() && min_text.is_none() {
         return Some(Value::Null);
     }
-    
+
     if let Some(t) = min_text {
         return Some(Value::Text(t));
     }
-    
+
     match (min_int, min_float) {
         (Some(i), Some(f)) => {
             if (i as f64) < f {
@@ -449,7 +467,7 @@ mod tests {
     fn test_abs() {
         let args = vec![Some(Value::Int(-5))];
         assert_eq!(eval_abs(&args), Some(Value::Int(5)));
-        
+
         let args = vec![Some(Value::Float(-3.125))];
         if let Some(Value::Float(f)) = eval_abs(&args) {
             assert!((f - 3.125).abs() < 0.001);

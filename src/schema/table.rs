@@ -74,13 +74,28 @@ pub enum IndexType {
     Hnsw,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ReferentialAction {
+    Cascade,
+    Restrict,
+    #[default]
+    NoAction,
+    SetNull,
+    SetDefault,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Constraint {
     NotNull,
     PrimaryKey,
     Unique,
     AutoIncrement,
-    ForeignKey { table: String, column: String },
+    ForeignKey {
+        table: String,
+        column: String,
+        on_delete: Option<ReferentialAction>,
+        on_update: Option<ReferentialAction>,
+    },
     Check(String),
 }
 
@@ -143,12 +158,16 @@ impl ColumnDef {
                         Constraint::ForeignKey {
                             table: t1,
                             column: c1,
+                            on_delete: d1,
+                            on_update: u1,
                         },
                         Constraint::ForeignKey {
                             table: t2,
                             column: c2,
+                            on_delete: d2,
+                            on_update: u2,
                         },
-                    ) => t1 == t2 && c1 == c2,
+                    ) => t1 == t2 && c1 == c2 && d1 == d2 && u1 == u2,
                     (Constraint::Check(e1), Constraint::Check(e2)) => e1 == e2,
                     _ => false,
                 }
@@ -172,33 +191,76 @@ impl ColumnDef {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SortDirection {
+    #[default]
+    Asc,
+    Desc,
+}
+
 #[derive(Debug, Clone, PartialEq)]
-pub enum IndexColumnDef {
+pub struct IndexColumnDef {
+    pub column_or_expr: IndexColumnKind,
+    pub direction: SortDirection,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum IndexColumnKind {
     Column(String),
     Expression(String),
 }
 
 impl IndexColumnDef {
+    pub fn column(name: impl Into<String>) -> Self {
+        Self {
+            column_or_expr: IndexColumnKind::Column(name.into()),
+            direction: SortDirection::Asc,
+        }
+    }
+
+    pub fn column_desc(name: impl Into<String>) -> Self {
+        Self {
+            column_or_expr: IndexColumnKind::Column(name.into()),
+            direction: SortDirection::Desc,
+        }
+    }
+
+    pub fn expression(expr: impl Into<String>) -> Self {
+        Self {
+            column_or_expr: IndexColumnKind::Expression(expr.into()),
+            direction: SortDirection::Asc,
+        }
+    }
+
+    pub fn with_direction(mut self, direction: SortDirection) -> Self {
+        self.direction = direction;
+        self
+    }
+
     pub fn is_column(&self) -> bool {
-        matches!(self, IndexColumnDef::Column(_))
+        matches!(self.column_or_expr, IndexColumnKind::Column(_))
     }
 
     pub fn is_expression(&self) -> bool {
-        matches!(self, IndexColumnDef::Expression(_))
+        matches!(self.column_or_expr, IndexColumnKind::Expression(_))
     }
 
     pub fn as_column(&self) -> Option<&str> {
-        match self {
-            IndexColumnDef::Column(c) => Some(c),
-            IndexColumnDef::Expression(_) => None,
+        match &self.column_or_expr {
+            IndexColumnKind::Column(c) => Some(c),
+            IndexColumnKind::Expression(_) => None,
         }
     }
 
     pub fn as_expression(&self) -> Option<&str> {
-        match self {
-            IndexColumnDef::Column(_) => None,
-            IndexColumnDef::Expression(e) => Some(e),
+        match &self.column_or_expr {
+            IndexColumnKind::Column(_) => None,
+            IndexColumnKind::Expression(e) => Some(e),
         }
+    }
+
+    pub fn is_desc(&self) -> bool {
+        self.direction == SortDirection::Desc
     }
 }
 
@@ -222,7 +284,7 @@ impl IndexDef {
             name: name.into(),
             column_defs: columns
                 .into_iter()
-                .map(|c| IndexColumnDef::Column(c.into()))
+                .map(|c| IndexColumnDef::column(c.into()))
                 .collect(),
             is_unique,
             index_type,
@@ -254,11 +316,8 @@ impl IndexDef {
         &self.name
     }
 
-    pub fn columns(&self) -> Vec<String> {
-        self.column_defs
-            .iter()
-            .filter_map(|cd| cd.as_column().map(|s| s.to_string()))
-            .collect()
+    pub fn columns(&self) -> impl Iterator<Item = &str> + '_ {
+        self.column_defs.iter().filter_map(|cd| cd.as_column())
     }
 
     pub fn column_defs(&self) -> &[IndexColumnDef] {

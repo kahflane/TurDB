@@ -117,6 +117,7 @@
 //! - Constraint checks add overhead proportional to constraints defined
 
 mod delete;
+pub mod fast_load;
 mod insert;
 pub mod mvcc_helpers;
 mod update;

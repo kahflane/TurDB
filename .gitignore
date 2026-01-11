@@ -27,3 +27,6 @@ book/*
 
 testdata/
 scripts/prepare_qdrant_comparison.py
+
+docs/ignore/
+docs/plans/

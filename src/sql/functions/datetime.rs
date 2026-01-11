@@ -205,7 +205,15 @@ fn eval_dayname<'a>(args: &[Option<Value<'a>>]) -> Option<Value<'a>> {
     let datetime = get_text(args.first()?)?;
     let (year, month, day) = parse_date(&datetime)?;
     let dow = day_of_week(year, month, day);
-    let names = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
+    let names = [
+        "Sunday",
+        "Monday",
+        "Tuesday",
+        "Wednesday",
+        "Thursday",
+        "Friday",
+        "Saturday",
+    ];
     Some(Value::Text(Cow::Borrowed(names[dow as usize])))
 }
 
@@ -213,8 +221,18 @@ fn eval_monthname<'a>(args: &[Option<Value<'a>>]) -> Option<Value<'a>> {
     let datetime = get_text(args.first()?)?;
     let (_, month, _) = parse_date(&datetime)?;
     let names = [
-        "January", "February", "March", "April", "May", "June",
-        "July", "August", "September", "October", "November", "December",
+        "January",
+        "February",
+        "March",
+        "April",
+        "May",
+        "June",
+        "July",
+        "August",
+        "September",
+        "October",
+        "November",
+        "December",
     ];
     Some(Value::Text(Cow::Borrowed(names[(month - 1) as usize])))
 }
@@ -267,12 +285,12 @@ fn eval_quarter<'a>(args: &[Option<Value<'a>>]) -> Option<Value<'a>> {
 fn eval_date_add<'a>(args: &[Option<Value<'a>>]) -> Option<Value<'a>> {
     let date_str = get_text(args.first()?)?;
     let days = get_int(args.get(1)?)?;
-    
+
     let (year, month, day) = parse_date(&date_str)?;
     let day_number = date_to_days(year, month, day);
     let new_day_number = day_number + days;
     let (new_year, new_month, new_day) = days_to_date(new_day_number);
-    
+
     Some(Value::Text(Cow::Owned(format!(
         "{:04}-{:02}-{:02}",
         new_year, new_month, new_day
@@ -282,12 +300,12 @@ fn eval_date_add<'a>(args: &[Option<Value<'a>>]) -> Option<Value<'a>> {
 fn eval_date_sub<'a>(args: &[Option<Value<'a>>]) -> Option<Value<'a>> {
     let date_str = get_text(args.first()?)?;
     let days = get_int(args.get(1)?)?;
-    
+
     let (year, month, day) = parse_date(&date_str)?;
     let day_number = date_to_days(year, month, day);
     let new_day_number = day_number - days;
     let (new_year, new_month, new_day) = days_to_date(new_day_number);
-    
+
     Some(Value::Text(Cow::Owned(format!(
         "{:04}-{:02}-{:02}",
         new_year, new_month, new_day
@@ -297,17 +315,17 @@ fn eval_date_sub<'a>(args: &[Option<Value<'a>>]) -> Option<Value<'a>> {
 fn eval_addtime<'a>(args: &[Option<Value<'a>>]) -> Option<Value<'a>> {
     let datetime = get_text(args.first()?)?;
     let time_to_add = get_text(args.get(1)?)?;
-    
+
     let (hour1, min1, sec1) = parse_time(&datetime)?;
     let (hour2, min2, sec2) = parse_time(&time_to_add)?;
-    
+
     let total_secs = (hour1 as i64 * 3600 + min1 as i64 * 60 + sec1 as i64)
         + (hour2 as i64 * 3600 + min2 as i64 * 60 + sec2 as i64);
-    
+
     let new_hour = (total_secs / 3600) % 24;
     let new_min = (total_secs % 3600) / 60;
     let new_sec = total_secs % 60;
-    
+
     let date_part = datetime.split(' ').next().unwrap_or("");
     if date_part.contains('-') {
         Some(Value::Text(Cow::Owned(format!(
@@ -325,19 +343,23 @@ fn eval_addtime<'a>(args: &[Option<Value<'a>>]) -> Option<Value<'a>> {
 fn eval_subtime<'a>(args: &[Option<Value<'a>>]) -> Option<Value<'a>> {
     let datetime = get_text(args.first()?)?;
     let time_to_sub = get_text(args.get(1)?)?;
-    
+
     let (hour1, min1, sec1) = parse_time(&datetime)?;
     let (hour2, min2, sec2) = parse_time(&time_to_sub)?;
-    
+
     let total_secs = (hour1 as i64 * 3600 + min1 as i64 * 60 + sec1 as i64)
         - (hour2 as i64 * 3600 + min2 as i64 * 60 + sec2 as i64);
-    
-    let total_secs = if total_secs < 0 { total_secs + 86400 } else { total_secs };
-    
+
+    let total_secs = if total_secs < 0 {
+        total_secs + 86400
+    } else {
+        total_secs
+    };
+
     let new_hour = (total_secs / 3600) % 24;
     let new_min = (total_secs % 3600) / 60;
     let new_sec = total_secs % 60;
-    
+
     let date_part = datetime.split(' ').next().unwrap_or("");
     if date_part.contains('-') {
         Some(Value::Text(Cow::Owned(format!(
@@ -355,33 +377,33 @@ fn eval_subtime<'a>(args: &[Option<Value<'a>>]) -> Option<Value<'a>> {
 fn eval_datediff<'a>(args: &[Option<Value<'a>>]) -> Option<Value<'a>> {
     let date1_str = get_text(args.first()?)?;
     let date2_str = get_text(args.get(1)?)?;
-    
+
     let (y1, m1, d1) = parse_date(&date1_str)?;
     let (y2, m2, d2) = parse_date(&date2_str)?;
-    
+
     let days1 = date_to_days(y1, m1, d1);
     let days2 = date_to_days(y2, m2, d2);
-    
+
     Some(Value::Int(days1 - days2))
 }
 
 fn eval_timediff<'a>(args: &[Option<Value<'a>>]) -> Option<Value<'a>> {
     let time1 = get_text(args.first()?)?;
     let time2 = get_text(args.get(1)?)?;
-    
+
     let (h1, m1, s1) = parse_time(&time1)?;
     let (h2, m2, s2) = parse_time(&time2)?;
-    
+
     let secs1 = h1 as i64 * 3600 + m1 as i64 * 60 + s1 as i64;
     let secs2 = h2 as i64 * 3600 + m2 as i64 * 60 + s2 as i64;
     let diff = secs1 - secs2;
-    
+
     let sign = if diff < 0 { "-" } else { "" };
     let diff = diff.abs();
     let hours = diff / 3600;
     let mins = (diff % 3600) / 60;
     let secs = diff % 60;
-    
+
     Some(Value::Text(Cow::Owned(format!(
         "{}{:02}:{:02}:{:02}",
         sign, hours, mins, secs
@@ -427,23 +449,26 @@ fn eval_sec_to_time<'a>(args: &[Option<Value<'a>>]) -> Option<Value<'a>> {
 fn eval_makedate<'a>(args: &[Option<Value<'a>>]) -> Option<Value<'a>> {
     let year = get_int(args.first()?)?;
     let dayofyear = get_int(args.get(1)?)?;
-    
+
     if dayofyear < 1 {
         return Some(Value::Null);
     }
-    
+
     let jan1_days = date_to_days(year, 1, 1);
     let target_days = jan1_days + dayofyear - 1;
     let (y, m, d) = days_to_date(target_days);
-    
-    Some(Value::Text(Cow::Owned(format!("{:04}-{:02}-{:02}", y, m, d))))
+
+    Some(Value::Text(Cow::Owned(format!(
+        "{:04}-{:02}-{:02}",
+        y, m, d
+    ))))
 }
 
 fn eval_maketime<'a>(args: &[Option<Value<'a>>]) -> Option<Value<'a>> {
     let hour = get_int(args.first()?)?;
     let minute = get_int(args.get(1)?)?;
     let second = get_int(args.get(2)?)?;
-    
+
     Some(Value::Text(Cow::Owned(format!(
         "{:02}:{:02}:{:02}",
         hour, minute, second
@@ -452,8 +477,11 @@ fn eval_maketime<'a>(args: &[Option<Value<'a>>]) -> Option<Value<'a>> {
 
 fn eval_timestamp<'a>(args: &[Option<Value<'a>>]) -> Option<Value<'a>> {
     let date = get_text(args.first()?)?;
-    let time = args.get(1).and_then(get_text).unwrap_or_else(|| "00:00:00".to_string());
-    
+    let time = args
+        .get(1)
+        .and_then(get_text)
+        .unwrap_or_else(|| "00:00:00".to_string());
+
     let date_part = date.split(' ').next().unwrap_or(&date);
     Some(Value::Text(Cow::Owned(format!("{} {}", date_part, time))))
 }
@@ -471,24 +499,24 @@ fn eval_last_day<'a>(args: &[Option<Value<'a>>]) -> Option<Value<'a>> {
 fn eval_period_add<'a>(args: &[Option<Value<'a>>]) -> Option<Value<'a>> {
     let period = get_int(args.first()?)?;
     let months = get_int(args.get(1)?)?;
-    
+
     let year = period / 100;
     let month = period % 100;
-    
+
     let total_months = year * 12 + month + months - 1;
     let new_year = total_months / 12;
     let new_month = total_months % 12 + 1;
-    
+
     Some(Value::Int(new_year * 100 + new_month))
 }
 
 fn eval_period_diff<'a>(args: &[Option<Value<'a>>]) -> Option<Value<'a>> {
     let p1 = get_int(args.first()?)?;
     let p2 = get_int(args.get(1)?)?;
-    
+
     let months1 = (p1 / 100) * 12 + p1 % 100;
     let months2 = (p2 / 100) * 12 + p2 % 100;
-    
+
     Some(Value::Int(months1 - months2))
 }
 
@@ -550,7 +578,13 @@ fn days_in_month(year: i64, month: u32) -> u32 {
     match month {
         1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
         4 | 6 | 9 | 11 => 30,
-        2 => if is_leap_year(year) { 29 } else { 28 },
+        2 => {
+            if is_leap_year(year) {
+                29
+            } else {
+                28
+            }
+        }
         _ => 30,
     }
 }
@@ -615,7 +649,9 @@ fn get_local_timezone_offset() -> i64 {
         }
     }
     #[cfg(not(unix))]
-    { 0 }
+    {
+        0
+    }
 }
 
 fn format_unix_timestamp_local(secs: i64) -> String {
@@ -631,7 +667,11 @@ fn format_unix_timestamp(secs: i64) -> String {
     let minutes = (day_secs % 3600) / 60;
     let seconds = day_secs % 60;
     days += 719468;
-    let era = if days >= 0 { days / 146097 } else { (days - 146096) / 146097 };
+    let era = if days >= 0 {
+        days / 146097
+    } else {
+        (days - 146096) / 146097
+    };
     let doe = (days - era * 146097) as u32;
     let yoe = (doe - doe / 1461 + doe / 36524 - doe / 146097) / 365;
     let y = yoe as i64 + era * 400;
@@ -640,15 +680,26 @@ fn format_unix_timestamp(secs: i64) -> String {
     let d = doy - (153 * mp + 2) / 5 + 1;
     let m = if mp < 10 { mp + 3 } else { mp - 9 };
     let y = if m <= 2 { y + 1 } else { y };
-    format!("{:04}-{:02}-{:02} {:02}:{:02}:{:02}", y, m, d, hours, minutes, seconds)
+    format!(
+        "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+        y, m, d, hours, minutes, seconds
+    )
 }
 
 fn format_unix_date_local(secs: i64) -> String {
-    format_unix_timestamp_local(secs).split(' ').next().unwrap_or("").to_string()
+    format_unix_timestamp_local(secs)
+        .split(' ')
+        .next()
+        .unwrap_or("")
+        .to_string()
 }
 
 fn format_unix_time_local(secs: i64) -> String {
-    format_unix_timestamp_local(secs).split(' ').nth(1).unwrap_or("").to_string()
+    format_unix_timestamp_local(secs)
+        .split(' ')
+        .nth(1)
+        .unwrap_or("")
+        .to_string()
 }
 
 fn format_datetime_with_pattern(datetime_str: &str, pattern: &str) -> String {
@@ -667,22 +718,53 @@ fn format_datetime_with_pattern(datetime_str: &str, pattern: &str) -> String {
     let second = time_parts.get(2).unwrap_or(&"00");
 
     let hour_num: u32 = hour.parse().unwrap_or(0);
-    let hour_12 = if hour_num == 0 { 12 } else if hour_num > 12 { hour_num - 12 } else { hour_num };
+    let hour_12 = if hour_num == 0 {
+        12
+    } else if hour_num > 12 {
+        hour_num - 12
+    } else {
+        hour_num
+    };
     let am_pm = if hour_num < 12 { "AM" } else { "PM" };
 
     let year_num: i64 = year.parse().unwrap_or(0);
     let month_num: u32 = month.parse().unwrap_or(1);
     let day_num: u32 = day.parse().unwrap_or(1);
-    
-    let month_names = ["January", "February", "March", "April", "May", "June",
-        "July", "August", "September", "October", "November", "December"];
-    let month_abbrs = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
-        "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
-    let day_names = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
+
+    let month_names = [
+        "January",
+        "February",
+        "March",
+        "April",
+        "May",
+        "June",
+        "July",
+        "August",
+        "September",
+        "October",
+        "November",
+        "December",
+    ];
+    let month_abbrs = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    let day_names = [
+        "Sunday",
+        "Monday",
+        "Tuesday",
+        "Wednesday",
+        "Thursday",
+        "Friday",
+        "Saturday",
+    ];
     let day_abbrs = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
-    
-    let month_name = month_names.get((month_num as usize).saturating_sub(1)).unwrap_or(&"");
-    let month_abbr = month_abbrs.get((month_num as usize).saturating_sub(1)).unwrap_or(&"");
+
+    let month_name = month_names
+        .get((month_num as usize).saturating_sub(1))
+        .unwrap_or(&"");
+    let month_abbr = month_abbrs
+        .get((month_num as usize).saturating_sub(1))
+        .unwrap_or(&"");
     let dow = day_of_week(year_num, month_num, day_num) as usize;
     let day_name = day_names.get(dow).unwrap_or(&"");
     let day_abbr = day_abbrs.get(dow).unwrap_or(&"");
@@ -710,7 +792,10 @@ fn format_datetime_with_pattern(datetime_str: &str, pattern: &str) -> String {
         .replace("%l", &hour_12.to_string())
         .replace("%p", am_pm)
         .replace("%T", &format!("{}:{}:{}", hour, minute, second))
-        .replace("%r", &format!("{:02}:{:02}:{:02} {}", hour_12, minute, second, am_pm))
+        .replace(
+            "%r",
+            &format!("{:02}:{:02}:{:02} {}", hour_12, minute, second, am_pm),
+        )
         .replace("%D", &format!("{}{}", day, ordinal_suffix(day_num)))
         .replace("%t", &last_day.to_string())
         .replace("%j", &format!("{:03}", doy))
@@ -749,14 +834,23 @@ mod tests {
     #[test]
     fn test_dayname_monthname() {
         let args = vec![Some(Value::Text(Cow::Borrowed("2024-06-15")))];
-        assert_eq!(eval_dayname(&args), Some(Value::Text(Cow::Borrowed("Saturday"))));
-        assert_eq!(eval_monthname(&args), Some(Value::Text(Cow::Borrowed("June"))));
+        assert_eq!(
+            eval_dayname(&args),
+            Some(Value::Text(Cow::Borrowed("Saturday")))
+        );
+        assert_eq!(
+            eval_monthname(&args),
+            Some(Value::Text(Cow::Borrowed("June")))
+        );
     }
 
     #[test]
     fn test_makedate() {
         let args = vec![Some(Value::Int(2024)), Some(Value::Int(100))];
-        assert_eq!(eval_makedate(&args), Some(Value::Text(Cow::Owned("2024-04-09".to_string()))));
+        assert_eq!(
+            eval_makedate(&args),
+            Some(Value::Text(Cow::Owned("2024-04-09".to_string())))
+        );
     }
 
     #[test]
@@ -768,6 +862,9 @@ mod tests {
     #[test]
     fn test_sec_to_time() {
         let args = vec![Some(Value::Int(5400))];
-        assert_eq!(eval_sec_to_time(&args), Some(Value::Text(Cow::Owned("01:30:00".to_string()))));
+        assert_eq!(
+            eval_sec_to_time(&args),
+            Some(Value::Text(Cow::Owned("01:30:00".to_string())))
+        );
     }
 }

@@ -284,49 +284,61 @@ impl<'a> LeafNode<'a> {
         Ok(&self.data[value_data_start..value_data_start + value_len as usize])
     }
 
+    pub fn value_len_at(&self, index: usize) -> Result<usize> {
+        let slot = self.slot_at(index)?;
+        let cell_offset = slot.offset() as usize;
+        let key_len = slot.key_len() as usize;
+        let value_start = cell_offset + key_len;
+
+        ensure!(
+            value_start < PAGE_SIZE,
+            "value_len offset beyond page: {}",
+            value_start
+        );
+
+        let (value_len, _) = decode_varint(&self.data[value_start..])?;
+        Ok(value_len as usize)
+    }
+
     pub fn find_key(&self, key: &[u8]) -> SearchResult {
-        let target_prefix = u32::from_be_bytes(extract_prefix(key));
-        let count = self.cell_count() as usize;
-
-        if count == 0 {
-            return SearchResult::NotFound(0);
-        }
-
-        let mut left = 0usize;
-        let mut right = count;
-
-        while left < right {
-            let mid = left + (right - left) / 2;
-            let slot = match self.slot_at(mid) {
-                Ok(s) => s,
-                Err(_) => return SearchResult::NotFound(mid),
-            };
-
-            let slot_prefix = slot.prefix_as_u32();
-
-            match slot_prefix.cmp(&target_prefix) {
-                std::cmp::Ordering::Less => left = mid + 1,
-                std::cmp::Ordering::Greater => right = mid,
-                std::cmp::Ordering::Equal => {
-                    let full_key = match self.key_at(mid) {
-                        Ok(k) => k,
-                        Err(_) => return SearchResult::NotFound(mid),
-                    };
-                    match full_key.cmp(key) {
-                        std::cmp::Ordering::Equal => return SearchResult::Found(mid),
-                        std::cmp::Ordering::Less => left = mid + 1,
-                        std::cmp::Ordering::Greater => right = mid,
-                    }
-                }
-            }
-        }
-
-        SearchResult::NotFound(left)
+        super::simd_scan::find_key_simd(self.data, key, self.cell_count() as usize)
     }
 
     pub fn next_leaf(&self) -> u32 {
         let header = PageHeader::from_bytes(self.data).unwrap(); // INVARIANT: page validated in from_page constructor
         header.next_leaf()
+    }
+
+    /// SIMD-accelerated key search
+    ///
+    /// Uses SIMD instructions (AVX2 on x86_64, NEON on aarch64) to compare
+    /// multiple prefixes in parallel, reducing search iterations.
+    ///
+    /// Falls back to scalar binary search on unsupported architectures.
+    pub fn find_key_simd(&self, key: &[u8]) -> SearchResult {
+        super::simd_scan::find_key_simd(self.data, key, self.cell_count() as usize)
+    }
+
+    /// Get raw page data for SIMD operations
+    pub fn page_data(&self) -> &'a [u8] {
+        self.data
+    }
+
+    /// Create a batch iterator for efficient range scans
+    pub fn batch_iterator(&self) -> super::simd_scan::BatchSlotIterator<'a> {
+        super::simd_scan::BatchSlotIterator::new(self.data, self.cell_count() as usize)
+    }
+
+    /// Create a batch iterator starting at a specific index
+    pub fn batch_iterator_from(
+        &self,
+        start_index: usize,
+    ) -> super::simd_scan::BatchSlotIterator<'a> {
+        super::simd_scan::BatchSlotIterator::from_index(
+            self.data,
+            self.cell_count() as usize,
+            start_index,
+        )
     }
 }
 
@@ -439,43 +451,7 @@ impl<'a> LeafNodeMut<'a> {
     }
 
     pub fn find_key(&self, key: &[u8]) -> SearchResult {
-        let target_prefix = u32::from_be_bytes(extract_prefix(key));
-        let count = self.cell_count() as usize;
-
-        if count == 0 {
-            return SearchResult::NotFound(0);
-        }
-
-        let mut left = 0usize;
-        let mut right = count;
-
-        while left < right {
-            let mid = left + (right - left) / 2;
-            let slot = match self.slot_at(mid) {
-                Ok(s) => s,
-                Err(_) => return SearchResult::NotFound(mid),
-            };
-
-            let slot_prefix = slot.prefix_as_u32();
-
-            match slot_prefix.cmp(&target_prefix) {
-                std::cmp::Ordering::Less => left = mid + 1,
-                std::cmp::Ordering::Greater => right = mid,
-                std::cmp::Ordering::Equal => {
-                    let full_key = match self.key_at(mid) {
-                        Ok(k) => k,
-                        Err(_) => return SearchResult::NotFound(mid),
-                    };
-                    match full_key.cmp(key) {
-                        std::cmp::Ordering::Equal => return SearchResult::Found(mid),
-                        std::cmp::Ordering::Less => left = mid + 1,
-                        std::cmp::Ordering::Greater => right = mid,
-                    }
-                }
-            }
-        }
-
-        SearchResult::NotFound(left)
+        super::simd_scan::find_key_simd(self.data, key, self.cell_count() as usize)
     }
 
     pub fn insert_cell(&mut self, key: &[u8], value: &[u8]) -> Result<()> {
@@ -671,8 +647,7 @@ impl<'a> LeafNodeMut<'a> {
         );
 
         let value_data_start = value_start + varint_size;
-        self.data[value_data_start..value_data_start + new_value.len()]
-            .copy_from_slice(new_value);
+        self.data[value_data_start..value_data_start + new_value.len()].copy_from_slice(new_value);
 
         Ok(())
     }
@@ -697,8 +672,7 @@ impl<'a> LeafNodeMut<'a> {
         encode_varint(new_value.len() as u64, &mut self.data[value_start..]);
 
         let value_data_start = value_start + new_varint_size;
-        self.data[value_data_start..value_data_start + new_value.len()]
-            .copy_from_slice(new_value);
+        self.data[value_data_start..value_data_start + new_value.len()].copy_from_slice(new_value);
 
         let old_total_size = old_varint_size + old_value_len as usize;
         let new_total_size = new_varint_size + new_value.len();
@@ -707,6 +681,89 @@ impl<'a> LeafNodeMut<'a> {
         let header = PageHeader::from_bytes_mut(self.data)?;
         let new_frag = header.frag_bytes().saturating_add(freed as u8);
         header.set_frag_bytes(new_frag);
+
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod reproduction_test {
+    use super::*;
+    use crate::storage::PAGE_SIZE;
+
+    #[test]
+    fn test_many_keys_insertion() -> Result<()> {
+        let mut page = vec![0u8; PAGE_SIZE];
+        LeafNodeMut::init(&mut page)?;
+
+        // Insert 500 keys: 0, 2, 4, ... 998.
+        for i in (0..500).step_by(2) {
+            let key_val = (i as u64).to_be_bytes(); // 8 bytes
+            {
+                let mut leaf = LeafNodeMut::from_page(&mut page)?;
+                match leaf.insert_cell(&key_val, b"val") {
+                    Ok(_) => {}
+                    Err(e) => panic!("Failed to insert {}: {:?}", i, e),
+                }
+            }
+        }
+
+        // Check order
+        {
+            let leaf = LeafNode::from_page(&page)?;
+            assert_eq!(leaf.cell_count(), 250);
+            for i in 0..249 {
+                let k1 = leaf.key_at(i)?;
+                let k2 = leaf.key_at(i + 1)?;
+                assert!(k1 < k2, "Keys out of order at {}: {:?} >= {:?}", i, k1, k2);
+            }
+        }
+
+        // Insert key 1 (Small). Should go between 0 and 2.
+        let key_1 = (1u64).to_be_bytes();
+        {
+            let mut leaf = LeafNodeMut::from_page(&mut page)?;
+            leaf.insert_cell(&key_1, b"val")?;
+        }
+
+        // FULL VERIFY
+        {
+            let leaf = LeafNode::from_page(&page)?;
+            for i in 0..leaf.cell_count() as usize - 1 {
+                let k1 = leaf.key_at(i)?;
+                let k2 = leaf.key_at(i + 1)?;
+                if k1 >= k2 {
+                    panic!("Keys out of order at {}: {:?} >= {:?}", i, k1, k2);
+                }
+            }
+        }
+
+        // Check order again
+        {
+            let leaf = LeafNode::from_page(&page)?;
+            // binary search check
+            let idx = match leaf.find_key(&key_1) {
+                SearchResult::Found(i) => i,
+                _ => panic!("Key 1 not found"),
+            };
+            // println!("Key 1 found at index {}", idx);
+
+            // idx should be 1 (after 0)
+            // 0 is at index 0.
+            // 2 is at index 1 (before insert). now 2.
+            // 1 is at index 1.
+
+            if idx > 0 {
+                let k_prev = leaf.key_at(idx - 1)?;
+                let k_curr = leaf.key_at(idx)?;
+                assert!(k_prev < k_curr, "Prev {:?} >= Curr {:?}", k_prev, k_curr);
+            }
+            if idx < (leaf.cell_count() as usize - 1) {
+                let k_curr = leaf.key_at(idx)?;
+                let k_next = leaf.key_at(idx + 1)?;
+                assert!(k_curr < k_next, "Curr {:?} >= Next {:?}", k_curr, k_next);
+            }
+        }
 
         Ok(())
     }

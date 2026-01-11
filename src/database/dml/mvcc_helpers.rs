@@ -54,6 +54,29 @@ pub fn wrap_record_for_insert(txn_id: TxnId, user_record: &[u8], in_transaction:
     result
 }
 
+pub fn wrap_record_into_buffer(
+    txn_id: TxnId,
+    user_record: &[u8],
+    in_transaction: bool,
+    buffer: &mut Vec<u8>,
+) {
+    let mut header = RecordHeader::new(txn_id);
+    header.set_locked(in_transaction);
+
+    let total_len = RecordHeader::SIZE + user_record.len();
+    buffer.clear();
+    buffer.reserve(total_len);
+
+    // SAFETY: We immediately write to all bytes via write_to and copy_from_slice.
+    // No uninitialized memory is ever read.
+    #[allow(clippy::uninit_vec)]
+    unsafe {
+        buffer.set_len(total_len);
+    }
+    header.write_to(&mut buffer[..RecordHeader::SIZE]);
+    buffer[RecordHeader::SIZE..].copy_from_slice(user_record);
+}
+
 pub fn wrap_record_for_update(
     txn_id: TxnId,
     user_record: &[u8],
@@ -71,7 +94,11 @@ pub fn wrap_record_for_update(
     result
 }
 
-pub fn wrap_record_for_delete(txn_id: TxnId, existing_record: &[u8], in_transaction: bool) -> Result<Vec<u8>> {
+pub fn wrap_record_for_delete(
+    txn_id: TxnId,
+    existing_record: &[u8],
+    in_transaction: bool,
+) -> Result<Vec<u8>> {
     if existing_record.len() < RecordHeader::SIZE {
         eyre::bail!("existing value too small for delete");
     }
@@ -109,11 +136,7 @@ pub fn has_mvcc_header(raw_value: &[u8]) -> bool {
     raw_value.len() >= RecordHeader::SIZE
 }
 
-pub fn create_undo_record(
-    table_id: TableId,
-    key: &[u8],
-    raw_value: &[u8],
-) -> Result<UndoRecord> {
+pub fn create_undo_record(table_id: TableId, key: &[u8], raw_value: &[u8]) -> Result<UndoRecord> {
     let mvcc_table = MvccTable::new(table_id);
     mvcc_table.create_undo_record(key, raw_value)
 }
@@ -145,11 +168,11 @@ pub fn finalize_commit<S: Storage>(
 ) -> Result<()> {
     let page = storage.page_mut(entry.page_id as u32)?;
     let offset = entry.offset as usize;
-    
+
     if offset + RecordHeader::SIZE <= page.len() {
         MvccTable::finalize_commit_value(&mut page[offset..], commit_ts)?;
     }
-    
+
     Ok(())
 }
 
@@ -160,10 +183,10 @@ pub fn finalize_abort<S: Storage>(
 ) -> Result<()> {
     let page = storage.page_mut(entry.page_id as u32)?;
     let offset = entry.offset as usize;
-    
+
     if offset + RecordHeader::SIZE <= page.len() {
         MvccTable::finalize_abort_value(&mut page[offset..], original_txn_id)?;
     }
-    
+
     Ok(())
 }

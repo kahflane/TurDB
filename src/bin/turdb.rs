@@ -78,11 +78,14 @@ fn run() -> Result<()> {
     };
 
     let db = if create_mode {
-        Database::create(&db_path).wrap_err_with(|| format!("failed to create database at {:?}", db_path))?
+        Database::create(&db_path)
+            .wrap_err_with(|| format!("failed to create database at {:?}", db_path))?
     } else if db_path.exists() {
-        Database::open(&db_path).wrap_err_with(|| format!("failed to open database at {:?}", db_path))?
+        Database::open(&db_path)
+            .wrap_err_with(|| format!("failed to open database at {:?}", db_path))?
     } else {
-        Database::create(&db_path).wrap_err_with(|| format!("failed to create database at {:?}", db_path))?
+        Database::create(&db_path)
+            .wrap_err_with(|| format!("failed to create database at {:?}", db_path))?
     };
 
     let mut repl = Repl::new(db)?;

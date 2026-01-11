@@ -45,7 +45,16 @@
       "Bash(timeout 60 cargo test:*)",
       "Bash(for:*)",
       "Bash(do echo \"=== Run $i ===\")",
-      "Bash(done)"
+      "Bash(done)",
+      "Bash(tokei:*)",
+      "Bash(xxd:*)",
+      "Bash(pnpm install)",
+      "Bash(pnpm build:*)",
+      "Bash(pnpm add:*)",
+      "Bash(pnpm exec napi build:*)",
+      "Bash(pnpm tsc:*)",
+      "Bash(napi build:*)",
+      "Bash(pnpm run build:*)"
     ]
   }
 }

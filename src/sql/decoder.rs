@@ -56,7 +56,11 @@ impl SimpleDecoder {
     #[allow(clippy::type_complexity)]
     fn build_schemas(
         column_types: &[crate::records::types::DataType],
-    ) -> (crate::records::Schema, u16, Vec<(u16, usize, usize, crate::records::Schema)>) {
+    ) -> (
+        crate::records::Schema,
+        u16,
+        Vec<(u16, usize, usize, crate::records::Schema)>,
+    ) {
         use crate::records::types::ColumnDef;
         use crate::records::Schema;
 
@@ -202,8 +206,9 @@ impl SimpleDecoder {
                     if is_toast_pointer(raw) {
                         if let Some(ref detoaster) = self.detoaster {
                             let detoasted = detoaster.detoast(raw)?;
-                            let text = String::from_utf8(detoasted)
-                                .map_err(|e| eyre::eyre!("invalid UTF-8 in detoasted text: {}", e))?;
+                            let text = String::from_utf8(detoasted).map_err(|e| {
+                                eyre::eyre!("invalid UTF-8 in detoasted text: {}", e)
+                            })?;
                             Value::Text(Cow::Owned(text))
                         } else {
                             Value::ToastPointer(Cow::Owned(raw.to_vec()))
@@ -225,7 +230,7 @@ impl SimpleDecoder {
                     }
                 }
                 DataType::Uuid => Value::Uuid(*view.get_uuid(idx)?),
-                DataType::Vector => Value::Vector(Cow::Owned(view.get_vector(idx)?.to_vec())),
+                DataType::Vector => Value::Vector(Cow::Owned(view.get_vector_copy(idx)?)),
                 DataType::Jsonb => {
                     let jsonb_view = view.get_jsonb(idx)?;
                     Value::Jsonb(Cow::Owned(jsonb_view.data().to_vec()))
@@ -642,11 +647,7 @@ mod tests {
         builder.set_text(1, "John").unwrap();
         let old_record = builder.build().unwrap();
 
-        let new_decoder = SimpleDecoder::new(vec![
-            DataType::Int4,
-            DataType::Text,
-            DataType::Int4,
-        ]);
+        let new_decoder = SimpleDecoder::new(vec![DataType::Int4, DataType::Text, DataType::Int4]);
 
         let result = new_decoder.decode(&[], &old_record).unwrap();
 

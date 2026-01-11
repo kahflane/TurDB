@@ -144,12 +144,13 @@ impl UndoPageManager {
     ) -> Result<Option<(RecordHeader, Vec<u8>)>> {
         let page = storage.page(page_id as u32)?;
         let reader = UndoPageReader::new(page)?;
-        
+
         match reader.read_record_at(offset) {
             Ok(record) => {
-                let data_start = offset as usize + super::undo_page::UNDO_RECORD_HEADER_SIZE + record.key.len();
+                let data_start =
+                    offset as usize + super::undo_page::UNDO_RECORD_HEADER_SIZE + record.key.len();
                 let data_end = offset as usize + record.serialized_size();
-                
+
                 if data_end <= PAGE_SIZE {
                     let data_slice = &page[data_start..data_end];
                     Ok(Some((record.record_header, data_slice.to_vec())))
@@ -205,9 +206,7 @@ impl UndoRegistry {
     }
 
     pub fn get_or_create(&mut self, table_id: TableId) -> &mut UndoPageManager {
-        self.managers
-            .entry(table_id)
-            .or_default()
+        self.managers.entry(table_id).or_default()
     }
 
     pub fn get(&self, table_id: TableId) -> Option<&UndoPageManager> {
@@ -244,13 +243,15 @@ mod tests {
 
     impl Storage for MockStorage {
         fn page(&self, page_no: u32) -> Result<&[u8]> {
-            self.pages.get(page_no as usize)
+            self.pages
+                .get(page_no as usize)
                 .map(|p| p.as_slice())
                 .ok_or_else(|| eyre::eyre!("page not found"))
         }
 
         fn page_mut(&mut self, page_no: u32) -> Result<&mut [u8]> {
-            self.pages.get_mut(page_no as usize)
+            self.pages
+                .get_mut(page_no as usize)
                 .map(|p| p.as_mut_slice())
                 .ok_or_else(|| eyre::eyre!("page not found"))
         }

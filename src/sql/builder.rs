@@ -6,8 +6,8 @@ use crate::sql::executor::{
 };
 use crate::sql::predicate::CompiledPredicate;
 use crate::sql::state::{
-    GraceHashJoinState, HashAggregateState, IndexScanState, LimitState, NestedLoopJoinState,
-    SortState, WindowState,
+    GraceHashJoinState, HashAggregateState, HashAntiJoinState, HashSemiJoinState, IndexScanState,
+    LimitState, NestedLoopJoinState, SortState, TopKState, WindowState,
 };
 
 pub struct ExecutorBuilder<'a> {
@@ -56,9 +56,10 @@ impl<'a> ExecutorBuilder<'a> {
             PhysicalOperator::TableScan(_) => Ok(DynamicExecutor::TableScan(
                 TableScanExecutor::new(source, self.ctx.arena),
             )),
-            PhysicalOperator::DualScan => Ok(DynamicExecutor::TableScan(
-                TableScanExecutor::new(source, self.ctx.arena),
-            )),
+            PhysicalOperator::DualScan => Ok(DynamicExecutor::TableScan(TableScanExecutor::new(
+                source,
+                self.ctx.arena,
+            ))),
             PhysicalOperator::FilterExec(filter) => {
                 let child = self.build_operator(filter.input, source, column_map)?;
                 let predicate = CompiledPredicate::new(filter.predicate, column_map.to_vec());
@@ -76,21 +77,16 @@ impl<'a> ExecutorBuilder<'a> {
 
                 let child = self.build_operator(project.input, source, column_map)?;
 
-                let has_complex_expressions = project.expressions.iter().any(|expr| {
-                    match expr {
-                        Expr::Column(_) => false,
-                        Expr::Function(func) => {
-                            if func.over.is_some() {
-                                return false;
-                            }
-                            let name = func.name.name.to_uppercase();
-                            !matches!(
-                                name.as_str(),
-                                "COUNT" | "SUM" | "AVG" | "MIN" | "MAX"
-                            )
+                let has_complex_expressions = project.expressions.iter().any(|expr| match expr {
+                    Expr::Column(_) => false,
+                    Expr::Function(func) => {
+                        if func.over.is_some() {
+                            return false;
                         }
-                        _ => true,
+                        let name = func.name.name.to_uppercase();
+                        !matches!(name.as_str(), "COUNT" | "SUM" | "AVG" | "MIN" | "MAX")
                     }
+                    _ => true,
                 });
 
                 if has_complex_expressions && !project.expressions.is_empty() {
@@ -124,7 +120,10 @@ impl<'a> ExecutorBuilder<'a> {
                                     if let Expr::Column(col_ref) = expr {
                                         for (idx, group_expr) in group_by.iter().enumerate() {
                                             if let Expr::Column(group_col) = group_expr {
-                                                if group_col.column.eq_ignore_ascii_case(col_ref.column) {
+                                                if group_col
+                                                    .column
+                                                    .eq_ignore_ascii_case(col_ref.column)
+                                                {
                                                     return idx;
                                                 }
                                             }
@@ -152,13 +151,18 @@ impl<'a> ExecutorBuilder<'a> {
                                             if matches_func {
                                                 use crate::sql::ast::FunctionArgs;
                                                 let first_arg = match args {
-                                                    FunctionArgs::Args(arg_list) => arg_list.first().map(|a| a.value),
+                                                    FunctionArgs::Args(arg_list) => {
+                                                        arg_list.first().map(|a| a.value)
+                                                    }
                                                     _ => None,
                                                 };
                                                 let args_match = match (agg.argument, first_arg) {
-                                                    (Some(Expr::Column(agg_col)), Some(Expr::Column(arg_col))) => {
-                                                        agg_col.column.eq_ignore_ascii_case(arg_col.column)
-                                                    }
+                                                    (
+                                                        Some(Expr::Column(agg_col)),
+                                                        Some(Expr::Column(arg_col)),
+                                                    ) => agg_col
+                                                        .column
+                                                        .eq_ignore_ascii_case(arg_col.column),
                                                     (None, _) | (Some(Expr::Literal(_)), _) => true,
                                                     _ => false,
                                                 };
@@ -210,22 +214,80 @@ impl<'a> ExecutorBuilder<'a> {
                 }))
             }
             PhysicalOperator::SortExec(sort) => {
+                use crate::sql::planner::PhysicalOperator as POp;
+
+                let needs_full_columns = sort.order_by.iter().any(|key| {
+                    !matches!(key.expr, crate::sql::ast::Expr::Column(_))
+                });
+
+                if needs_full_columns {
+                    if let POp::ProjectExec(project) = sort.input {
+                        let full_column_map = self.compute_input_column_map(project.input);
+                        let child = self.build_operator(project.input, source, column_map)?;
+
+                        let sort_keys: Vec<SortKey<'a>> = sort
+                            .order_by
+                            .iter()
+                            .map(|key| {
+                                if let crate::sql::ast::Expr::Column(col) = key.expr {
+                                    if let Some((_, idx)) = full_column_map
+                                        .iter()
+                                        .find(|(n, _)| n.eq_ignore_ascii_case(col.column))
+                                    {
+                                        return SortKey::column(*idx, key.ascending);
+                                    }
+                                }
+                                SortKey::expression(key.expr, full_column_map.clone(), key.ascending)
+                            })
+                            .collect();
+
+                        let sorted = DynamicExecutor::Sort(SortState {
+                            child: Box::new(child),
+                            sort_keys,
+                            arena: self.ctx.arena,
+                            rows: Vec::new(),
+                            iter_idx: 0,
+                            sorted: false,
+                        });
+
+                        let projections: Vec<usize> = project
+                            .expressions
+                            .iter()
+                            .filter_map(|expr| {
+                                if let crate::sql::ast::Expr::Column(col) = expr {
+                                    full_column_map
+                                        .iter()
+                                        .find(|(n, _)| n.eq_ignore_ascii_case(col.column))
+                                        .map(|(_, idx)| *idx)
+                                } else {
+                                    None
+                                }
+                            })
+                            .collect();
+
+                        return Ok(DynamicExecutor::Project(
+                            Box::new(sorted),
+                            projections,
+                            self.ctx.arena,
+                        ));
+                    }
+                }
+
+                let input_column_map = self.compute_input_column_map(sort.input);
                 let child = self.build_operator(sort.input, source, column_map)?;
-                let sort_keys: Vec<SortKey> = sort
+                let sort_keys: Vec<SortKey<'a>> = sort
                     .order_by
                     .iter()
-                    .filter_map(|key| {
+                    .map(|key| {
                         if let crate::sql::ast::Expr::Column(col) = key.expr {
-                            column_map
+                            if let Some((_, idx)) = input_column_map
                                 .iter()
                                 .find(|(n, _)| n.eq_ignore_ascii_case(col.column))
-                                .map(|(_, idx)| SortKey {
-                                    column: *idx,
-                                    ascending: key.ascending,
-                                })
-                        } else {
-                            None
+                            {
+                                return SortKey::column(*idx, key.ascending);
+                            }
                         }
+                        SortKey::expression(key.expr, input_column_map.clone(), key.ascending)
                     })
                     .collect();
                 Ok(DynamicExecutor::Sort(SortState {
@@ -235,6 +297,36 @@ impl<'a> ExecutorBuilder<'a> {
                     rows: Vec::new(),
                     iter_idx: 0,
                     sorted: false,
+                }))
+            }
+            PhysicalOperator::TopKExec(topk) => {
+                let input_column_map = self.compute_input_column_map(topk.input);
+                let child = self.build_operator(topk.input, source, column_map)?;
+                let sort_keys: Vec<SortKey<'a>> = topk
+                    .order_by
+                    .iter()
+                    .map(|key| {
+                        if let crate::sql::ast::Expr::Column(col) = key.expr {
+                            if let Some((_, idx)) = input_column_map
+                                .iter()
+                                .find(|(n, _)| n.eq_ignore_ascii_case(col.column))
+                            {
+                                return SortKey::column(*idx, key.ascending);
+                            }
+                        }
+                        SortKey::expression(key.expr, input_column_map.clone(), key.ascending)
+                    })
+                    .collect();
+                Ok(DynamicExecutor::TopK(TopKState {
+                    child: Box::new(child),
+                    sort_keys,
+                    arena: self.ctx.arena,
+                    limit: topk.limit,
+                    offset: topk.offset.unwrap_or(0),
+                    heap: Vec::new(),
+                    result: Vec::new(),
+                    iter_idx: 0,
+                    computed: false,
                 }))
             }
             PhysicalOperator::IndexScan(_) => Ok(DynamicExecutor::TableScan(
@@ -381,9 +473,28 @@ impl<'a> ExecutorBuilder<'a> {
                     "GraceHashJoin requires two sources - use build_grace_hash_join instead"
                 )
             }
+            PhysicalOperator::HashSemiJoin(_) => {
+                eyre::bail!(
+                    "HashSemiJoin requires two sources - use build_hash_semi_join instead"
+                )
+            }
+            PhysicalOperator::HashAntiJoin(_) => {
+                eyre::bail!(
+                    "HashAntiJoin requires two sources - use build_hash_anti_join instead"
+                )
+            }
             PhysicalOperator::SubqueryExec(_) => Ok(DynamicExecutor::TableScan(
                 TableScanExecutor::new(source, self.ctx.arena),
             )),
+            PhysicalOperator::ScalarSubqueryExec(_) => {
+                eyre::bail!("ScalarSubqueryExec requires special handling")
+            }
+            PhysicalOperator::ExistsSubqueryExec(_) => {
+                eyre::bail!("ExistsSubqueryExec requires special handling")
+            }
+            PhysicalOperator::InListSubqueryExec(_) => {
+                eyre::bail!("InListSubqueryExec requires special handling")
+            }
             PhysicalOperator::WindowExec(window) => {
                 let child = self.build_operator(window.input, source, column_map)?;
                 Ok(DynamicExecutor::Window(WindowState::new_with_column_map(
@@ -394,9 +505,7 @@ impl<'a> ExecutorBuilder<'a> {
                 )))
             }
             PhysicalOperator::SetOpExec(_) => {
-                eyre::bail!(
-                    "SetOpExec requires special handling - use Database::query instead"
-                )
+                eyre::bail!("SetOpExec requires special handling - use Database::query instead")
             }
         }
     }
@@ -461,6 +570,9 @@ impl<'a> ExecutorBuilder<'a> {
         join_type: JoinType,
         left_col_count: usize,
         right_col_count: usize,
+        spill_dir: Option<std::path::PathBuf>,
+        memory_budget: usize,
+        query_id: u64,
     ) -> GraceHashJoinState<'a, S> {
         GraceHashJoinState {
             left: Box::new(left),
@@ -486,6 +598,54 @@ impl<'a> ExecutorBuilder<'a> {
             unmatched_build_idx: 0,
             left_col_count,
             right_col_count,
+            use_spill: spill_dir.is_some(),
+            left_spiller: None,
+            right_spiller: None,
+            spill_dir,
+            memory_budget,
+            query_id,
+            probe_row_buf: smallvec::SmallVec::new(),
+            build_row_buf: smallvec::SmallVec::new(),
+        }
+    }
+
+    pub fn build_hash_semi_join<S: RowSource>(
+        &self,
+        left: DynamicExecutor<'a, S>,
+        right: DynamicExecutor<'a, S>,
+        left_key_indices: Vec<usize>,
+        right_key_indices: Vec<usize>,
+        left_col_count: usize,
+    ) -> HashSemiJoinState<'a, S> {
+        HashSemiJoinState {
+            left: Box::new(left),
+            right: Box::new(right),
+            left_key_indices,
+            right_key_indices,
+            arena: self.ctx.arena,
+            hash_table: hashbrown::HashSet::new(),
+            built: false,
+            left_col_count,
+        }
+    }
+
+    pub fn build_hash_anti_join<S: RowSource>(
+        &self,
+        left: DynamicExecutor<'a, S>,
+        right: DynamicExecutor<'a, S>,
+        left_key_indices: Vec<usize>,
+        right_key_indices: Vec<usize>,
+        left_col_count: usize,
+    ) -> HashAntiJoinState<'a, S> {
+        HashAntiJoinState {
+            left: Box::new(left),
+            right: Box::new(right),
+            left_key_indices,
+            right_key_indices,
+            arena: self.ctx.arena,
+            hash_table: hashbrown::HashSet::new(),
+            built: false,
+            left_col_count,
         }
     }
 
@@ -519,6 +679,7 @@ impl<'a> ExecutorBuilder<'a> {
             }
             PhysicalOperator::SortExec(sort) => self.find_window_functions_in_input(sort.input),
             PhysicalOperator::LimitExec(limit) => self.find_window_functions_in_input(limit.input),
+            PhysicalOperator::TopKExec(topk) => self.find_window_functions_in_input(topk.input),
             _ => &[],
         }
     }
@@ -543,6 +704,9 @@ impl<'a> ExecutorBuilder<'a> {
             }
             PhysicalOperator::LimitExec(limit) => {
                 self.count_base_columns_before_window(limit.input, default)
+            }
+            PhysicalOperator::TopKExec(topk) => {
+                self.count_base_columns_before_window(topk.input, default)
             }
             _ => default,
         }
@@ -585,6 +749,7 @@ impl<'a> ExecutorBuilder<'a> {
             PhysicalOperator::FilterExec(filter) => self.get_aggregate_info(filter.input),
             PhysicalOperator::SortExec(sort) => self.get_aggregate_info(sort.input),
             PhysicalOperator::LimitExec(limit) => self.get_aggregate_info(limit.input),
+            PhysicalOperator::TopKExec(topk) => self.get_aggregate_info(topk.input),
             _ => None,
         }
     }
@@ -609,7 +774,9 @@ impl<'a> ExecutorBuilder<'a> {
         for (idx, agg) in aggregates.iter().enumerate() {
             if let Some(Expr::Column(col)) = agg.argument {
                 let agg_name = match agg.function {
-                    crate::sql::planner::AggregateFunction::Count => format!("count_{}", col.column),
+                    crate::sql::planner::AggregateFunction::Count => {
+                        format!("count_{}", col.column)
+                    }
                     crate::sql::planner::AggregateFunction::Sum => format!("sum_{}", col.column),
                     crate::sql::planner::AggregateFunction::Avg => format!("avg_{}", col.column),
                     crate::sql::planner::AggregateFunction::Min => format!("min_{}", col.column),
@@ -653,13 +820,26 @@ impl<'a> ExecutorBuilder<'a> {
                 }
             }
             PhysicalOperator::DualScan => Vec::new(),
-            PhysicalOperator::IndexScan(_) => {
-                Vec::new()
-            }
+            PhysicalOperator::IndexScan(_) => Vec::new(),
             PhysicalOperator::FilterExec(filter) => self.compute_input_column_map(filter.input),
             PhysicalOperator::SortExec(sort) => self.compute_input_column_map(sort.input),
             PhysicalOperator::LimitExec(limit) => self.compute_input_column_map(limit.input),
-            PhysicalOperator::ProjectExec(project) => self.compute_input_column_map(project.input),
+            PhysicalOperator::TopKExec(topk) => self.compute_input_column_map(topk.input),
+            PhysicalOperator::ProjectExec(project) => project
+                .expressions
+                .iter()
+                .zip(project.aliases.iter())
+                .enumerate()
+                .filter_map(|(idx, (expr, alias))| {
+                    if let Some(name) = alias {
+                        Some((name.to_string(), idx))
+                    } else if let crate::sql::ast::Expr::Column(col) = expr {
+                        Some((col.column.to_string(), idx))
+                    } else {
+                        None
+                    }
+                })
+                .collect(),
             PhysicalOperator::WindowExec(window) => self.compute_input_column_map(window.input),
             PhysicalOperator::HashAggregate(agg) => {
                 self.build_aggregate_column_map(agg.group_by, agg.aggregates, &[])
@@ -691,6 +871,21 @@ impl<'a> ExecutorBuilder<'a> {
                     result.push((name, idx + offset));
                 }
                 result
+            }
+            PhysicalOperator::HashSemiJoin(join) => {
+                self.compute_input_column_map(join.left)
+            }
+            PhysicalOperator::HashAntiJoin(join) => {
+                self.compute_input_column_map(join.left)
+            }
+            PhysicalOperator::ScalarSubqueryExec(_) => {
+                vec![("scalar_result".to_string(), 0)]
+            }
+            PhysicalOperator::ExistsSubqueryExec(_) => {
+                vec![("exists_result".to_string(), 0)]
+            }
+            PhysicalOperator::InListSubqueryExec(_) => {
+                vec![("in_result".to_string(), 0)]
             }
             PhysicalOperator::SetOpExec(_) => Vec::new(),
             PhysicalOperator::SecondaryIndexScan(scan) => {

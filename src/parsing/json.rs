@@ -505,11 +505,11 @@ fn parse_object(tokenizer: &mut JsonTokenizer) -> Result<JsonValue> {
 
 pub fn parse_json_path(path: &str) -> Option<Vec<String>> {
     let path = path.trim();
-    
+
     if path.starts_with('$') {
         return parse_dollar_path(path);
     }
-    
+
     if !path.starts_with('{') || !path.ends_with('}') {
         return None;
     }
@@ -527,16 +527,16 @@ fn parse_dollar_path(path: &str) -> Option<Vec<String>> {
     if !path.starts_with('$') {
         return None;
     }
-    
+
     let rest = &path[1..];
     if rest.is_empty() {
         return Some(vec![]);
     }
-    
+
     let mut elements = Vec::new();
     let mut current = String::new();
     let mut in_bracket = false;
-    
+
     for ch in rest.chars() {
         match ch {
             '.' if !in_bracket => {
@@ -565,11 +565,11 @@ fn parse_dollar_path(path: &str) -> Option<Vec<String>> {
             }
         }
     }
-    
+
     if !current.is_empty() {
         elements.push(current);
     }
-    
+
     Some(elements)
 }
 

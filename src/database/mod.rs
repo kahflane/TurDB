@@ -88,25 +88,48 @@
 //! - Insert: > 100K rows/sec
 //! - Query planning: < 100µs for simple queries
 
+mod convert;
 #[allow(clippy::module_inception)]
 mod database;
-mod convert;
 mod ddl;
 pub mod dirty_tracker;
 mod dml;
+pub mod group_commit;
 mod macros;
+pub mod page_locks;
 pub mod prepared;
 mod recovery;
 pub mod row;
 pub mod timing;
+mod batch;
+mod config;
+mod lifecycle;
+mod pragma;
 mod toast;
 mod transaction;
+pub(crate) mod query;
 
 pub use database::Database;
-pub use timing::{get_batch_timing_stats, get_timing_stats, reset_timing_stats};
-pub use transaction::{ActiveTransaction, Savepoint};
 pub use prepared::{BoundStatement, PreparedStatement};
 pub use row::Row;
+pub use timing::{get_batch_timing_stats, get_timing_stats, reset_timing_stats};
+pub use transaction::{ActiveTransaction, Savepoint};
+
+/// Database operating mode.
+///
+/// When a database has too many WAL frames to recover within the memory budget,
+/// it opens in `ReadOnlyDegraded` mode instead of failing. In this mode:
+/// - All write operations are blocked
+/// - Read operations work on potentially stale data (pre-WAL state)
+/// - User must explicitly run `PRAGMA recover_wal` to perform streaming recovery
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DatabaseMode {
+    /// Normal read-write mode - all operations available
+    ReadWrite,
+    /// Degraded read-only mode due to pending WAL recovery
+    /// The `pending_wal_frames` field indicates how many frames need recovery
+    ReadOnlyDegraded { pending_wal_frames: u32 },
+}
 
 #[derive(Debug)]
 pub enum ExecuteResult {
@@ -166,6 +189,9 @@ pub enum ExecuteResult {
     },
     AlterTable {
         action: String,
+    },
+    Explain {
+        plan: String,
     },
 }
 
@@ -966,7 +992,10 @@ mod tests {
             "Complex JOIN query should succeed now that executor supports joins"
         );
         let rows = result.unwrap();
-        println!("Complex JOIN with filter and LIMIT returned {} rows", rows.len());
+        println!(
+            "Complex JOIN with filter and LIMIT returned {} rows",
+            rows.len()
+        );
 
         db.close().unwrap();
 
@@ -1723,7 +1752,7 @@ mod tests {
 
     #[test]
     fn test_create_index_with_expression() {
-        use crate::schema::IndexColumnDef;
+        use crate::schema::IndexColumnKind;
 
         let dir = tempdir().unwrap();
         let db_path = dir.path().join("test_db");
@@ -1757,7 +1786,7 @@ mod tests {
         let col_defs = idx.column_defs();
         assert_eq!(col_defs.len(), 1);
         assert!(
-            matches!(&col_defs[0], IndexColumnDef::Expression(e) if e.contains("LOWER")),
+            matches!(&col_defs[0].column_or_expr, IndexColumnKind::Expression(e) if e.contains("LOWER")),
             "First column should be LOWER expression, got: {:?}",
             col_defs[0]
         );
@@ -1765,7 +1794,7 @@ mod tests {
 
     #[test]
     fn test_create_index_with_mixed_columns_and_expressions() {
-        use crate::schema::IndexColumnDef;
+        use crate::schema::IndexColumnKind;
 
         let dir = tempdir().unwrap();
         let db_path = dir.path().join("test_db");
@@ -1794,11 +1823,11 @@ mod tests {
         let col_defs = idx.column_defs();
         assert_eq!(col_defs.len(), 2);
         assert!(
-            matches!(&col_defs[0], IndexColumnDef::Column(c) if c == "tenant_id"),
+            matches!(&col_defs[0].column_or_expr, IndexColumnKind::Column(c) if c == "tenant_id"),
             "First should be column tenant_id"
         );
         assert!(
-            matches!(&col_defs[1], IndexColumnDef::Expression(_)),
+            matches!(&col_defs[1].column_or_expr, IndexColumnKind::Expression(_)),
             "Second should be expression"
         );
     }
@@ -1842,7 +1871,7 @@ mod tests {
 
     #[test]
     fn test_create_partial_index_with_expression_and_where() {
-        use crate::schema::IndexColumnDef;
+        use crate::schema::IndexColumnKind;
 
         let dir = tempdir().unwrap();
         let db_path = dir.path().join("test_db");
@@ -1877,7 +1906,7 @@ mod tests {
         let col_defs = idx.column_defs();
         assert_eq!(col_defs.len(), 1);
         assert!(
-            matches!(&col_defs[0], IndexColumnDef::Expression(e) if e.contains("LOWER")),
+            matches!(&col_defs[0].column_or_expr, IndexColumnKind::Expression(e) if e.contains("LOWER")),
             "Should have LOWER expression"
         );
 
@@ -1956,8 +1985,10 @@ mod tests {
 
         let db = Database::create(&db_path).unwrap();
 
-        db.execute("CREATE TABLE orders (id INT PRIMARY KEY, customer_id INT, status TEXT, amount INT)")
-            .unwrap();
+        db.execute(
+            "CREATE TABLE orders (id INT PRIMARY KEY, customer_id INT, status TEXT, amount INT)",
+        )
+        .unwrap();
 
         db.execute("INSERT INTO orders VALUES (1, 100, 'pending', 50)")
             .unwrap();
@@ -1972,10 +2003,16 @@ mod tests {
             .unwrap();
 
         let rows = db
-            .query("SELECT id FROM orders WHERE customer_id = 100 AND status = 'pending' ORDER BY id")
+            .query(
+                "SELECT id FROM orders WHERE customer_id = 100 AND status = 'pending' ORDER BY id",
+            )
             .unwrap();
 
-        assert_eq!(rows.len(), 2, "Should find 2 pending orders for customer 100");
+        assert_eq!(
+            rows.len(),
+            2,
+            "Should find 2 pending orders for customer 100"
+        );
         let ids: Vec<i64> = rows
             .iter()
             .filter_map(|r| match &r.values[0] {
@@ -2099,10 +2136,7 @@ mod tests {
             }
         }
 
-        let categories: Vec<&str> = rows
-            .iter()
-            .filter_map(|r| get_text(&r.values[1]))
-            .collect();
+        let categories: Vec<&str> = rows.iter().filter_map(|r| get_text(&r.values[1])).collect();
         assert_eq!(
             categories,
             vec!["appliances", "books", "clothing", "electronics"]
@@ -2136,7 +2170,11 @@ mod tests {
             .query("SELECT o.id, c.name FROM orders o JOIN customers c ON o.customer_id = c.id LIMIT 2")
             .unwrap();
 
-        assert_eq!(rows.len(), 2, "JOIN with LIMIT 2 should return exactly 2 rows");
+        assert_eq!(
+            rows.len(),
+            2,
+            "JOIN with LIMIT 2 should return exactly 2 rows"
+        );
     }
 
     #[test]
@@ -2563,7 +2601,8 @@ mod tests {
         let db_path = dir.path().join("test_db");
 
         let db = Database::create(&db_path).unwrap();
-        db.execute("CREATE TABLE users (id INT, name TEXT)").unwrap();
+        db.execute("CREATE TABLE users (id INT, name TEXT)")
+            .unwrap();
         db.execute("INSERT INTO users VALUES (1, 'Alice')").unwrap();
 
         let (columns, rows) = db.query_with_columns("SELECT * FROM users").unwrap();
@@ -2577,7 +2616,8 @@ mod tests {
         let db_path = dir.path().join("test_db");
 
         let db = Database::create(&db_path).unwrap();
-        db.execute("CREATE TABLE users (id INT, name TEXT)").unwrap();
+        db.execute("CREATE TABLE users (id INT, name TEXT)")
+            .unwrap();
         db.execute("INSERT INTO users VALUES (1, 'Alice')").unwrap();
 
         let result = db.execute("SELECT * FROM users").unwrap();
@@ -2587,6 +2627,114 @@ mod tests {
                 assert_eq!(rows.len(), 1);
             }
             _ => panic!("Expected Select result"),
+        }
+    }
+
+    #[test]
+    fn test_system_tables_queryable_with_schema_prefix() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("test_db");
+
+        let db = Database::create(&db_path).unwrap();
+
+        // Query memory_stats system table with fully qualified name
+        let result = db.execute("SELECT * FROM turdb_catalog.memory_stats");
+        assert!(
+            result.is_ok(),
+            "Should be able to query turdb_catalog.memory_stats: {:?}",
+            result.err()
+        );
+
+        // Query wal_stats system table
+        let result = db.execute("SELECT * FROM turdb_catalog.wal_stats");
+        assert!(
+            result.is_ok(),
+            "Should be able to query turdb_catalog.wal_stats: {:?}",
+            result.err()
+        );
+    }
+
+    #[test]
+    fn test_system_tables_persisted_across_reopens() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("test_db");
+
+        // Create database and verify system tables exist
+        {
+            let db = Database::create(&db_path).unwrap();
+            let result = db.execute("SELECT * FROM turdb_catalog.memory_stats");
+            assert!(result.is_ok(), "System tables should exist after create");
+        }
+
+        // Reopen and verify system tables still exist
+        {
+            let db = Database::open(&db_path).unwrap();
+            let result = db.execute("SELECT * FROM turdb_catalog.memory_stats");
+            assert!(
+                result.is_ok(),
+                "System tables should exist after reopen: {:?}",
+                result.err()
+            );
+        }
+    }
+
+    #[test]
+    fn test_persist_memory_stats_writes_to_system_table() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("test_db");
+        let db = Database::create(&db_path).unwrap();
+
+        // Write stats to system table
+        let result = db.persist_memory_stats();
+        assert!(result.is_ok(), "persist_memory_stats should succeed: {:?}", result.err());
+
+        // Query the stats back
+        let result = db.execute("SELECT stat_name, stat_value FROM turdb_catalog.memory_stats");
+        assert!(result.is_ok(), "Should be able to query stats: {:?}", result.err());
+
+        if let super::ExecuteResult::Select { rows, .. } = result.unwrap() {
+            assert!(!rows.is_empty(), "Should have stats rows after persist");
+            // Find the memory_budget_total stat
+            let budget_row = rows.iter().find(|r| {
+                if let Some(crate::types::OwnedValue::Text(name)) = r.values.first() {
+                    name == "memory_budget_total"
+                } else {
+                    false
+                }
+            });
+            assert!(budget_row.is_some(), "Should have memory_budget_total stat");
+        } else {
+            panic!("Expected SELECT result");
+        }
+    }
+
+    #[test]
+    fn test_stats_visible_across_sessions() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("test_db");
+
+        // First session: create db, persist stats
+        {
+            let db = Database::create(&db_path).unwrap();
+
+            // Write some stats
+            db.persist_memory_stats().unwrap();
+            db.persist_wal_stats().unwrap();
+        }
+
+        // Second session: open db, read stats
+        {
+            let db = Database::open(&db_path).unwrap();
+
+            // Query stats - should see data from first session
+            let result = db.execute("SELECT stat_name, stat_value FROM turdb_catalog.memory_stats WHERE stat_name = 'memory_budget_total'");
+            assert!(result.is_ok(), "Should be able to query stats: {:?}", result.err());
+
+            if let super::ExecuteResult::Select { rows, .. } = result.unwrap() {
+                assert!(!rows.is_empty(), "Should have stats from previous session");
+            } else {
+                panic!("Expected SELECT result");
+            }
         }
     }
 }

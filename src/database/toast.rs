@@ -128,8 +128,11 @@ impl Database {
         let chunk_id = pointer.chunk_id;
 
         let (new_hint, new_root) = if wal_enabled {
-            let mut wal_storage =
-                WalStoragePerTable::new(&mut toast_storage, &self.shared.dirty_tracker, toast_table_id);
+            let mut wal_storage = WalStoragePerTable::new(
+                &mut toast_storage,
+                &self.shared.dirty_tracker,
+                toast_table_id,
+            );
             let mut btree = BTree::with_rightmost_hint(&mut wal_storage, root_page, hint)?;
             for (seq, chunk) in data.chunks(TOAST_CHUNK_SIZE).enumerate() {
                 let chunk_key = make_chunk_key(chunk_id, seq as u32);
@@ -179,7 +182,6 @@ impl Database {
             crate::storage::TableFileHeader::from_bytes(page0)?.root_page()
         };
 
-
         let btree = BTree::new(&mut *toast_storage, root_page)?;
 
         let mut result = Vec::with_capacity(total_size);
@@ -210,7 +212,8 @@ impl Database {
             for val in row.values {
                 let new_val = match val {
                     OwnedValue::ToastPointer(ptr) => {
-                        let data = self.detoast_value(file_manager, schema_name, table_name, &ptr)?;
+                        let data =
+                            self.detoast_value(file_manager, schema_name, table_name, &ptr)?;
                         if let Ok(s) = String::from_utf8(data.clone()) {
                             OwnedValue::Text(s)
                         } else {

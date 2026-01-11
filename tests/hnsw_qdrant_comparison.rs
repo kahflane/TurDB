@@ -147,7 +147,6 @@ fn calculate_recall(turdb: &[(i64, f64)], qdrant: &[(u64, f32)], k: usize) -> f3
 }
 
 #[test]
-#[ignore]
 fn compare_turdb_sql_vs_qdrant_euclidean() {
     println!("\n=== TurDB SQL vs Qdrant Comparison Test ===\n");
 
@@ -194,19 +193,26 @@ fn compare_turdb_sql_vs_qdrant_euclidean() {
 
     let qdrant = QdrantClient::new(QDRANT_HOST, QDRANT_PORT, QDRANT_API_KEY, QDRANT_COLLECTION);
 
+    let query_indices: Vec<usize> = (0..vectors_f32.len()).collect();
+    let total_queries = query_indices.len();
+
     println!(
-        "\nRunning {} queries with k={}...",
-        embeddings.query_indices.len(),
+        "\nRunning {} queries (comprehensive test) with k={}...",
+        total_queries,
         K
     );
 
-    let mut recalls: Vec<f32> = Vec::new();
+    let mut recalls: Vec<f32> = Vec::with_capacity(total_queries);
+    let mut latencies: Vec<std::time::Duration> = Vec::with_capacity(total_queries);
     let mut failed_queries: Vec<(usize, f32)> = Vec::new();
 
-    for (i, &query_idx) in embeddings.query_indices.iter().enumerate() {
+    let start_time = std::time::Instant::now();
+
+    for (i, &query_idx) in query_indices.iter().enumerate() {
         let query = &vectors_f32[query_idx];
         let query_literal = vector_to_sql_literal(query);
 
+        // Get ground truth from Qdrant
         let qdrant_results = match qdrant.search(query, K) {
             Ok(r) => r,
             Err(e) => {
@@ -220,6 +226,7 @@ fn compare_turdb_sql_vs_qdrant_euclidean() {
             query_literal, K
         );
 
+        let query_start = std::time::Instant::now();
         let turdb_results: Vec<(i64, f64)> = match db.query(&sql) {
             Ok(rows) => rows
                 .iter()
@@ -241,64 +248,72 @@ fn compare_turdb_sql_vs_qdrant_euclidean() {
                 continue;
             }
         };
+        let query_duration = query_start.elapsed();
+        latencies.push(query_duration);
 
         let recall = calculate_recall(&turdb_results, &qdrant_results, K);
         recalls.push(recall);
 
-        if recall < MIN_RECALL {
+        if recall < 0.99 { // Strict 99% recall requirement
             failed_queries.push((query_idx, recall));
         }
 
-        if i < 5 || recall < MIN_RECALL {
-            println!(
-                "  Query {} (idx {}): recall={:.2}%, TurDB top-3: {:?}, Qdrant top-3: {:?}",
-                i,
-                query_idx,
-                recall * 100.0,
-                turdb_results
-                    .iter()
-                    .take(3)
-                    .map(|(id, _)| id)
-                    .collect::<Vec<_>>(),
-                qdrant_results
-                    .iter()
-                    .take(3)
-                    .map(|(id, _)| id)
-                    .collect::<Vec<_>>(),
-            );
+        // Print progress every 50 queries
+        if (i + 1) % 50 == 0 {
+             let avg_current = recalls.iter().sum::<f32>() / recalls.len() as f32;
+             println!("  Processed {}/{} queries. Current avg recall: {:.2}%", i + 1, total_queries, avg_current * 100.0);
         }
     }
+    
+    let total_duration = start_time.elapsed();
 
+    // Statistics
     let avg_recall = recalls.iter().sum::<f32>() / recalls.len() as f32;
     let min_recall_actual = recalls.iter().cloned().fold(f32::INFINITY, f32::min);
     let max_recall = recalls.iter().cloned().fold(0.0f32, f32::max);
+    
+    latencies.sort();
+    let zero_duration = std::time::Duration::from_secs(0);
+    let min_latency = latencies.first().unwrap_or(&zero_duration);
+    let max_latency = latencies.last().unwrap_or(&zero_duration);
+    let p50_latency = latencies.get(latencies.len() / 2).unwrap_or(&zero_duration);
+    let p95_latency = latencies.get((latencies.len() as f64 * 0.95) as usize).unwrap_or(&zero_duration);
+    let p99_latency = latencies.get((latencies.len() as f64 * 0.99) as usize).unwrap_or(&zero_duration);
+    let avg_latency = total_duration / total_queries as u32;
+    let qps = total_queries as f64 / total_duration.as_secs_f64();
 
-    println!("\n=== Results ===");
+    println!("\n=== Final Benchmark Results ===");
     println!("  Queries completed: {}", recalls.len());
+    println!("  Total time: {:.2?}", total_duration);
+    println!("  QPS: {:.2}", qps);
+    println!("\n  --- Recall Metrics ---");
     println!("  Average recall@{}: {:.2}%", K, avg_recall * 100.0);
     println!("  Min recall: {:.2}%", min_recall_actual * 100.0);
     println!("  Max recall: {:.2}%", max_recall * 100.0);
-    println!(
-        "  Queries below {}% recall: {}",
-        MIN_RECALL * 100.0,
-        failed_queries.len()
-    );
+    println!("  Queries below 99% recall: {}", failed_queries.len());
+    
+    println!("\n  --- Latency Metrics ---");
+    println!("  Min: {:?}", min_latency);
+    println!("  Max: {:?}", max_latency);
+    println!("  Avg: {:?}", avg_latency);
+    println!("  p50: {:?}", p50_latency);
+    println!("  p95: {:?}", p95_latency);
+    println!("  p99: {:?}", p99_latency);
 
     if !failed_queries.is_empty() {
-        println!(
-            "\n  Failed queries (below {}% recall):",
-            MIN_RECALL * 100.0
-        );
-        for (idx, recall) in failed_queries.iter().take(10) {
+        println!("\n  Failed queries (below 99% recall):");
+        for (idx, recall) in failed_queries.iter().take(20) {
             println!("    Query idx {}: {:.2}%", idx, recall * 100.0);
+        }
+        if failed_queries.len() > 20 {
+            println!("    ... and {} more", failed_queries.len() - 20);
         }
     }
 
     assert!(
-        avg_recall >= MIN_RECALL,
-        "Average recall {:.2}% is below minimum {:.2}%",
-        avg_recall * 100.0,
-        MIN_RECALL * 100.0
+        avg_recall >= 0.99,
+        "Average recall {:.2}% is below strict target 99.00%",
+        avg_recall * 100.0
     );
 
     println!("\n=== Test PASSED ===\n");

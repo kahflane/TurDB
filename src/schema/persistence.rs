@@ -100,7 +100,9 @@
 //! - Position in file if applicable
 
 use crate::records::types::DataType;
-use crate::schema::{Catalog, ColumnDef, Constraint, IndexDef, IndexType, Schema, TableDef};
+use crate::schema::{
+    Catalog, ColumnDef, Constraint, IndexDef, IndexType, ReferentialAction, Schema, TableDef,
+};
 use eyre::{bail, ensure, Result, WrapErr};
 use std::fs::File;
 use std::io::{Read, Write};
@@ -240,7 +242,12 @@ impl CatalogPersistence {
             Constraint::Unique => {
                 buf.push(2);
             }
-            Constraint::ForeignKey { table, column } => {
+            Constraint::ForeignKey {
+                table,
+                column,
+                on_delete,
+                on_update,
+            } => {
                 buf.push(3);
                 let table_bytes = table.as_bytes();
                 buf.extend((table_bytes.len() as u16).to_le_bytes());
@@ -248,6 +255,8 @@ impl CatalogPersistence {
                 let column_bytes = column.as_bytes();
                 buf.extend((column_bytes.len() as u16).to_le_bytes());
                 buf.extend(column_bytes);
+                buf.push(Self::encode_referential_action(*on_delete));
+                buf.push(Self::encode_referential_action(*on_update));
             }
             Constraint::Check(expr) => {
                 buf.push(4);
@@ -262,7 +271,32 @@ impl CatalogPersistence {
         Ok(())
     }
 
+    fn encode_referential_action(action: Option<ReferentialAction>) -> u8 {
+        match action {
+            None => 0,
+            Some(ReferentialAction::Cascade) => 1,
+            Some(ReferentialAction::Restrict) => 2,
+            Some(ReferentialAction::NoAction) => 3,
+            Some(ReferentialAction::SetNull) => 4,
+            Some(ReferentialAction::SetDefault) => 5,
+        }
+    }
+
+    fn decode_referential_action(byte: u8) -> Option<ReferentialAction> {
+        match byte {
+            0 => None,
+            1 => Some(ReferentialAction::Cascade),
+            2 => Some(ReferentialAction::Restrict),
+            3 => Some(ReferentialAction::NoAction),
+            4 => Some(ReferentialAction::SetNull),
+            5 => Some(ReferentialAction::SetDefault),
+            _ => None,
+        }
+    }
+
     fn serialize_index(index: &IndexDef, buf: &mut Vec<u8>) -> Result<()> {
+        use crate::schema::SortDirection;
+
         let name_bytes = index.name().as_bytes();
         ensure!(
             name_bytes.len() <= u16::MAX as usize,
@@ -273,13 +307,19 @@ impl CatalogPersistence {
         buf.extend((name_bytes.len() as u16).to_le_bytes());
         buf.extend(name_bytes);
 
-        let column_count = index.columns().len() as u16;
+        let column_defs = index.column_defs();
+        let column_count = column_defs.len() as u16;
         buf.extend(column_count.to_le_bytes());
 
-        for col_name in index.columns() {
+        for col_def in column_defs {
+            let col_name = col_def.as_column().unwrap_or("");
             let col_bytes = col_name.as_bytes();
             buf.extend((col_bytes.len() as u16).to_le_bytes());
             buf.extend(col_bytes);
+            buf.push(match col_def.direction {
+                SortDirection::Asc => 0,
+                SortDirection::Desc => 1,
+            });
         }
 
         buf.push(if index.is_unique() { 1 } else { 0 });
@@ -645,7 +685,24 @@ impl CatalogPersistence {
                     .to_string();
                 pos += column_len;
 
-                Ok((Constraint::ForeignKey { table, column }, pos))
+                let (on_delete, on_update) = if pos + 2 <= bytes.len() {
+                    let on_delete = Self::decode_referential_action(bytes[pos]);
+                    let on_update = Self::decode_referential_action(bytes[pos + 1]);
+                    pos += 2;
+                    (on_delete, on_update)
+                } else {
+                    (None, None)
+                };
+
+                Ok((
+                    Constraint::ForeignKey {
+                        table,
+                        column,
+                        on_delete,
+                        on_update,
+                    },
+                    pos,
+                ))
             }
             4 => {
                 ensure!(
@@ -672,6 +729,8 @@ impl CatalogPersistence {
     }
 
     fn deserialize_index(bytes: &[u8], mut pos: usize) -> Result<(IndexDef, usize)> {
+        use crate::schema::{IndexColumnDef, SortDirection};
+
         ensure!(
             pos + 2 <= bytes.len(),
             "unexpected end of data reading index name length"
@@ -695,7 +754,7 @@ impl CatalogPersistence {
         let column_count = u16::from_le_bytes([bytes[pos], bytes[pos + 1]]) as usize;
         pos += 2;
 
-        let mut columns = Vec::new();
+        let mut column_defs = Vec::new();
         for _ in 0..column_count {
             ensure!(
                 pos + 2 <= bytes.len(),
@@ -713,7 +772,18 @@ impl CatalogPersistence {
                 .to_string();
             pos += col_name_len;
 
-            columns.push(col_name);
+            ensure!(
+                pos < bytes.len(),
+                "unexpected end of data reading index column direction"
+            );
+            let direction = match bytes[pos] {
+                0 => SortDirection::Asc,
+                1 => SortDirection::Desc,
+                _ => SortDirection::Asc,
+            };
+            pos += 1;
+
+            column_defs.push(IndexColumnDef::column(col_name).with_direction(direction));
         }
 
         ensure!(
@@ -734,7 +804,10 @@ impl CatalogPersistence {
         };
         pos += 1;
 
-        Ok((IndexDef::new(name, columns, is_unique, index_type), pos))
+        Ok((
+            IndexDef::new_expression(name, column_defs, is_unique, index_type),
+            pos,
+        ))
     }
 
     pub fn save(catalog: &Catalog, path: &Path) -> Result<()> {

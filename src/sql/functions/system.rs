@@ -151,30 +151,30 @@ fn eval_conv<'a>(args: &[Option<Value<'a>>]) -> Option<Value<'a>> {
     if args.len() < 3 {
         return None;
     }
-    
+
     let num_str = match args.first()?.as_ref()? {
         Value::Text(s) => s.to_string(),
         Value::Int(n) => n.to_string(),
         Value::Null => return Some(Value::Null),
         _ => return None,
     };
-    
+
     let from_base = match args.get(1)?.as_ref()? {
         Value::Int(n) => *n as u32,
         _ => return None,
     };
-    
+
     let to_base = match args.get(2)?.as_ref()? {
         Value::Int(n) => *n as u32,
         _ => return None,
     };
-    
+
     if !(2..=36).contains(&from_base) || !(2..=36).contains(&to_base) {
         return Some(Value::Null);
     }
-    
+
     let num = i64::from_str_radix(&num_str, from_base).ok()?;
-    
+
     let result = if to_base == 10 {
         num.to_string()
     } else {
@@ -199,7 +199,7 @@ fn eval_conv<'a>(args: &[Option<Value<'a>>]) -> Option<Value<'a>> {
         digits.reverse();
         digits.into_iter().collect()
     };
-    
+
     Some(Value::Text(Cow::Owned(result)))
 }
 
@@ -245,18 +245,17 @@ mod tests {
 
     #[test]
     fn test_coalesce() {
-        let args = vec![
-            Some(Value::Null),
-            Some(Value::Null),
-            Some(Value::Int(5)),
-        ];
+        let args = vec![Some(Value::Null), Some(Value::Null), Some(Value::Int(5))];
         assert_eq!(eval_coalesce(&args), Some(Value::Int(5)));
     }
 
     #[test]
     fn test_bin() {
         let args = vec![Some(Value::Int(12))];
-        assert_eq!(eval_bin(&args), Some(Value::Text(Cow::Owned("1100".to_string()))));
+        assert_eq!(
+            eval_bin(&args),
+            Some(Value::Text(Cow::Owned("1100".to_string())))
+        );
     }
 
     #[test]
@@ -266,6 +265,9 @@ mod tests {
             Some(Value::Int(16)),
             Some(Value::Int(10)),
         ];
-        assert_eq!(eval_conv(&args), Some(Value::Text(Cow::Owned("10".to_string()))));
+        assert_eq!(
+            eval_conv(&args),
+            Some(Value::Text(Cow::Owned("10".to_string())))
+        );
     }
 }

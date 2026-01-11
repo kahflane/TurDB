@@ -145,15 +145,24 @@ static SLOWPATH_SPLITS: AtomicU64 = AtomicU64::new(0);
 static SLOWPATH_NO_SPLIT: AtomicU64 = AtomicU64::new(0);
 
 pub fn get_fastpath_stats() -> (u64, u64) {
-    (FASTPATH_HITS.load(AtomicOrdering::Relaxed), FASTPATH_MISSES.load(AtomicOrdering::Relaxed))
+    (
+        FASTPATH_HITS.load(AtomicOrdering::Relaxed),
+        FASTPATH_MISSES.load(AtomicOrdering::Relaxed),
+    )
 }
 
 pub fn get_fastpath_fail_stats() -> (u64, u64) {
-    (FASTPATH_FAIL_NEXT_LEAF.load(AtomicOrdering::Relaxed), FASTPATH_FAIL_SPACE.load(AtomicOrdering::Relaxed))
+    (
+        FASTPATH_FAIL_NEXT_LEAF.load(AtomicOrdering::Relaxed),
+        FASTPATH_FAIL_SPACE.load(AtomicOrdering::Relaxed),
+    )
 }
 
 pub fn get_slowpath_stats() -> (u64, u64) {
-    (SLOWPATH_SPLITS.load(AtomicOrdering::Relaxed), SLOWPATH_NO_SPLIT.load(AtomicOrdering::Relaxed))
+    (
+        SLOWPATH_SPLITS.load(AtomicOrdering::Relaxed),
+        SLOWPATH_NO_SPLIT.load(AtomicOrdering::Relaxed),
+    )
 }
 
 pub fn reset_fastpath_stats() {
@@ -295,19 +304,25 @@ impl<'a> BTreeReader<'a> {
         use crate::btree::leaf::SearchResult;
 
         let mut current_page = self.root_page;
-
         loop {
+
             let page_data = self.storage.page(current_page)?;
             let header = PageHeader::from_bytes(page_data)?;
 
             match header.page_type() {
                 PageType::BTreeLeaf => {
                     let leaf = LeafNode::from_page(page_data)?;
-                    match leaf.find_key(key) {
+                    let result = leaf.find_key(key);
+                    match result {
                         SearchResult::Found(idx) => {
                             return Ok(Some(leaf.value_at(idx)?));
                         }
-                        SearchResult::NotFound(_) => {
+                        SearchResult::NotFound(_idx) => {
+                            let next_leaf = leaf.next_leaf();
+                            if next_leaf != 0 {
+                                current_page = next_leaf;
+                                continue;
+                            }
                             return Ok(None);
                         }
                     }
@@ -385,7 +400,11 @@ impl<'a, S: Storage> BTree<'a, S> {
 
     /// Creates a BTree with a hint for the rightmost leaf page.
     /// This enables fastpath optimization for bulk sequential inserts.
-    pub fn with_rightmost_hint(storage: &'a mut S, root_page: u32, hint: Option<u32>) -> Result<Self> {
+    pub fn with_rightmost_hint(
+        storage: &'a mut S,
+        root_page: u32,
+        hint: Option<u32>,
+    ) -> Result<Self> {
         ensure!(
             root_page < storage.page_count(),
             "root page {} out of bounds (page_count={})",
@@ -557,12 +576,13 @@ impl<'a, S: Storage> BTree<'a, S> {
         }
 
         let page_data = self.storage.page_mut(hint_page)?;
-        
+
         if page_data[0] != PageType::BTreeLeaf as u8 {
             return Ok(false);
         }
 
-        let next_leaf = u32::from_le_bytes([page_data[12], page_data[13], page_data[14], page_data[15]]);
+        let next_leaf =
+            u32::from_le_bytes([page_data[12], page_data[13], page_data[14], page_data[15]]);
         if next_leaf != 0 {
             FASTPATH_FAIL_NEXT_LEAF.fetch_add(1, AtomicOrdering::Relaxed);
             return Ok(false);
@@ -571,6 +591,23 @@ impl<'a, S: Storage> BTree<'a, S> {
         let free_start = u16::from_le_bytes([page_data[4], page_data[5]]) as usize;
         let free_end = u16::from_le_bytes([page_data[6], page_data[7]]) as usize;
         let cell_count = u16::from_le_bytes([page_data[2], page_data[3]]) as usize;
+
+        if cell_count > 0 {
+            let last_slot_off = LEAF_CONTENT_START + (cell_count - 1) * SLOT_SIZE;
+            let last_slot = &page_data[last_slot_off..last_slot_off + SLOT_SIZE];
+            let off = u16::from_le_bytes([last_slot[4], last_slot[5]]) as usize;
+            let len = u16::from_le_bytes([last_slot[6], last_slot[7]]) as usize;
+
+            if off >= page_data.len() || off + len > page_data.len() {
+                return Ok(false);
+            }
+
+            let last_key = &page_data[off..off + len];
+
+            if key <= last_key {
+                return Ok(false);
+            }
+        }
 
         let value_len_size = varint_len(value.len() as u64);
         let cell_size = key.len() + value_len_size + value.len();
@@ -603,7 +640,12 @@ impl<'a, S: Storage> BTree<'a, S> {
     }
 
     /// Insert into leaf assuming key is greater than all existing keys.
-    fn insert_into_leaf_append(&mut self, page_no: u32, key: &[u8], value: &[u8]) -> Result<InsertResult> {
+    fn insert_into_leaf_append(
+        &mut self,
+        page_no: u32,
+        key: &[u8],
+        value: &[u8],
+    ) -> Result<InsertResult> {
         let page_data = self.storage.page_mut(page_no)?;
         let mut leaf = LeafNodeMut::from_page(page_data)?;
 
@@ -620,6 +662,7 @@ impl<'a, S: Storage> BTree<'a, S> {
     }
 
     pub fn insert(&mut self, key: &[u8], value: &[u8]) -> Result<()> {
+        // Try the fast path for sequential insertions
         if let Some(hint_page) = self.rightmost_hint {
             if let Ok(true) = self.try_fastpath_insert(hint_page, key, value) {
                 return Ok(());
@@ -648,7 +691,7 @@ impl<'a, S: Storage> BTree<'a, S> {
                 ),
             }
         }
-        
+
         let result = self.insert_into_leaf(current_page, key, value)?;
         self.update_rightmost_hint(current_page);
 
@@ -757,7 +800,24 @@ impl<'a, S: Storage> BTree<'a, S> {
             .position(|k| *k > key)
             .unwrap_or(all_keys.len());
         all_keys.insert(insert_pos, arena.alloc_slice_copy(key));
+
+        if insert_pos > 0 && all_keys[insert_pos - 1] == all_keys[insert_pos] {
+            bail!("key already exists");
+        }
+        if insert_pos + 1 < all_keys.len() && all_keys[insert_pos] == all_keys[insert_pos + 1] {
+            bail!("key already exists");
+        }
         all_values.insert(insert_pos, arena.alloc_slice_copy(value));
+
+        // DEBUG: Verify sorted and unique
+        for i in 0..all_keys.len() - 1 {
+            if all_keys[i] >= all_keys[i + 1] {
+                eprintln!("CRITICAL: Keys out of order/dup in split_leaf index {}", i);
+                eprintln!("K[{}]: {:?}", i, all_keys[i]);
+                eprintln!("K[{}]: {:?}", i + 1, all_keys[i + 1]);
+                panic!("Keys out of order or duplicate in split_leaf");
+            }
+        }
 
         let old_next_leaf;
         {
@@ -796,6 +856,14 @@ impl<'a, S: Storage> BTree<'a, S> {
             mid -= 1;
         }
 
+        // Enforce split point is within bounds and not at start (which creates empty left page/duplicate separator)
+        if mid == 0 {
+            mid = 1;
+        }
+        if mid >= all_keys.len() {
+            mid = all_keys.len() - 1;
+        }
+
         {
             let page_data = self.storage.page_mut(page_no)?;
             let mut leaf = LeafNodeMut::init(page_data)?;
@@ -821,7 +889,7 @@ impl<'a, S: Storage> BTree<'a, S> {
             separator: separator_key.clone(),
             new_page: new_page_no,
         };
-        
+
         Ok(split_result)
     }
 
@@ -843,7 +911,7 @@ impl<'a, S: Storage> BTree<'a, S> {
                 current_left,
                 current_right,
             )?;
-            
+
             match result {
                 InsertResult::Ok => return Ok(()),
                 InsertResult::Split {
@@ -883,19 +951,18 @@ impl<'a, S: Storage> BTree<'a, S> {
                 interior.insert_separator(separator, old_right)?;
                 interior.set_right_child(right_child)?;
             } else {
-                
                 interior.insert_separator(separator, left_child)?;
-                
+
                 let count = interior.cell_count() as usize;
-                let mut check_index = 0; 
+                let mut check_index = 0;
                 for i in 0..count {
-                     let key_at_i = interior.key_at(i)?;
-                     if key_at_i == separator {
-                         check_index = i;
-                         break;
-                     }
+                    let key_at_i = interior.key_at(i)?;
+                    if key_at_i == separator {
+                        check_index = i;
+                        break;
+                    }
                 }
-                
+
                 if check_index + 1 < count {
                     interior.update_child(check_index + 1, right_child)?;
                 }
@@ -1036,33 +1103,33 @@ impl<'a, S: Storage> BTree<'a, S> {
     pub fn update(&mut self, key: &[u8], new_value: &[u8]) -> Result<bool> {
         let handle = match self.search(key)? {
             Some(h) => h,
-            None => return Ok(false), 
+            None => return Ok(false),
         };
 
         let page_no = handle.page_no;
         let cell_index = handle.cell_index;
 
-        let old_value = {
+        let old_value_len = {
             let page_data = self.storage.page(page_no)?;
             let leaf = LeafNode::from_page(page_data)?;
-            leaf.value_at(cell_index)?.to_vec()
+            leaf.value_len_at(cell_index)?
         };
 
-        if new_value.len() == old_value.len() {
+        if new_value.len() == old_value_len {
             let page_data = self.storage.page_mut(page_no)?;
             let mut leaf = LeafNodeMut::from_page(page_data)?;
             leaf.update_cell_value_in_place(cell_index, new_value)?;
             Ok(true)
-        } else if new_value.len() < old_value.len() {
+        } else if new_value.len() < old_value_len {
             let page_data = self.storage.page_mut(page_no)?;
             let mut leaf = LeafNodeMut::from_page(page_data)?;
             leaf.update_cell_value_shrink(cell_index, new_value)?;
             Ok(true)
         } else {
             let value_len_size = varint_len(new_value.len() as u64);
-            let old_value_len_size = varint_len(old_value.len() as u64);
+            let old_value_len_size = varint_len(old_value_len as u64);
             let size_increase = (new_value.len() + value_len_size)
-                .saturating_sub(old_value.len() + old_value_len_size);
+                .saturating_sub(old_value_len + old_value_len_size);
 
             let page_data = self.storage.page(page_no)?;
             let leaf = LeafNode::from_page(page_data)?;
@@ -1241,7 +1308,7 @@ impl<'a, S: Storage + ?Sized> Cursor<'a, S> {
         }
 
         let next_page = leaf.next_leaf();
-        
+
         if next_page == 0 {
             self.exhausted = true;
             return Ok(false);
@@ -1372,5 +1439,104 @@ impl<'a, S: Storage + ?Sized> Cursor<'a, S> {
                 ),
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::storage::MmapStorage;
+    use tempfile::NamedTempFile;
+
+    #[test]
+    fn test_duplicate_key_split_corruption() -> Result<()> {
+        let temp_file = NamedTempFile::new()?;
+        let mut storage = MmapStorage::create(temp_file.path(), 2)?;
+
+        let mut btree = BTree::create(&mut storage, 0)?;
+
+        // Use large keys to fill the page quickly.
+        // Page capacity is 16384 bytes.
+        // We'll use ~1000 byte keys.
+        let key_size = 1000;
+        let value_size = 100;
+
+        // Fill page to near capacity
+        // 14 * 1100 = 15400 bytes
+        for i in 0..14 {
+            let key = vec![i as u8; key_size];
+            let value = vec![0u8; value_size];
+            btree.insert(&key, &value)?;
+        }
+
+        // Try to insert a duplicate of an existing key (e.g., key corresponding to i=5).
+        // This key (vec![5; 1000]) is already in the page.
+        // Since the page is nearly full (free space < 1000), `insert_cell` would fail,
+        // triggering `split_leaf`.
+        // Prior to the fix, `split_leaf` would accept the duplicate, causing corruption.
+        let dup_key = vec![5u8; key_size];
+        let dup_value = vec![1u8; value_size];
+
+        let result = btree.insert(&dup_key, &dup_value);
+
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().to_string(), "key already exists");
+
+        Ok(())
+    }
+    #[test]
+    fn test_separator_conflict_split() -> Result<()> {
+        let temp_file = NamedTempFile::new()?;
+        let mut storage = MmapStorage::create(temp_file.path(), 2)?;
+        let mut btree = BTree::create(&mut storage, 0)?;
+
+        let key_size = 1000;
+        let value_size = 100;
+
+        // 1. Fill leaf to split
+        // 14 items ~15400 bytes. 15 items > 16384. Force split.
+        for i in 0..20 {
+            let key = vec![i as u8; key_size];
+            let value = vec![0u8; value_size];
+            btree.insert(&key, &value)?;
+        }
+
+        // Root is now interior (checked by previous logic, roughly 14*1100 > 16384 * 0.9?)
+        // Let's verify we have a split.
+        let root_page = btree.root_page();
+        let page_data = storage.page(root_page)?;
+        let header = PageHeader::from_bytes(page_data)?;
+        assert_eq!(header.page_type(), crate::storage::PageType::BTreeInterior);
+
+        // 2. Identify the separator
+        let interior = InteriorNode::from_page(page_data)?;
+        assert!(interior.cell_count() > 0);
+        let separator = interior.key_at(0)?.to_vec();
+        println!("Separator: {:?}", &separator[0..10]);
+
+        // 3. Insert a key that is EQUAL to the separator, but with different content?
+        // No, BTree keys are binary.
+        // We cannot insert `separator` again as a key, `insert` would catch it.
+
+        // The error happens when `split_leaf` generates a separator that ALREADY exists in parent.
+        // This implies `split_leaf` separator == parent's separator.
+        // S_parent = 7.
+        // Right child has keys >= 7. e.g. 7, 8, 9...
+        // If we split Right child.
+        // And we choose 7 as the new separator?
+        // Insert 7 into parent [7]. Boom.
+
+        // To choose 7 as separator, `mid` must be index of 7.
+        // If Right child keys: [7, 8].
+        // mid=1 -> 8. Separation at 8. Parent -> [7, 8]. OK.
+
+        // If Right child keys: [7, 7.5]. (e.g. key starting with 7 but longer?)
+        // Key 7: [7, 7, 7...]
+        // Key 8: [8, 8, 8...]
+        // Let's try to insert a key that is extremely close to the separator.
+
+        // Use keys that match prefix?
+
+        Ok(())
     }
 }

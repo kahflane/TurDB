@@ -186,16 +186,16 @@ impl Database {
             Expr::Function(func) => {
                 let name = func.name.name.to_uppercase();
                 match name.as_str() {
-                    "CURRENT_TIMESTAMP" | "NOW" | "CURRENT_DATE" | "CURRENT_TIME"
-                    | "LOCALTIME" | "LOCALTIMESTAMP" => Some(name),
+                    "CURRENT_TIMESTAMP" | "NOW" | "CURRENT_DATE" | "CURRENT_TIME" | "LOCALTIME"
+                    | "LOCALTIMESTAMP" => Some(name),
                     _ => None,
                 }
             }
             Expr::Column(col) => {
                 let name = col.column.to_uppercase();
                 match name.as_str() {
-                    "CURRENT_TIMESTAMP" | "NOW" | "CURRENT_DATE" | "CURRENT_TIME"
-                    | "LOCALTIME" | "LOCALTIMESTAMP" => Some(name),
+                    "CURRENT_TIMESTAMP" | "NOW" | "CURRENT_DATE" | "CURRENT_TIME" | "LOCALTIME"
+                    | "LOCALTIMESTAMP" => Some(name),
                     _ => None,
                 }
             }
@@ -238,6 +238,28 @@ impl Database {
             },
             _ => None,
         }
+    }
+
+    pub(crate) fn convert_referential_action(
+        action: Option<crate::sql::ast::ReferentialAction>,
+    ) -> Option<crate::schema::ReferentialAction> {
+        action.map(|a| match a {
+            crate::sql::ast::ReferentialAction::Cascade => {
+                crate::schema::ReferentialAction::Cascade
+            }
+            crate::sql::ast::ReferentialAction::Restrict => {
+                crate::schema::ReferentialAction::Restrict
+            }
+            crate::sql::ast::ReferentialAction::NoAction => {
+                crate::schema::ReferentialAction::NoAction
+            }
+            crate::sql::ast::ReferentialAction::SetNull => {
+                crate::schema::ReferentialAction::SetNull
+            }
+            crate::sql::ast::ReferentialAction::SetDefault => {
+                crate::schema::ReferentialAction::SetDefault
+            }
+        })
     }
 
     pub(crate) fn eval_literal(expr: &crate::sql::ast::Expr<'_>) -> Result<OwnedValue> {
@@ -378,7 +400,9 @@ impl Database {
         }
     }
 
-    pub(crate) fn jsonb_value_to_bytes(value: &crate::records::jsonb::JsonbBuilderValue) -> Vec<u8> {
+    pub(crate) fn jsonb_value_to_bytes(
+        value: &crate::records::jsonb::JsonbBuilderValue,
+    ) -> Vec<u8> {
         use crate::records::jsonb::{JsonbBuilder, JsonbBuilderValue};
 
         fn build_from_value(value: &JsonbBuilderValue) -> JsonbBuilder {

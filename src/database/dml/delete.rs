@@ -124,7 +124,7 @@ impl Database {
         let schema_name = delete.table.schema.unwrap_or(DEFAULT_SCHEMA);
         let table_name = delete.table.name;
 
-        let table_def = catalog.resolve_table(table_name)?;
+        let table_def = catalog.resolve_table_in_schema(delete.table.schema, table_name)?;
         let table_id = table_def.id();
         let columns = table_def.columns().to_vec();
         let has_toast = table_def.has_toast();
@@ -136,11 +136,17 @@ impl Database {
             .map(|idx| {
                 let col_indices: Vec<usize> = idx
                     .columns()
-                    .iter()
                     .filter_map(|col_name| columns.iter().position(|c| c.name() == col_name))
                     .collect();
                 (idx.name().to_string(), col_indices)
             })
+            .collect();
+
+        let hnsw_indexes: Vec<String> = table_def
+            .indexes()
+            .iter()
+            .filter(|idx| idx.index_type() == IndexType::Hnsw)
+            .map(|idx| idx.name().to_string())
             .collect();
 
         let unique_columns: Vec<(usize, String, bool)> = columns
@@ -162,12 +168,24 @@ impl Database {
             })
             .collect();
 
-        let mut fk_references: Vec<(String, String, String, usize)> = Vec::new();
+        let mut fk_references: Vec<(
+            String,
+            String,
+            String,
+            usize,
+            Option<crate::schema::ReferentialAction>,
+        )> = Vec::new();
         for (schema_key, schema_val) in catalog.schemas() {
             for (child_table_name, child_table_def) in schema_val.tables() {
                 for col in child_table_def.columns().iter() {
                     for constraint in col.constraints() {
-                        if let Constraint::ForeignKey { table, column } = constraint {
+                        if let Constraint::ForeignKey {
+                            table,
+                            column,
+                            on_delete,
+                            ..
+                        } = constraint
+                        {
                             if table == table_name {
                                 let ref_col_idx =
                                     columns.iter().position(|c| c.name() == column).unwrap_or(0);
@@ -176,6 +194,7 @@ impl Database {
                                     child_table_name.clone(),
                                     col.name().to_string(),
                                     ref_col_idx,
+                                    *on_delete,
                                 ));
                             }
                         }
@@ -189,9 +208,10 @@ impl Database {
             String,
             Vec<crate::schema::table::ColumnDef>,
             usize,
+            Option<crate::schema::ReferentialAction>,
         )> = fk_references
             .iter()
-            .map(|(schema_key, child_name, fk_col_name, _ref_col_idx)| {
+            .map(|(schema_key, child_name, fk_col_name, _ref_col_idx, on_delete)| {
                 let child_def = catalog
                     .schemas()
                     .get(schema_key)
@@ -209,6 +229,7 @@ impl Database {
                     child_name.clone(),
                     child_def.columns().to_vec(),
                     fk_col_idx,
+                    *on_delete,
                 )
             })
             .collect();
@@ -231,32 +252,58 @@ impl Database {
         let btree = BTree::new(&mut *storage, root_page)?;
 
         let mut pk_lookup_info: Option<(Vec<u8>, OwnedValue)> = 'pk_analysis: {
-            if let Some(crate::sql::ast::Expr::BinaryOp { left, op: crate::sql::ast::BinaryOperator::Eq, right }) = delete.where_clause.as_ref() {
-                if let Some(pk_idx) = columns.iter().position(|c| c.has_constraint(&Constraint::PrimaryKey)) {
+            if let Some(crate::sql::ast::Expr::BinaryOp {
+                left,
+                op: crate::sql::ast::BinaryOperator::Eq,
+                right,
+            }) = delete.where_clause.as_ref()
+            {
+                if let Some(pk_idx) = columns
+                    .iter()
+                    .position(|c| c.has_constraint(&Constraint::PrimaryKey))
+                {
                     let pk_col_name = columns[pk_idx].name();
 
                     let val_expr = match (&**left, &**right) {
-                        (crate::sql::ast::Expr::Column(c), val) if c.column.eq_ignore_ascii_case(pk_col_name) => Some(val),
-                        (val, crate::sql::ast::Expr::Column(c)) if c.column.eq_ignore_ascii_case(pk_col_name) => Some(val),
+                        (crate::sql::ast::Expr::Column(c), val)
+                            if c.column.eq_ignore_ascii_case(pk_col_name) =>
+                        {
+                            Some(val)
+                        }
+                        (val, crate::sql::ast::Expr::Column(c))
+                            if c.column.eq_ignore_ascii_case(pk_col_name) =>
+                        {
+                            Some(val)
+                        }
                         _ => None,
                     };
 
                     if let Some(expr) = val_expr {
                         let val_opt = if let crate::sql::ast::Expr::Parameter(param_ref) = expr {
-                             match param_ref {
-                                 crate::sql::ast::ParameterRef::Anonymous => params.first().cloned(),
-                                 crate::sql::ast::ParameterRef::Positional(idx) => if *idx > 0 { params.get((*idx - 1) as usize).cloned() } else { None },
-                                 _ => None,
-                             }
+                            match param_ref {
+                                crate::sql::ast::ParameterRef::Anonymous => params.first().cloned(),
+                                crate::sql::ast::ParameterRef::Positional(idx) => {
+                                    if *idx > 0 {
+                                        params.get((*idx - 1) as usize).cloned()
+                                    } else {
+                                        None
+                                    }
+                                }
+                                _ => None,
+                            }
                         } else {
                             Self::eval_literal(expr).ok()
                         };
 
                         if let Some(val) = val_opt {
                             let pk_index_name = format!("{}_pkey", pk_col_name);
-                            
+
                             if file_manager.index_exists(schema_name, table_name, &pk_index_name) {
-                                if let Ok(index_storage_arc) = file_manager.index_data_mut(schema_name, table_name, &pk_index_name) {
+                                if let Ok(index_storage_arc) = file_manager.index_data_mut(
+                                    schema_name,
+                                    table_name,
+                                    &pk_index_name,
+                                ) {
                                     let mut index_storage = index_storage_arc.write();
 
                                     let index_root_page = {
@@ -266,7 +313,8 @@ impl Database {
                                         header.root_page()
                                     };
 
-                                    let index_btree = BTree::new(&mut *index_storage, index_root_page)?;
+                                    let index_btree =
+                                        BTree::new(&mut *index_storage, index_root_page)?;
 
                                     let mut index_key = Vec::new();
                                     Self::encode_value_as_key(&val, &mut index_key);
@@ -290,74 +338,84 @@ impl Database {
 
         loop {
             let mut cursor = if let Some((ref key, _)) = pk_lookup_info {
-                 btree.cursor_seek(key)?
+                btree.cursor_seek(key)?
             } else {
-                 btree.cursor_first()?
+                btree.cursor_first()?
             };
 
-        while cursor.valid() {
-            let key = cursor.key()?;
+            while cursor.valid() {
+                let key = cursor.key()?;
 
-            if let Some((ref target_key, _)) = pk_lookup_info {
-                if key != target_key.as_slice() {
-                    break;
-                }
-            }
-
-            let value = cursor.value()?;
-
-            let user_data = get_user_data(value);
-            let record = RecordView::new(user_data, &schema)?;
-            let row_values = OwnedValue::extract_row_from_record(&record, &columns)?;
-
-            let should_delete = if let Some((_, ref target_val)) = pk_lookup_info {
-                if let Some(pk_idx) = columns.iter().position(|c| c.has_constraint(&Constraint::PrimaryKey)) {
-                    &row_values[pk_idx] == target_val
-                } else {
-                    false
-                }
-            } else if let Some(ref pred) = predicate {
-                use crate::sql::executor::ExecutorRow;
-
-                let values = owned_values_to_values(&row_values);
-                let values_slice = arena.alloc_slice_fill_iter(values.into_iter());
-                let exec_row = ExecutorRow::new(values_slice);
-                pred.evaluate(&exec_row)
-            } else {
-                true
-            };
-
-            if should_delete {
-                if !fk_references.is_empty() {
-                    for (_, _, _, ref_col_idx) in &fk_references {
-                        if let Some(v) = row_values.get(*ref_col_idx) {
-                            values_to_check.push((*ref_col_idx, v.clone()));
-                        }
+                if let Some((ref target_key, _)) = pk_lookup_info {
+                    if key != target_key.as_slice() {
+                        break;
                     }
                 }
-                rows_to_delete.push((key.to_vec(), value.to_vec(), row_values));
+
+                let value = cursor.value()?;
+
+                let user_data = get_user_data(value);
+                let record = RecordView::new(user_data, &schema)?;
+                let row_values = OwnedValue::extract_row_from_record(&record, &columns)?;
+
+                let should_delete = if let Some((_, ref target_val)) = pk_lookup_info {
+                    if let Some(pk_idx) = columns
+                        .iter()
+                        .position(|c| c.has_constraint(&Constraint::PrimaryKey))
+                    {
+                        &row_values[pk_idx] == target_val
+                    } else {
+                        false
+                    }
+                } else if let Some(ref pred) = predicate {
+                    use crate::sql::executor::ExecutorRow;
+
+                    let values = owned_values_to_values(&row_values);
+                    let values_slice = arena.alloc_slice_fill_iter(values.into_iter());
+                    let exec_row = ExecutorRow::new(values_slice);
+                    pred.evaluate(&exec_row)
+                } else {
+                    true
+                };
+
+                if should_delete {
+                    if !fk_references.is_empty() {
+                        for (_, _, _, ref_col_idx, _) in &fk_references {
+                            if let Some(v) = row_values.get(*ref_col_idx) {
+                                values_to_check.push((*ref_col_idx, v.clone()));
+                            }
+                        }
+                    }
+                    rows_to_delete.push((key.to_vec(), value.to_vec(), row_values));
+                }
+
+                cursor.advance()?;
             }
 
-            cursor.advance()?;
+            if pk_lookup_info.is_some() && rows_to_delete.is_empty() {
+                pk_lookup_info = None;
+                continue;
+            }
+
+            break;
         }
 
-        if pk_lookup_info.is_some() && rows_to_delete.is_empty() {
-            pk_lookup_info = None;
-            continue;
-        }
-
-        break;
-        }
+        let mut cascade_deletes: Vec<(String, String, Vec<Vec<u8>>)> = Vec::new();
 
         if !values_to_check.is_empty() {
-            for (child_schema, child_name, child_columns, fk_col_idx) in &child_table_schemas {
+            for (child_schema, child_name, child_columns, fk_col_idx, on_delete) in
+                &child_table_schemas
+            {
                 let child_storage_arc = file_manager.table_data_mut(child_schema, child_name)?;
                 let mut child_storage = child_storage_arc.write();
                 let child_btree = BTree::new(&mut *child_storage, root_page)?;
                 let mut child_cursor = child_btree.cursor_first()?;
                 let child_record_schema = create_record_schema(child_columns);
 
+                let mut keys_to_cascade: Vec<Vec<u8>> = Vec::new();
+
                 while child_cursor.valid() {
+                    let child_key = child_cursor.key()?.to_vec();
                     let child_value = child_cursor.value()?;
                     let child_user_data = get_user_data(child_value);
                     let child_record = RecordView::new(child_user_data, &child_record_schema)?;
@@ -366,17 +424,36 @@ impl Database {
 
                     if let Some(child_fk_val) = child_row.get(*fk_col_idx) {
                         for (ref_col_idx, del_val) in &values_to_check {
-                            if let Some((_, _, _, matching_ref_idx)) =
-                                fk_references.iter().find(|(s, n, _, r)| {
+                            if let Some((_, _, _, matching_ref_idx, _)) =
+                                fk_references.iter().find(|(s, n, _, r, _)| {
                                     s == child_schema && n == child_name && r == ref_col_idx
                                 })
                             {
                                 if matching_ref_idx == ref_col_idx && child_fk_val == del_val {
-                                    bail!(
-                                        "FOREIGN KEY constraint violated: row in '{}' is still referenced by '{}'",
-                                        table_name,
-                                        child_name
-                                    );
+                                    match on_delete {
+                                        Some(crate::schema::ReferentialAction::Cascade) => {
+                                            keys_to_cascade.push(child_key.clone());
+                                        }
+                                        Some(crate::schema::ReferentialAction::SetNull) => {
+                                            bail!(
+                                                "SET NULL not yet implemented for ON DELETE"
+                                            );
+                                        }
+                                        Some(crate::schema::ReferentialAction::SetDefault) => {
+                                            bail!(
+                                                "SET DEFAULT not yet implemented for ON DELETE"
+                                            );
+                                        }
+                                        Some(crate::schema::ReferentialAction::Restrict)
+                                        | Some(crate::schema::ReferentialAction::NoAction)
+                                        | None => {
+                                            bail!(
+                                                "FOREIGN KEY constraint violated: row in '{}' is still referenced by '{}'",
+                                                table_name,
+                                                child_name
+                                            );
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -384,6 +461,24 @@ impl Database {
 
                     child_cursor.advance()?;
                 }
+
+                if !keys_to_cascade.is_empty() {
+                    cascade_deletes.push((
+                        child_schema.clone(),
+                        child_name.clone(),
+                        keys_to_cascade,
+                    ));
+                }
+            }
+        }
+
+        for (child_schema, child_name, keys) in &cascade_deletes {
+            let child_storage_arc = file_manager.table_data_mut(child_schema, child_name)?;
+            let mut child_storage = child_storage_arc.write();
+            let mut child_btree = BTree::new(&mut *child_storage, root_page)?;
+
+            for key in keys {
+                let _ = child_btree.delete(key);
             }
         }
 
@@ -501,6 +596,19 @@ impl Database {
             }
         }
 
+        for index_name in &hnsw_indexes {
+            if file_manager.hnsw_exists(schema_name, table_name, index_name) {
+                let hnsw = self.get_or_create_hnsw_index(schema_name, table_name, index_name)?;
+                let mut hnsw_guard = hnsw.write();
+
+                for (row_key, _old_value, _row_values) in &rows_to_delete {
+                    if row_key.len() == 8 {
+                        let row_id = u64::from_be_bytes(row_key[..8].try_into().unwrap());
+                        let _ = hnsw_guard.delete_by_row_id(row_id);
+                    }
+                }
+            }
+        }
 
         drop(storage);
 
@@ -514,23 +622,36 @@ impl Database {
             if let Some(ref txn) = *active_txn {
                 (txn.txn_id, true)
             } else {
-                (self.shared.txn_manager.global_ts.fetch_add(1, Ordering::SeqCst), false)
+                (
+                    self.shared
+                        .txn_manager
+                        .global_ts
+                        .fetch_add(1, Ordering::SeqCst),
+                    false,
+                )
             }
         };
 
         let storage_arc = file_manager.table_data_mut(schema_name, table_name)?;
         let mut storage = storage_arc.write();
 
-        with_btree_storage!(wal_enabled, &mut *storage, &self.shared.dirty_tracker, table_id as u32, root_page, |btree_mut: &mut crate::btree::BTree<_>| {
-            for (key, old_value, _row_values) in &rows_to_delete {
-                let tombstone = wrap_record_for_delete(txn_id, old_value, in_transaction)?;
-                if !btree_mut.update(key, &tombstone)? {
-                    btree_mut.delete(key)?;
-                    btree_mut.insert(key, &tombstone)?;
+        with_btree_storage!(
+            wal_enabled,
+            &mut *storage,
+            &self.shared.dirty_tracker,
+            table_id as u32,
+            root_page,
+            |btree_mut: &mut crate::btree::BTree<_>| {
+                for (key, old_value, _row_values) in &rows_to_delete {
+                    let tombstone = wrap_record_for_delete(txn_id, old_value, in_transaction)?;
+                    if !btree_mut.update(key, &tombstone)? {
+                        btree_mut.delete(key)?;
+                        btree_mut.insert(key, &tombstone)?;
+                    }
                 }
+                Ok::<_, eyre::Report>(())
             }
-            Ok::<_, eyre::Report>(())
-        });
+        );
 
         drop(storage);
 

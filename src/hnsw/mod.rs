@@ -122,6 +122,10 @@ pub mod quantization;
 pub mod search;
 pub mod storage;
 
+pub const MAX_LEVELS: usize = 4;
+pub const MAX_L0_NEIGHBORS: usize = 32;
+pub const MAX_LEVEL_NEIGHBORS: usize = 16;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[repr(u8)]
 pub enum DistanceFunction {
@@ -220,14 +224,12 @@ impl<'a> VectorRef<'a> {
     }
 }
 
-const MAX_LEVEL0_NEIGHBORS: usize = 32;
-const MAX_LEVEL_NEIGHBORS: usize = 16;
 
 pub struct HnswNode {
     row_id: u64,
     max_level: u8,
     l0_count: u8,
-    l0_neighbors: [NodeId; MAX_LEVEL0_NEIGHBORS],
+    l0_neighbors: [NodeId; MAX_L0_NEIGHBORS],
     higher_levels: Vec<Vec<NodeId>>,
 }
 
@@ -242,14 +244,14 @@ impl HnswNode {
             row_id,
             max_level,
             l0_count: 0,
-            l0_neighbors: [NodeId::none(); MAX_LEVEL0_NEIGHBORS],
+            l0_neighbors: [NodeId::none(); MAX_L0_NEIGHBORS],
             higher_levels,
         }
     }
 
     pub fn max_serialized_size(max_level: u8) -> usize {
         let mut size = 8 + 1 + 1;
-        size += MAX_LEVEL0_NEIGHBORS * 6;
+        size += MAX_L0_NEIGHBORS * 6;
         size += (max_level as usize) * (1 + MAX_LEVEL_NEIGHBORS * 6);
         size
     }
@@ -271,7 +273,7 @@ impl HnswNode {
     }
 
     pub fn add_level0_neighbor(&mut self, neighbor: NodeId) {
-        if (self.l0_count as usize) < MAX_LEVEL0_NEIGHBORS {
+        if (self.l0_count as usize) < MAX_L0_NEIGHBORS {
             self.l0_neighbors[self.l0_count as usize] = neighbor;
             self.l0_count += 1;
         }
@@ -366,14 +368,14 @@ impl HnswNode {
         let l0_count = buf[9];
 
         ensure!(
-            l0_count as usize <= MAX_LEVEL0_NEIGHBORS,
+            l0_count as usize <= MAX_L0_NEIGHBORS,
             "l0_count {} exceeds maximum {}",
             l0_count,
-            MAX_LEVEL0_NEIGHBORS
+            MAX_L0_NEIGHBORS
         );
 
         let mut offset = 10;
-        let mut l0_neighbors = [NodeId::none(); MAX_LEVEL0_NEIGHBORS];
+        let mut l0_neighbors = [NodeId::none(); MAX_L0_NEIGHBORS];
         for (i, neighbor) in l0_neighbors.iter_mut().enumerate().take(l0_count as usize) {
             ensure!(
                 offset + 6 <= buf.len(),
@@ -414,6 +416,197 @@ impl HnswNode {
             l0_count,
             l0_neighbors,
             higher_levels,
+        })
+    }
+}
+
+#[derive(Clone, Copy)]
+#[repr(C)]
+pub struct HnswNodeInline {
+    row_id: u64,
+    max_level: u8,
+    l0_count: u8,
+    l0_neighbors: [NodeId; MAX_L0_NEIGHBORS],
+    higher_counts: [u8; MAX_LEVELS],
+    higher_neighbors: [[NodeId; MAX_LEVEL_NEIGHBORS]; MAX_LEVELS],
+}
+
+impl HnswNodeInline {
+    pub fn new(row_id: u64, max_level: u8) -> Self {
+        let capped_level = max_level.min(MAX_LEVELS as u8);
+        Self {
+            row_id,
+            max_level: capped_level,
+            l0_count: 0,
+            l0_neighbors: [NodeId::none(); MAX_L0_NEIGHBORS],
+            higher_counts: [0u8; MAX_LEVELS],
+            higher_neighbors: [[NodeId::none(); MAX_LEVEL_NEIGHBORS]; MAX_LEVELS],
+        }
+    }
+
+    pub const fn serialized_size() -> usize {
+        8 + 1 + 1 + (MAX_L0_NEIGHBORS * 6) + MAX_LEVELS + (MAX_LEVELS * MAX_LEVEL_NEIGHBORS * 6)
+    }
+
+    pub fn row_id(&self) -> u64 {
+        self.row_id
+    }
+
+    pub fn max_level(&self) -> u8 {
+        self.max_level
+    }
+
+    pub fn level0_neighbor_count(&self) -> u8 {
+        self.l0_count
+    }
+
+    pub fn level0_neighbors(&self) -> &[NodeId] {
+        &self.l0_neighbors[..self.l0_count as usize]
+    }
+
+    pub fn add_level0_neighbor(&mut self, neighbor: NodeId) {
+        if (self.l0_count as usize) < MAX_L0_NEIGHBORS {
+            self.l0_neighbors[self.l0_count as usize] = neighbor;
+            self.l0_count += 1;
+        }
+    }
+
+    pub fn neighbors_at_level(&self, level: u8) -> &[NodeId] {
+        if level == 0 {
+            self.level0_neighbors()
+        } else if (level as usize) <= MAX_LEVELS && level <= self.max_level {
+            let idx = (level - 1) as usize;
+            &self.higher_neighbors[idx][..self.higher_counts[idx] as usize]
+        } else {
+            &[]
+        }
+    }
+
+    pub fn add_neighbor_at_level(&mut self, level: u8, neighbor: NodeId) {
+        if level == 0 {
+            self.add_level0_neighbor(neighbor);
+        } else if (level as usize) <= MAX_LEVELS && level <= self.max_level {
+            let idx = (level - 1) as usize;
+            if (self.higher_counts[idx] as usize) < MAX_LEVEL_NEIGHBORS {
+                self.higher_neighbors[idx][self.higher_counts[idx] as usize] = neighbor;
+                self.higher_counts[idx] += 1;
+            }
+        }
+    }
+
+    pub fn remove_neighbor_at_level(&mut self, level: u8, neighbor: NodeId) {
+        if level == 0 {
+            if let Some(pos) = self.l0_neighbors[..self.l0_count as usize]
+                .iter()
+                .position(|&n| n == neighbor)
+            {
+                for i in pos..((self.l0_count as usize) - 1) {
+                    self.l0_neighbors[i] = self.l0_neighbors[i + 1];
+                }
+                self.l0_count -= 1;
+                self.l0_neighbors[self.l0_count as usize] = NodeId::none();
+            }
+        } else if (level as usize) <= MAX_LEVELS && level <= self.max_level {
+            let idx = (level - 1) as usize;
+            let count = self.higher_counts[idx] as usize;
+            if let Some(pos) = self.higher_neighbors[idx][..count]
+                .iter()
+                .position(|&n| n == neighbor)
+            {
+                for i in pos..(count - 1) {
+                    self.higher_neighbors[idx][i] = self.higher_neighbors[idx][i + 1];
+                }
+                self.higher_counts[idx] -= 1;
+                self.higher_neighbors[idx][self.higher_counts[idx] as usize] = NodeId::none();
+            }
+        }
+    }
+
+    pub fn write_to(&self, buf: &mut [u8]) -> usize {
+        let mut offset = 0;
+        buf[offset..offset + 8].copy_from_slice(&self.row_id.to_le_bytes());
+        offset += 8;
+        buf[offset] = self.max_level;
+        offset += 1;
+        buf[offset] = self.l0_count;
+        offset += 1;
+
+        for i in 0..self.l0_count as usize {
+            self.l0_neighbors[i].write_to(&mut buf[offset..offset + 6]);
+            offset += 6;
+        }
+
+        for level in 0..self.max_level as usize {
+            if level >= MAX_LEVELS {
+                break;
+            }
+            buf[offset] = self.higher_counts[level];
+            offset += 1;
+            for i in 0..self.higher_counts[level] as usize {
+                self.higher_neighbors[level][i].write_to(&mut buf[offset..offset + 6]);
+                offset += 6;
+            }
+        }
+
+        offset
+    }
+
+    pub fn read_from(buf: &[u8]) -> eyre::Result<Self> {
+        use eyre::ensure;
+
+        ensure!(buf.len() >= 10, "buffer too small for HnswNodeInline header");
+
+        let row_id = u64::from_le_bytes([
+            buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7],
+        ]);
+        let max_level = buf[8].min(MAX_LEVELS as u8);
+        let l0_count = buf[9].min(MAX_L0_NEIGHBORS as u8);
+
+        let mut offset = 10;
+        let mut l0_neighbors = [NodeId::none(); MAX_L0_NEIGHBORS];
+        for neighbor in l0_neighbors.iter_mut().take(l0_count as usize) {
+            ensure!(
+                offset + 6 <= buf.len(),
+                "buffer too small for L0 neighbor"
+            );
+            *neighbor = NodeId::read_from(&buf[offset..offset + 6]);
+            offset += 6;
+        }
+
+        let mut higher_counts = [0u8; MAX_LEVELS];
+        let mut higher_neighbors = [[NodeId::none(); MAX_LEVEL_NEIGHBORS]; MAX_LEVELS];
+
+        for level in 0..max_level as usize {
+            if level >= MAX_LEVELS {
+                break;
+            }
+            ensure!(
+                offset < buf.len(),
+                "buffer too small for level {} count",
+                level + 1
+            );
+            let count = buf[offset].min(MAX_LEVEL_NEIGHBORS as u8);
+            higher_counts[level] = count;
+            offset += 1;
+
+            for neighbor in higher_neighbors[level].iter_mut().take(count as usize) {
+                ensure!(
+                    offset + 6 <= buf.len(),
+                    "buffer too small for level {} neighbor",
+                    level + 1
+                );
+                *neighbor = NodeId::read_from(&buf[offset..offset + 6]);
+                offset += 6;
+            }
+        }
+
+        Ok(Self {
+            row_id,
+            max_level,
+            l0_count,
+            l0_neighbors,
+            higher_counts,
+            higher_neighbors,
         })
     }
 }
@@ -576,6 +769,7 @@ pub struct PersistentHnswIndex {
     storage: storage::HnswStorage,
     current_page: u32,
     vacuum_queue: VacuumQueue,
+    row_id_map: hashbrown::HashMap<u64, NodeId>,
 }
 
 impl PersistentHnswIndex {
@@ -611,6 +805,7 @@ impl PersistentHnswIndex {
             storage,
             current_page: 0,
             vacuum_queue: VacuumQueue::default(),
+            row_id_map: hashbrown::HashMap::new(),
         })
     }
 
@@ -625,12 +820,54 @@ impl PersistentHnswIndex {
             0
         };
 
-        Ok(Self {
+        let mut result = Self {
             index,
             storage,
             current_page,
             vacuum_queue: VacuumQueue::default(),
-        })
+            row_id_map: hashbrown::HashMap::new(),
+        };
+
+        result.rebuild_row_id_map()?;
+
+        Ok(result)
+    }
+
+    fn rebuild_row_id_map(&mut self) -> eyre::Result<()> {
+        self.row_id_map.clear();
+
+        for page_no in 1..=self.current_page {
+            if let Ok(page_data) = self.storage.get_page(page_no) {
+                if let Ok(page) = storage::HnswPageRef::from_bytes(page_data) {
+                    for slot_idx in 0..page.slot_count() {
+                        if let Some(slot) = page.get_slot(slot_idx) {
+                            if slot.is_active() {
+                                if let Ok(data) = page.read_node_data(slot_idx) {
+                                    if let Ok(node) = HnswNode::read_from(data) {
+                                        let node_id = NodeId::new(page_no, slot_idx);
+                                        self.row_id_map.insert(node.row_id(), node_id);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    pub fn find_node_by_row_id(&self, row_id: u64) -> Option<NodeId> {
+        self.row_id_map.get(&row_id).copied()
+    }
+
+    pub fn delete_by_row_id(&mut self, row_id: u64) -> eyre::Result<()> {
+        let node_id = self.row_id_map.remove(&row_id);
+        if let Some(nid) = node_id {
+            self.delete(nid)?;
+        }
+        Ok(())
     }
 
     pub fn index(&self) -> &HnswIndex {
@@ -756,6 +993,16 @@ impl PersistentHnswIndex {
         vector: &[f32],
         random_value: f64,
     ) -> eyre::Result<NodeId> {
+        self.insert_with_callback(row_id, vector, random_value, |_| None)
+    }
+
+    pub fn insert_with_callback(
+        &mut self,
+        row_id: u64,
+        vector: &[f32],
+        random_value: f64,
+        get_existing_vector: impl Fn(u64) -> Option<Vec<f32>>,
+    ) -> eyre::Result<NodeId> {
         eyre::ensure!(
             vector.len() == self.index.dimensions() as usize,
             "vector dimension {} does not match index dimension {}",
@@ -768,15 +1015,21 @@ impl PersistentHnswIndex {
 
         let node = HnswNode::new(row_id, target_level);
         let node_id = self.allocate_node(&node)?;
+        self.row_id_map.insert(row_id, node_id);
 
         if self.index.entry_point().is_none() {
             self.index.set_entry_point(node_id, target_level);
             return Ok(node_id);
         }
 
-        let entry_point = self.index.entry_point().unwrap(); // INVARIANT: is_some checked above
-        let entry_vector = self.get_vector_for_node(entry_point)?;
-        let entry_distance = distance::euclidean_squared_scalar(vector, &entry_vector);
+        let entry_point = self.index.entry_point().unwrap();
+        let entry_row_id = self.read_node(entry_point)?.row_id();
+        let entry_vector = get_existing_vector(entry_row_id).unwrap_or_default();
+        let entry_distance = if entry_vector.is_empty() {
+            f32::INFINITY
+        } else {
+            distance::euclidean_squared(vector, &entry_vector)
+        };
 
         let mut insert_ctx = operations::InsertContext::new(target_level);
         insert_ctx.set_entry(entry_point, entry_distance, self.index.max_level());
@@ -788,8 +1041,9 @@ impl PersistentHnswIndex {
         };
 
         let compute_distance = |n: NodeId| {
-            self.get_vector_for_node(n)
-                .map(|v| distance::euclidean_squared_scalar(vector, &v))
+            let node_row_id = self.read_node(n).map(|node| node.row_id()).unwrap_or(0);
+            get_existing_vector(node_row_id)
+                .map(|v| distance::euclidean_squared(vector, &v))
                 .unwrap_or(f32::INFINITY)
         };
 
@@ -835,10 +1089,6 @@ impl PersistentHnswIndex {
         Ok(page.can_fit(data_size))
     }
 
-    fn get_vector_for_node(&self, _node_id: NodeId) -> eyre::Result<Vec<f32>> {
-        eyre::bail!("get_vector_for_node requires table integration - not implemented yet")
-    }
-
     pub fn search(
         &self,
         query: &[f32],
@@ -865,7 +1115,7 @@ impl PersistentHnswIndex {
             };
             let row_id = node.row_id();
             match get_vector(row_id) {
-                Some(v) => distance::euclidean_squared_scalar(query, &v),
+                Some(v) => distance::euclidean_squared(query, &v),
                 None => f32::INFINITY,
             }
         };
@@ -953,7 +1203,7 @@ impl PersistentHnswIndex {
             };
             let row_id = node.row_id();
             match get_vector(row_id) {
-                Some(v) => distance::euclidean_squared_scalar(query, &v),
+                Some(v) => distance::euclidean_squared(query, &v),
                 None => f32::INFINITY,
             }
         };

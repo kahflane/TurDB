@@ -13,7 +13,12 @@ pub struct CompiledPredicate<'a> {
 
 impl<'a> CompiledPredicate<'a> {
     pub fn new(expr: &'a crate::sql::ast::Expr<'a>, column_map: Vec<(String, usize)>) -> Self {
-        Self { expr, column_map, params: None, set_param_count: 0 }
+        Self {
+            expr,
+            column_map,
+            params: None,
+            set_param_count: 0,
+        }
     }
 
     pub fn with_params(
@@ -190,7 +195,11 @@ impl<'a> CompiledPredicate<'a> {
                     let idx = match param_ref {
                         crate::sql::ast::ParameterRef::Anonymous => self.set_param_count,
                         crate::sql::ast::ParameterRef::Positional(n) => {
-                            if *n > 0 { (*n - 1) as usize } else { return None; }
+                            if *n > 0 {
+                                (*n - 1) as usize
+                            } else {
+                                return None;
+                            }
                         }
                         crate::sql::ast::ParameterRef::Named(_) => self.set_param_count,
                     };
@@ -217,13 +226,32 @@ impl<'a> CompiledPredicate<'a> {
             OwnedValue::Inet4(a) => Value::Inet4(*a),
             OwnedValue::Inet6(a) => Value::Inet6(*a),
             OwnedValue::Jsonb(b) => Value::Jsonb(Cow::Owned(b.clone())),
-            OwnedValue::TimestampTz(micros, offset_secs) => Value::TimestampTz { micros: *micros, offset_secs: *offset_secs },
-            OwnedValue::Interval(micros, days, months) => Value::Interval { micros: *micros, days: *days, months: *months },
+            OwnedValue::TimestampTz(micros, offset_secs) => Value::TimestampTz {
+                micros: *micros,
+                offset_secs: *offset_secs,
+            },
+            OwnedValue::Interval(micros, days, months) => Value::Interval {
+                micros: *micros,
+                days: *days,
+                months: *months,
+            },
             OwnedValue::Point(x, y) => Value::Point { x: *x, y: *y },
-            OwnedValue::Box(low, high) => Value::GeoBox { low: *low, high: *high },
-            OwnedValue::Circle(center, radius) => Value::Circle { center: *center, radius: *radius },
-            OwnedValue::Enum(type_id, ordinal) => Value::Enum { type_id: *type_id, ordinal: *ordinal },
-            OwnedValue::Decimal(digits, scale) => Value::Decimal { digits: *digits, scale: *scale },
+            OwnedValue::Box(low, high) => Value::GeoBox {
+                low: *low,
+                high: *high,
+            },
+            OwnedValue::Circle(center, radius) => Value::Circle {
+                center: *center,
+                radius: *radius,
+            },
+            OwnedValue::Enum(type_id, ordinal) => Value::Enum {
+                type_id: *type_id,
+                ordinal: *ordinal,
+            },
+            OwnedValue::Decimal(digits, scale) => Value::Decimal {
+                digits: *digits,
+                scale: *scale,
+            },
             OwnedValue::ToastPointer(b) => Value::ToastPointer(Cow::Owned(b.clone())),
             OwnedValue::Date(_) | OwnedValue::Time(_) | OwnedValue::Timestamp(_) => Value::Null,
         }
@@ -478,10 +506,17 @@ impl<'a> CompiledPredicate<'a> {
             },
             DataType::Timestamp | DataType::TimestampTz => match val {
                 Value::Text(s) => self.parse_timestamp(s),
-                Value::TimestampTz { micros, offset_secs } => {
-                    Some(Value::TimestampTz { micros: *micros, offset_secs: *offset_secs })
-                }
-                Value::Int(t) => Some(Value::TimestampTz { micros: *t, offset_secs: 0 }),
+                Value::TimestampTz {
+                    micros,
+                    offset_secs,
+                } => Some(Value::TimestampTz {
+                    micros: *micros,
+                    offset_secs: *offset_secs,
+                }),
+                Value::Int(t) => Some(Value::TimestampTz {
+                    micros: *t,
+                    offset_secs: 0,
+                }),
                 Value::Null => Some(Value::Null),
                 _ => None,
             },
@@ -506,7 +541,11 @@ impl<'a> CompiledPredicate<'a> {
             4 | 6 | 9 | 11 => 30,
             2 => {
                 let is_leap = (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0);
-                if is_leap { 29 } else { 28 }
+                if is_leap {
+                    29
+                } else {
+                    28
+                }
             }
             _ => return None,
         };
@@ -549,7 +588,8 @@ impl<'a> CompiledPredicate<'a> {
         } else {
             (0, 0)
         };
-        let micros = (hour as i64 * 3600 + minute as i64 * 60 + second as i64) * 1_000_000 + micros_frac;
+        let micros =
+            (hour as i64 * 3600 + minute as i64 * 60 + second as i64) * 1_000_000 + micros_frac;
         Some(Value::Int(micros))
     }
 
@@ -573,7 +613,10 @@ impl<'a> CompiledPredicate<'a> {
             0
         };
         let micros = days * 86400 * 1_000_000 + time_micros;
-        Some(Value::TimestampTz { micros, offset_secs: 0 })
+        Some(Value::TimestampTz {
+            micros,
+            offset_secs: 0,
+        })
     }
 
     fn parse_and_build_jsonb(&self, s: &str) -> Option<Value<'a>> {
@@ -584,14 +627,20 @@ impl<'a> CompiledPredicate<'a> {
             return Some(Value::Jsonb(Cow::Owned(JsonbBuilder::new_null().build())));
         }
         if s == "true" {
-            return Some(Value::Jsonb(Cow::Owned(JsonbBuilder::new_bool(true).build())));
+            return Some(Value::Jsonb(Cow::Owned(
+                JsonbBuilder::new_bool(true).build(),
+            )));
         }
         if s == "false" {
-            return Some(Value::Jsonb(Cow::Owned(JsonbBuilder::new_bool(false).build())));
+            return Some(Value::Jsonb(Cow::Owned(
+                JsonbBuilder::new_bool(false).build(),
+            )));
         }
         if s.starts_with('"') && s.ends_with('"') && s.len() >= 2 {
             let inner = &s[1..s.len() - 1];
-            return Some(Value::Jsonb(Cow::Owned(JsonbBuilder::new_string(inner).build())));
+            return Some(Value::Jsonb(Cow::Owned(
+                JsonbBuilder::new_string(inner).build(),
+            )));
         }
         if s.starts_with('{') || s.starts_with('[') {
             if let Some(jsonb_bytes) = self.parse_json_to_jsonb(s) {
@@ -600,8 +649,12 @@ impl<'a> CompiledPredicate<'a> {
             return None;
         }
         if let Ok(n) = s.parse::<f64>() {
-            if s.chars().all(|c| c.is_ascii_digit() || c == '.' || c == '-' || c == '+' || c == 'e' || c == 'E') {
-                return Some(Value::Jsonb(Cow::Owned(JsonbBuilder::new_number(n).build())));
+            if s.chars().all(|c| {
+                c.is_ascii_digit() || c == '.' || c == '-' || c == '+' || c == 'e' || c == 'E'
+            }) {
+                return Some(Value::Jsonb(Cow::Owned(
+                    JsonbBuilder::new_number(n).build(),
+                )));
             }
         }
         None
@@ -632,7 +685,9 @@ impl<'a> CompiledPredicate<'a> {
                 return parse_array(&s[1..s.len() - 1]);
             }
             if let Ok(n) = s.parse::<f64>() {
-                if s.chars().all(|c| c.is_ascii_digit() || c == '.' || c == '-' || c == '+' || c == 'e' || c == 'E') {
+                if s.chars().all(|c| {
+                    c.is_ascii_digit() || c == '.' || c == '-' || c == '+' || c == 'e' || c == 'E'
+                }) {
                     return Some(JsonbBuilderValue::Number(n));
                 }
             }
@@ -790,10 +845,7 @@ impl<'a> CompiledPredicate<'a> {
         let func_name = func.name.name.to_uppercase();
 
         if func.over.is_none()
-            && matches!(
-                func_name.as_str(),
-                "COUNT" | "SUM" | "AVG" | "MIN" | "MAX"
-            )
+            && matches!(func_name.as_str(), "COUNT" | "SUM" | "AVG" | "MIN" | "MAX")
         {
             let lookup_name = match &func.args {
                 FunctionArgs::Star => func_name.to_lowercase(),
@@ -990,23 +1042,19 @@ impl<'a> CompiledPredicate<'a> {
         as_text: bool,
     ) -> Option<Value<'a>> {
         match json_val {
-            Value::Jsonb(bytes) => {
-                self.extract_from_jsonb_binary(bytes.as_ref(), key, as_text)
-            }
-            Value::Text(s) => {
-                match key {
-                    Value::Text(key_str) => {
-                        if key_str.starts_with('$') {
-                            let path_elements = self.parse_json_path_elements(key_str)?;
-                            self.traverse_json_path(s, &path_elements, as_text)
-                        } else {
-                            self.extract_json_key(s, key_str, as_text)
-                        }
+            Value::Jsonb(bytes) => self.extract_from_jsonb_binary(bytes.as_ref(), key, as_text),
+            Value::Text(s) => match key {
+                Value::Text(key_str) => {
+                    if key_str.starts_with('$') {
+                        let path_elements = self.parse_json_path_elements(key_str)?;
+                        self.traverse_json_path(s, &path_elements, as_text)
+                    } else {
+                        self.extract_json_key(s, key_str, as_text)
                     }
-                    Value::Int(index) => self.extract_json_array_index(s, *index, as_text),
-                    _ => None,
                 }
-            }
+                Value::Int(index) => self.extract_json_array_index(s, *index, as_text),
+                _ => None,
+            },
             _ => None,
         }
     }
@@ -1220,9 +1268,7 @@ impl<'a> CompiledPredicate<'a> {
             Value::Jsonb(bytes) => {
                 self.traverse_jsonb_path(bytes.as_ref(), &path_elements, as_text)
             }
-            Value::Text(s) => {
-                self.traverse_json_path(s, &path_elements, as_text)
-            }
+            Value::Text(s) => self.traverse_json_path(s, &path_elements, as_text),
             _ => None,
         }
     }
@@ -1480,12 +1526,12 @@ impl<'a> CompiledPredicate<'a> {
     }
 
     fn eval_vector_l2_distance(&self, left: &Value<'a>, right: &Value<'a>) -> Option<Value<'a>> {
-        let (vec1, vec2) = match (left, right) {
-            (Value::Vector(v1), Value::Vector(v2)) if v1.len() == v2.len() => {
-                (v1.as_ref(), v2.as_ref())
-            }
-            _ => return None,
-        };
+        let vec1 = self.value_to_vec(left)?;
+        let vec2 = self.value_to_vec(right)?;
+
+        if vec1.len() != vec2.len() {
+            return None;
+        }
 
         let sum: f32 = vec1
             .iter()
@@ -1501,12 +1547,12 @@ impl<'a> CompiledPredicate<'a> {
         left: &Value<'a>,
         right: &Value<'a>,
     ) -> Option<Value<'a>> {
-        let (vec1, vec2) = match (left, right) {
-            (Value::Vector(v1), Value::Vector(v2)) if v1.len() == v2.len() => {
-                (v1.as_ref(), v2.as_ref())
-            }
-            _ => return None,
-        };
+        let vec1 = self.value_to_vec(left)?;
+        let vec2 = self.value_to_vec(right)?;
+
+        if vec1.len() != vec2.len() {
+            return None;
+        }
 
         let dot: f32 = vec1.iter().zip(vec2.iter()).map(|(a, b)| a * b).sum();
         let norm1: f32 = vec1.iter().map(|x| x * x).sum::<f32>().sqrt();
@@ -1523,15 +1569,36 @@ impl<'a> CompiledPredicate<'a> {
     }
 
     fn eval_vector_inner_product(&self, left: &Value<'a>, right: &Value<'a>) -> Option<Value<'a>> {
-        let (vec1, vec2) = match (left, right) {
-            (Value::Vector(v1), Value::Vector(v2)) if v1.len() == v2.len() => {
-                (v1.as_ref(), v2.as_ref())
-            }
-            _ => return None,
-        };
+        let vec1 = self.value_to_vec(left)?;
+        let vec2 = self.value_to_vec(right)?;
+
+        if vec1.len() != vec2.len() {
+            return None;
+        }
 
         let dot: f32 = vec1.iter().zip(vec2.iter()).map(|(a, b)| a * b).sum();
-        Some(Value::Float(-dot as f64))
+
+        Some(Value::Float(dot as f64))
+    }
+
+    fn value_to_vec(&self, val: &Value<'a>) -> Option<Cow<'a, [f32]>> {
+        match val {
+            Value::Vector(v) => Some(v.clone()),
+            Value::Text(s) => {
+                let trimmed = s.trim();
+                if trimmed.starts_with('[') && trimmed.ends_with(']') {
+                    let inner = &trimmed[1..trimmed.len() - 1];
+                    let parsed: Result<Vec<f32>, _> = inner
+                        .split(',')
+                        .map(|x| x.trim().parse::<f32>())
+                        .collect();
+                    parsed.ok().map(Cow::Owned)
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
     }
 
     fn eval_arithmetic_op<F, G>(

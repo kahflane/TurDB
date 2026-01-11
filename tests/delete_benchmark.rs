@@ -1,10 +1,11 @@
-use std::time::Instant;
 use rusqlite::Connection;
+use std::time::Instant;
 use turdb::{Database, OwnedValue};
 
 const ROW_COUNT: usize = 1000;
 const SQLITE_TARGET: &str = "/Users/julfikar/Documents/PassionFruit.nosync/turdb/turdb-core/.worktrees/delete_bench_sqlite.db";
-const TURDB_TARGET: &str = "/Users/julfikar/Documents/PassionFruit.nosync/turdb/turdb-core/.worktrees/delete_bench_turdb";
+const TURDB_TARGET: &str =
+    "/Users/julfikar/Documents/PassionFruit.nosync/turdb/turdb-core/.worktrees/delete_bench_turdb";
 
 fn generate_test_data(count: usize) -> Vec<Vec<OwnedValue>> {
     (0..count)
@@ -41,7 +42,8 @@ fn owned_to_rusqlite(val: &OwnedValue) -> rusqlite::types::Value {
 fn setup_sqlite_with_data(path: &str, data: &[Vec<OwnedValue>]) -> Connection {
     let conn = Connection::open(path).expect("Failed to create SQLite DB");
 
-    conn.execute_batch("
+    conn.execute_batch(
+        "
         PRAGMA journal_mode = OFF;
         PRAGMA synchronous = OFF;
         PRAGMA cache_size = -64000;
@@ -62,18 +64,25 @@ fn setup_sqlite_with_data(path: &str, data: &[Vec<OwnedValue>]) -> Connection {
             total_compressed_bytes REAL,
             total_uncompressed_bytes REAL
         );
-    ").expect("Failed to create SQLite table");
+    ",
+    )
+    .expect("Failed to create SQLite table");
 
     {
-        let mut insert_stmt = conn.prepare_cached(
-            "INSERT INTO dataset_versions VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
-        ).expect("Failed to prepare insert");
+        let mut insert_stmt = conn
+            .prepare_cached(
+                "INSERT INTO dataset_versions VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .expect("Failed to prepare insert");
 
         conn.execute("BEGIN IMMEDIATE", []).expect("BEGIN failed");
 
         for row in data {
-            let sqlite_row: Vec<rusqlite::types::Value> = row.iter().map(owned_to_rusqlite).collect();
-            insert_stmt.execute(rusqlite::params_from_iter(sqlite_row.iter())).expect("Insert failed");
+            let sqlite_row: Vec<rusqlite::types::Value> =
+                row.iter().map(owned_to_rusqlite).collect();
+            insert_stmt
+                .execute(rusqlite::params_from_iter(sqlite_row.iter()))
+                .expect("Insert failed");
         }
 
         conn.execute("COMMIT", []).expect("COMMIT failed");
@@ -86,8 +95,10 @@ fn setup_turdb_with_data(path: &str, data: &[Vec<OwnedValue>]) -> Database {
     let db = Database::create(path).expect("Failed to create TurDB");
 
     db.execute("PRAGMA WAL = OFF;").expect("Failed to SET WAL");
-    db.execute("PRAGMA synchronous = OFF;").expect("Failed to SET Synchronous");
-    db.execute("
+    db.execute("PRAGMA synchronous = OFF;")
+        .expect("Failed to SET Synchronous");
+    db.execute(
+        "
         CREATE TABLE dataset_versions (
           id BIGINT PRIMARY KEY,
           dataset_id BIGINT,
@@ -102,16 +113,19 @@ fn setup_turdb_with_data(path: &str, data: &[Vec<OwnedValue>]) -> Database {
           total_compressed_bytes FLOAT,
           total_uncompressed_bytes FLOAT
         )
-    ").expect("Failed to create TurDB table");
+    ",
+    )
+    .expect("Failed to create TurDB table");
 
-    let insert_stmt = db.prepare(
-        "INSERT INTO dataset_versions VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
-    ).expect("Failed to prepare TurDB insert");
+    let insert_stmt = db
+        .prepare("INSERT INTO dataset_versions VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
+        .expect("Failed to prepare TurDB insert");
 
     db.execute("BEGIN").expect("BEGIN failed");
 
     for row in data {
-        insert_stmt.bind(row[0].clone())
+        insert_stmt
+            .bind(row[0].clone())
             .bind(row[1].clone())
             .bind(row[2].clone())
             .bind(row[3].clone())
@@ -138,7 +152,10 @@ fn benchmark_single_deletes() {
     let _ = std::fs::remove_dir_all(TURDB_TARGET);
 
     println!("\n============================================================");
-    println!("  Single Delete Benchmark (Apple-to-Apple) - {} rows", ROW_COUNT);
+    println!(
+        "  Single Delete Benchmark (Apple-to-Apple) - {} rows",
+        ROW_COUNT
+    );
     println!("============================================================\n");
 
     println!("Generating {} test rows...", ROW_COUNT);
@@ -154,11 +171,13 @@ fn benchmark_single_deletes() {
     let sqlite_start = Instant::now();
 
     {
-        let mut delete_stmt = sqlite_conn.prepare_cached(
-            "DELETE FROM dataset_versions WHERE id = ?"
-        ).expect("Failed to prepare delete");
+        let mut delete_stmt = sqlite_conn
+            .prepare_cached("DELETE FROM dataset_versions WHERE id = ?")
+            .expect("Failed to prepare delete");
 
-        sqlite_conn.execute("BEGIN IMMEDIATE", []).expect("BEGIN failed");
+        sqlite_conn
+            .execute("BEGIN IMMEDIATE", [])
+            .expect("BEGIN failed");
 
         for i in 0..ROW_COUNT {
             delete_stmt.execute([i as i64]).expect("Delete failed");
@@ -168,25 +187,29 @@ fn benchmark_single_deletes() {
     }
 
     let sqlite_elapsed = sqlite_start.elapsed();
-    println!("SQLite: {} deletes in {:.3}s = {:.0} deletes/sec\n",
-             ROW_COUNT, sqlite_elapsed.as_secs_f64(),
-             ROW_COUNT as f64 / sqlite_elapsed.as_secs_f64());
+    println!(
+        "SQLite: {} deletes in {:.3}s = {:.0} deletes/sec\n",
+        ROW_COUNT,
+        sqlite_elapsed.as_secs_f64(),
+        ROW_COUNT as f64 / sqlite_elapsed.as_secs_f64()
+    );
 
     // ========== TURDB BENCHMARK ==========
     println!("--- TurDB Single Delete Benchmark ---");
     println!("Setting up TurDB with {} rows...", ROW_COUNT);
     let turdb = setup_turdb_with_data(TURDB_TARGET, &test_data);
 
-    let delete_stmt = turdb.prepare(
-        "DELETE FROM dataset_versions WHERE id = ?"
-    ).expect("Failed to prepare TurDB delete");
+    let delete_stmt = turdb
+        .prepare("DELETE FROM dataset_versions WHERE id = ?")
+        .expect("Failed to prepare TurDB delete");
 
     let turdb_start = Instant::now();
 
     turdb.execute("BEGIN").expect("BEGIN failed");
 
     for i in 0..ROW_COUNT {
-        delete_stmt.bind(OwnedValue::Int(i as i64))
+        delete_stmt
+            .bind(OwnedValue::Int(i as i64))
             .execute(&turdb)
             .expect("TurDB delete failed");
     }
@@ -194,26 +217,33 @@ fn benchmark_single_deletes() {
     turdb.execute("COMMIT").expect("COMMIT failed");
 
     let turdb_elapsed = turdb_start.elapsed();
-    println!("TurDB:  {} deletes in {:.3}s = {:.0} deletes/sec\n",
-             ROW_COUNT, turdb_elapsed.as_secs_f64(),
-             ROW_COUNT as f64 / turdb_elapsed.as_secs_f64());
+    println!(
+        "TurDB:  {} deletes in {:.3}s = {:.0} deletes/sec\n",
+        ROW_COUNT,
+        turdb_elapsed.as_secs_f64(),
+        ROW_COUNT as f64 / turdb_elapsed.as_secs_f64()
+    );
 
     // ========== COMPARISON ==========
     println!("============================================================");
     println!("  RESULTS (Single Deletes - Apple-to-Apple)");
     println!("============================================================");
-    println!("SQLite (prepare_cached): {:.3}s ({:.0} deletes/sec)",
-             sqlite_elapsed.as_secs_f64(),
-             ROW_COUNT as f64 / sqlite_elapsed.as_secs_f64());
-    println!("TurDB (PreparedStatement): {:.3}s ({:.0} deletes/sec)",
-             turdb_elapsed.as_secs_f64(),
-             ROW_COUNT as f64 / turdb_elapsed.as_secs_f64());
+    println!(
+        "SQLite (prepare_cached): {:.3}s ({:.0} deletes/sec)",
+        sqlite_elapsed.as_secs_f64(),
+        ROW_COUNT as f64 / sqlite_elapsed.as_secs_f64()
+    );
+    println!(
+        "TurDB (PreparedStatement): {:.3}s ({:.0} deletes/sec)",
+        turdb_elapsed.as_secs_f64(),
+        ROW_COUNT as f64 / turdb_elapsed.as_secs_f64()
+    );
 
     let ratio = sqlite_elapsed.as_secs_f64() / turdb_elapsed.as_secs_f64();
     if ratio > 1.0 {
         println!("\nTurDB is {:.2}x FASTER than SQLite!", ratio);
     } else {
-        println!("\nTurDB is {:.2}x SLOWER than SQLite", 1.0/ratio);
+        println!("\nTurDB is {:.2}x SLOWER than SQLite", 1.0 / ratio);
     }
 
     let _ = std::fs::remove_file(SQLITE_TARGET);
@@ -229,7 +259,10 @@ fn benchmark_bulk_delete() {
     let _ = std::fs::remove_dir_all(turdb_path);
 
     println!("\n============================================================");
-    println!("  Bulk Delete Benchmark (Apple-to-Apple) - {} rows", ROW_COUNT);
+    println!(
+        "  Bulk Delete Benchmark (Apple-to-Apple) - {} rows",
+        ROW_COUNT
+    );
     println!("============================================================\n");
 
     println!("Generating {} test rows...", ROW_COUNT);
@@ -244,19 +277,27 @@ fn benchmark_bulk_delete() {
 
     let sqlite_start = Instant::now();
 
-    sqlite_conn.execute("BEGIN IMMEDIATE", []).expect("BEGIN failed");
-    sqlite_conn.execute("DELETE FROM dataset_versions WHERE dataset_id < 500", [])
+    sqlite_conn
+        .execute("BEGIN IMMEDIATE", [])
+        .expect("BEGIN failed");
+    sqlite_conn
+        .execute("DELETE FROM dataset_versions WHERE dataset_id < 500", [])
         .expect("Bulk delete failed");
     sqlite_conn.execute("COMMIT", []).expect("COMMIT failed");
 
     let sqlite_elapsed = sqlite_start.elapsed();
-    let sqlite_remaining: i64 = sqlite_conn.query_row(
-        "SELECT COUNT(*) FROM dataset_versions", [], |row| row.get(0)
-    ).unwrap();
+    let sqlite_remaining: i64 = sqlite_conn
+        .query_row("SELECT COUNT(*) FROM dataset_versions", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
     let sqlite_deleted = ROW_COUNT as i64 - sqlite_remaining;
-    println!("SQLite: {} rows deleted in {:.3}s = {:.0} deletes/sec\n",
-             sqlite_deleted, sqlite_elapsed.as_secs_f64(),
-             sqlite_deleted as f64 / sqlite_elapsed.as_secs_f64());
+    println!(
+        "SQLite: {} rows deleted in {:.3}s = {:.0} deletes/sec\n",
+        sqlite_deleted,
+        sqlite_elapsed.as_secs_f64(),
+        sqlite_deleted as f64 / sqlite_elapsed.as_secs_f64()
+    );
 
     // ========== TURDB BENCHMARK ==========
     println!("--- TurDB Bulk Delete Benchmark ---");
@@ -266,35 +307,44 @@ fn benchmark_bulk_delete() {
     let turdb_start = Instant::now();
 
     turdb.execute("BEGIN").expect("BEGIN failed");
-    turdb.execute("DELETE FROM dataset_versions WHERE dataset_id < 500")
+    turdb
+        .execute("DELETE FROM dataset_versions WHERE dataset_id < 500")
         .expect("TurDB bulk delete failed");
     turdb.execute("COMMIT").expect("COMMIT failed");
 
     let turdb_elapsed = turdb_start.elapsed();
-    let rows = turdb.query("SELECT COUNT(*) FROM dataset_versions")
+    let rows = turdb
+        .query("SELECT COUNT(*) FROM dataset_versions")
         .expect("Count failed");
     let turdb_remaining: i64 = rows[0].get_int(0).unwrap();
     let turdb_deleted = ROW_COUNT as i64 - turdb_remaining;
-    println!("TurDB:  {} rows deleted in {:.3}s = {:.0} deletes/sec\n",
-             turdb_deleted, turdb_elapsed.as_secs_f64(),
-             turdb_deleted as f64 / turdb_elapsed.as_secs_f64());
+    println!(
+        "TurDB:  {} rows deleted in {:.3}s = {:.0} deletes/sec\n",
+        turdb_deleted,
+        turdb_elapsed.as_secs_f64(),
+        turdb_deleted as f64 / turdb_elapsed.as_secs_f64()
+    );
 
     // ========== COMPARISON ==========
     println!("============================================================");
     println!("  RESULTS (Bulk Delete - Apple-to-Apple)");
     println!("============================================================");
-    println!("SQLite: {:.3}s ({:.0} deletes/sec)",
-             sqlite_elapsed.as_secs_f64(),
-             sqlite_deleted as f64 / sqlite_elapsed.as_secs_f64());
-    println!("TurDB:  {:.3}s ({:.0} deletes/sec)",
-             turdb_elapsed.as_secs_f64(),
-             turdb_deleted as f64 / turdb_elapsed.as_secs_f64());
+    println!(
+        "SQLite: {:.3}s ({:.0} deletes/sec)",
+        sqlite_elapsed.as_secs_f64(),
+        sqlite_deleted as f64 / sqlite_elapsed.as_secs_f64()
+    );
+    println!(
+        "TurDB:  {:.3}s ({:.0} deletes/sec)",
+        turdb_elapsed.as_secs_f64(),
+        turdb_deleted as f64 / turdb_elapsed.as_secs_f64()
+    );
 
     let ratio = sqlite_elapsed.as_secs_f64() / turdb_elapsed.as_secs_f64();
     if ratio > 1.0 {
         println!("\nTurDB is {:.2}x FASTER than SQLite!", ratio);
     } else {
-        println!("\nTurDB is {:.2}x SLOWER than SQLite", 1.0/ratio);
+        println!("\nTurDB is {:.2}x SLOWER than SQLite", 1.0 / ratio);
     }
 
     let _ = std::fs::remove_file(sqlite_path);

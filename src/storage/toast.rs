@@ -199,7 +199,8 @@ impl Detoaster for TableDetoaster {
             .as_mut()
             .ok_or_else(|| eyre::eyre!("file manager not available"))?;
 
-        let toast_storage_arc = file_manager.table_data_mut(&self.schema_name, &toast_table_name)?;
+        let toast_storage_arc =
+            file_manager.table_data_mut(&self.schema_name, &toast_table_name)?;
         let mut toast_storage = toast_storage_arc.write();
 
         let root_page = {

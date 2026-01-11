@@ -1,9 +1,12 @@
 use crate::sql::adapter::BTreeCursorAdapter;
 use crate::sql::ast::JoinType;
 use crate::sql::executor::{AggregateFunction, DynamicExecutor, ExecutorRow, RowSource, SortKey};
+use crate::sql::partition_spiller::PartitionSpiller;
 use crate::sql::predicate::CompiledPredicate;
 use crate::types::Value;
 use bumpalo::Bump;
+use smallvec::SmallVec;
+use std::path::PathBuf;
 
 pub struct LimitState<'a, S: RowSource> {
     pub child: Box<DynamicExecutor<'a, S>>,
@@ -15,11 +18,23 @@ pub struct LimitState<'a, S: RowSource> {
 
 pub struct SortState<'a, S: RowSource> {
     pub child: Box<DynamicExecutor<'a, S>>,
-    pub sort_keys: Vec<SortKey>,
+    pub sort_keys: Vec<SortKey<'a>>,
     pub arena: &'a Bump,
     pub rows: Vec<Vec<Value<'static>>>,
     pub iter_idx: usize,
     pub sorted: bool,
+}
+
+pub struct TopKState<'a, S: RowSource> {
+    pub child: Box<DynamicExecutor<'a, S>>,
+    pub sort_keys: Vec<SortKey<'a>>,
+    pub arena: &'a Bump,
+    pub limit: u64,
+    pub offset: u64,
+    pub heap: Vec<Vec<Value<'static>>>,
+    pub result: Vec<Vec<Value<'static>>>,
+    pub iter_idx: usize,
+    pub computed: bool,
 }
 
 pub struct HashAggregateState<'a, S: RowSource> {
@@ -199,6 +214,36 @@ pub struct GraceHashJoinState<'a, S: RowSource> {
     pub unmatched_build_idx: usize,
     pub left_col_count: usize,
     pub right_col_count: usize,
+    pub use_spill: bool,
+    pub left_spiller: Option<PartitionSpiller>,
+    pub right_spiller: Option<PartitionSpiller>,
+    pub spill_dir: Option<PathBuf>,
+    pub memory_budget: usize,
+    pub query_id: u64,
+    pub probe_row_buf: SmallVec<[Value<'static>; 16]>,
+    pub build_row_buf: SmallVec<[Value<'static>; 16]>,
+}
+
+pub struct HashSemiJoinState<'a, S: RowSource> {
+    pub left: Box<DynamicExecutor<'a, S>>,
+    pub right: Box<DynamicExecutor<'a, S>>,
+    pub left_key_indices: Vec<usize>,
+    pub right_key_indices: Vec<usize>,
+    pub arena: &'a Bump,
+    pub hash_table: hashbrown::HashSet<u64>,
+    pub built: bool,
+    pub left_col_count: usize,
+}
+
+pub struct HashAntiJoinState<'a, S: RowSource> {
+    pub left: Box<DynamicExecutor<'a, S>>,
+    pub right: Box<DynamicExecutor<'a, S>>,
+    pub left_key_indices: Vec<usize>,
+    pub right_key_indices: Vec<usize>,
+    pub arena: &'a Bump,
+    pub hash_table: hashbrown::HashSet<u64>,
+    pub built: bool,
+    pub left_col_count: usize,
 }
 
 pub struct IndexScanState<'a> {
@@ -347,7 +392,9 @@ impl<'a, S: RowSource> WindowState<'a, S> {
                         } else {
                             partition_indices
                                 .iter()
-                                .filter(|&&row_idx| self.get_arg_value(row_idx, window_func).is_some())
+                                .filter(|&&row_idx| {
+                                    self.get_arg_value(row_idx, window_func).is_some()
+                                })
                                 .count() as f64
                         };
                         for &row_idx in &partition_indices {
