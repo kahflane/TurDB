@@ -198,17 +198,14 @@ impl<'a> Planner<'a> {
                         if let Some(optimized) =
                             index_selector.try_optimize_sort_to_index_scan_with_limit(sort, Some(effective_limit))
                         {
-                            if limit.offset.unwrap_or(0) > 0 {
-                                let physical = self
-                                    .arena
-                                    .alloc(PhysicalOperator::LimitExec(PhysicalLimitExec {
-                                        input: optimized,
-                                        limit: Some(limit_val),
-                                        offset: limit.offset,
-                                    }));
-                                return Ok(physical);
-                            }
-                            return Ok(optimized);
+                            let physical = self
+                                .arena
+                                .alloc(PhysicalOperator::LimitExec(PhysicalLimitExec {
+                                    input: optimized,
+                                    limit: Some(limit_val),
+                                    offset: limit.offset,
+                                }));
+                            return Ok(physical);
                         }
 
                         let sort_input = self.logical_to_physical(sort.input)?;

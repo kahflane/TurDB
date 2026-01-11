@@ -797,13 +797,27 @@ impl Database {
                 let storage = storage_arc.read();
 
                 let root_page = 1u32;
-                let inner_source = StreamingBTreeSource::from_btree_scan_with_projections(
-                    &storage,
-                    root_page,
-                    column_types,
-                    None,
-                )
-                .wrap_err("failed to create inner table scan")?;
+                let inner_source = if inner_scan.reverse {
+                    BTreeSource::Reverse(
+                        ReverseBTreeSource::from_btree_scan_reverse_with_projections(
+                            &storage,
+                            root_page,
+                            column_types,
+                            None,
+                        )
+                        .wrap_err("failed to create reverse inner table scan")?,
+                    )
+                } else {
+                    BTreeSource::Forward(
+                        StreamingBTreeSource::from_btree_scan_with_projections(
+                            &storage,
+                            root_page,
+                            column_types,
+                            None,
+                        )
+                        .wrap_err("failed to create inner table scan")?,
+                    )
+                };
 
                 let inner_arena = Bump::new();
                 let inner_plan = crate::sql::planner::PhysicalPlan {
@@ -1364,6 +1378,7 @@ impl Database {
                         PhysicalOperator::HashAggregate(agg) => find_subquery_in_join(agg.input),
                         PhysicalOperator::SortedAggregate(agg) => find_subquery_in_join(agg.input),
                         PhysicalOperator::SortExec(s) => find_subquery_in_join(s.input),
+                        PhysicalOperator::TopKExec(t) => find_subquery_in_join(t.input),
                         PhysicalOperator::LimitExec(l) => find_subquery_in_join(l.input),
                         PhysicalOperator::WindowExec(w) => find_subquery_in_join(w.input),
                         _ => None,
@@ -1391,6 +1406,7 @@ impl Database {
                         PhysicalOperator::HashAggregate(agg) => find_scan_in_join(agg.input),
                         PhysicalOperator::SortedAggregate(agg) => find_scan_in_join(agg.input),
                         PhysicalOperator::SortExec(s) => find_scan_in_join(s.input),
+                        PhysicalOperator::TopKExec(t) => find_scan_in_join(t.input),
                         PhysicalOperator::LimitExec(l) => find_scan_in_join(l.input),
                         PhysicalOperator::WindowExec(w) => find_scan_in_join(w.input),
                         _ => None,

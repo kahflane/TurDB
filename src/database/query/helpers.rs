@@ -77,6 +77,7 @@ pub fn find_table_scan<'a>(op: &'a PhysicalOperator<'a>) -> Option<&'a PhysicalT
         PhysicalOperator::ProjectExec(project) => find_table_scan(project.input),
         PhysicalOperator::LimitExec(limit) => find_table_scan(limit.input),
         PhysicalOperator::SortExec(sort) => find_table_scan(sort.input),
+        PhysicalOperator::TopKExec(topk) => find_table_scan(topk.input),
         PhysicalOperator::HashAggregate(agg) => find_table_scan(agg.input),
         PhysicalOperator::SortedAggregate(agg) => find_table_scan(agg.input),
         PhysicalOperator::SubqueryExec(subq) => find_table_scan(subq.child_plan),
@@ -95,6 +96,7 @@ pub fn find_nested_subquery<'a>(
         PhysicalOperator::ProjectExec(project) => find_nested_subquery(project.input),
         PhysicalOperator::LimitExec(limit) => find_nested_subquery(limit.input),
         PhysicalOperator::SortExec(sort) => find_nested_subquery(sort.input),
+        PhysicalOperator::TopKExec(topk) => find_nested_subquery(topk.input),
         PhysicalOperator::HashAggregate(agg) => find_nested_subquery(agg.input),
         PhysicalOperator::SortedAggregate(agg) => find_nested_subquery(agg.input),
         PhysicalOperator::WindowExec(window) => find_nested_subquery(window.input),
@@ -109,6 +111,7 @@ pub fn has_filter(op: &PhysicalOperator<'_>) -> bool {
         PhysicalOperator::ProjectExec(project) => has_filter(project.input),
         PhysicalOperator::LimitExec(limit) => has_filter(limit.input),
         PhysicalOperator::SortExec(sort) => has_filter(sort.input),
+        PhysicalOperator::TopKExec(topk) => has_filter(topk.input),
         PhysicalOperator::WindowExec(window) => has_filter(window.input),
         _ => false,
     }
@@ -121,6 +124,7 @@ pub fn has_aggregate(op: &PhysicalOperator<'_>) -> bool {
         PhysicalOperator::ProjectExec(project) => has_aggregate(project.input),
         PhysicalOperator::LimitExec(limit) => has_aggregate(limit.input),
         PhysicalOperator::SortExec(sort) => has_aggregate(sort.input),
+        PhysicalOperator::TopKExec(topk) => has_aggregate(topk.input),
         PhysicalOperator::FilterExec(filter) => has_aggregate(filter.input),
         PhysicalOperator::WindowExec(window) => has_aggregate(window.input),
         _ => false,
@@ -134,6 +138,7 @@ pub fn has_window(op: &PhysicalOperator<'_>) -> bool {
         PhysicalOperator::ProjectExec(project) => has_window(project.input),
         PhysicalOperator::LimitExec(limit) => has_window(limit.input),
         PhysicalOperator::SortExec(sort) => has_window(sort.input),
+        PhysicalOperator::TopKExec(topk) => has_window(topk.input),
         PhysicalOperator::FilterExec(filter) => has_window(filter.input),
         _ => false,
     }
@@ -143,6 +148,10 @@ pub fn has_window(op: &PhysicalOperator<'_>) -> bool {
 pub fn has_order_by_expression(op: &PhysicalOperator<'_>) -> bool {
     match op {
         PhysicalOperator::SortExec(sort) => sort
+            .order_by
+            .iter()
+            .any(|key| !matches!(key.expr, Expr::Column(_))),
+        PhysicalOperator::TopKExec(topk) => topk
             .order_by
             .iter()
             .any(|key| !matches!(key.expr, Expr::Column(_))),
@@ -158,6 +167,7 @@ pub fn has_order_by_expression(op: &PhysicalOperator<'_>) -> bool {
 pub fn find_limit(op: &PhysicalOperator<'_>) -> Option<(Option<u64>, Option<u64>)> {
     match op {
         PhysicalOperator::LimitExec(limit) => Some((limit.limit, limit.offset)),
+        PhysicalOperator::TopKExec(topk) => Some((Some(topk.limit), topk.offset)),
         PhysicalOperator::ProjectExec(project) => find_limit(project.input),
         PhysicalOperator::FilterExec(filter) => find_limit(filter.input),
         PhysicalOperator::SortExec(sort) => find_limit(sort.input),
@@ -171,6 +181,7 @@ pub fn find_sort_exec<'a>(op: &'a PhysicalOperator<'a>) -> Option<&'a PhysicalSo
         PhysicalOperator::SortExec(sort) => Some(sort),
         PhysicalOperator::ProjectExec(project) => find_sort_exec(project.input),
         PhysicalOperator::LimitExec(limit) => find_sort_exec(limit.input),
+        PhysicalOperator::TopKExec(topk) => find_sort_exec(topk.input),
         PhysicalOperator::FilterExec(filter) => find_sort_exec(filter.input),
         PhysicalOperator::WindowExec(window) => find_sort_exec(window.input),
         _ => None,
@@ -201,6 +212,7 @@ pub fn find_projections(op: &PhysicalOperator<'_>, table_def: &TableDef) -> Opti
         PhysicalOperator::FilterExec(filter) => find_projections(filter.input, table_def),
         PhysicalOperator::LimitExec(limit) => find_projections(limit.input, table_def),
         PhysicalOperator::SortExec(sort) => find_projections(sort.input, table_def),
+        PhysicalOperator::TopKExec(topk) => find_projections(topk.input, table_def),
         _ => None,
     }
 }
