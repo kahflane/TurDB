@@ -49,7 +49,22 @@
 //! let optimized = optimizer.optimize(logical_plan, arena)?;
 //! ```
 
+pub mod bounds;
+pub mod cost;
+pub mod index_selection;
+pub mod join_analysis;
 pub mod rules;
+
+pub use bounds::{
+    bounds_to_scan_type, collect_bounds_from_expr, expr_references_column,
+    extract_scan_bounds_for_column, ColumnBound, ColumnScanBounds, ScanBoundType,
+};
+pub use cost::{find_applicable_indexes, select_best_index, CostEstimator};
+pub use index_selection::{
+    compute_residual_filter, extract_equality_predicate, normalize_predicate,
+    predicate_implies_where_clause, predicate_uses_index_column, IndexSelector,
+};
+pub use join_analysis::{EquiJoinKey, JoinAnalyzer};
 
 use crate::sql::planner::LogicalOperator;
 use bumpalo::Bump;

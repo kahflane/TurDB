@@ -344,6 +344,7 @@ fn euclidean_squared_dispatch(a: &[f32], b: &[f32]) -> f32 {
         if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
             return unsafe { euclidean_squared_avx2(a, b) };
         }
+        return euclidean_squared_scalar(a, b);
     }
 
     #[cfg(target_arch = "aarch64")]
@@ -367,6 +368,7 @@ fn cosine_dispatch(a: &[f32], b: &[f32]) -> f32 {
         if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
             return unsafe { cosine_avx2(a, b) };
         }
+        return cosine_scalar(a, b);
     }
 
     #[cfg(target_arch = "aarch64")]
@@ -386,6 +388,7 @@ fn inner_product_dispatch(a: &[f32], b: &[f32]) -> f32 {
         if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
             return unsafe { inner_product_avx2(a, b) };
         }
+        return inner_product_scalar(a, b);
     }
 
     #[cfg(target_arch = "aarch64")]
