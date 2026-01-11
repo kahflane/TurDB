@@ -17,19 +17,16 @@
 //! - **Sorts**: TopK for LIMIT + ORDER BY, regular sort otherwise
 
 use crate::sql::ast::{Expr, JoinType};
-use crate::sql::optimizer::Optimizer;
+use crate::sql::optimizer::{IndexSelector, Optimizer};
 use super::encoding::encode_literal_to_bytes;
-use super::logical::{
-    LogicalFilter, LogicalOperator, LogicalPlan, LogicalProject, LogicalScan, LogicalSort,
-};
+use super::logical::{LogicalOperator, LogicalPlan};
 use super::physical::{
     AggregateExpr, AggregateFunction, PhysicalFilterExec, PhysicalGraceHashJoin,
     PhysicalHashAggregate, PhysicalHashAntiJoin, PhysicalHashSemiJoin, PhysicalLimitExec,
     PhysicalNestedLoopJoin, PhysicalOperator, PhysicalPlan, PhysicalProjectExec,
-    PhysicalSecondaryIndexScan, PhysicalSetOpExec, PhysicalSortExec, PhysicalSubqueryExec,
+    PhysicalSetOpExec, PhysicalSortExec, PhysicalSubqueryExec,
     PhysicalTableScan, PhysicalTopKExec, PhysicalWindowExec,
 };
-use super::types::ScanRange;
 use super::Planner;
 use eyre::{bail, Result};
 
@@ -50,6 +47,8 @@ impl<'a> Planner<'a> {
         &self,
         op: &'a LogicalOperator<'a>,
     ) -> Result<&'a PhysicalOperator<'a>> {
+        let index_selector = IndexSelector::new(self.catalog, self.arena);
+
         match op {
             LogicalOperator::Scan(scan) => {
                 let table_name = if let Some(schema) = scan.schema {
@@ -73,7 +72,8 @@ impl<'a> Planner<'a> {
             }
             LogicalOperator::DualScan => Ok(self.arena.alloc(PhysicalOperator::DualScan)),
             LogicalOperator::Filter(filter) => {
-                if let Some(index_scan) = self.try_optimize_filter_to_index_scan(filter) {
+                let encode_fn = |expr: &Expr<'a>| encode_literal_to_bytes(self.arena, expr);
+                if let Some(index_scan) = index_selector.try_optimize_filter_to_index_scan(filter, encode_fn) {
                     return Ok(index_scan);
                 }
 
@@ -179,7 +179,7 @@ impl<'a> Planner<'a> {
                 }
             }
             LogicalOperator::Sort(sort) => {
-                if let Some(optimized) = self.try_optimize_sort_to_index_scan(sort) {
+                if let Some(optimized) = index_selector.try_optimize_sort_to_index_scan(sort) {
                     return Ok(optimized);
                 }
                 let input = self.logical_to_physical(sort.input)?;
@@ -196,7 +196,7 @@ impl<'a> Planner<'a> {
                     if let LogicalOperator::Sort(sort) = limit.input {
                         let effective_limit = (limit_val + limit.offset.unwrap_or(0)) as usize;
                         if let Some(optimized) =
-                            self.try_optimize_sort_to_index_scan_with_limit(sort, Some(effective_limit))
+                            index_selector.try_optimize_sort_to_index_scan_with_limit(sort, Some(effective_limit))
                         {
                             if limit.offset.unwrap_or(0) > 0 {
                                 let physical = self
@@ -348,312 +348,5 @@ impl<'a> Planner<'a> {
         }
 
         result.into_bump_slice()
-    }
-
-    pub(crate) fn try_optimize_filter_to_index_scan(
-        &self,
-        filter: &LogicalFilter<'a>,
-    ) -> Option<&'a PhysicalOperator<'a>> {
-        fn find_scan<'b>(op: &'b LogicalOperator<'b>) -> Option<&'b LogicalScan<'b>> {
-            match op {
-                LogicalOperator::Scan(scan) => Some(scan),
-                LogicalOperator::Project(proj) => find_scan(proj.input),
-                _ => None,
-            }
-        }
-
-        fn find_project<'b>(op: &'b LogicalOperator<'b>) -> Option<&'b LogicalProject<'b>> {
-            match op {
-                LogicalOperator::Project(proj) => Some(proj),
-                _ => None,
-            }
-        }
-
-        let scan = find_scan(filter.input)?;
-        let table_def = self.catalog.resolve_table(scan.table).ok()?;
-
-        let (col_name, literal_expr) = self.extract_equality_predicate(filter.predicate)?;
-
-        let matching_index = table_def.indexes().iter().find(|idx| {
-            if idx.has_expressions() || idx.is_partial() {
-                return false;
-            }
-            if idx.index_type() != crate::schema::IndexType::BTree {
-                return false;
-            }
-            idx.columns()
-                .next()
-                .map(|first_col| first_col.eq_ignore_ascii_case(col_name))
-                .unwrap_or(false)
-        })?;
-
-        let key_bytes = encode_literal_to_bytes(self.arena, literal_expr)?;
-
-        let index_name = self.arena.alloc_str(matching_index.name());
-        let table_def_alloc = self.arena.alloc(table_def.clone());
-        let _index_columns: Vec<String> = matching_index.columns().map(|s| s.to_string()).collect();
-
-        let covered_columns = vec![col_name.to_string()];
-        let residual = self.compute_residual_filter(filter.predicate, &covered_columns);
-
-        let index_scan = self.arena.alloc(PhysicalOperator::SecondaryIndexScan(
-            PhysicalSecondaryIndexScan {
-                schema: scan.schema,
-                table: scan.table,
-                index_name,
-                table_def: Some(table_def_alloc),
-                reverse: false,
-                is_unique_index: matching_index.is_unique(),
-                key_range: Some(ScanRange::PrefixScan { prefix: key_bytes }),
-                limit: None,
-            },
-        ));
-
-        let with_residual = if let Some(residual_predicate) = residual {
-            self.arena
-                .alloc(PhysicalOperator::FilterExec(PhysicalFilterExec {
-                    input: index_scan,
-                    predicate: residual_predicate,
-                }))
-        } else {
-            index_scan
-        };
-
-        let project = find_project(filter.input);
-        if let Some(proj) = project {
-            let physical_proj =
-                self.arena
-                    .alloc(PhysicalOperator::ProjectExec(PhysicalProjectExec {
-                        input: with_residual,
-                        expressions: proj.expressions,
-                        aliases: proj.aliases,
-                    }));
-            return Some(physical_proj);
-        }
-
-        Some(with_residual)
-    }
-
-    pub(crate) fn extract_equality_predicate(
-        &self,
-        expr: &'a Expr<'a>,
-    ) -> Option<(&'a str, &'a Expr<'a>)> {
-        use crate::sql::ast::BinaryOperator;
-
-        match expr {
-            Expr::BinaryOp {
-                left,
-                op: BinaryOperator::Eq,
-                right,
-            } => match (left, right) {
-                (Expr::Column(col_ref), lit @ Expr::Literal(_)) => Some((col_ref.column, lit)),
-                (lit @ Expr::Literal(_), Expr::Column(col_ref)) => Some((col_ref.column, lit)),
-                _ => None,
-            },
-            Expr::BinaryOp {
-                left,
-                op: BinaryOperator::And,
-                right,
-            } => self
-                .extract_equality_predicate(left)
-                .or_else(|| self.extract_equality_predicate(right)),
-            _ => None,
-        }
-    }
-
-    pub(crate) fn try_optimize_sort_to_index_scan(
-        &self,
-        sort: &LogicalSort<'a>,
-    ) -> Option<&'a PhysicalOperator<'a>> {
-        self.try_optimize_sort_to_index_scan_with_limit(sort, None)
-    }
-
-    pub(crate) fn try_optimize_sort_to_index_scan_with_limit(
-        &self,
-        sort: &LogicalSort<'a>,
-        limit: Option<usize>,
-    ) -> Option<&'a PhysicalOperator<'a>> {
-        if sort.order_by.len() != 1 {
-            return None;
-        }
-
-        let sort_key = &sort.order_by[0];
-
-        let col_name = match sort_key.expr {
-            Expr::Column(col_ref) => col_ref.column,
-            _ => return None,
-        };
-
-        fn find_scan<'b>(op: &'b LogicalOperator<'b>) -> Option<&'b LogicalScan<'b>> {
-            match op {
-                LogicalOperator::Scan(scan) => Some(scan),
-                LogicalOperator::Project(proj) => find_scan(proj.input),
-                LogicalOperator::Filter(filter) => find_scan(filter.input),
-                _ => None,
-            }
-        }
-
-        fn has_filter(op: &LogicalOperator<'_>) -> bool {
-            match op {
-                LogicalOperator::Filter(_) => true,
-                LogicalOperator::Project(proj) => has_filter(proj.input),
-                _ => false,
-            }
-        }
-
-        if has_filter(sort.input) {
-            return None;
-        }
-
-        let scan = find_scan(sort.input)?;
-        let table_def = self.catalog.resolve_table(scan.table).ok()?;
-
-        let reverse = !sort_key.ascending;
-
-        let pk_col = table_def
-            .columns()
-            .iter()
-            .find(|c| c.has_constraint(&crate::schema::table::Constraint::PrimaryKey));
-
-        if let Some(pk) = pk_col {
-            if pk.name().eq_ignore_ascii_case(col_name) {
-                let table_scan = self
-                    .arena
-                    .alloc(PhysicalOperator::TableScan(PhysicalTableScan {
-                        schema: scan.schema,
-                        table: scan.table,
-                        alias: scan.alias,
-                        post_scan_filter: None,
-                        table_def: Some(table_def),
-                        reverse,
-                    }));
-
-                return match sort.input {
-                    LogicalOperator::Scan(_) => Some(table_scan),
-                    LogicalOperator::Project(proj) => {
-                        let physical_proj =
-                            self.arena
-                                .alloc(PhysicalOperator::ProjectExec(PhysicalProjectExec {
-                                    input: table_scan,
-                                    expressions: proj.expressions,
-                                    aliases: proj.aliases,
-                                }));
-                        Some(physical_proj)
-                    }
-                    _ => None,
-                };
-            }
-        }
-
-        let matching_index = table_def.indexes().iter().find(|idx| {
-            if idx.has_expressions() || idx.is_partial() {
-                return false;
-            }
-            idx.columns()
-                .next()
-                .map(|first_col| first_col.eq_ignore_ascii_case(col_name))
-                .unwrap_or(false)
-        });
-
-        if let Some(idx) = matching_index {
-            let index_name = self.arena.alloc_str(idx.name());
-            let table_def_alloc = self.arena.alloc(table_def.clone());
-
-            let index_scan = self.arena.alloc(PhysicalOperator::SecondaryIndexScan(
-                PhysicalSecondaryIndexScan {
-                    schema: scan.schema,
-                    table: scan.table,
-                    index_name,
-                    table_def: Some(table_def_alloc),
-                    reverse,
-                    is_unique_index: idx.is_unique(),
-                    key_range: None,
-                    limit,
-                },
-            ));
-
-            return match sort.input {
-                LogicalOperator::Scan(_) => Some(index_scan),
-                LogicalOperator::Project(proj) => {
-                    let physical_proj =
-                        self.arena
-                            .alloc(PhysicalOperator::ProjectExec(PhysicalProjectExec {
-                                input: index_scan,
-                                expressions: proj.expressions,
-                                aliases: proj.aliases,
-                            }));
-                    Some(physical_proj)
-                }
-                _ => None,
-            };
-        }
-
-        None
-    }
-
-    pub(crate) fn compute_residual_filter(
-        &self,
-        predicate: &'a Expr<'a>,
-        index_columns: &[String],
-    ) -> Option<&'a Expr<'a>> {
-        use crate::sql::ast::BinaryOperator;
-
-        match predicate {
-            Expr::BinaryOp { left, op, right } => match op {
-                BinaryOperator::And => {
-                    let left_residual = self.compute_residual_filter(left, index_columns);
-                    let right_residual = self.compute_residual_filter(right, index_columns);
-
-                    match (left_residual, right_residual) {
-                        (Some(l), Some(r)) => Some(self.arena.alloc(Expr::BinaryOp {
-                            left: l,
-                            op: BinaryOperator::And,
-                            right: r,
-                        })),
-                        (Some(l), None) => Some(l),
-                        (None, Some(r)) => Some(r),
-                        (None, None) => None,
-                    }
-                }
-                BinaryOperator::Eq
-                | BinaryOperator::Lt
-                | BinaryOperator::LtEq
-                | BinaryOperator::Gt
-                | BinaryOperator::GtEq => {
-                    if self.predicate_uses_index_column(predicate, index_columns) {
-                        None
-                    } else {
-                        Some(predicate)
-                    }
-                }
-                _ => Some(predicate),
-            },
-            Expr::Between { expr, .. } => {
-                if self.predicate_uses_index_column(expr, index_columns) {
-                    None
-                } else {
-                    Some(predicate)
-                }
-            }
-            _ => Some(predicate),
-        }
-    }
-
-    pub(crate) fn predicate_uses_index_column(
-        &self,
-        expr: &Expr<'a>,
-        index_columns: &[String],
-    ) -> bool {
-        match expr {
-            Expr::Column(col_ref) => index_columns
-                .iter()
-                .any(|c| c.eq_ignore_ascii_case(col_ref.column)),
-            Expr::BinaryOp { left, right, .. } => {
-                self.predicate_uses_index_column(left, index_columns)
-                    || self.predicate_uses_index_column(right, index_columns)
-            }
-            Expr::Between { expr, .. } => self.predicate_uses_index_column(expr, index_columns),
-            _ => false,
-        }
     }
 }
