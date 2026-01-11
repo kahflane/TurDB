@@ -621,6 +621,7 @@ pub enum DirectOrCached<'a> {
 
 impl<'a> DirectOrCached<'a> {
     /// Returns a reference to the page data, regardless of access method.
+    #[inline]
     pub fn data(&self) -> &[u8] {
         match self {
             DirectOrCached::Direct(slice) => slice,
@@ -629,11 +630,13 @@ impl<'a> DirectOrCached<'a> {
     }
 
     /// Returns true if this is a direct (zero-copy) access.
+    #[inline]
     pub fn is_direct(&self) -> bool {
         matches!(self, DirectOrCached::Direct(_))
     }
 
     /// Returns true if this is a cached access.
+    #[inline]
     pub fn is_cached(&self) -> bool {
         matches!(self, DirectOrCached::Cached(_))
     }

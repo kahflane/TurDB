@@ -140,6 +140,47 @@ impl Clone for Database {
     }
 }
 
+struct SharedDatabaseConfig {
+    path: PathBuf,
+    wal_dir: PathBuf,
+    next_table_id: u64,
+    next_index_id: u64,
+    wal_enabled: bool,
+    memory_budget: Arc<MemoryBudget>,
+    mode: super::DatabaseMode,
+    max_open_files: usize,
+}
+
+impl SharedDatabase {
+    fn new(config: SharedDatabaseConfig) -> Arc<Self> {
+        use std::sync::atomic::{AtomicBool, AtomicU64};
+
+        Arc::new(Self {
+            path: config.path,
+            file_manager: RwLock::new(None),
+            catalog: RwLock::new(None),
+            wal: Mutex::new(None),
+            wal_dir: config.wal_dir,
+            next_row_id: AtomicU64::new(1),
+            next_table_id: AtomicU64::new(config.next_table_id),
+            next_index_id: AtomicU64::new(config.next_index_id),
+            closed: AtomicBool::new(false),
+            wal_enabled: AtomicBool::new(config.wal_enabled),
+            dirty_tracker: ShardedDirtyTracker::new(),
+            txn_manager: TransactionManager::new(),
+            table_id_lookup: RwLock::new(hashbrown::HashMap::new()),
+            group_commit_queue: super::group_commit::GroupCommitQueue::with_default_config(),
+            page_locks: super::page_locks::PageLockManager::new(),
+            join_memory_budget: std::sync::atomic::AtomicUsize::new(10 * 1024 * 1024),
+            hnsw_indexes: RwLock::new(hashbrown::HashMap::new()),
+            memory_budget: config.memory_budget,
+            mode: RwLock::new(config.mode),
+            page_buffer_pool: PageBufferPool::new(DEFAULT_BUFFER_POOL_SIZE),
+            max_open_files: config.max_open_files,
+        })
+    }
+}
+
 impl SharedDatabase {
     pub(crate) fn save_catalog(&self) -> Result<()> {
         use crate::schema::persistence::CatalogPersistence;
@@ -216,7 +257,6 @@ impl Database {
         use crate::storage::{MetaFileHeader, FILE_HEADER_SIZE};
         use std::fs::File;
         use std::io::Read;
-        use std::sync::atomic::{AtomicBool, AtomicU64};
 
         let path = path.as_ref().to_path_buf();
 
@@ -271,43 +311,27 @@ impl Database {
             (0, super::DatabaseMode::ReadWrite)
         };
 
-        let wal_enable = wal_enabled.unwrap_or(false);
-
-        let shared = Arc::new(SharedDatabase {
+        let shared = SharedDatabase::new(SharedDatabaseConfig {
             path,
-            file_manager: RwLock::new(None),
-            catalog: RwLock::new(None),
-            wal: Mutex::new(None),
             wal_dir,
-
-            next_row_id: AtomicU64::new(1),
-            next_table_id: AtomicU64::new(next_table_id),
-            next_index_id: AtomicU64::new(next_index_id),
-            closed: AtomicBool::new(false),
-            wal_enabled: AtomicBool::new(wal_enable),
-            dirty_tracker: ShardedDirtyTracker::new(),
-            txn_manager: TransactionManager::new(),
-            table_id_lookup: RwLock::new(hashbrown::HashMap::new()),
-            group_commit_queue: super::group_commit::GroupCommitQueue::with_default_config(),
-            page_locks: super::page_locks::PageLockManager::new(),
-            join_memory_budget: std::sync::atomic::AtomicUsize::new(10 * 1024 * 1024),
-            hnsw_indexes: RwLock::new(hashbrown::HashMap::new()),
+            next_table_id,
+            next_index_id,
+            wal_enabled: wal_enabled.unwrap_or(false),
             memory_budget,
-            mode: RwLock::new(mode),
-            page_buffer_pool: PageBufferPool::new(DEFAULT_BUFFER_POOL_SIZE),
+            mode,
             max_open_files: max_files,
         });
 
         let db = Self {
             shared,
             active_txn: Mutex::new(None),
-            foreign_keys_enabled: AtomicBool::new(true),
+            foreign_keys_enabled: std::sync::atomic::AtomicBool::new(true),
         };
 
         db.ensure_catalog()?;
         db.ensure_system_tables()?;
 
-        let _ = frames_recovered; // Recovery info not returned in this variant
+        let _ = frames_recovered;
 
         Ok(db)
     }
@@ -324,7 +348,6 @@ impl Database {
         use crate::storage::{MetaFileHeader, PAGE_SIZE};
         use std::fs::File;
         use std::io::Write;
-        use std::sync::atomic::{AtomicBool, AtomicU64};
         use zerocopy::IntoBytes;
 
         let path = path.as_ref().to_path_buf();
@@ -352,43 +375,26 @@ impl Database {
 
         let wal_dir = path.join("wal");
 
-        // Use custom or default configuration
         let memory_budget = match memory_budget_bytes {
             Some(bytes) => Arc::new(MemoryBudget::with_limit(bytes)),
             None => Arc::new(MemoryBudget::auto_detect()),
         };
-        let max_files = max_open_files.unwrap_or(DEFAULT_MAX_OPEN_FILES);
-        let wal_enable = wal_enabled.unwrap_or(false);
 
-        let shared = Arc::new(SharedDatabase {
+        let shared = SharedDatabase::new(SharedDatabaseConfig {
             path,
-            file_manager: RwLock::new(None),
-            catalog: RwLock::new(None),
-            wal: Mutex::new(None),
             wal_dir,
-
-            next_row_id: AtomicU64::new(1),
-            next_table_id: AtomicU64::new(1),
-            next_index_id: AtomicU64::new(1),
-            closed: AtomicBool::new(false),
-            wal_enabled: AtomicBool::new(wal_enable),
-            dirty_tracker: ShardedDirtyTracker::new(),
-            txn_manager: TransactionManager::new(),
-            table_id_lookup: RwLock::new(hashbrown::HashMap::new()),
-            group_commit_queue: super::group_commit::GroupCommitQueue::with_default_config(),
-            page_locks: super::page_locks::PageLockManager::new(),
-            join_memory_budget: std::sync::atomic::AtomicUsize::new(10 * 1024 * 1024),
-            hnsw_indexes: RwLock::new(hashbrown::HashMap::new()),
+            next_table_id: 1,
+            next_index_id: 1,
+            wal_enabled: wal_enabled.unwrap_or(false),
             memory_budget,
-            mode: RwLock::new(super::DatabaseMode::ReadWrite),
-            page_buffer_pool: PageBufferPool::new(DEFAULT_BUFFER_POOL_SIZE),
-            max_open_files: max_files,
+            mode: super::DatabaseMode::ReadWrite,
+            max_open_files: max_open_files.unwrap_or(DEFAULT_MAX_OPEN_FILES),
         });
 
         let db = Self {
             shared,
             active_txn: Mutex::new(None),
-            foreign_keys_enabled: AtomicBool::new(true),
+            foreign_keys_enabled: std::sync::atomic::AtomicBool::new(true),
         };
 
         db.ensure_system_tables()?;
@@ -400,7 +406,6 @@ impl Database {
         use crate::storage::{MetaFileHeader, FILE_HEADER_SIZE};
         use std::fs::File;
         use std::io::Read;
-        use std::sync::atomic::{AtomicBool, AtomicU64};
 
         let path = path.as_ref().to_path_buf();
 
@@ -451,35 +456,21 @@ impl Database {
             (0, super::DatabaseMode::ReadWrite)
         };
 
-        let shared = Arc::new(SharedDatabase {
+        let shared = SharedDatabase::new(SharedDatabaseConfig {
             path,
-            file_manager: RwLock::new(None),
-            catalog: RwLock::new(None),
-            wal: Mutex::new(None),
             wal_dir,
-
-            next_row_id: AtomicU64::new(1),
-            next_table_id: AtomicU64::new(next_table_id),
-            next_index_id: AtomicU64::new(next_index_id),
-            closed: AtomicBool::new(false),
-            wal_enabled: AtomicBool::new(false),
-            dirty_tracker: ShardedDirtyTracker::new(),
-            txn_manager: TransactionManager::new(),
-            table_id_lookup: RwLock::new(hashbrown::HashMap::new()),
-            group_commit_queue: super::group_commit::GroupCommitQueue::with_default_config(),
-            page_locks: super::page_locks::PageLockManager::new(),
-            join_memory_budget: std::sync::atomic::AtomicUsize::new(10 * 1024 * 1024),
-            hnsw_indexes: RwLock::new(hashbrown::HashMap::new()),
+            next_table_id,
+            next_index_id,
+            wal_enabled: false,
             memory_budget,
-            mode: RwLock::new(mode),
-            page_buffer_pool: PageBufferPool::new(DEFAULT_BUFFER_POOL_SIZE),
+            mode,
             max_open_files: DEFAULT_MAX_OPEN_FILES,
         });
 
         let db = Self {
             shared,
             active_txn: Mutex::new(None),
-            foreign_keys_enabled: AtomicBool::new(true),
+            foreign_keys_enabled: std::sync::atomic::AtomicBool::new(true),
         };
 
         db.ensure_catalog()?;
@@ -497,7 +488,6 @@ impl Database {
         use crate::storage::{MetaFileHeader, PAGE_SIZE};
         use std::fs::File;
         use std::io::Write;
-        use std::sync::atomic::{AtomicBool, AtomicU64};
         use zerocopy::IntoBytes;
 
         let path = path.as_ref().to_path_buf();
@@ -525,36 +515,21 @@ impl Database {
 
         let wal_dir = path.join("wal");
 
-
-        let shared = Arc::new(SharedDatabase {
+        let shared = SharedDatabase::new(SharedDatabaseConfig {
             path,
-            file_manager: RwLock::new(None),
-            catalog: RwLock::new(None),
-            wal: Mutex::new(None),
             wal_dir,
-
-            next_row_id: AtomicU64::new(1),
-            next_table_id: AtomicU64::new(1),
-            next_index_id: AtomicU64::new(1),
-            closed: AtomicBool::new(false),
-            wal_enabled: AtomicBool::new(false),
-            dirty_tracker: ShardedDirtyTracker::new(),
-            txn_manager: TransactionManager::new(),
-            table_id_lookup: RwLock::new(hashbrown::HashMap::new()),
-            group_commit_queue: super::group_commit::GroupCommitQueue::with_default_config(),
-            page_locks: super::page_locks::PageLockManager::new(),
-            join_memory_budget: std::sync::atomic::AtomicUsize::new(10 * 1024 * 1024),
-            hnsw_indexes: RwLock::new(hashbrown::HashMap::new()),
+            next_table_id: 1,
+            next_index_id: 1,
+            wal_enabled: false,
             memory_budget: Arc::new(MemoryBudget::auto_detect()),
-            mode: RwLock::new(super::DatabaseMode::ReadWrite),
-            page_buffer_pool: PageBufferPool::new(DEFAULT_BUFFER_POOL_SIZE),
+            mode: super::DatabaseMode::ReadWrite,
             max_open_files: DEFAULT_MAX_OPEN_FILES,
         });
 
         let db = Self {
             shared,
             active_txn: Mutex::new(None),
-            foreign_keys_enabled: AtomicBool::new(true),
+            foreign_keys_enabled: std::sync::atomic::AtomicBool::new(true),
         };
 
         db.ensure_system_tables()?;
