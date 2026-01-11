@@ -414,7 +414,7 @@ mod tests {
 
     /// Helper to create a test payload with the given data byte
     fn test_payload(pool: &PageBufferPool, table_id: u32, page_no: u32, data_byte: u8, db_size: u32) -> CommitPayload {
-        let mut buffer = pool.acquire();
+        let mut buffer = pool.acquire().expect("test pool should have buffers");
         buffer[0] = data_byte;
         smallvec![(table_id, page_no, buffer, db_size)]
     }
