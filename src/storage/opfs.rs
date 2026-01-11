@@ -1,4 +1,8 @@
-//! # OPFS Storage Backend
+//! # OPFS Storage Backend (STUB)
+//!
+//! **STATUS: NOT YET IMPLEMENTED** - This is a stub module that defines the interface
+//! for OPFS-based storage. All methods currently return errors. Full implementation
+//! requires web-sys bindings to the FileSystemSyncAccessHandle API.
 //!
 //! This module provides `OpfsStorage`, a storage backend for browser WASM environments
 //! using the Origin Private File System (OPFS) API with synchronous FileSystemSyncAccessHandle.

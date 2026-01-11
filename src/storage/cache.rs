@@ -667,9 +667,9 @@ impl PageCache {
         }
 
         let page_ref = self.get_or_insert(key, |buf| {
-            let buf_array: &mut [u8; PAGE_SIZE] = buf.try_into().map_err(|_| {
-                eyre::eyre!("buffer size mismatch: expected {} bytes", PAGE_SIZE)
-            })?;
+            let buf_array: &mut [u8; PAGE_SIZE] = buf
+                .try_into()
+                .map_err(|_| eyre::eyre!("buffer size mismatch"))?;
             storage.read_page(key.page_no, buf_array)
         })?;
 

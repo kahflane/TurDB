@@ -264,17 +264,17 @@ impl DatabaseBuilder {
     ///     .open()?;
     /// ```
     pub fn open(self) -> Result<super::Database> {
-        let storage_kind = self.storage_kind.ok_or_else(|| {
+        let storage_kind = self.storage_kind.as_ref().ok_or_else(|| {
             eyre::eyre!("storage kind not specified: call .path() or .opfs() first")
         })?;
 
-        match &storage_kind {
+        match storage_kind {
             StorageKind::Mmap { path } => {
                 let meta_path = path.join("turdb.meta");
                 if meta_path.exists() {
-                    Self::open_existing(&storage_kind)
+                    self.open_existing(path)
                 } else {
-                    Self::create_new(&storage_kind)
+                    self.create_new(path)
                 }
             }
             #[cfg(target_arch = "wasm32")]
@@ -284,20 +284,22 @@ impl DatabaseBuilder {
         }
     }
 
-    fn open_existing(storage_kind: &StorageKind) -> Result<super::Database> {
-        let path = storage_kind.path().ok_or_else(|| {
-            eyre::eyre!("open_existing called with non-mmap storage kind")
-        })?;
-
-        super::Database::open(path)
+    fn open_existing(&self, path: &std::path::Path) -> Result<super::Database> {
+        super::Database::open_with_config(
+            path,
+            self.memory_budget,
+            self.max_open_files,
+            self.wal_enabled,
+        )
     }
 
-    fn create_new(storage_kind: &StorageKind) -> Result<super::Database> {
-        let path = storage_kind.path().ok_or_else(|| {
-            eyre::eyre!("create_new called with non-mmap storage kind")
-        })?;
-
-        super::Database::create(path)
+    fn create_new(&self, path: &std::path::Path) -> Result<super::Database> {
+        super::Database::create_with_config(
+            path,
+            self.memory_budget,
+            self.max_open_files,
+            self.wal_enabled,
+        )
     }
 
     /// Returns the configured storage kind, if any.

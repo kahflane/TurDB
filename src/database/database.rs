@@ -85,6 +85,9 @@ type AggregateGroups = HashMap<Vec<u64>, (Vec<OwnedValue>, Vec<(i64, f64)>)>;
 /// Sized to handle typical concurrent commit workloads without allocation.
 const DEFAULT_BUFFER_POOL_SIZE: usize = 16;
 
+/// Default maximum number of open file handles in the LRU cache.
+const DEFAULT_MAX_OPEN_FILES: usize = 64;
+
 pub(crate) struct SharedDatabase {
     pub(crate) path: PathBuf,
     pub(crate) file_manager: RwLock<Option<FileManager>>,
@@ -115,6 +118,8 @@ pub(crate) struct SharedDatabase {
     pub(crate) mode: RwLock<super::DatabaseMode>,
     /// Pre-allocated buffer pool for zero-allocation commit operations
     pub(crate) page_buffer_pool: PageBufferPool,
+    /// Maximum number of open file handles in the LRU cache
+    pub(crate) max_open_files: usize,
 }
 
 pub struct Database {
@@ -199,6 +204,198 @@ impl Database {
         Self::open_with_recovery(path).map(|(db, _)| db)
     }
 
+    /// Opens a database with custom configuration options.
+    ///
+    /// This is used internally by `DatabaseBuilder` to apply custom settings.
+    pub(crate) fn open_with_config<P: AsRef<Path>>(
+        path: P,
+        memory_budget_bytes: Option<usize>,
+        max_open_files: Option<usize>,
+        wal_enabled: Option<bool>,
+    ) -> Result<Self> {
+        use crate::storage::{MetaFileHeader, FILE_HEADER_SIZE};
+        use std::fs::File;
+        use std::io::Read;
+        use std::sync::atomic::{AtomicBool, AtomicU64};
+
+        let path = path.as_ref().to_path_buf();
+
+        let meta_path = path.join("turdb.meta");
+        ensure!(meta_path.exists(), "database not found at {:?}", path);
+
+        let mut header_bytes = [0u8; FILE_HEADER_SIZE];
+        File::open(&meta_path)
+            .wrap_err_with(|| format!("failed to open metadata file at {:?}", meta_path))?
+            .read_exact(&mut header_bytes)
+            .wrap_err("failed to read database header")?;
+
+        let header = MetaFileHeader::from_bytes(&header_bytes)
+            .wrap_err("failed to parse database metadata header")?;
+
+        let next_table_id = header.next_table_id();
+        let next_index_id = header.next_index_id();
+
+        let wal_dir = path.join("wal");
+
+        // Use custom or default configuration
+        let memory_budget = match memory_budget_bytes {
+            Some(bytes) => Arc::new(MemoryBudget::with_limit(bytes)),
+            None => Arc::new(MemoryBudget::auto_detect()),
+        };
+        let max_files = max_open_files.unwrap_or(DEFAULT_MAX_OPEN_FILES);
+        let recovery_available = memory_budget.available(Pool::Recovery);
+
+        let estimate = Self::estimate_recovery_cost(&wal_dir)?;
+
+        let (frames_recovered, mode) = if estimate.frame_count > 0 {
+            if estimate.estimated_bytes <= recovery_available {
+                let frames = Self::recover_all_tables(&path, &wal_dir)?;
+                (frames, super::DatabaseMode::ReadWrite)
+            } else {
+                eprintln!(
+                    "[turdb] WAL recovery requires ~{}MB but only {}MB available in recovery pool.",
+                    estimate.estimated_bytes / 1_000_000,
+                    recovery_available / 1_000_000
+                );
+                eprintln!(
+                    "[turdb] Opening in read-only degraded mode. Run PRAGMA recover_wal to recover."
+                );
+                (
+                    0,
+                    super::DatabaseMode::ReadOnlyDegraded {
+                        pending_wal_frames: estimate.frame_count,
+                    },
+                )
+            }
+        } else {
+            (0, super::DatabaseMode::ReadWrite)
+        };
+
+        let wal_enable = wal_enabled.unwrap_or(false);
+
+        let shared = Arc::new(SharedDatabase {
+            path,
+            file_manager: RwLock::new(None),
+            catalog: RwLock::new(None),
+            wal: Mutex::new(None),
+            wal_dir,
+
+            next_row_id: AtomicU64::new(1),
+            next_table_id: AtomicU64::new(next_table_id),
+            next_index_id: AtomicU64::new(next_index_id),
+            closed: AtomicBool::new(false),
+            wal_enabled: AtomicBool::new(wal_enable),
+            dirty_tracker: ShardedDirtyTracker::new(),
+            txn_manager: TransactionManager::new(),
+            table_id_lookup: RwLock::new(hashbrown::HashMap::new()),
+            group_commit_queue: super::group_commit::GroupCommitQueue::with_default_config(),
+            page_locks: super::page_locks::PageLockManager::new(),
+            join_memory_budget: std::sync::atomic::AtomicUsize::new(10 * 1024 * 1024),
+            hnsw_indexes: RwLock::new(hashbrown::HashMap::new()),
+            memory_budget,
+            mode: RwLock::new(mode),
+            page_buffer_pool: PageBufferPool::new(DEFAULT_BUFFER_POOL_SIZE),
+            max_open_files: max_files,
+        });
+
+        let db = Self {
+            shared,
+            active_txn: Mutex::new(None),
+            foreign_keys_enabled: AtomicBool::new(true),
+        };
+
+        db.ensure_catalog()?;
+        db.ensure_system_tables()?;
+
+        let _ = frames_recovered; // Recovery info not returned in this variant
+
+        Ok(db)
+    }
+
+    /// Creates a new database with custom configuration options.
+    ///
+    /// This is used internally by `DatabaseBuilder` to apply custom settings.
+    pub(crate) fn create_with_config<P: AsRef<Path>>(
+        path: P,
+        memory_budget_bytes: Option<usize>,
+        max_open_files: Option<usize>,
+        wal_enabled: Option<bool>,
+    ) -> Result<Self> {
+        use crate::storage::{MetaFileHeader, PAGE_SIZE};
+        use std::fs::File;
+        use std::io::Write;
+        use std::sync::atomic::{AtomicBool, AtomicU64};
+        use zerocopy::IntoBytes;
+
+        let path = path.as_ref().to_path_buf();
+
+        std::fs::create_dir_all(&path)
+            .wrap_err_with(|| format!("failed to create database directory at {:?}", path))?;
+
+        let root_dir = path.join(DEFAULT_SCHEMA);
+        std::fs::create_dir_all(&root_dir).wrap_err_with(|| {
+            format!(
+                "failed to create default schema directory at {:?}",
+                root_dir
+            )
+        })?;
+
+        let meta_path = path.join("turdb.meta");
+        let mut page = vec![0u8; PAGE_SIZE];
+        let header = MetaFileHeader::new();
+        page[..128].copy_from_slice(header.as_bytes());
+
+        let mut file = File::create(&meta_path)
+            .wrap_err_with(|| format!("failed to create metadata file at {:?}", meta_path))?;
+        file.write_all(&page)
+            .wrap_err("failed to write database header")?;
+
+        let wal_dir = path.join("wal");
+
+        // Use custom or default configuration
+        let memory_budget = match memory_budget_bytes {
+            Some(bytes) => Arc::new(MemoryBudget::with_limit(bytes)),
+            None => Arc::new(MemoryBudget::auto_detect()),
+        };
+        let max_files = max_open_files.unwrap_or(DEFAULT_MAX_OPEN_FILES);
+        let wal_enable = wal_enabled.unwrap_or(false);
+
+        let shared = Arc::new(SharedDatabase {
+            path,
+            file_manager: RwLock::new(None),
+            catalog: RwLock::new(None),
+            wal: Mutex::new(None),
+            wal_dir,
+
+            next_row_id: AtomicU64::new(1),
+            next_table_id: AtomicU64::new(1),
+            next_index_id: AtomicU64::new(1),
+            closed: AtomicBool::new(false),
+            wal_enabled: AtomicBool::new(wal_enable),
+            dirty_tracker: ShardedDirtyTracker::new(),
+            txn_manager: TransactionManager::new(),
+            table_id_lookup: RwLock::new(hashbrown::HashMap::new()),
+            group_commit_queue: super::group_commit::GroupCommitQueue::with_default_config(),
+            page_locks: super::page_locks::PageLockManager::new(),
+            join_memory_budget: std::sync::atomic::AtomicUsize::new(10 * 1024 * 1024),
+            hnsw_indexes: RwLock::new(hashbrown::HashMap::new()),
+            memory_budget,
+            mode: RwLock::new(super::DatabaseMode::ReadWrite),
+            page_buffer_pool: PageBufferPool::new(DEFAULT_BUFFER_POOL_SIZE),
+            max_open_files: max_files,
+        });
+
+        let db = Self {
+            shared,
+            active_txn: Mutex::new(None),
+            foreign_keys_enabled: AtomicBool::new(true),
+        };
+
+        db.ensure_system_tables()?;
+
+        Ok(db)
+    }
+
     pub fn open_with_recovery<P: AsRef<Path>>(path: P) -> Result<(Self, RecoveryInfo)> {
         use crate::storage::{MetaFileHeader, FILE_HEADER_SIZE};
         use std::fs::File;
@@ -276,6 +473,7 @@ impl Database {
             memory_budget,
             mode: RwLock::new(mode),
             page_buffer_pool: PageBufferPool::new(DEFAULT_BUFFER_POOL_SIZE),
+            max_open_files: DEFAULT_MAX_OPEN_FILES,
         });
 
         let db = Self {
@@ -350,6 +548,7 @@ impl Database {
             memory_budget: Arc::new(MemoryBudget::auto_detect()),
             mode: RwLock::new(super::DatabaseMode::ReadWrite),
             page_buffer_pool: PageBufferPool::new(DEFAULT_BUFFER_POOL_SIZE),
+            max_open_files: DEFAULT_MAX_OPEN_FILES,
         });
 
         let db = Self {
@@ -380,9 +579,10 @@ impl Database {
         }
         let mut guard = self.shared.file_manager.write();
         if guard.is_none() {
-            let fm = FileManager::open(&self.shared.path, 64).wrap_err_with(|| {
-                format!("failed to open file manager at {:?}", self.shared.path)
-            })?;
+            let fm = FileManager::open(&self.shared.path, self.shared.max_open_files)
+                .wrap_err_with(|| {
+                    format!("failed to open file manager at {:?}", self.shared.path)
+                })?;
             *guard = Some(fm);
         }
         Ok(())

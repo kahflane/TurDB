@@ -76,11 +76,12 @@
 //!
 //! ## Thread Safety
 //!
-//! `StorageDriver` requires `Send + Sync` bounds for thread-safe database operations.
-//! Individual implementations may have additional safety considerations:
+//! `StorageDriver` requires `Send` bound. For `Sync` access:
 //!
-//! - `MmapStorage`: Send but not Sync (wrapped in RwLock at FileManager level)
-//! - `OpfsStorage`: Worker-only, single-threaded access
+//! - `MmapStorage`: `Send` but not `Sync` (contains `MmapMut`). External `RwLock`
+//!   synchronization is required for concurrent access.
+//! - `AnyStorage`: Wraps storage in `RwLock` internally to provide `Sync` bound.
+//! - `OpfsStorage`: Worker-only, single-threaded access (WASM)
 //!
 //! ## Platform Considerations
 //!
@@ -94,6 +95,7 @@
 //! durability guarantees).
 
 use eyre::Result;
+use parking_lot::RwLock;
 use std::path::PathBuf;
 
 use super::mmap::MmapStorage;
@@ -222,24 +224,41 @@ impl StorageKind {
     }
 }
 
-/// Type-erased storage backend that implements `StorageDriver`.
+/// Type-erased storage backend that implements `StorageDriver` with `Sync` support.
 ///
 /// This enum allows `FileManager` to work with different storage backends
-/// without requiring generics throughout the codebase.
-#[derive(Debug)]
+/// without requiring generics throughout the codebase. Internal `RwLock` wrappers
+/// provide thread-safety (`Sync` bound) for concurrent access.
+///
+/// # Zero-Copy Support
+///
+/// `AnyStorage` does **not** support zero-copy page access because `RwLock` guards
+/// cannot return references that outlive the lock. Use `MmapStorage` directly
+/// (wrapped in external `Arc<RwLock<...>>`) for zero-copy access.
 pub enum AnyStorage {
-    /// Memory-mapped storage for native platforms.
-    Mmap(MmapStorage),
+    /// Memory-mapped storage for native platforms (wrapped in RwLock for Sync).
+    Mmap(RwLock<MmapStorage>),
 
-    /// OPFS storage for WASM (Worker context only).
+    /// OPFS storage for WASM (Worker context only, wrapped in RwLock for Sync).
     #[cfg(target_arch = "wasm32")]
-    Opfs(super::opfs::OpfsStorage),
+    Opfs(RwLock<super::opfs::OpfsStorage>),
+}
+
+// Debug impl since RwLock<MmapStorage> doesn't auto-derive Debug
+impl std::fmt::Debug for AnyStorage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AnyStorage::Mmap(_) => f.debug_tuple("Mmap").field(&"<RwLock<MmapStorage>>").finish(),
+            #[cfg(target_arch = "wasm32")]
+            AnyStorage::Opfs(_) => f.debug_tuple("Opfs").field(&"<RwLock<OpfsStorage>>").finish(),
+        }
+    }
 }
 
 impl AnyStorage {
     /// Creates a new AnyStorage from an MmapStorage.
     pub fn from_mmap(storage: MmapStorage) -> Self {
-        AnyStorage::Mmap(storage)
+        AnyStorage::Mmap(RwLock::new(storage))
     }
 
     /// Returns true if this is mmap storage.
@@ -247,19 +266,23 @@ impl AnyStorage {
         matches!(self, AnyStorage::Mmap(_))
     }
 
-    /// Returns a reference to the inner MmapStorage, if applicable.
-    pub fn as_mmap(&self) -> Option<&MmapStorage> {
+    /// Executes a function with read access to the inner MmapStorage.
+    ///
+    /// Returns `None` if this is not mmap storage.
+    pub fn with_mmap<R, F: FnOnce(&MmapStorage) -> R>(&self, f: F) -> Option<R> {
         match self {
-            AnyStorage::Mmap(s) => Some(s),
+            AnyStorage::Mmap(s) => Some(f(&s.read())),
             #[cfg(target_arch = "wasm32")]
             AnyStorage::Opfs(_) => None,
         }
     }
 
-    /// Returns a mutable reference to the inner MmapStorage, if applicable.
-    pub fn as_mmap_mut(&mut self) -> Option<&mut MmapStorage> {
+    /// Executes a function with write access to the inner MmapStorage.
+    ///
+    /// Returns `None` if this is not mmap storage.
+    pub fn with_mmap_mut<R, F: FnOnce(&mut MmapStorage) -> R>(&self, f: F) -> Option<R> {
         match self {
-            AnyStorage::Mmap(s) => Some(s),
+            AnyStorage::Mmap(s) => Some(f(&mut s.write())),
             #[cfg(target_arch = "wasm32")]
             AnyStorage::Opfs(_) => None,
         }
@@ -269,114 +292,74 @@ impl AnyStorage {
 impl StorageDriver for AnyStorage {
     fn read_page(&self, page_no: u32, buf: &mut [u8; PAGE_SIZE]) -> Result<()> {
         match self {
-            AnyStorage::Mmap(s) => s.read_page(page_no, buf),
+            AnyStorage::Mmap(s) => s.read().read_page(page_no, buf),
             #[cfg(target_arch = "wasm32")]
-            AnyStorage::Opfs(s) => s.read_page(page_no, buf),
+            AnyStorage::Opfs(s) => s.read().read_page(page_no, buf),
         }
     }
 
     fn write_page(&mut self, page_no: u32, data: &[u8; PAGE_SIZE]) -> Result<()> {
         match self {
-            AnyStorage::Mmap(s) => s.write_page(page_no, data),
+            AnyStorage::Mmap(s) => s.write().write_page(page_no, data),
             #[cfg(target_arch = "wasm32")]
-            AnyStorage::Opfs(s) => s.write_page(page_no, data),
+            AnyStorage::Opfs(s) => s.write().write_page(page_no, data),
         }
     }
 
     fn grow(&mut self, new_page_count: u32) -> Result<()> {
         match self {
-            AnyStorage::Mmap(s) => s.grow(new_page_count),
+            AnyStorage::Mmap(s) => s.write().grow(new_page_count),
             #[cfg(target_arch = "wasm32")]
-            AnyStorage::Opfs(s) => s.grow(new_page_count),
+            AnyStorage::Opfs(s) => s.write().grow(new_page_count),
         }
     }
 
     fn page_count(&self) -> u32 {
         match self {
-            AnyStorage::Mmap(s) => s.page_count(),
+            AnyStorage::Mmap(s) => s.read().page_count(),
             #[cfg(target_arch = "wasm32")]
-            AnyStorage::Opfs(s) => s.page_count(),
+            AnyStorage::Opfs(s) => s.read().page_count(),
         }
     }
 
     fn sync(&self) -> Result<()> {
         match self {
-            AnyStorage::Mmap(s) => s.sync(),
+            AnyStorage::Mmap(s) => s.read().sync(),
             #[cfg(target_arch = "wasm32")]
-            AnyStorage::Opfs(s) => s.sync(),
+            AnyStorage::Opfs(s) => s.read().sync(),
         }
     }
 
+    /// AnyStorage does not support zero-copy due to RwLock wrapper.
     fn supports_zero_copy(&self) -> bool {
-        match self {
-            AnyStorage::Mmap(s) => s.supports_zero_copy(),
-            #[cfg(target_arch = "wasm32")]
-            AnyStorage::Opfs(s) => s.supports_zero_copy(),
-        }
+        false
     }
 
-    fn page_direct(&self, page_no: u32) -> Option<Result<&[u8]>> {
-        match self {
-            AnyStorage::Mmap(s) => s.page_direct(page_no),
-            #[cfg(target_arch = "wasm32")]
-            AnyStorage::Opfs(s) => s.page_direct(page_no),
-        }
+    /// AnyStorage cannot return direct references through RwLock.
+    /// Use MmapStorage directly for zero-copy access.
+    fn page_direct(&self, _page_no: u32) -> Option<Result<&[u8]>> {
+        None
     }
 
-    fn page_direct_mut(&mut self, page_no: u32) -> Option<Result<&mut [u8]>> {
-        match self {
-            AnyStorage::Mmap(s) => s.page_direct_mut(page_no),
-            #[cfg(target_arch = "wasm32")]
-            AnyStorage::Opfs(s) => s.page_direct_mut(page_no),
-        }
+    /// AnyStorage cannot return direct references through RwLock.
+    /// Use MmapStorage directly for zero-copy access.
+    fn page_direct_mut(&mut self, _page_no: u32) -> Option<Result<&mut [u8]>> {
+        None
     }
 
     fn prefetch(&self, start_page: u32, count: u32) {
         match self {
-            AnyStorage::Mmap(s) => s.prefetch(start_page, count),
+            AnyStorage::Mmap(s) => s.read().prefetch(start_page, count),
             #[cfg(target_arch = "wasm32")]
-            AnyStorage::Opfs(s) => s.prefetch(start_page, count),
+            AnyStorage::Opfs(s) => s.read().prefetch(start_page, count),
         }
     }
 }
 
-impl Storage for AnyStorage {
-    fn page(&self, page_no: u32) -> Result<&[u8]> {
-        match self {
-            AnyStorage::Mmap(s) => s.page(page_no),
-            #[cfg(target_arch = "wasm32")]
-            AnyStorage::Opfs(_) => {
-                eyre::bail!("OPFS storage does not support zero-copy page access; use StorageDriver::read_page instead")
-            }
-        }
-    }
-
-    fn page_mut(&mut self, page_no: u32) -> Result<&mut [u8]> {
-        match self {
-            AnyStorage::Mmap(s) => s.page_mut(page_no),
-            #[cfg(target_arch = "wasm32")]
-            AnyStorage::Opfs(_) => {
-                eyre::bail!("OPFS storage does not support zero-copy page access; use StorageDriver::write_page instead")
-            }
-        }
-    }
-
-    fn grow(&mut self, new_page_count: u32) -> Result<()> {
-        StorageDriver::grow(self, new_page_count)
-    }
-
-    fn page_count(&self) -> u32 {
-        StorageDriver::page_count(self)
-    }
-
-    fn sync(&self) -> Result<()> {
-        StorageDriver::sync(self)
-    }
-
-    fn prefetch_pages(&self, start_page: u32, count: u32) {
-        StorageDriver::prefetch(self, start_page, count)
-    }
-}
+// NOTE: AnyStorage does NOT implement Storage trait because RwLock guards
+// cannot return references that outlive the lock. Use StorageDriver's
+// copy-based interface (read_page/write_page) instead, or access MmapStorage
+// directly via with_mmap/with_mmap_mut for zero-copy operations.
 
 #[cfg(test)]
 mod tests {
@@ -426,14 +409,15 @@ mod tests {
         }
 
         #[test]
-        fn any_storage_as_mmap_returns_inner_storage() {
+        fn any_storage_with_mmap_provides_read_access() {
             let dir = tempdir().unwrap();
             let path = dir.path().join("test.db");
 
             let mmap = MmapStorage::create(&path, 1).unwrap();
             let any = AnyStorage::from_mmap(mmap);
 
-            assert!(any.as_mmap().is_some());
+            let page_count = any.with_mmap(|s| s.page_count());
+            assert_eq!(page_count, Some(1));
         }
 
         #[test]
@@ -463,8 +447,10 @@ mod tests {
             data[0] = 99;
             any.write_page(0, &data).unwrap();
 
-            let page = any.as_mmap().unwrap().page(0).unwrap();
-            assert_eq!(page[0], 99);
+            // Read back via StorageDriver interface
+            let mut buf = [0u8; PAGE_SIZE];
+            any.read_page(0, &mut buf).unwrap();
+            assert_eq!(buf[0], 99);
         }
 
         #[test]
@@ -493,45 +479,46 @@ mod tests {
         }
 
         #[test]
-        fn any_storage_supports_zero_copy_returns_true_for_mmap() {
+        fn any_storage_does_not_support_zero_copy() {
+            // AnyStorage wraps in RwLock, so zero-copy is disabled
             let dir = tempdir().unwrap();
             let path = dir.path().join("test.db");
 
             let mmap = MmapStorage::create(&path, 1).unwrap();
             let any = AnyStorage::from_mmap(mmap);
 
-            assert!(any.supports_zero_copy());
+            assert!(!any.supports_zero_copy());
         }
 
         #[test]
-        fn any_storage_page_direct_returns_valid_slice() {
+        fn any_storage_page_direct_returns_none() {
+            // AnyStorage cannot return direct references through RwLock
             let dir = tempdir().unwrap();
             let path = dir.path().join("test.db");
 
-            let mut mmap = MmapStorage::create(&path, 1).unwrap();
-            mmap.page_mut(0).unwrap()[0] = 77;
-
+            let mmap = MmapStorage::create(&path, 1).unwrap();
             let any = AnyStorage::from_mmap(mmap);
 
-            let result = any.page_direct(0);
-            assert!(result.is_some());
-
-            let page = result.unwrap().unwrap();
-            assert_eq!(page[0], 77);
+            assert!(any.page_direct(0).is_none());
         }
 
         #[test]
-        fn any_storage_implements_storage_trait() {
+        fn any_storage_with_mmap_mut_provides_write_access() {
             let dir = tempdir().unwrap();
             let path = dir.path().join("test.db");
 
-            let mmap = MmapStorage::create(&path, 2).unwrap();
-            let mut any = AnyStorage::from_mmap(mmap);
+            let mmap = MmapStorage::create(&path, 1).unwrap();
+            let any = AnyStorage::from_mmap(mmap);
 
-            Storage::page_mut(&mut any, 0).unwrap()[0] = 123;
+            // Write directly to inner storage
+            any.with_mmap_mut(|s| {
+                s.page_mut(0).unwrap()[0] = 55;
+            });
 
-            let page = Storage::page(&any, 0).unwrap();
-            assert_eq!(page[0], 123);
+            // Read back via StorageDriver interface
+            let mut buf = [0u8; PAGE_SIZE];
+            any.read_page(0, &mut buf).unwrap();
+            assert_eq!(buf[0], 55);
         }
 
         #[test]
@@ -544,6 +531,19 @@ mod tests {
 
             let result = StorageDriver::sync(&any);
             assert!(result.is_ok());
+        }
+
+        #[test]
+        fn any_storage_is_sync() {
+            // Verify AnyStorage can be shared across threads
+            fn assert_sync<T: Sync>() {}
+            assert_sync::<AnyStorage>();
+        }
+
+        #[test]
+        fn any_storage_is_send() {
+            fn assert_send<T: Send>() {}
+            assert_send::<AnyStorage>();
         }
     }
 }
