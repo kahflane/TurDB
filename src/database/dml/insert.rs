@@ -355,7 +355,8 @@ impl Database {
             }
         };
 
-        let root_page = 1u32;
+        let mut root_page: u32;
+        let initial_root_page: u32;
         let validator = ConstraintValidator::new(&table_def_for_validator);
 
         let mut file_manager_guard = self.shared.file_manager.write();
@@ -373,6 +374,8 @@ impl Database {
             let storage = main_storage_arc.write();
             let page = storage.page(0)?;
             let header = TableFileHeader::from_bytes(page)?;
+            root_page = header.root_page();
+            initial_root_page = root_page;
             let ai = if auto_increment_col_idx.is_some() {
                 header.auto_increment()
             } else {
@@ -928,11 +931,13 @@ impl Database {
                     BTree::with_rightmost_hint(&mut wal_storage, root_page, rightmost_hint)?;
                 btree.insert(&row_key, &buffers.mvcc_buffer)?;
                 rightmost_hint = btree.rightmost_hint();
+                root_page = btree.root_page();
             } else {
                 let mut btree =
                     BTree::with_rightmost_hint(&mut *table_storage, root_page, rightmost_hint)?;
                 btree.insert(&row_key, &buffers.mvcc_buffer)?;
                 rightmost_hint = btree.rightmost_hint();
+                root_page = btree.root_page();
             }
 
             {
@@ -1092,6 +1097,15 @@ impl Database {
                 let header = TableFileHeader::from_bytes_mut(page)?;
                 let new_row_count = header.row_count().saturating_add(count as u64);
                 header.set_row_count(new_row_count);
+            }
+        }
+
+        if root_page != initial_root_page {
+            if let Some(storage_arc) = storage_map.get(&table_file_key) {
+                let mut storage = storage_arc.write();
+                let page = storage.page_mut(0)?;
+                let header = TableFileHeader::from_bytes_mut(page)?;
+                header.set_root_page(root_page);
             }
         }
 

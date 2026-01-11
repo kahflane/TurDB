@@ -44,6 +44,35 @@ pub fn compute_group_key_for_dynamic(row: &ExecutorRow, group_by: &[usize]) -> V
     key
 }
 
+/// Computes a group key from expressions for dynamic grouping.
+pub fn compute_group_key_from_exprs<'a>(
+    row: &ExecutorRow<'a>,
+    group_by_exprs: &[crate::sql::predicate::CompiledPredicate<'a>],
+) -> Vec<u8> {
+    let mut key = Vec::new();
+    for expr in group_by_exprs {
+        if let Some(val) = expr.evaluate_to_value(row) {
+            val.encode_to_key(&mut key);
+        }
+    }
+    key
+}
+
+/// Evaluates group by expressions and returns the values.
+pub fn evaluate_group_by_exprs<'a>(
+    row: &ExecutorRow<'a>,
+    group_by_exprs: &[crate::sql::predicate::CompiledPredicate<'a>],
+) -> Vec<Value<'static>> {
+    group_by_exprs
+        .iter()
+        .map(|expr| {
+            expr.evaluate_to_value(row)
+                .map(|v| v.to_owned_static())
+                .unwrap_or(Value::Null)
+        })
+        .collect()
+}
+
 /// Compares two values for sorting.
 #[inline]
 pub fn compare_values_for_sort(a: &Value, b: &Value) -> Ordering {

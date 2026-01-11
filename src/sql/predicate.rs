@@ -9,6 +9,7 @@ pub struct CompiledPredicate<'a> {
     column_map: Vec<(String, usize)>,
     params: Option<Vec<OwnedValue>>,
     set_param_count: usize,
+    scalar_subquery_results: Option<hashbrown::HashMap<usize, OwnedValue>>,
 }
 
 impl<'a> CompiledPredicate<'a> {
@@ -18,6 +19,7 @@ impl<'a> CompiledPredicate<'a> {
             column_map,
             params: None,
             set_param_count: 0,
+            scalar_subquery_results: None,
         }
     }
 
@@ -32,7 +34,26 @@ impl<'a> CompiledPredicate<'a> {
             column_map,
             params: Some(params.to_vec()),
             set_param_count,
+            scalar_subquery_results: None,
         }
+    }
+
+    pub fn with_scalar_subqueries(
+        expr: &'a crate::sql::ast::Expr<'a>,
+        column_map: Vec<(String, usize)>,
+        scalar_results: hashbrown::HashMap<usize, OwnedValue>,
+    ) -> Self {
+        Self {
+            expr,
+            column_map,
+            params: None,
+            set_param_count: 0,
+            scalar_subquery_results: Some(scalar_results),
+        }
+    }
+
+    pub fn set_scalar_subquery_results(&mut self, results: hashbrown::HashMap<usize, OwnedValue>) {
+        self.scalar_subquery_results = Some(results);
     }
 
     pub fn evaluate(&self, row: &ExecutorRow<'a>) -> bool {
@@ -204,6 +225,14 @@ impl<'a> CompiledPredicate<'a> {
                         crate::sql::ast::ParameterRef::Named(_) => self.set_param_count,
                     };
                     params.get(idx).map(|v| self.owned_value_to_value(v))
+                } else {
+                    None
+                }
+            }
+            Expr::Subquery(subq) => {
+                if let Some(ref results) = self.scalar_subquery_results {
+                    let key = (*subq) as *const _ as usize;
+                    results.get(&key).map(|v| self.owned_value_to_value(v))
                 } else {
                     None
                 }

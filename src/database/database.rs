@@ -81,6 +81,9 @@ use crate::database::timing::{INSERT_TIME_NS, PARSE_TIME_NS};
 /// Aggregate group state: group key hashes -> (accumulated group values, (count, sum) pairs for AVG)
 type AggregateGroups = HashMap<Vec<u64>, (Vec<OwnedValue>, Vec<(i64, f64)>)>;
 
+/// Result type for subquery materialization: (rows, column_map)
+type MaterializedSubqueryResult = (Vec<Vec<OwnedValue>>, Vec<(String, usize)>);
+
 /// Default number of pre-allocated page buffers in the buffer pool.
 /// Sized to handle typical concurrent commit workloads without allocation.
 const DEFAULT_BUFFER_POOL_SIZE: usize = 16;
@@ -737,6 +740,168 @@ impl Database {
         let mut file_manager_guard = self.shared.file_manager.write();
         let file_manager = file_manager_guard.as_mut().unwrap();
 
+        fn collect_scalar_subqueries<'a>(
+            expr: &'a crate::sql::ast::Expr<'a>,
+            subqueries: &mut Vec<&'a crate::sql::ast::SelectStmt<'a>>,
+        ) {
+            use crate::sql::ast::Expr;
+            match expr {
+                Expr::Subquery(subq) => {
+                    subqueries.push(subq);
+                }
+                Expr::BinaryOp { left, right, .. } => {
+                    collect_scalar_subqueries(left, subqueries);
+                    collect_scalar_subqueries(right, subqueries);
+                }
+                Expr::UnaryOp { expr, .. } => {
+                    collect_scalar_subqueries(expr, subqueries);
+                }
+                Expr::IsNull { expr, .. } => {
+                    collect_scalar_subqueries(expr, subqueries);
+                }
+                Expr::InList { expr, list, .. } => {
+                    collect_scalar_subqueries(expr, subqueries);
+                    for item in list.iter() {
+                        collect_scalar_subqueries(item, subqueries);
+                    }
+                }
+                Expr::Between { expr, low, high, .. } => {
+                    collect_scalar_subqueries(expr, subqueries);
+                    collect_scalar_subqueries(low, subqueries);
+                    collect_scalar_subqueries(high, subqueries);
+                }
+                Expr::Case { operand, conditions, else_result } => {
+                    if let Some(op) = operand {
+                        collect_scalar_subqueries(op, subqueries);
+                    }
+                    for cond in conditions.iter() {
+                        collect_scalar_subqueries(cond.condition, subqueries);
+                        collect_scalar_subqueries(cond.result, subqueries);
+                    }
+                    if let Some(else_e) = else_result {
+                        collect_scalar_subqueries(else_e, subqueries);
+                    }
+                }
+                Expr::Function(func) => {
+                    if let crate::sql::ast::FunctionArgs::Args(args) = &func.args {
+                        for arg in args.iter() {
+                            collect_scalar_subqueries(arg.value, subqueries);
+                        }
+                    }
+                }
+                Expr::Cast { expr, .. } => {
+                    collect_scalar_subqueries(expr, subqueries);
+                }
+                _ => {}
+            }
+        }
+
+        fn find_filter_predicates<'a>(
+            op: &'a crate::sql::planner::PhysicalOperator<'a>,
+            predicates: &mut Vec<&'a crate::sql::ast::Expr<'a>>,
+        ) {
+            use crate::sql::planner::PhysicalOperator;
+            match op {
+                PhysicalOperator::FilterExec(f) => {
+                    predicates.push(f.predicate);
+                    find_filter_predicates(f.input, predicates);
+                }
+                PhysicalOperator::ProjectExec(p) => find_filter_predicates(p.input, predicates),
+                PhysicalOperator::LimitExec(l) => find_filter_predicates(l.input, predicates),
+                PhysicalOperator::SortExec(s) => find_filter_predicates(s.input, predicates),
+                PhysicalOperator::TopKExec(t) => find_filter_predicates(t.input, predicates),
+                PhysicalOperator::HashAggregate(a) => find_filter_predicates(a.input, predicates),
+                PhysicalOperator::NestedLoopJoin(j) => {
+                    find_filter_predicates(j.left, predicates);
+                    find_filter_predicates(j.right, predicates);
+                }
+                PhysicalOperator::GraceHashJoin(j) => {
+                    find_filter_predicates(j.left, predicates);
+                    find_filter_predicates(j.right, predicates);
+                }
+                PhysicalOperator::SubqueryExec(s) => find_filter_predicates(s.child_plan, predicates),
+                _ => {}
+            }
+        }
+
+        fn execute_scalar_subquery<'a>(
+            subq: &'a crate::sql::ast::SelectStmt<'a>,
+            catalog: &crate::schema::catalog::Catalog,
+            file_manager: &mut FileManager,
+            arena: &'a Bump,
+        ) -> Result<OwnedValue> {
+            let planner = Planner::new(catalog, arena);
+            let stmt = crate::sql::ast::Statement::Select(subq);
+            let subq_plan = planner.create_physical_plan(&stmt)?;
+
+            let plan_source = find_plan_source(subq_plan.root);
+
+            if let Some(PlanSource::TableScan(scan)) = plan_source {
+                let schema_name = scan.schema.unwrap_or(DEFAULT_SCHEMA);
+                let table_name = scan.table;
+
+                let table_def = catalog.resolve_table_in_schema(scan.schema, table_name)?;
+                let column_types: Vec<_> = table_def.columns().iter().map(|c| c.data_type()).collect();
+
+                let storage_arc = file_manager.table_data(schema_name, table_name)?;
+                let storage = storage_arc.read();
+
+                let root_page = {
+                    use crate::storage::TableFileHeader;
+                    let page = storage.page(0)?;
+                    TableFileHeader::from_bytes(page)?.root_page()
+                };
+                let source = StreamingBTreeSource::from_btree_scan_with_projections(
+                    &storage,
+                    root_page,
+                    column_types,
+                    None,
+                )?;
+
+                let column_map: Vec<(String, usize)> = table_def
+                    .columns()
+                    .iter()
+                    .enumerate()
+                    .map(|(idx, col)| (col.name().to_lowercase(), idx))
+                    .collect();
+
+                let ctx = ExecutionContext::new(arena);
+                let builder = ExecutorBuilder::new(&ctx);
+                let mut executor = builder
+                    .build_with_source_and_column_map(&subq_plan, source, &column_map)?;
+
+                executor.open()?;
+                let result = if let Some(row) = executor.next()? {
+                    row.values.first().map(OwnedValue::from).unwrap_or(OwnedValue::Null)
+                } else {
+                    OwnedValue::Null
+                };
+                executor.close()?;
+                Ok(result)
+            } else {
+                Ok(OwnedValue::Null)
+            }
+        }
+
+        let mut scalar_subquery_results: hashbrown::HashMap<usize, OwnedValue> = hashbrown::HashMap::new();
+        {
+            let mut filter_predicates: Vec<&crate::sql::ast::Expr> = Vec::new();
+            find_filter_predicates(physical_plan.root, &mut filter_predicates);
+
+            for predicate in filter_predicates {
+                let mut subqueries: Vec<&crate::sql::ast::SelectStmt> = Vec::new();
+                collect_scalar_subqueries(predicate, &mut subqueries);
+
+                for subq in subqueries {
+                    let key = subq as *const _ as usize;
+                    if !scalar_subquery_results.contains_key(&key) {
+                        let result = execute_scalar_subquery(subq, catalog, file_manager, &arena)?;
+                        scalar_subquery_results.insert(key, result);
+                    }
+                }
+            }
+        }
+
         fn execute_subquery_recursive<'a>(
             subq: &'a crate::sql::planner::PhysicalSubqueryExec<'a>,
             catalog: &crate::schema::catalog::Catalog,
@@ -808,7 +973,11 @@ impl Database {
                     })?;
                 let storage = storage_arc.read();
 
-                let root_page = 1u32;
+                let root_page = {
+                    use crate::storage::TableFileHeader;
+                    let page = storage.page(0)?;
+                    TableFileHeader::from_bytes(page)?.root_page()
+                };
                 let inner_source = if inner_scan.reverse {
                     BTreeSource::Reverse(
                         ReverseBTreeSource::from_btree_scan_reverse_with_projections(
@@ -863,9 +1032,217 @@ impl Database {
                 }
                 inner_executor.close()?;
                 Ok(materialized_rows)
+            } else if let Some(inner_join) = find_join_in_subquery(subq.child_plan) {
+                let (mut join_rows, join_column_map) =
+                    execute_join_in_subquery(inner_join, subq.child_plan, &subq.output_schema, catalog, file_manager)?;
+
+                fn get_limit_from_plan<'a>(
+                    op: &'a crate::sql::planner::PhysicalOperator<'a>,
+                ) -> (Option<usize>, usize) {
+                    use crate::sql::planner::PhysicalOperator;
+                    match op {
+                        PhysicalOperator::LimitExec(l) => (l.limit.map(|v| v as usize), l.offset.unwrap_or(0) as usize),
+                        PhysicalOperator::FilterExec(f) => get_limit_from_plan(f.input),
+                        PhysicalOperator::ProjectExec(p) => get_limit_from_plan(p.input),
+                        PhysicalOperator::SortExec(s) => get_limit_from_plan(s.input),
+                        PhysicalOperator::TopKExec(t) => (Some(t.limit as usize), t.offset.unwrap_or(0) as usize),
+                        _ => (None, 0),
+                    }
+                }
+
+                let (limit, offset) = get_limit_from_plan(subq.child_plan);
+
+                if offset > 0 {
+                    join_rows = join_rows.into_iter().skip(offset).collect();
+                }
+
+                if let Some(lim) = limit {
+                    join_rows.truncate(lim);
+                }
+
+                fn get_project_from_plan<'a>(
+                    op: &'a crate::sql::planner::PhysicalOperator<'a>,
+                ) -> Option<&'a [&'a crate::sql::ast::Expr<'a>]> {
+                    use crate::sql::planner::PhysicalOperator;
+                    match op {
+                        PhysicalOperator::ProjectExec(p) => Some(p.expressions),
+                        PhysicalOperator::LimitExec(l) => get_project_from_plan(l.input),
+                        PhysicalOperator::SortExec(s) => get_project_from_plan(s.input),
+                        PhysicalOperator::TopKExec(t) => get_project_from_plan(t.input),
+                        _ => None,
+                    }
+                }
+
+                if let Some(projections) = get_project_from_plan(subq.child_plan) {
+                    let project_arena = Bump::new();
+                    let compiled_projections: Vec<crate::sql::predicate::CompiledPredicate> = projections
+                        .iter()
+                        .map(|expr| crate::sql::predicate::CompiledPredicate::new(expr, join_column_map.clone()))
+                        .collect();
+
+                    let _ctx = ExecutionContext::new(&project_arena);
+
+                    let mut projected_rows: Vec<Vec<OwnedValue>> = Vec::new();
+                    for row_owned in &join_rows {
+                        let values: smallvec::SmallVec<[Value<'_>; 16]> =
+                            row_owned.iter().map(|v| v.to_value()).collect();
+                        let row_ref = ExecutorRow::new(&values);
+
+                        let projected: Vec<OwnedValue> = compiled_projections
+                            .iter()
+                            .map(|pred| {
+                                pred.evaluate_to_value(&row_ref)
+                                    .map(|v| OwnedValue::from(&v))
+                                    .unwrap_or(OwnedValue::Null)
+                            })
+                            .collect();
+                        projected_rows.push(projected);
+                    }
+                    Ok(projected_rows)
+                } else {
+                    Ok(join_rows)
+                }
             } else {
                 bail!("subquery inner plan must have a table scan")
             }
+        }
+
+        fn find_join_in_subquery<'a>(
+            op: &'a crate::sql::planner::PhysicalOperator<'a>,
+        ) -> Option<&'a crate::sql::planner::PhysicalNestedLoopJoin<'a>> {
+            use crate::sql::planner::PhysicalOperator;
+            match op {
+                PhysicalOperator::NestedLoopJoin(join) => Some(join),
+                PhysicalOperator::FilterExec(f) => find_join_in_subquery(f.input),
+                PhysicalOperator::ProjectExec(p) => find_join_in_subquery(p.input),
+                PhysicalOperator::LimitExec(l) => find_join_in_subquery(l.input),
+                PhysicalOperator::SortExec(s) => find_join_in_subquery(s.input),
+                PhysicalOperator::TopKExec(t) => find_join_in_subquery(t.input),
+                PhysicalOperator::HashAggregate(a) => find_join_in_subquery(a.input),
+                _ => None,
+            }
+        }
+
+        fn execute_join_in_subquery<'a>(
+            join: &'a crate::sql::planner::PhysicalNestedLoopJoin<'a>,
+            _full_plan: &'a crate::sql::planner::PhysicalOperator<'a>,
+            _output_schema: &crate::sql::planner::OutputSchema<'a>,
+            catalog: &crate::schema::catalog::Catalog,
+            file_manager: &mut FileManager,
+        ) -> Result<MaterializedSubqueryResult> {
+            fn get_table_scan<'a>(
+                op: &'a crate::sql::planner::PhysicalOperator<'a>,
+            ) -> Option<&'a crate::sql::planner::PhysicalTableScan<'a>> {
+                use crate::sql::planner::PhysicalOperator;
+                match op {
+                    PhysicalOperator::TableScan(scan) => Some(scan),
+                    PhysicalOperator::FilterExec(f) => get_table_scan(f.input),
+                    PhysicalOperator::ProjectExec(p) => get_table_scan(p.input),
+                    PhysicalOperator::LimitExec(l) => get_table_scan(l.input),
+                    _ => None,
+                }
+            }
+
+            let left_scan = get_table_scan(join.left);
+            let right_scan = get_table_scan(join.right);
+
+            let mut left_rows: Vec<Vec<OwnedValue>> = Vec::new();
+            let mut right_rows: Vec<Vec<OwnedValue>> = Vec::new();
+            let mut column_map: Vec<(String, usize)> = Vec::new();
+            let mut idx = 0usize;
+
+            if let Some(scan) = left_scan {
+                let schema_name = scan.schema.unwrap_or(DEFAULT_SCHEMA);
+                let table_name = scan.table;
+                let alias = scan.alias.unwrap_or(table_name);
+                let table_def = catalog.resolve_table_in_schema(scan.schema, table_name)?;
+                let column_types: Vec<_> =
+                    table_def.columns().iter().map(|c| c.data_type()).collect();
+                let storage_arc = file_manager.table_data(schema_name, table_name)?;
+                let storage = storage_arc.read();
+                let root_page = {
+                    use crate::storage::TableFileHeader;
+                    let page = storage.page(0)?;
+                    TableFileHeader::from_bytes(page)?.root_page()
+                };
+                let mut source = StreamingBTreeSource::from_btree_scan_with_projections(
+                    &storage,
+                    root_page,
+                    column_types,
+                    None,
+                )?;
+                while let Some(row) = source.next_row()? {
+                    left_rows.push(row.iter().map(OwnedValue::from).collect());
+                }
+                for col in table_def.columns() {
+                    column_map.push((col.name().to_lowercase(), idx));
+                    column_map.push((format!("{}.{}", alias, col.name()).to_lowercase(), idx));
+                    if scan.alias.is_some() {
+                        column_map.push((format!("{}.{}", table_name, col.name()).to_lowercase(), idx));
+                    }
+                    idx += 1;
+                }
+            }
+
+            if let Some(scan) = right_scan {
+                let schema_name = scan.schema.unwrap_or(DEFAULT_SCHEMA);
+                let table_name = scan.table;
+                let alias = scan.alias.unwrap_or(table_name);
+                let table_def = catalog.resolve_table_in_schema(scan.schema, table_name)?;
+                let column_types: Vec<_> =
+                    table_def.columns().iter().map(|c| c.data_type()).collect();
+                let storage_arc = file_manager.table_data(schema_name, table_name)?;
+                let storage = storage_arc.read();
+                let root_page = {
+                    use crate::storage::TableFileHeader;
+                    let page = storage.page(0)?;
+                    TableFileHeader::from_bytes(page)?.root_page()
+                };
+                let mut source = StreamingBTreeSource::from_btree_scan_with_projections(
+                    &storage,
+                    root_page,
+                    column_types,
+                    None,
+                )?;
+                while let Some(row) = source.next_row()? {
+                    right_rows.push(row.iter().map(OwnedValue::from).collect());
+                }
+                for col in table_def.columns() {
+                    column_map.push((col.name().to_lowercase(), idx));
+                    column_map.push((format!("{}.{}", alias, col.name()).to_lowercase(), idx));
+                    if scan.alias.is_some() {
+                        column_map.push((format!("{}.{}", table_name, col.name()).to_lowercase(), idx));
+                    }
+                    idx += 1;
+                }
+            }
+
+            let condition_predicate = join.condition.map(|c| {
+                crate::sql::predicate::CompiledPredicate::new(c, column_map.clone())
+            });
+
+            let mut result_rows: Vec<Vec<OwnedValue>> = Vec::new();
+            for left_row in &left_rows {
+                for right_row in &right_rows {
+                    let mut combined: Vec<OwnedValue> = left_row.clone();
+                    combined.extend(right_row.iter().cloned());
+
+                    let passes = if let Some(ref pred) = condition_predicate {
+                        let values: smallvec::SmallVec<[Value<'_>; 16]> =
+                            combined.iter().map(|v| v.to_value()).collect();
+                        let row_ref = ExecutorRow::new(&values);
+                        pred.evaluate(&row_ref)
+                    } else {
+                        true
+                    };
+
+                    if passes {
+                        result_rows.push(combined);
+                    }
+                }
+            }
+
+            Ok((result_rows, column_map))
         }
 
         let plan_source = find_plan_source(physical_plan.root);
@@ -928,7 +1305,11 @@ impl Database {
                     })?;
                 let storage = storage_arc.read();
 
-                let root_page = 1u32;
+                let root_page = {
+                    use crate::storage::TableFileHeader;
+                    let page = storage.page(0)?;
+                    TableFileHeader::from_bytes(page)?.root_page()
+                };
                 let source: BTreeSource = if scan.reverse {
                     BTreeSource::Reverse(
                         ReverseBTreeSource::from_btree_scan_reverse_with_projections(
@@ -951,7 +1332,11 @@ impl Database {
                     )
                 };
 
-                let ctx = ExecutionContext::new(&arena);
+                let ctx = if scalar_subquery_results.is_empty() {
+                    ExecutionContext::new(&arena)
+                } else {
+                    ExecutionContext::with_scalar_subqueries(&arena, scalar_subquery_results.clone())
+                };
                 let builder = ExecutorBuilder::new(&ctx);
 
                 let all_columns_map: Vec<(String, usize)> = table_def
@@ -1018,7 +1403,11 @@ impl Database {
                     })?;
                 let storage = storage_arc.read();
 
-                let root_page = 1u32;
+                let root_page = {
+                    use crate::storage::TableFileHeader;
+                    let page = storage.page(0)?;
+                    TableFileHeader::from_bytes(page)?.root_page()
+                };
 
                 let (start_key, end_key): (Option<&[u8]>, Option<&[u8]>) = match &scan.key_range {
                     ScanRange::FullScan => (None, None),
@@ -1056,7 +1445,11 @@ impl Database {
                 )
                 .wrap_err("failed to create range scan for index scan")?;
 
-                let ctx = ExecutionContext::new(&arena);
+                let ctx = if scalar_subquery_results.is_empty() {
+                    ExecutionContext::new(&arena)
+                } else {
+                    ExecutionContext::with_scalar_subqueries(&arena, scalar_subquery_results.clone())
+                };
                 let builder = ExecutorBuilder::new(&ctx);
 
                 let all_columns_map: Vec<(String, usize)> = table_def
@@ -1290,7 +1683,11 @@ impl Database {
 
                 let materialized_source = MaterializedRowSource::new(materialized_rows);
 
-                let ctx = ExecutionContext::new(&arena);
+                let ctx = if scalar_subquery_results.is_empty() {
+                    ExecutionContext::new(&arena)
+                } else {
+                    ExecutionContext::with_scalar_subqueries(&arena, scalar_subquery_results.clone())
+                };
                 let builder = ExecutorBuilder::new(&ctx);
 
                 let all_columns_map: Vec<(String, usize)> = table_def
@@ -1343,7 +1740,11 @@ impl Database {
                     .map(|(idx, col)| (col.name.to_lowercase(), idx))
                     .collect();
 
-                let ctx = ExecutionContext::new(&arena);
+                let ctx = if scalar_subquery_results.is_empty() {
+                    ExecutionContext::new(&arena)
+                } else {
+                    ExecutionContext::with_scalar_subqueries(&arena, scalar_subquery_results.clone())
+                };
                 let builder = ExecutorBuilder::new(&ctx);
                 let mut executor = builder
                     .build_with_source_and_column_map(
@@ -1425,6 +1826,171 @@ impl Database {
                     }
                 }
 
+                fn find_nested_join<'a>(
+                    op: &'a crate::sql::planner::PhysicalOperator<'a>,
+                ) -> Option<&'a crate::sql::planner::PhysicalNestedLoopJoin<'a>> {
+                    use crate::sql::planner::PhysicalOperator;
+                    match op {
+                        PhysicalOperator::NestedLoopJoin(join) => Some(join),
+                        PhysicalOperator::FilterExec(f) => find_nested_join(f.input),
+                        PhysicalOperator::ProjectExec(p) => find_nested_join(p.input),
+                        PhysicalOperator::LimitExec(l) => find_nested_join(l.input),
+                        PhysicalOperator::SortExec(s) => find_nested_join(s.input),
+                        PhysicalOperator::TopKExec(t) => find_nested_join(t.input),
+                        _ => None,
+                    }
+                }
+
+                fn execute_nested_join_recursive<'a>(
+                    nested_join: &'a crate::sql::planner::PhysicalNestedLoopJoin<'a>,
+                    catalog: &crate::schema::catalog::Catalog,
+                    file_manager: &mut FileManager,
+                ) -> Result<MaterializedSubqueryResult> {
+                    let mut left_rows: Vec<Vec<OwnedValue>> = Vec::new();
+                    let mut right_rows: Vec<Vec<OwnedValue>> = Vec::new();
+                    let mut column_map: Vec<(String, usize)> = Vec::new();
+                    let mut idx = 0usize;
+
+                    fn get_scan_from_op<'a>(
+                        op: &'a crate::sql::planner::PhysicalOperator<'a>,
+                    ) -> Option<&'a crate::sql::planner::PhysicalTableScan<'a>> {
+                        use crate::sql::planner::PhysicalOperator;
+                        match op {
+                            PhysicalOperator::TableScan(scan) => Some(scan),
+                            PhysicalOperator::FilterExec(f) => get_scan_from_op(f.input),
+                            PhysicalOperator::ProjectExec(p) => get_scan_from_op(p.input),
+                            PhysicalOperator::LimitExec(l) => get_scan_from_op(l.input),
+                            _ => None,
+                        }
+                    }
+
+                    fn get_nested_join_from_op<'a>(
+                        op: &'a crate::sql::planner::PhysicalOperator<'a>,
+                    ) -> Option<&'a crate::sql::planner::PhysicalNestedLoopJoin<'a>> {
+                        use crate::sql::planner::PhysicalOperator;
+                        match op {
+                            PhysicalOperator::NestedLoopJoin(j) => Some(j),
+                            PhysicalOperator::FilterExec(f) => get_nested_join_from_op(f.input),
+                            PhysicalOperator::ProjectExec(p) => get_nested_join_from_op(p.input),
+                            PhysicalOperator::LimitExec(l) => get_nested_join_from_op(l.input),
+                            _ => None,
+                        }
+                    }
+
+                    let left_scan = get_scan_from_op(nested_join.left);
+                    let right_scan = get_scan_from_op(nested_join.right);
+                    let left_nested = get_nested_join_from_op(nested_join.left);
+                    let right_nested = get_nested_join_from_op(nested_join.right);
+
+                    if let Some(scan) = left_scan {
+                        let schema_name = scan.schema.unwrap_or(DEFAULT_SCHEMA);
+                        let table_name = scan.table;
+                        let alias = scan.alias.unwrap_or(table_name);
+                        let table_def = catalog.resolve_table_in_schema(scan.schema, table_name)?;
+                        let column_types: Vec<_> =
+                            table_def.columns().iter().map(|c| c.data_type()).collect();
+                        let storage_arc = file_manager.table_data(schema_name, table_name)?;
+                        let storage = storage_arc.read();
+                        let root_page = {
+                            use crate::storage::TableFileHeader;
+                            let page = storage.page(0)?;
+                            TableFileHeader::from_bytes(page)?.root_page()
+                        };
+                        let mut source = StreamingBTreeSource::from_btree_scan_with_projections(
+                            &storage,
+                            root_page,
+                            column_types,
+                            None,
+                        )?;
+                        while let Some(row) = source.next_row()? {
+                            left_rows.push(row.iter().map(OwnedValue::from).collect());
+                        }
+                        for col in table_def.columns() {
+                            column_map.push((col.name().to_lowercase(), idx));
+                            column_map.push((format!("{}.{}", alias, col.name()).to_lowercase(), idx));
+                            if scan.alias.is_some() {
+                                column_map.push((format!("{}.{}", table_name, col.name()).to_lowercase(), idx));
+                            }
+                            idx += 1;
+                        }
+                    } else if let Some(nested) = left_nested {
+                        let (rows, nested_col_map) = execute_nested_join_recursive(nested, catalog, file_manager)?;
+                        left_rows = rows;
+                        for (name, nested_idx) in nested_col_map {
+                            column_map.push((name, idx + nested_idx));
+                        }
+                        if let Some(row) = left_rows.first() {
+                            idx += row.len();
+                        }
+                    }
+
+                    if let Some(scan) = right_scan {
+                        let schema_name = scan.schema.unwrap_or(DEFAULT_SCHEMA);
+                        let table_name = scan.table;
+                        let alias = scan.alias.unwrap_or(table_name);
+                        let table_def = catalog.resolve_table_in_schema(scan.schema, table_name)?;
+                        let column_types: Vec<_> =
+                            table_def.columns().iter().map(|c| c.data_type()).collect();
+                        let storage_arc = file_manager.table_data(schema_name, table_name)?;
+                        let storage = storage_arc.read();
+                        let root_page = {
+                            use crate::storage::TableFileHeader;
+                            let page = storage.page(0)?;
+                            TableFileHeader::from_bytes(page)?.root_page()
+                        };
+                        let mut source = StreamingBTreeSource::from_btree_scan_with_projections(
+                            &storage,
+                            root_page,
+                            column_types,
+                            None,
+                        )?;
+                        while let Some(row) = source.next_row()? {
+                            right_rows.push(row.iter().map(OwnedValue::from).collect());
+                        }
+                        for col in table_def.columns() {
+                            column_map.push((col.name().to_lowercase(), idx));
+                            column_map.push((format!("{}.{}", alias, col.name()).to_lowercase(), idx));
+                            if scan.alias.is_some() {
+                                column_map.push((format!("{}.{}", table_name, col.name()).to_lowercase(), idx));
+                            }
+                            idx += 1;
+                        }
+                    } else if let Some(nested) = right_nested {
+                        let (rows, nested_col_map) = execute_nested_join_recursive(nested, catalog, file_manager)?;
+                        right_rows = rows;
+                        for (name, nested_idx) in nested_col_map {
+                            column_map.push((name, idx + nested_idx));
+                        }
+                    }
+
+                    let condition_predicate = nested_join.condition.map(|c| {
+                        crate::sql::predicate::CompiledPredicate::new(c, column_map.clone())
+                    });
+
+                    let mut result_rows: Vec<Vec<OwnedValue>> = Vec::new();
+                    for left_row in &left_rows {
+                        for right_row in &right_rows {
+                            let mut combined: Vec<OwnedValue> = left_row.clone();
+                            combined.extend(right_row.iter().cloned());
+
+                            let passes = if let Some(ref pred) = condition_predicate {
+                                let values: smallvec::SmallVec<[Value<'_>; 16]> =
+                                    combined.iter().map(|v| v.to_value()).collect();
+                                let row_ref = ExecutorRow::new(&values);
+                                pred.evaluate(&row_ref)
+                            } else {
+                                true
+                            };
+
+                            if passes {
+                                result_rows.push(combined);
+                            }
+                        }
+                    }
+
+                    Ok((result_rows, column_map))
+                }
+
                 let (left_op, right_op, join_type, condition, join_keys) = match plan_source {
                     Some(PlanSource::NestedLoopJoin(j)) => {
                         (j.left, j.right, j.join_type, j.condition, &[][..])
@@ -1445,6 +2011,8 @@ impl Database {
                 let right_subq = find_subquery_in_join(right_op);
                 let left_scan = find_scan_in_join(left_op);
                 let right_scan = find_scan_in_join(right_op);
+                let left_nested_join = find_nested_join(left_op);
+                let right_nested_join = find_nested_join(right_op);
 
                 let mut left_rows: Vec<Vec<OwnedValue>> = Vec::new();
                 let mut right_rows: Vec<Vec<OwnedValue>> = Vec::new();
@@ -1456,6 +2024,9 @@ impl Database {
                 let mut right_table_name: Option<&str> = None;
                 let mut right_alias: Option<&str> = None;
                 let mut right_schema: Option<&str> = None;
+
+                let mut left_nested_join_column_map: Vec<(String, usize)> = Vec::new();
+                let mut right_nested_join_column_map: Vec<(String, usize)> = Vec::new();
 
                 if let Some(subq) = left_subq {
                     left_rows = execute_subquery_recursive(subq, catalog, file_manager)?;
@@ -1482,9 +2053,14 @@ impl Database {
                         table_def.columns().iter().map(|c| c.data_type()).collect();
                     let storage_arc = file_manager.table_data(schema_name, table_name)?;
                     let storage = storage_arc.read();
+                    let root_page = {
+                        use crate::storage::TableFileHeader;
+                        let page = storage.page(0)?;
+                        TableFileHeader::from_bytes(page)?.root_page()
+                    };
                     let source = StreamingBTreeSource::from_btree_scan_with_projections(
                         &storage,
-                        1,
+                        root_page,
                         column_types.clone(),
                         None,
                     )?;
@@ -1492,6 +2068,9 @@ impl Database {
                     while let Some(row) = cursor.next_row()? {
                         left_rows.push(row.iter().map(OwnedValue::from).collect());
                     }
+                } else if let Some(nested_join) = left_nested_join {
+                    (left_rows, left_nested_join_column_map) =
+                        execute_nested_join_recursive(nested_join, catalog, file_manager)?;
                 }
 
                 if let Some(subq) = right_subq {
@@ -1520,9 +2099,14 @@ impl Database {
                         table_def.columns().iter().map(|c| c.data_type()).collect();
                     let storage_arc = file_manager.table_data(schema_name, table_name)?;
                     let storage = storage_arc.read();
+                    let root_page = {
+                        use crate::storage::TableFileHeader;
+                        let page = storage.page(0)?;
+                        TableFileHeader::from_bytes(page)?.root_page()
+                    };
                     let source = StreamingBTreeSource::from_btree_scan_with_projections(
                         &storage,
-                        1,
+                        root_page,
                         column_types.clone(),
                         None,
                     )?;
@@ -1531,6 +2115,10 @@ impl Database {
                         right_rows.push(row.iter().map(OwnedValue::from).collect());
                     }
                     right_col_count = column_types.len();
+                } else if let Some(nested_join) = right_nested_join {
+                    (right_rows, right_nested_join_column_map) =
+                        execute_nested_join_recursive(nested_join, catalog, file_manager)?;
+                    right_col_count = right_rows.first().map(|r| r.len()).unwrap_or(0);
                 }
 
                 let mut join_column_map: Vec<(String, usize)> = Vec::new();
@@ -1555,6 +2143,11 @@ impl Database {
                         }
                         idx += 1;
                     }
+                } else if !left_nested_join_column_map.is_empty() {
+                    for (name, nested_idx) in &left_nested_join_column_map {
+                        join_column_map.push((name.clone(), idx + nested_idx));
+                    }
+                    idx += left_rows.first().map(|r| r.len()).unwrap_or(0);
                 }
 
                 if let Some(subq) = right_subq {
@@ -1575,6 +2168,10 @@ impl Database {
                                 .push((format!("{}.{}", alias, col.name()).to_lowercase(), idx));
                         }
                         idx += 1;
+                    }
+                } else if !right_nested_join_column_map.is_empty() {
+                    for (name, nested_idx) in &right_nested_join_column_map {
+                        join_column_map.push((name.clone(), idx + nested_idx));
                     }
                 }
 
@@ -1600,6 +2197,8 @@ impl Database {
                     subq.output_schema.columns.len()
                 } else if let Some(table_name) = left_table_name {
                     catalog.resolve_table_in_schema(left_schema, table_name).map(|t| t.columns().len()).unwrap_or(0)
+                } else if !left_nested_join_column_map.is_empty() {
+                    left_rows.first().map(|r| r.len()).unwrap_or(0)
                 } else {
                     0
                 };
@@ -2511,7 +3110,11 @@ impl Database {
                 })?;
             let storage = storage_arc.read();
 
-            let root_page = 1u32;
+            let root_page = {
+                use crate::storage::TableFileHeader;
+                let page = storage.page(0)?;
+                TableFileHeader::from_bytes(page)?.root_page()
+            };
             let source = StreamingBTreeSource::from_btree_scan_with_projections(
                 &storage,
                 root_page,

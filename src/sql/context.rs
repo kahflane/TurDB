@@ -1,9 +1,11 @@
 use bumpalo::Bump;
+use crate::types::OwnedValue;
 
 pub struct ExecutionContext<'a> {
     pub arena: &'a Bump,
     pub file_manager: Option<&'a mut crate::storage::FileManager>,
     pub catalog: Option<&'a crate::schema::Catalog>,
+    pub scalar_subquery_results: Option<hashbrown::HashMap<usize, OwnedValue>>,
 }
 
 impl<'a> ExecutionContext<'a> {
@@ -12,6 +14,16 @@ impl<'a> ExecutionContext<'a> {
             arena,
             file_manager: None,
             catalog: None,
+            scalar_subquery_results: None,
+        }
+    }
+
+    pub fn with_scalar_subqueries(arena: &'a Bump, results: hashbrown::HashMap<usize, OwnedValue>) -> Self {
+        Self {
+            arena,
+            file_manager: None,
+            catalog: None,
+            scalar_subquery_results: Some(results),
         }
     }
 
@@ -24,6 +36,7 @@ impl<'a> ExecutionContext<'a> {
             arena,
             file_manager: Some(file_manager),
             catalog: Some(catalog),
+            scalar_subquery_results: None,
         }
     }
 

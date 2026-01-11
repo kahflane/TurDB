@@ -82,8 +82,8 @@ use crate::sql::state::{
 };
 use crate::sql::util::{
     allocate_value_to_arena, clone_value_owned, clone_value_ref_to_arena, compare_values_for_sort,
-    compute_group_key_for_dynamic, encode_value_to_key, hash_keys, hash_keys_static, hash_value,
-    keys_match_static,
+    compute_group_key_for_dynamic, compute_group_key_from_exprs, encode_value_to_key,
+    evaluate_group_by_exprs, hash_keys, hash_keys_static, hash_value, keys_match_static,
 };
 use crate::types::Value;
 use bumpalo::Bump;
@@ -2604,12 +2604,22 @@ impl<'a, S: RowSource> Executor<'a> for DynamicExecutor<'a, S> {
             DynamicExecutor::HashAggregate(state) => {
                 if !state.computed {
                     while let Some(row) = state.child.next()? {
-                        let group_key = compute_group_key_for_dynamic(&row, &state.group_by);
-                        let group_values: Vec<Value<'static>> = state
-                            .group_by
-                            .iter()
-                            .map(|&col| row.get(col).map(clone_value_owned).unwrap_or(Value::Null))
-                            .collect();
+                        let (group_key, group_values) =
+                            if let Some(ref group_by_exprs) = state.group_by_exprs {
+                                let key = compute_group_key_from_exprs(&row, group_by_exprs);
+                                let values = evaluate_group_by_exprs(&row, group_by_exprs);
+                                (key, values)
+                            } else {
+                                let key = compute_group_key_for_dynamic(&row, &state.group_by);
+                                let values: Vec<Value<'static>> = state
+                                    .group_by
+                                    .iter()
+                                    .map(|&col| {
+                                        row.get(col).map(clone_value_owned).unwrap_or(Value::Null)
+                                    })
+                                    .collect();
+                                (key, values)
+                            };
 
                         let entry = state.groups.entry(group_key).or_insert_with(|| {
                             let initial_states: Vec<AggregateState> = state
