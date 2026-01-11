@@ -81,6 +81,10 @@ use crate::database::timing::{INSERT_TIME_NS, PARSE_TIME_NS};
 /// Aggregate group state: group key hashes -> (accumulated group values, (count, sum) pairs for AVG)
 type AggregateGroups = HashMap<Vec<u64>, (Vec<OwnedValue>, Vec<(i64, f64)>)>;
 
+/// Default number of pre-allocated page buffers in the buffer pool.
+/// Sized to handle typical concurrent commit workloads without allocation.
+const DEFAULT_BUFFER_POOL_SIZE: usize = 16;
+
 pub(crate) struct SharedDatabase {
     pub(crate) path: PathBuf,
     pub(crate) file_manager: RwLock<Option<FileManager>>,
@@ -254,7 +258,7 @@ impl Database {
             hnsw_indexes: RwLock::new(hashbrown::HashMap::new()),
             memory_budget,
             mode: RwLock::new(mode),
-            page_buffer_pool: PageBufferPool::new(16), // Pre-allocate 16 page buffers
+            page_buffer_pool: PageBufferPool::new(DEFAULT_BUFFER_POOL_SIZE),
         });
 
         let db = Self {
@@ -328,7 +332,7 @@ impl Database {
             hnsw_indexes: RwLock::new(hashbrown::HashMap::new()),
             memory_budget: Arc::new(MemoryBudget::auto_detect()),
             mode: RwLock::new(super::DatabaseMode::ReadWrite),
-            page_buffer_pool: PageBufferPool::new(16), // Pre-allocate 16 page buffers
+            page_buffer_pool: PageBufferPool::new(DEFAULT_BUFFER_POOL_SIZE),
         });
 
         let db = Self {
