@@ -1760,6 +1760,16 @@ where
     }
 }
 
+/// Unified executor enum for dynamic dispatch of query operators.
+///
+/// ## Boxing Strategy
+///
+/// Certain variants use `Box` to reduce the overall enum size:
+/// - `GraceHashJoinState` is boxed because it contains large partition buffers
+/// - Recursive variants (`Filter`, `Project`, `ProjectExpr`) are boxed for the child
+///
+/// These are **one-time allocations per operator** during query planning, not per-row
+/// allocations during execution, so they comply with the zero-allocation-per-row goal.
 pub enum DynamicExecutor<'a, S: RowSource> {
     TableScan(TableScanExecutor<'a, S>),
     IndexScan(IndexScanState<'a>),
@@ -1774,6 +1784,7 @@ pub enum DynamicExecutor<'a, S: RowSource> {
     Sort(SortState<'a, S>),
     TopK(TopKState<'a, S>),
     NestedLoopJoin(NestedLoopJoinState<'a, S>),
+    /// Boxed to reduce enum size - GraceHashJoinState contains large partition buffers
     GraceHashJoin(Box<GraceHashJoinState<'a, S>>),
     HashSemiJoin(HashSemiJoinState<'a, S>),
     HashAntiJoin(HashAntiJoinState<'a, S>),
