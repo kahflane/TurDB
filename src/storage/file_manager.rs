@@ -107,6 +107,7 @@ use std::path::{Path, PathBuf};
 
 use eyre::{ensure, Result, WrapErr};
 
+use super::driver::StorageKind;
 use super::{MmapStorage, PAGE_SIZE};
 use parking_lot::RwLock;
 use std::sync::Arc;
@@ -272,14 +273,28 @@ impl<K: Clone + Eq + std::hash::Hash, V> LruFileCache<K, V> {
 pub struct FileManager {
     base_path: PathBuf,
     max_open_files: usize,
+    storage_kind: StorageKind,
     meta_storage: MmapStorage,
     open_files: LruFileCache<FileKey, Arc<RwLock<MmapStorage>>>,
 }
 
 impl FileManager {
     pub fn open<P: AsRef<Path>>(path: P, max_open_files: usize) -> Result<Self> {
-        let base_path = path.as_ref().to_path_buf();
+        Self::open_with_storage(StorageKind::mmap(path.as_ref()), max_open_files)
+    }
+
+    /// Opens an existing database with the specified storage kind.
+    ///
+    /// Currently only `StorageKind::Mmap` is supported on native platforms.
+    /// WASM support via `StorageKind::Opfs` will be added in a future release.
+    pub fn open_with_storage(storage_kind: StorageKind, max_open_files: usize) -> Result<Self> {
         let max_open_files = max_open_files.max(MIN_MAX_OPEN_FILES);
+
+        let base_path = match &storage_kind {
+            StorageKind::Mmap { path } => path.clone(),
+            #[cfg(target_arch = "wasm32")]
+            StorageKind::Opfs { name } => PathBuf::from(name),
+        };
 
         ensure!(
             base_path.exists(),
@@ -308,14 +323,28 @@ impl FileManager {
         Ok(Self {
             base_path,
             max_open_files,
+            storage_kind,
             meta_storage,
             open_files: LruFileCache::new(max_open_files),
         })
     }
 
     pub fn create<P: AsRef<Path>>(path: P, max_open_files: usize) -> Result<Self> {
-        let base_path = path.as_ref().to_path_buf();
+        Self::create_with_storage(StorageKind::mmap(path.as_ref()), max_open_files)
+    }
+
+    /// Creates a new database with the specified storage kind.
+    ///
+    /// Currently only `StorageKind::Mmap` is supported on native platforms.
+    /// WASM support via `StorageKind::Opfs` will be added in a future release.
+    pub fn create_with_storage(storage_kind: StorageKind, max_open_files: usize) -> Result<Self> {
         let max_open_files = max_open_files.max(MIN_MAX_OPEN_FILES);
+
+        let base_path = match &storage_kind {
+            StorageKind::Mmap { path } => path.clone(),
+            #[cfg(target_arch = "wasm32")]
+            StorageKind::Opfs { name } => PathBuf::from(name),
+        };
 
         fs::create_dir_all(&base_path).wrap_err_with(|| {
             format!(
@@ -349,9 +378,15 @@ impl FileManager {
         Ok(Self {
             base_path,
             max_open_files,
+            storage_kind,
             meta_storage,
             open_files: LruFileCache::new(max_open_files),
         })
+    }
+
+    /// Returns the storage kind used by this FileManager.
+    pub fn storage_kind(&self) -> &StorageKind {
+        &self.storage_kind
     }
 
     pub fn base_path(&self) -> &Path {

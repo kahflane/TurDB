@@ -178,6 +178,23 @@ impl SharedDatabase {
 }
 
 impl Database {
+    /// Creates a new `DatabaseBuilder` for configuring database options.
+    ///
+    /// Use the builder pattern to configure storage kind, memory budget,
+    /// and other settings before opening the database.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let db = Database::builder()
+    ///     .path("./mydb")
+    ///     .memory_budget(64 * 1024 * 1024)
+    ///     .open()?;
+    /// ```
+    pub fn builder() -> super::DatabaseBuilder {
+        super::DatabaseBuilder::new()
+    }
+
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
         Self::open_with_recovery(path).map(|(db, _)| db)
     }

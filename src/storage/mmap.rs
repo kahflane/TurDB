@@ -100,6 +100,7 @@ use std::path::Path;
 use eyre::{ensure, Result, WrapErr};
 use memmap2::MmapMut;
 
+use super::driver::StorageDriver;
 use super::PAGE_SIZE;
 
 #[derive(Debug)]
@@ -283,5 +284,214 @@ impl MmapStorage {
                 libc::MADV_WILLNEED,
             );
         }
+    }
+}
+
+impl StorageDriver for MmapStorage {
+    fn read_page(&self, page_no: u32, buf: &mut [u8; PAGE_SIZE]) -> Result<()> {
+        let page = self.page(page_no)?;
+        buf.copy_from_slice(page);
+        Ok(())
+    }
+
+    fn write_page(&mut self, page_no: u32, data: &[u8; PAGE_SIZE]) -> Result<()> {
+        let page = self.page_mut(page_no)?;
+        page.copy_from_slice(data);
+        Ok(())
+    }
+
+    fn grow(&mut self, new_page_count: u32) -> Result<()> {
+        MmapStorage::grow(self, new_page_count)
+    }
+
+    fn page_count(&self) -> u32 {
+        MmapStorage::page_count(self)
+    }
+
+    fn sync(&self) -> Result<()> {
+        MmapStorage::sync(self)
+    }
+
+    fn supports_zero_copy(&self) -> bool {
+        true
+    }
+
+    fn page_direct(&self, page_no: u32) -> Option<Result<&[u8]>> {
+        Some(self.page(page_no))
+    }
+
+    fn page_direct_mut(&mut self, page_no: u32) -> Option<Result<&mut [u8]>> {
+        Some(self.page_mut(page_no))
+    }
+
+    fn prefetch(&self, start_page: u32, count: u32) {
+        self.prefetch_pages(start_page, count)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    #[test]
+    fn storage_driver_read_page_returns_correct_data() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.db");
+
+        let mut storage = MmapStorage::create(&path, 2).unwrap();
+
+        let test_pattern: [u8; PAGE_SIZE] = {
+            let mut arr = [0u8; PAGE_SIZE];
+            for (i, byte) in arr.iter_mut().enumerate() {
+                *byte = (i % 256) as u8;
+            }
+            arr
+        };
+        storage.page_mut(0).unwrap().copy_from_slice(&test_pattern);
+
+        let mut buf = [0u8; PAGE_SIZE];
+        StorageDriver::read_page(&storage, 0, &mut buf).unwrap();
+
+        assert_eq!(buf, test_pattern);
+    }
+
+    #[test]
+    fn storage_driver_write_page_persists_data() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.db");
+
+        let mut storage = MmapStorage::create(&path, 2).unwrap();
+
+        let test_data: [u8; PAGE_SIZE] = {
+            let mut arr = [0u8; PAGE_SIZE];
+            arr[0] = 0xDE;
+            arr[1] = 0xAD;
+            arr[2] = 0xBE;
+            arr[3] = 0xEF;
+            arr
+        };
+
+        StorageDriver::write_page(&mut storage, 0, &test_data).unwrap();
+        StorageDriver::sync(&storage).unwrap();
+
+        let page = storage.page(0).unwrap();
+        assert_eq!(&page[0..4], &[0xDE, 0xAD, 0xBE, 0xEF]);
+    }
+
+    #[test]
+    fn storage_driver_grow_increases_page_count() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.db");
+
+        let mut storage = MmapStorage::create(&path, 1).unwrap();
+        assert_eq!(StorageDriver::page_count(&storage), 1);
+
+        StorageDriver::grow(&mut storage, 5).unwrap();
+        assert_eq!(StorageDriver::page_count(&storage), 5);
+    }
+
+    #[test]
+    fn storage_driver_supports_zero_copy_returns_true() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.db");
+
+        let storage = MmapStorage::create(&path, 1).unwrap();
+
+        assert!(StorageDriver::supports_zero_copy(&storage));
+    }
+
+    #[test]
+    fn storage_driver_page_direct_returns_valid_slice() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.db");
+
+        let mut storage = MmapStorage::create(&path, 2).unwrap();
+        storage.page_mut(0).unwrap()[0] = 42;
+
+        let result = StorageDriver::page_direct(&storage, 0);
+        assert!(result.is_some());
+
+        let page = result.unwrap().unwrap();
+        assert_eq!(page[0], 42);
+        assert_eq!(page.len(), PAGE_SIZE);
+    }
+
+    #[test]
+    fn storage_driver_page_direct_mut_allows_modification() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.db");
+
+        let mut storage = MmapStorage::create(&path, 2).unwrap();
+
+        {
+            let result = StorageDriver::page_direct_mut(&mut storage, 0);
+            assert!(result.is_some());
+            let page = result.unwrap().unwrap();
+            page[0] = 99;
+        }
+
+        let page = storage.page(0).unwrap();
+        assert_eq!(page[0], 99);
+    }
+
+    #[test]
+    fn storage_driver_read_page_out_of_bounds_fails() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.db");
+
+        let storage = MmapStorage::create(&path, 2).unwrap();
+
+        let mut buf = [0u8; PAGE_SIZE];
+        let result = StorageDriver::read_page(&storage, 100, &mut buf);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn storage_driver_write_page_out_of_bounds_fails() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.db");
+
+        let mut storage = MmapStorage::create(&path, 2).unwrap();
+
+        let data = [0u8; PAGE_SIZE];
+        let result = StorageDriver::write_page(&mut storage, 100, &data);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn storage_driver_multiple_page_operations() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.db");
+
+        let mut storage = MmapStorage::create(&path, 5).unwrap();
+
+        for i in 0..5u32 {
+            let mut data = [0u8; PAGE_SIZE];
+            data[0] = i as u8;
+            data[PAGE_SIZE - 1] = (i * 2) as u8;
+            StorageDriver::write_page(&mut storage, i, &data).unwrap();
+        }
+
+        for i in 0..5u32 {
+            let mut buf = [0u8; PAGE_SIZE];
+            StorageDriver::read_page(&storage, i, &mut buf).unwrap();
+            assert_eq!(buf[0], i as u8);
+            assert_eq!(buf[PAGE_SIZE - 1], (i * 2) as u8);
+        }
+    }
+
+    #[test]
+    fn storage_driver_sync_does_not_fail() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.db");
+
+        let mut storage = MmapStorage::create(&path, 1).unwrap();
+
+        let data = [42u8; PAGE_SIZE];
+        StorageDriver::write_page(&mut storage, 0, &data).unwrap();
+
+        let result = StorageDriver::sync(&storage);
+        assert!(result.is_ok());
     }
 }

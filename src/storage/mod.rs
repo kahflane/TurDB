@@ -85,16 +85,20 @@
 //! - Windows (CreateFileMapping/MapViewOfFile)
 
 mod cache;
+mod driver;
 mod file_manager;
 mod freelist;
 mod headers;
 mod mmap;
+#[cfg(target_arch = "wasm32")]
+mod opfs;
 mod page;
 pub mod toast;
 mod wal;
 mod wal_storage;
 
-pub use cache::{PageCache, PageKey, PageRef};
+pub use cache::{DirectOrCached, PageCache, PageKey, PageRef};
+pub use driver::{AnyStorage, StorageDriver, StorageKind};
 pub use file_manager::{
     FileKey, FileManager, LruFileCache, TableFiles, CATALOG_FILE_NAME, DEFAULT_MAX_OPEN_FILES,
     DEFAULT_SCHEMA, HNSW_FILE_EXTENSION, HNSW_MAGIC, INDEX_FILE_EXTENSION, MIN_MAX_OPEN_FILES,

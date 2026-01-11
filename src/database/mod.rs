@@ -88,6 +88,7 @@
 //! - Insert: > 100K rows/sec
 //! - Query planning: < 100µs for simple queries
 
+mod builder;
 mod convert;
 #[allow(clippy::module_inception)]
 mod database;
@@ -109,6 +110,7 @@ mod toast;
 mod transaction;
 pub(crate) mod query;
 
+pub use builder::DatabaseBuilder;
 pub use database::Database;
 pub use prepared::{BoundStatement, PreparedStatement};
 pub use row::Row;

@@ -595,6 +595,88 @@ impl Drop for PageRef<'_> {
     }
 }
 
+/// Represents page data that is either accessed directly (zero-copy) or through the cache.
+///
+/// This enum enables the PageCache to provide zero-copy access when the underlying
+/// storage supports it (e.g., mmap), while falling back to cached access for
+/// storage backends that don't support direct memory access (e.g., OPFS).
+///
+/// ## Zero-Copy Path (Mmap)
+///
+/// When the storage supports zero-copy (`supports_zero_copy() == true`), `Direct`
+/// variant is returned, providing a direct slice into the mmap region. This path
+/// avoids any memory copies and has zero runtime overhead.
+///
+/// ## Cached Path (OPFS)
+///
+/// When the storage doesn't support zero-copy, data is copied into the PageCache
+/// buffer, and `Cached` variant is returned. The PageRef provides the same interface
+/// but with an additional memory copy.
+pub enum DirectOrCached<'a> {
+    /// Direct access to page data (zero-copy, mmap only).
+    Direct(&'a [u8]),
+    /// Cached access to page data (buffered copy).
+    Cached(PageRef<'a>),
+}
+
+impl<'a> DirectOrCached<'a> {
+    /// Returns a reference to the page data, regardless of access method.
+    pub fn data(&self) -> &[u8] {
+        match self {
+            DirectOrCached::Direct(slice) => slice,
+            DirectOrCached::Cached(page_ref) => page_ref.data(),
+        }
+    }
+
+    /// Returns true if this is a direct (zero-copy) access.
+    pub fn is_direct(&self) -> bool {
+        matches!(self, DirectOrCached::Direct(_))
+    }
+
+    /// Returns true if this is a cached access.
+    pub fn is_cached(&self) -> bool {
+        matches!(self, DirectOrCached::Cached(_))
+    }
+}
+
+impl PageCache {
+    /// Returns page data using zero-copy access if available, otherwise through the cache.
+    ///
+    /// This method checks if the storage supports zero-copy access via `page_direct()`.
+    /// If so, it returns a direct slice into the storage. Otherwise, it loads the page
+    /// into the cache using `read_page()`.
+    ///
+    /// ## Arguments
+    ///
+    /// * `key` - The page key identifying the file and page number
+    /// * `storage` - The storage driver to read from
+    ///
+    /// ## Returns
+    ///
+    /// `DirectOrCached::Direct` for mmap storage (zero-copy), or
+    /// `DirectOrCached::Cached` for other storage backends (copy through cache).
+    pub fn get_direct<'a, S: super::driver::StorageDriver>(
+        &'a self,
+        key: PageKey,
+        storage: &'a S,
+    ) -> eyre::Result<DirectOrCached<'a>> {
+        if storage.supports_zero_copy() {
+            if let Some(result) = storage.page_direct(key.page_no) {
+                return Ok(DirectOrCached::Direct(result?));
+            }
+        }
+
+        let page_ref = self.get_or_insert(key, |buf| {
+            let buf_array: &mut [u8; PAGE_SIZE] = buf.try_into().map_err(|_| {
+                eyre::eyre!("buffer size mismatch: expected {} bytes", PAGE_SIZE)
+            })?;
+            storage.read_page(key.page_no, buf_array)
+        })?;
+
+        Ok(DirectOrCached::Cached(page_ref))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
