@@ -698,7 +698,8 @@ mod reproduction_test {
 
         // Insert 500 keys: 0, 2, 4, ... 998.
         for i in (0..500).step_by(2) {
-            let key_val = (i as u64).to_be_bytes(); // 8 bytes
+            // 8 bytes big-endian key
+            let key_val = (i as u64).to_be_bytes();
             {
                 let mut leaf = LeafNodeMut::from_page(&mut page)?;
                 match leaf.insert_cell(&key_val, b"val") {

@@ -36,6 +36,7 @@ const QDRANT_COLLECTION: &str = "turdb_comparison";
 
 const EMBEDDINGS_PATH: &str = "testdata/embeddings_1k.json";
 const K: usize = 50;
+#[allow(dead_code)]
 const MIN_RECALL: f32 = 0.80;
 
 #[derive(Debug, Deserialize)]
@@ -55,6 +56,7 @@ struct EmbeddingsFile {
     #[allow(dead_code)]
     texts: Vec<String>,
     vectors: Vec<Vec<f64>>,
+    #[allow(dead_code)]
     query_indices: Vec<usize>,
 }
 

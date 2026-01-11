@@ -252,7 +252,7 @@ impl ConstantFoldingRule {
                 }
                 BinaryOperator::Eq => {
                     if let (Expr::Literal(l), Expr::Literal(r)) = (*left, *right) {
-                        Some(if literals_equal(&l, &r) {
+                        Some(if literals_equal(l, r) {
                             FoldedPredicate::AlwaysTrue
                         } else {
                             FoldedPredicate::AlwaysFalse
@@ -263,7 +263,7 @@ impl ConstantFoldingRule {
                 }
                 BinaryOperator::NotEq => {
                     if let (Expr::Literal(l), Expr::Literal(r)) = (*left, *right) {
-                        Some(if literals_equal(&l, &r) {
+                        Some(if literals_equal(l, r) {
                             FoldedPredicate::AlwaysFalse
                         } else {
                             FoldedPredicate::AlwaysTrue

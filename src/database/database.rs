@@ -47,7 +47,7 @@ use crate::database::query::{
 use crate::database::row::Row;
 use crate::database::transaction::ActiveTransaction;
 use crate::database::{ExecuteResult, RecoveryInfo};
-use crate::memory::{MemoryBudget, Pool};
+use crate::memory::{MemoryBudget, PageBufferPool, Pool};
 use crate::mvcc::TransactionManager;
 
 use crate::schema::Catalog;
@@ -73,9 +73,13 @@ use parking_lot::{Mutex, RwLock};
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering as AtomicOrdering;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::database::timing::{INSERT_TIME_NS, PARSE_TIME_NS};
+
+/// Aggregate group state: group key hashes -> (accumulated group values, (count, sum) pairs for AVG)
+type AggregateGroups = HashMap<Vec<u64>, (Vec<OwnedValue>, Vec<(i64, f64)>)>;
 
 pub(crate) struct SharedDatabase {
     pub(crate) path: PathBuf,
@@ -105,6 +109,8 @@ pub(crate) struct SharedDatabase {
     pub(crate) memory_budget: Arc<MemoryBudget>,
     /// Current database operating mode (ReadWrite or ReadOnlyDegraded)
     pub(crate) mode: RwLock<super::DatabaseMode>,
+    /// Pre-allocated buffer pool for zero-allocation commit operations
+    pub(crate) page_buffer_pool: PageBufferPool,
 }
 
 pub struct Database {
@@ -248,6 +254,7 @@ impl Database {
             hnsw_indexes: RwLock::new(hashbrown::HashMap::new()),
             memory_budget,
             mode: RwLock::new(mode),
+            page_buffer_pool: PageBufferPool::new(16), // Pre-allocate 16 page buffers
         });
 
         let db = Self {
@@ -321,6 +328,7 @@ impl Database {
             hnsw_indexes: RwLock::new(hashbrown::HashMap::new()),
             memory_budget: Arc::new(MemoryBudget::auto_detect()),
             mode: RwLock::new(super::DatabaseMode::ReadWrite),
+            page_buffer_pool: PageBufferPool::new(16), // Pre-allocate 16 page buffers
         });
 
         let db = Self {
@@ -371,8 +379,8 @@ impl Database {
 
             let table_count = catalog
                 .schemas()
-                .iter()
-                .map(|(_, schema)| schema.tables().len())
+                .values()
+                .map(|schema| schema.tables().len())
                 .sum::<usize>();
             let estimated_schema_memory = table_count * 1024;
             let _ = self
@@ -2177,8 +2185,7 @@ impl Database {
                         })
                         .collect();
 
-                    let mut groups: HashMap<Vec<u64>, (Vec<OwnedValue>, Vec<(i64, f64)>)> =
-                        HashMap::new();
+                    let mut groups: AggregateGroups = HashMap::new();
 
                     for row in &result_rows {
                         let group_key: Vec<u64> = group_by_indices

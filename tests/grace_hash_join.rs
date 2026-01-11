@@ -26,6 +26,7 @@ fn create_test_db() -> (Database, TempDir) {
     (db, temp_dir)
 }
 
+#[allow(dead_code)]
 trait ValueExt {
     fn is_null(&self) -> bool;
     fn as_int(&self) -> Option<i64>;
@@ -220,7 +221,7 @@ fn right_join_includes_unmatched_right_rows() {
 
     let null_customer_rows: Vec<_> = rows
         .iter()
-        .filter(|r| r.values.get(0).map(|v| v.is_null()).unwrap_or(false))
+        .filter(|r| r.values.first().map(|v| v.is_null()).unwrap_or(false))
         .collect();
     assert_eq!(
         null_customer_rows.len(),
@@ -353,7 +354,7 @@ fn large_join_completes_successfully() {
 
     let count = rows
         .first()
-        .and_then(|r| r.values.get(0))
+        .and_then(|r| r.values.first())
         .and_then(|v| v.as_int())
         .unwrap_or(0);
     assert_eq!(count, 10000, "Should have 1000 * 10 = 10000 joined rows");

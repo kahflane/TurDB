@@ -72,5 +72,7 @@
 //! - `PRAGMA wal_checkpoint_threshold` - Get/set auto-checkpoint frame count
 
 mod budget;
+mod page_buffer;
 
 pub use budget::{BudgetStats, MemoryBudget, MemoryError, Pool};
+pub use page_buffer::{PageBufferPool, PooledPageBuffer};

@@ -117,6 +117,7 @@ use crate::storage::IndexFileHeader;
 use eyre::{bail, Result, WrapErr};
 use smallvec::SmallVec;
 
+use super::group_commit::CommitPayload;
 use super::{Database, ExecuteResult};
 
 /// Named checkpoint within a transaction for partial rollback.
@@ -290,7 +291,7 @@ impl Database {
             // then submit the data to the group commit queue.
 
             let dirty_table_ids = self.shared.dirty_tracker.all_dirty_table_ids();
-            let mut payload: SmallVec<[(u32, u32, Vec<u8>, u32); 4]> = SmallVec::new();
+            let mut payload: CommitPayload = SmallVec::new();
 
             if !dirty_table_ids.is_empty() {
                 // To safely capture data, we need file manager access to get storage
@@ -332,7 +333,9 @@ impl Database {
 
                         for page_no in pages_to_flush {
                             if let Ok(data) = storage.page(page_no) {
-                                payload.push((table_id, page_no, data.to_vec(), db_size));
+                                let mut buffer = self.shared.page_buffer_pool.acquire();
+                                buffer.copy_from_page(data);
+                                payload.push((table_id, page_no, buffer, db_size));
                             }
                         }
                     }
@@ -373,8 +376,8 @@ impl Database {
                     .as_mut()
                     .ok_or_else(|| eyre::eyre!("WAL not initialized but WAL mode is enabled"))?;
 
-                for (table_id, page_no, data, db_size) in payload {
-                    wal.write_frame_with_file_id(page_no, db_size, &data, table_id as u64)
+                for (table_id, page_no, buffer, db_size) in payload {
+                    wal.write_frame_with_file_id(page_no, db_size, buffer.as_slice(), table_id as u64)
                         .wrap_err("failed to write WAL frame in direct commit")?;
                 }
             }
@@ -395,8 +398,8 @@ impl Database {
             .ok_or_else(|| eyre::eyre!("WAL not initialized but WAL mode is enabled"))?;
 
         for commit in pending_commits {
-            for (table_id, page_no, data, db_size) in &commit.payload {
-                wal.write_frame_with_file_id(*page_no, *db_size, data, *table_id as u64)
+            for (table_id, page_no, buffer, db_size) in &commit.payload {
+                wal.write_frame_with_file_id(*page_no, *db_size, buffer.as_slice(), *table_id as u64)
                     .wrap_err("failed to write WAL frame in group commit")?;
             }
         }
@@ -439,7 +442,7 @@ impl Database {
         let schema_name = DEFAULT_SCHEMA;
         let table_name = table_def.name();
 
-        let table_storage_arc = file_manager.table_data_mut(&schema_name, table_name)?;
+        let table_storage_arc = file_manager.table_data_mut(schema_name, table_name)?;
         let mut table_storage = table_storage_arc.write();
 
         let btree = BTree::new(&mut *table_storage, 1)?;

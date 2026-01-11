@@ -473,7 +473,7 @@ impl Database {
                 };
 
                 let table_reader =
-                    crate::btree::BTreeReader::new(&*table_storage, table_root_page)?;
+                    crate::btree::BTreeReader::new(&table_storage, table_root_page)?;
 
                 let mut key_buffer: Vec<u8> = Vec::new();
                 let mut entries: Vec<(u32, u16, [u8; 8])> = Vec::new();

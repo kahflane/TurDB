@@ -639,8 +639,8 @@ fn get_local_timezone_offset() -> i64 {
         use std::mem::MaybeUninit;
         let mut tm = MaybeUninit::<libc::tm>::uninit();
         let time_t = now as libc::time_t;
+        // SAFETY: localtime_r is thread-safe and tm is properly initialized
         unsafe {
-            // SAFETY: localtime_r is thread-safe and tm is properly initialized
             if libc::localtime_r(&time_t, tm.as_mut_ptr()).is_null() {
                 return 0;
             }

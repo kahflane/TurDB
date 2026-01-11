@@ -663,7 +663,7 @@ mod tests {
             OwnedValue::Null,
             OwnedValue::Bool(true),
             OwnedValue::Int(42),
-            OwnedValue::Float(3.14),
+            OwnedValue::Float(2.72),
             OwnedValue::Text("hello".to_string()),
             OwnedValue::Blob(vec![1, 2, 3]),
             OwnedValue::Vector(vec![1.0, 2.0, 3.0]),

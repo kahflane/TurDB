@@ -96,8 +96,10 @@ pub fn cosine_scalar(a: &[f32], b: &[f32]) -> f32 {
     1.0 - (dot / norm_product)
 }
 
-// SAFETY: Caller must ensure slices a and b have equal length.
-// Requires x86_64 CPU with AVX2 and FMA support (checked via target_feature).
+/// # Safety
+///
+/// Caller must ensure slices a and b have equal length.
+/// Requires x86_64 CPU with AVX2 and FMA support (checked via target_feature).
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2", enable = "fma")]
 pub unsafe fn euclidean_squared_avx2(a: &[f32], b: &[f32]) -> f32 {
@@ -126,9 +128,11 @@ pub unsafe fn euclidean_squared_avx2(a: &[f32], b: &[f32]) -> f32 {
     result
 }
 
-// SAFETY: Caller must ensure slices a and b have equal length.
-// Requires x86_64 CPU with AVX2 and FMA support (checked via target_feature).
-// Delegates to euclidean_squared_avx2 which performs the SIMD operations safely.
+/// # Safety
+///
+/// Caller must ensure slices a and b have equal length.
+/// Requires x86_64 CPU with AVX2 and FMA support (checked via target_feature).
+/// Delegates to euclidean_squared_avx2 which performs the SIMD operations safely.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2", enable = "fma")]
 pub unsafe fn euclidean_avx2(a: &[f32], b: &[f32]) -> f32 {
@@ -197,6 +201,10 @@ pub unsafe fn euclidean_neon(a: &[f32], b: &[f32]) -> f32 {
     euclidean_squared_neon(a, b).sqrt()
 }
 
+/// # Safety
+///
+/// Caller must ensure slices a and b have equal length.
+/// Requires x86_64 CPU with AVX2 and FMA support.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2", enable = "fma")]
 pub unsafe fn dot_product_avx2(a: &[f32], b: &[f32]) -> f32 {
@@ -223,12 +231,20 @@ pub unsafe fn dot_product_avx2(a: &[f32], b: &[f32]) -> f32 {
     result
 }
 
+/// # Safety
+///
+/// Caller must ensure slices a and b have equal length.
+/// Requires x86_64 CPU with AVX2 and FMA support.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2", enable = "fma")]
 pub unsafe fn inner_product_avx2(a: &[f32], b: &[f32]) -> f32 {
     -dot_product_avx2(a, b)
 }
 
+/// # Safety
+///
+/// Caller must ensure slices a and b have equal length.
+/// Requires x86_64 CPU with AVX2 and FMA support.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2", enable = "fma")]
 pub unsafe fn cosine_avx2(a: &[f32], b: &[f32]) -> f32 {
@@ -344,11 +360,12 @@ fn euclidean_squared_dispatch(a: &[f32], b: &[f32]) -> f32 {
         if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
             return unsafe { euclidean_squared_avx2(a, b) };
         }
-        return euclidean_squared_scalar(a, b);
+        euclidean_squared_scalar(a, b)
     }
 
     #[cfg(target_arch = "aarch64")]
     {
+        // SAFETY: NEON is always available on aarch64, slices a and b have equal length
         unsafe { euclidean_squared_neon(a, b) }
     }
 
@@ -368,11 +385,12 @@ fn cosine_dispatch(a: &[f32], b: &[f32]) -> f32 {
         if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
             return unsafe { cosine_avx2(a, b) };
         }
-        return cosine_scalar(a, b);
+        cosine_scalar(a, b)
     }
 
     #[cfg(target_arch = "aarch64")]
     {
+        // SAFETY: NEON is always available on aarch64, slices a and b have equal length
         unsafe { cosine_neon(a, b) }
     }
 
@@ -388,11 +406,12 @@ fn inner_product_dispatch(a: &[f32], b: &[f32]) -> f32 {
         if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
             return unsafe { inner_product_avx2(a, b) };
         }
-        return inner_product_scalar(a, b);
+        inner_product_scalar(a, b)
     }
 
     #[cfg(target_arch = "aarch64")]
     {
+        // SAFETY: NEON is always available on aarch64, slices a and b have equal length
         unsafe { inner_product_neon(a, b) }
     }
 

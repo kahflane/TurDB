@@ -717,7 +717,7 @@ impl Wal {
     pub fn rotate_segment(&self) -> Result<()> {
         let mut segment_guard = self.current_segment.lock();
         let current_sequence = segment_guard.sequence;
-        let old_path = segment_guard.path.clone(); // Assumption: WalSegment has path
+        let old_path = segment_guard.path.clone();
 
         let new_sequence = current_sequence + 1;
         let new_segment_path = self.dir.join(format!("wal.{:06}", new_sequence));

@@ -110,11 +110,11 @@ mod context_tests {
     fn test_context_unqualified_resolution() {
         let mut ctx = SubqueryContext::new();
         ctx.push_scope();
-        ctx.bind("table", "value", OwnedValue::Float(3.14));
+        ctx.bind("table", "value", OwnedValue::Float(2.72));
 
         let resolved = ctx.resolve(None, "value");
         assert!(resolved.is_some());
-        assert_eq!(*resolved.unwrap(), OwnedValue::Float(3.14));
+        assert_eq!(*resolved.unwrap(), OwnedValue::Float(2.72));
     }
 }
 

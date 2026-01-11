@@ -108,6 +108,16 @@ use eyre::{bail, Result};
 use smallvec::SmallVec;
 use std::sync::atomic::Ordering;
 
+/// FK child table info for cascading deletes:
+/// (schema_name, table_name, column_defs, fk_column_index, on_delete_action)
+type FkChildTableInfo = (
+    String,
+    String,
+    Vec<crate::schema::table::ColumnDef>,
+    usize,
+    Option<crate::schema::ReferentialAction>,
+);
+
 impl Database {
     pub(crate) fn execute_delete(
         &self,
@@ -203,13 +213,7 @@ impl Database {
             }
         }
 
-        let child_table_schemas: Vec<(
-            String,
-            String,
-            Vec<crate::schema::table::ColumnDef>,
-            usize,
-            Option<crate::schema::ReferentialAction>,
-        )> = fk_references
+        let child_table_schemas: Vec<FkChildTableInfo> = fk_references
             .iter()
             .map(|(schema_key, child_name, fk_col_name, _ref_col_idx, on_delete)| {
                 let child_def = catalog
