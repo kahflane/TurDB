@@ -224,6 +224,28 @@ pub struct GraceHashJoinState<'a, S: RowSource> {
     pub build_row_buf: SmallVec<[Value<'static>; 16]>,
 }
 
+pub struct HashSemiJoinState<'a, S: RowSource> {
+    pub left: Box<DynamicExecutor<'a, S>>,
+    pub right: Box<DynamicExecutor<'a, S>>,
+    pub left_key_indices: Vec<usize>,
+    pub right_key_indices: Vec<usize>,
+    pub arena: &'a Bump,
+    pub hash_table: hashbrown::HashSet<u64>,
+    pub built: bool,
+    pub left_col_count: usize,
+}
+
+pub struct HashAntiJoinState<'a, S: RowSource> {
+    pub left: Box<DynamicExecutor<'a, S>>,
+    pub right: Box<DynamicExecutor<'a, S>>,
+    pub left_key_indices: Vec<usize>,
+    pub right_key_indices: Vec<usize>,
+    pub arena: &'a Bump,
+    pub hash_table: hashbrown::HashSet<u64>,
+    pub built: bool,
+    pub left_col_count: usize,
+}
+
 pub struct IndexScanState<'a> {
     pub source: BTreeCursorAdapter,
     pub arena: &'a Bump,

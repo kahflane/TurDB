@@ -110,6 +110,22 @@ pub use row::Row;
 pub use timing::{get_batch_timing_stats, get_timing_stats, reset_timing_stats};
 pub use transaction::{ActiveTransaction, Savepoint};
 
+/// Database operating mode.
+///
+/// When a database has too many WAL frames to recover within the memory budget,
+/// it opens in `ReadOnlyDegraded` mode instead of failing. In this mode:
+/// - All write operations are blocked
+/// - Read operations work on potentially stale data (pre-WAL state)
+/// - User must explicitly run `PRAGMA recover_wal` to perform streaming recovery
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DatabaseMode {
+    /// Normal read-write mode - all operations available
+    ReadWrite,
+    /// Degraded read-only mode due to pending WAL recovery
+    /// The `pending_wal_frames` field indicates how many frames need recovery
+    ReadOnlyDegraded { pending_wal_frames: u32 },
+}
+
 #[derive(Debug)]
 pub enum ExecuteResult {
     CreateTable {
@@ -1731,7 +1747,7 @@ mod tests {
 
     #[test]
     fn test_create_index_with_expression() {
-        use crate::schema::IndexColumnDef;
+        use crate::schema::IndexColumnKind;
 
         let dir = tempdir().unwrap();
         let db_path = dir.path().join("test_db");
@@ -1765,7 +1781,7 @@ mod tests {
         let col_defs = idx.column_defs();
         assert_eq!(col_defs.len(), 1);
         assert!(
-            matches!(&col_defs[0], IndexColumnDef::Expression(e) if e.contains("LOWER")),
+            matches!(&col_defs[0].column_or_expr, IndexColumnKind::Expression(e) if e.contains("LOWER")),
             "First column should be LOWER expression, got: {:?}",
             col_defs[0]
         );
@@ -1773,7 +1789,7 @@ mod tests {
 
     #[test]
     fn test_create_index_with_mixed_columns_and_expressions() {
-        use crate::schema::IndexColumnDef;
+        use crate::schema::IndexColumnKind;
 
         let dir = tempdir().unwrap();
         let db_path = dir.path().join("test_db");
@@ -1802,11 +1818,11 @@ mod tests {
         let col_defs = idx.column_defs();
         assert_eq!(col_defs.len(), 2);
         assert!(
-            matches!(&col_defs[0], IndexColumnDef::Column(c) if c == "tenant_id"),
+            matches!(&col_defs[0].column_or_expr, IndexColumnKind::Column(c) if c == "tenant_id"),
             "First should be column tenant_id"
         );
         assert!(
-            matches!(&col_defs[1], IndexColumnDef::Expression(_)),
+            matches!(&col_defs[1].column_or_expr, IndexColumnKind::Expression(_)),
             "Second should be expression"
         );
     }
@@ -1850,7 +1866,7 @@ mod tests {
 
     #[test]
     fn test_create_partial_index_with_expression_and_where() {
-        use crate::schema::IndexColumnDef;
+        use crate::schema::IndexColumnKind;
 
         let dir = tempdir().unwrap();
         let db_path = dir.path().join("test_db");
@@ -1885,7 +1901,7 @@ mod tests {
         let col_defs = idx.column_defs();
         assert_eq!(col_defs.len(), 1);
         assert!(
-            matches!(&col_defs[0], IndexColumnDef::Expression(e) if e.contains("LOWER")),
+            matches!(&col_defs[0].column_or_expr, IndexColumnKind::Expression(e) if e.contains("LOWER")),
             "Should have LOWER expression"
         );
 
@@ -2606,6 +2622,114 @@ mod tests {
                 assert_eq!(rows.len(), 1);
             }
             _ => panic!("Expected Select result"),
+        }
+    }
+
+    #[test]
+    fn test_system_tables_queryable_with_schema_prefix() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("test_db");
+
+        let db = Database::create(&db_path).unwrap();
+
+        // Query memory_stats system table with fully qualified name
+        let result = db.execute("SELECT * FROM turdb_catalog.memory_stats");
+        assert!(
+            result.is_ok(),
+            "Should be able to query turdb_catalog.memory_stats: {:?}",
+            result.err()
+        );
+
+        // Query wal_stats system table
+        let result = db.execute("SELECT * FROM turdb_catalog.wal_stats");
+        assert!(
+            result.is_ok(),
+            "Should be able to query turdb_catalog.wal_stats: {:?}",
+            result.err()
+        );
+    }
+
+    #[test]
+    fn test_system_tables_persisted_across_reopens() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("test_db");
+
+        // Create database and verify system tables exist
+        {
+            let db = Database::create(&db_path).unwrap();
+            let result = db.execute("SELECT * FROM turdb_catalog.memory_stats");
+            assert!(result.is_ok(), "System tables should exist after create");
+        }
+
+        // Reopen and verify system tables still exist
+        {
+            let db = Database::open(&db_path).unwrap();
+            let result = db.execute("SELECT * FROM turdb_catalog.memory_stats");
+            assert!(
+                result.is_ok(),
+                "System tables should exist after reopen: {:?}",
+                result.err()
+            );
+        }
+    }
+
+    #[test]
+    fn test_persist_memory_stats_writes_to_system_table() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("test_db");
+        let db = Database::create(&db_path).unwrap();
+
+        // Write stats to system table
+        let result = db.persist_memory_stats();
+        assert!(result.is_ok(), "persist_memory_stats should succeed: {:?}", result.err());
+
+        // Query the stats back
+        let result = db.execute("SELECT stat_name, stat_value FROM turdb_catalog.memory_stats");
+        assert!(result.is_ok(), "Should be able to query stats: {:?}", result.err());
+
+        if let super::ExecuteResult::Select { rows, .. } = result.unwrap() {
+            assert!(!rows.is_empty(), "Should have stats rows after persist");
+            // Find the memory_budget_total stat
+            let budget_row = rows.iter().find(|r| {
+                if let Some(crate::types::OwnedValue::Text(name)) = r.values.first() {
+                    name == "memory_budget_total"
+                } else {
+                    false
+                }
+            });
+            assert!(budget_row.is_some(), "Should have memory_budget_total stat");
+        } else {
+            panic!("Expected SELECT result");
+        }
+    }
+
+    #[test]
+    fn test_stats_visible_across_sessions() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("test_db");
+
+        // First session: create db, persist stats
+        {
+            let db = Database::create(&db_path).unwrap();
+
+            // Write some stats
+            db.persist_memory_stats().unwrap();
+            db.persist_wal_stats().unwrap();
+        }
+
+        // Second session: open db, read stats
+        {
+            let db = Database::open(&db_path).unwrap();
+
+            // Query stats - should see data from first session
+            let result = db.execute("SELECT stat_name, stat_value FROM turdb_catalog.memory_stats WHERE stat_name = 'memory_budget_total'");
+            assert!(result.is_ok(), "Should be able to query stats: {:?}", result.err());
+
+            if let super::ExecuteResult::Select { rows, .. } = result.unwrap() {
+                assert!(!rows.is_empty(), "Should have stats from previous session");
+            } else {
+                panic!("Expected SELECT result");
+            }
         }
     }
 }

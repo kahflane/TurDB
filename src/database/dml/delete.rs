@@ -124,7 +124,7 @@ impl Database {
         let schema_name = delete.table.schema.unwrap_or(DEFAULT_SCHEMA);
         let table_name = delete.table.name;
 
-        let table_def = catalog.resolve_table(table_name)?;
+        let table_def = catalog.resolve_table_in_schema(delete.table.schema, table_name)?;
         let table_id = table_def.id();
         let columns = table_def.columns().to_vec();
         let has_toast = table_def.has_toast();

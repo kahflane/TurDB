@@ -6,8 +6,8 @@ use crate::sql::executor::{
 };
 use crate::sql::predicate::CompiledPredicate;
 use crate::sql::state::{
-    GraceHashJoinState, HashAggregateState, IndexScanState, LimitState, NestedLoopJoinState,
-    SortState, TopKState, WindowState,
+    GraceHashJoinState, HashAggregateState, HashAntiJoinState, HashSemiJoinState, IndexScanState,
+    LimitState, NestedLoopJoinState, SortState, TopKState, WindowState,
 };
 
 pub struct ExecutorBuilder<'a> {
@@ -473,9 +473,28 @@ impl<'a> ExecutorBuilder<'a> {
                     "GraceHashJoin requires two sources - use build_grace_hash_join instead"
                 )
             }
+            PhysicalOperator::HashSemiJoin(_) => {
+                eyre::bail!(
+                    "HashSemiJoin requires two sources - use build_hash_semi_join instead"
+                )
+            }
+            PhysicalOperator::HashAntiJoin(_) => {
+                eyre::bail!(
+                    "HashAntiJoin requires two sources - use build_hash_anti_join instead"
+                )
+            }
             PhysicalOperator::SubqueryExec(_) => Ok(DynamicExecutor::TableScan(
                 TableScanExecutor::new(source, self.ctx.arena),
             )),
+            PhysicalOperator::ScalarSubqueryExec(_) => {
+                eyre::bail!("ScalarSubqueryExec requires special handling")
+            }
+            PhysicalOperator::ExistsSubqueryExec(_) => {
+                eyre::bail!("ExistsSubqueryExec requires special handling")
+            }
+            PhysicalOperator::InListSubqueryExec(_) => {
+                eyre::bail!("InListSubqueryExec requires special handling")
+            }
             PhysicalOperator::WindowExec(window) => {
                 let child = self.build_operator(window.input, source, column_map)?;
                 Ok(DynamicExecutor::Window(WindowState::new_with_column_map(
@@ -587,6 +606,46 @@ impl<'a> ExecutorBuilder<'a> {
             query_id,
             probe_row_buf: smallvec::SmallVec::new(),
             build_row_buf: smallvec::SmallVec::new(),
+        }
+    }
+
+    pub fn build_hash_semi_join<S: RowSource>(
+        &self,
+        left: DynamicExecutor<'a, S>,
+        right: DynamicExecutor<'a, S>,
+        left_key_indices: Vec<usize>,
+        right_key_indices: Vec<usize>,
+        left_col_count: usize,
+    ) -> HashSemiJoinState<'a, S> {
+        HashSemiJoinState {
+            left: Box::new(left),
+            right: Box::new(right),
+            left_key_indices,
+            right_key_indices,
+            arena: self.ctx.arena,
+            hash_table: hashbrown::HashSet::new(),
+            built: false,
+            left_col_count,
+        }
+    }
+
+    pub fn build_hash_anti_join<S: RowSource>(
+        &self,
+        left: DynamicExecutor<'a, S>,
+        right: DynamicExecutor<'a, S>,
+        left_key_indices: Vec<usize>,
+        right_key_indices: Vec<usize>,
+        left_col_count: usize,
+    ) -> HashAntiJoinState<'a, S> {
+        HashAntiJoinState {
+            left: Box::new(left),
+            right: Box::new(right),
+            left_key_indices,
+            right_key_indices,
+            arena: self.ctx.arena,
+            hash_table: hashbrown::HashSet::new(),
+            built: false,
+            left_col_count,
         }
     }
 
@@ -812,6 +871,21 @@ impl<'a> ExecutorBuilder<'a> {
                     result.push((name, idx + offset));
                 }
                 result
+            }
+            PhysicalOperator::HashSemiJoin(join) => {
+                self.compute_input_column_map(join.left)
+            }
+            PhysicalOperator::HashAntiJoin(join) => {
+                self.compute_input_column_map(join.left)
+            }
+            PhysicalOperator::ScalarSubqueryExec(_) => {
+                vec![("scalar_result".to_string(), 0)]
+            }
+            PhysicalOperator::ExistsSubqueryExec(_) => {
+                vec![("exists_result".to_string(), 0)]
+            }
+            PhysicalOperator::InListSubqueryExec(_) => {
+                vec![("in_result".to_string(), 0)]
             }
             PhysicalOperator::SetOpExec(_) => Vec::new(),
             PhysicalOperator::SecondaryIndexScan(scan) => {

@@ -96,6 +96,7 @@
 
 pub mod catalog;
 pub mod persistence;
+pub mod system_tables;
 pub mod table;
 
 pub use catalog::Catalog;

@@ -50,6 +50,7 @@
 //! Related indexes are automatically dropped before the column is removed.
 
 use crate::database::{Database, ExecuteResult};
+use crate::memory::Pool;
 use crate::schema::ColumnDef as SchemaColumnDef;
 use crate::storage::{IndexFileHeader, TableFileHeader, DEFAULT_SCHEMA};
 use crate::types::{create_record_schema, OwnedValue};
@@ -162,6 +163,12 @@ impl Database {
         let column_count = columns.len() as u32;
         let table_id = self.allocate_table_id();
         catalog.create_table_with_id(schema_name, table_name, columns, table_id)?;
+
+        let estimated_table_memory = 1024 + (column_count as usize * 128);
+        let _ = self
+            .shared
+            .memory_budget
+            .allocate(Pool::Schema, estimated_table_memory);
 
         drop(catalog_guard);
 

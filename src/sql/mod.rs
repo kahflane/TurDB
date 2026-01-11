@@ -55,12 +55,14 @@ pub mod expr;
 pub mod functions;
 pub mod lexer;
 pub mod mvcc_scan;
+pub mod optimizer;
 pub mod parser;
+pub mod partition_spiller;
 pub mod planner;
 pub mod predicate;
-pub mod partition_spiller;
 pub mod row_serde;
 pub mod state;
+pub mod subquery;
 pub mod token;
 pub mod util;
 

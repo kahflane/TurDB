@@ -165,7 +165,7 @@ impl Database {
         let schema_name = insert.table.schema.unwrap_or(DEFAULT_SCHEMA);
         let table_name = insert.table.name;
 
-        let table_def = catalog.resolve_table(table_name)?;
+        let table_def = catalog.resolve_table_in_schema(insert.table.schema, table_name)?;
         let table_id = table_def.id();
         let columns = table_def.columns().to_vec();
         let table_def_for_validator = table_def.clone();

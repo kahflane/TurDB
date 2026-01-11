@@ -117,6 +117,26 @@ impl Catalog {
         }
     }
 
+    pub fn resolve_table_in_schema(
+        &self,
+        schema: Option<&str>,
+        table: &str,
+    ) -> Result<&TableDef> {
+        let schema_name = schema.unwrap_or(&self.default_schema);
+        let schema_obj = self
+            .schemas
+            .get(schema_name)
+            .ok_or_else(|| eyre::eyre!("schema '{}' not found", schema_name))?;
+
+        schema_obj.get_table(table).ok_or_else(|| {
+            eyre::eyre!(
+                "table '{}' not found in schema '{}'",
+                table,
+                schema_name
+            )
+        })
+    }
+
     pub fn schemas(&self) -> &HashMap<String, Schema> {
         &self.schemas
     }
@@ -241,6 +261,23 @@ impl Catalog {
             }
         }
         None
+    }
+
+    pub fn table_with_schema_by_id(&self, table_id: u64) -> Option<(&str, &TableDef)> {
+        for (schema_name, schema) in &self.schemas {
+            for table in schema.tables().values() {
+                if table.id() == table_id {
+                    return Some((schema_name, table));
+                }
+            }
+        }
+        None
+    }
+
+    pub fn next_table_id(&mut self) -> TableId {
+        let id = self.next_table_id;
+        self.next_table_id += 1;
+        id
     }
 }
 

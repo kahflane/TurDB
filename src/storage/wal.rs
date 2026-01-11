@@ -98,6 +98,7 @@ use zerocopy::{FromBytes, Immutable, IntoBytes};
 
 pub const WAL_FRAME_HEADER_SIZE: usize = 32;
 pub const MAX_SEGMENT_SIZE: u64 = 64 * 1024 * 1024;
+pub const DEFAULT_CHECKPOINT_THRESHOLD: u32 = 1000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SyncMode {
@@ -195,6 +196,8 @@ pub struct Wal {
     salt1: u32,
     salt2: u32,
     sync_mode: std::sync::atomic::AtomicU8,
+    frame_count: std::sync::atomic::AtomicU32,
+    checkpoint_threshold: std::sync::atomic::AtomicU32,
 }
 
 impl Wal {
@@ -249,6 +252,8 @@ impl Wal {
             salt1: Self::generate_salt(),
             salt2: Self::generate_salt(),
             sync_mode: std::sync::atomic::AtomicU8::new(SyncMode::Full as u8),
+            frame_count: std::sync::atomic::AtomicU32::new(0),
+            checkpoint_threshold: std::sync::atomic::AtomicU32::new(DEFAULT_CHECKPOINT_THRESHOLD),
         })
     }
 
@@ -287,6 +292,8 @@ impl Wal {
             }
         }
 
+        let frame_count = page_index.len() as u32;
+
         Ok(Self {
             dir: dir.to_path_buf(),
             current_segment: Mutex::new(segment),
@@ -296,6 +303,8 @@ impl Wal {
             salt1,
             salt2,
             sync_mode: std::sync::atomic::AtomicU8::new(SyncMode::Full as u8),
+            frame_count: std::sync::atomic::AtomicU32::new(frame_count),
+            checkpoint_threshold: std::sync::atomic::AtomicU32::new(DEFAULT_CHECKPOINT_THRESHOLD),
         })
     }
 
@@ -311,6 +320,39 @@ impl Wal {
             1 => SyncMode::Normal,
             _ => SyncMode::Off,
         }
+    }
+
+    pub fn frame_count(&self) -> u32 {
+        use std::sync::atomic::Ordering;
+        self.frame_count.load(Ordering::Acquire)
+    }
+
+    pub fn total_wal_size_bytes(&self) -> u64 {
+        self.frame_count() as u64 * (WAL_FRAME_HEADER_SIZE + PAGE_SIZE) as u64
+    }
+
+    pub fn checkpoint_threshold(&self) -> u32 {
+        use std::sync::atomic::Ordering;
+        self.checkpoint_threshold.load(Ordering::Acquire)
+    }
+
+    pub fn set_checkpoint_threshold(&self, threshold: u32) {
+        use std::sync::atomic::Ordering;
+        self.checkpoint_threshold.store(threshold, Ordering::Release);
+    }
+
+    pub fn needs_checkpoint(&self) -> bool {
+        self.frame_count() >= self.checkpoint_threshold()
+    }
+
+    pub fn reset_frame_count(&self) {
+        use std::sync::atomic::Ordering;
+        self.frame_count.store(0, Ordering::Release);
+    }
+
+    fn increment_frame_count(&self) {
+        use std::sync::atomic::Ordering;
+        self.frame_count.fetch_add(1, Ordering::AcqRel);
     }
 
     pub fn recover(&self, storage: &mut super::MmapStorage) -> Result<u32> {
@@ -510,6 +552,8 @@ impl Wal {
 
         self.cleanup_old_segments()?;
 
+        self.reset_frame_count();
+
         Ok(())
     }
 
@@ -545,7 +589,7 @@ impl Wal {
         Ok(())
     }
 
-    pub fn needs_checkpoint(&self, threshold_bytes: u64) -> bool {
+    pub fn needs_checkpoint_by_size(&self, threshold_bytes: u64) -> bool {
         self.current_offset() >= threshold_bytes
     }
 
@@ -655,6 +699,8 @@ impl Wal {
 
         let mut mmap = self.read_mmap.write();
         *mmap = None;
+
+        self.increment_frame_count();
 
         Ok(())
     }
@@ -799,6 +845,65 @@ impl WalSegment {
         self.offset += (WAL_FRAME_HEADER_SIZE + PAGE_SIZE) as u64;
 
         Ok((header, page_data))
+    }
+
+    pub fn read_frame_into(&mut self, buf: &mut [u8]) -> Result<WalFrameHeader> {
+        debug_assert!(
+            buf.len() >= WAL_FRAME_HEADER_SIZE + PAGE_SIZE,
+            "buffer must be at least {} bytes",
+            WAL_FRAME_HEADER_SIZE + PAGE_SIZE
+        );
+
+        self.file
+            .read_exact(&mut buf[..WAL_FRAME_HEADER_SIZE])
+            .wrap_err("failed to read WAL frame header")?;
+
+        let header = WalFrameHeader::read_from_bytes(&buf[..WAL_FRAME_HEADER_SIZE])
+            .map_err(|e| eyre::eyre!("invalid WAL frame header: {:?}", e))?;
+
+        self.file
+            .read_exact(&mut buf[WAL_FRAME_HEADER_SIZE..WAL_FRAME_HEADER_SIZE + PAGE_SIZE])
+            .wrap_err("failed to read WAL frame page data")?;
+
+        let page_data = &buf[WAL_FRAME_HEADER_SIZE..WAL_FRAME_HEADER_SIZE + PAGE_SIZE];
+        if !validate_checksum(&header, page_data) {
+            bail!("WAL frame checksum validation failed");
+        }
+
+        self.offset += (WAL_FRAME_HEADER_SIZE + PAGE_SIZE) as u64;
+
+        Ok(header)
+    }
+
+    pub fn read_header_only(&mut self) -> Result<WalFrameHeader> {
+        use std::io::{Seek, SeekFrom};
+
+        let mut header_bytes = [0u8; WAL_FRAME_HEADER_SIZE];
+        self.file
+            .read_exact(&mut header_bytes)
+            .wrap_err("failed to read WAL frame header")?;
+
+        let header = WalFrameHeader::read_from_bytes(&header_bytes)
+            .map_err(|e| eyre::eyre!("invalid WAL frame header: {:?}", e))?;
+
+        self.file
+            .seek(SeekFrom::Current(PAGE_SIZE as i64))
+            .wrap_err("failed to seek past WAL frame page data")?;
+
+        self.offset += (WAL_FRAME_HEADER_SIZE + PAGE_SIZE) as u64;
+
+        Ok(header)
+    }
+
+    pub fn reset_position(&mut self) -> Result<()> {
+        use std::io::{Seek, SeekFrom};
+
+        self.file
+            .seek(SeekFrom::Start(0))
+            .wrap_err("failed to reset WAL segment position")?;
+        self.offset = 0;
+
+        Ok(())
     }
 }
 
@@ -1362,7 +1467,7 @@ mod tests {
 
         let wal = Wal::create(&wal_dir).expect("should create WAL");
 
-        assert!(!wal.needs_checkpoint(1000));
+        assert!(!wal.needs_checkpoint_by_size(1000));
 
         let page_data = vec![99u8; PAGE_SIZE];
         wal.write_frame(1, 1, &page_data)
@@ -1370,8 +1475,8 @@ mod tests {
 
         let frame_size = (WAL_FRAME_HEADER_SIZE + PAGE_SIZE) as u64;
 
-        assert!(wal.needs_checkpoint(frame_size - 1));
-        assert!(!wal.needs_checkpoint(frame_size + 1));
+        assert!(wal.needs_checkpoint_by_size(frame_size - 1));
+        assert!(!wal.needs_checkpoint_by_size(frame_size + 1));
 
         std::fs::remove_dir_all(&temp_dir).ok();
     }

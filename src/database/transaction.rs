@@ -113,7 +113,7 @@
 use crate::mvcc::{TxnId, TxnState, UndoRegistry, WriteEntry};
 use crate::schema::table::{Constraint, IndexType};
 use crate::sql::ast::IsolationLevel;
-use crate::storage::{IndexFileHeader, DEFAULT_SCHEMA};
+use crate::storage::IndexFileHeader;
 use eyre::{bail, Result, WrapErr};
 use smallvec::SmallVec;
 
@@ -337,7 +337,7 @@ impl Database {
                         }
                     }
                 }
-            } // file_manager_guard dropped here, releasing locks
+            }
 
             if self.shared.group_commit_queue.is_enabled() {
                 match self.shared.group_commit_queue.submit_and_wait(payload) {
@@ -357,6 +357,9 @@ impl Database {
                             }
                             result?;
                         }
+
+                        self.maybe_auto_checkpoint();
+
                         return Ok(ExecuteResult::Commit);
                     }
                     Err(e) => {
@@ -375,6 +378,8 @@ impl Database {
                         .wrap_err("failed to write WAL frame in direct commit")?;
                 }
             }
+
+            self.maybe_auto_checkpoint();
         }
 
         Ok(ExecuteResult::Commit)
@@ -395,6 +400,7 @@ impl Database {
                     .wrap_err("failed to write WAL frame in group commit")?;
             }
         }
+
         Ok(())
     }
 
@@ -433,7 +439,7 @@ impl Database {
         let schema_name = DEFAULT_SCHEMA;
         let table_name = table_def.name();
 
-        let table_storage_arc = file_manager.table_data_mut(schema_name, table_name)?;
+        let table_storage_arc = file_manager.table_data_mut(&schema_name, table_name)?;
         let mut table_storage = table_storage_arc.write();
 
         let btree = BTree::new(&mut *table_storage, 1)?;
@@ -452,6 +458,20 @@ impl Database {
         }
 
         Ok(())
+    }
+
+    fn maybe_auto_checkpoint(&self) {
+        let needs_checkpoint = {
+            let wal_guard = self.shared.wal.lock();
+            wal_guard
+                .as_ref()
+                .map(|wal| wal.needs_checkpoint())
+                .unwrap_or(false)
+        };
+
+        if needs_checkpoint {
+            let _ = self.shared.checkpoint();
+        }
     }
 
     pub(crate) fn execute_rollback(
@@ -518,14 +538,14 @@ impl Database {
         let catalog = catalog_guard.as_ref().unwrap();
 
         let table_id = entry.table_id;
-        let table_def = catalog.table_by_id(table_id as u64);
+        let result = catalog.table_with_schema_by_id(table_id as u64);
 
-        if table_def.is_none() {
+        if result.is_none() {
             return Ok(());
         }
 
-        let table_def = table_def.unwrap();
-        let schema_name = DEFAULT_SCHEMA;
+        let (schema_name, table_def) = result.unwrap();
+        let schema_name = schema_name.to_string();
         let table_name = table_def.name().to_string();
         let columns = table_def.columns().to_vec();
 
@@ -565,7 +585,7 @@ impl Database {
 
         let schema = create_record_schema(&columns);
 
-        let table_storage_arc = file_manager.table_data_mut(schema_name, &table_name)?;
+        let table_storage_arc = file_manager.table_data_mut(&schema_name, &table_name)?;
         let mut table_storage = table_storage_arc.write();
 
         let mut btree = BTree::new(&mut *table_storage, 1)?;
@@ -597,11 +617,11 @@ impl Database {
                 let mut key_buf: SmallVec<[u8; 64]> = SmallVec::new();
 
                 for (col_idx, index_name, _is_pk) in &unique_columns {
-                    if file_manager.index_exists(schema_name, &table_name, index_name) {
+                    if file_manager.index_exists(&schema_name, &table_name, index_name) {
                         if let Some(value) = row_values.get(*col_idx) {
                             if !value.is_null() {
                                 let index_storage_arc = file_manager.index_data_mut(
-                                    schema_name,
+                                    &schema_name,
                                     &table_name,
                                     index_name,
                                 )?;
@@ -627,14 +647,14 @@ impl Database {
                     if col_indices.is_empty() {
                         continue;
                     }
-                    if file_manager.index_exists(schema_name, &table_name, index_name) {
+                    if file_manager.index_exists(&schema_name, &table_name, index_name) {
                         let all_non_null = col_indices
                             .iter()
                             .all(|&idx| row_values.get(idx).is_some_and(|v| !v.is_null()));
 
                         if all_non_null {
                             let index_storage_arc = file_manager.index_data_mut(
-                                schema_name,
+                                &schema_name,
                                 &table_name,
                                 index_name,
                             )?;
@@ -676,11 +696,11 @@ impl Database {
                 let mut key_buf: SmallVec<[u8; 64]> = SmallVec::new();
 
                 for (col_idx, index_name, _is_pk) in &unique_columns {
-                    if file_manager.index_exists(schema_name, &table_name, index_name) {
+                    if file_manager.index_exists(&schema_name, &table_name, index_name) {
                         if let Some(value) = row_values.get(*col_idx) {
                             if !value.is_null() {
                                 let index_storage_arc = file_manager.index_data_mut(
-                                    schema_name,
+                                    &schema_name,
                                     &table_name,
                                     index_name,
                                 )?;
@@ -715,14 +735,14 @@ impl Database {
                     if col_indices.is_empty() {
                         continue;
                     }
-                    if file_manager.index_exists(schema_name, &table_name, index_name) {
+                    if file_manager.index_exists(&schema_name, &table_name, index_name) {
                         let all_non_null = col_indices
                             .iter()
                             .all(|&idx| row_values.get(idx).is_some_and(|v| !v.is_null()));
 
                         if all_non_null {
                             let index_storage_arc = file_manager.index_data_mut(
-                                schema_name,
+                                &schema_name,
                                 &table_name,
                                 index_name,
                             )?;

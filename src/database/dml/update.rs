@@ -133,7 +133,7 @@ impl Database {
         let table_name = update.table.name;
         let table_alias = update.table.alias;
 
-        let table_def = catalog.resolve_table(table_name)?.clone();
+        let table_def = catalog.resolve_table_in_schema(update.table.schema, table_name)?.clone();
         let table_id = table_def.id();
         let columns = table_def.columns().to_vec();
         let has_toast = table_def.has_toast();
@@ -1862,7 +1862,7 @@ impl Database {
                 let schema = table_ref.schema.unwrap_or(DEFAULT_SCHEMA);
                 let table_name = table_ref.name;
                 let alias = table_ref.alias;
-                let table_def = catalog.resolve_table(table_name)?;
+                let table_def = catalog.resolve_table_in_schema(table_ref.schema, table_name)?;
                 let columns = table_def.columns().to_vec();
                 tables.push((schema.to_string(), table_name.to_string(), alias, columns));
             }

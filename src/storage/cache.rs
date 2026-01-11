@@ -91,11 +91,13 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::Arc;
 
 use eyre::{ensure, Result};
 use parking_lot::RwLock;
 
 use super::PAGE_SIZE;
+use crate::memory::{MemoryBudget, Pool};
 
 const SHARD_COUNT: usize = 64;
 
@@ -260,10 +262,15 @@ impl CacheShard {
 pub struct PageCache {
     shards: Vec<RwLock<CacheShard>>,
     capacity_per_shard: usize,
+    budget: Option<Arc<MemoryBudget>>,
 }
 
 impl PageCache {
     pub fn new(total_capacity: usize) -> Result<Self> {
+        Self::with_budget(total_capacity, None)
+    }
+
+    pub fn with_budget(total_capacity: usize, budget: Option<Arc<MemoryBudget>>) -> Result<Self> {
         ensure!(
             total_capacity >= SHARD_COUNT,
             "cache capacity {} must be at least {} (one per shard)",
@@ -288,6 +295,7 @@ impl PageCache {
         Ok(Self {
             shards,
             capacity_per_shard,
+            budget,
         })
     }
 
@@ -342,12 +350,36 @@ impl PageCache {
             return Ok(PageRef { cache: self, key });
         }
 
+        if let Some(budget) = &self.budget {
+            while !budget.can_allocate(Pool::Cache, PAGE_SIZE) {
+                if let Some((evicted_key, _was_dirty)) = guard.evict() {
+                    if let Some(idx) = guard.get(&evicted_key) {
+                        guard.remove(idx);
+                        budget.release(Pool::Cache, PAGE_SIZE);
+                    }
+                } else {
+                    eyre::bail!(
+                        "cannot cache page: memory budget exhausted and no evictable pages (budget={} bytes)",
+                        budget.total_limit()
+                    );
+                }
+            }
+
+            budget.allocate(Pool::Cache, PAGE_SIZE)?;
+        }
+
         if guard.is_full() {
             if let Some((evicted_key, _was_dirty)) = guard.evict() {
                 if let Some(idx) = guard.get(&evicted_key) {
                     guard.remove(idx);
+                    if let Some(budget) = &self.budget {
+                        budget.release(Pool::Cache, PAGE_SIZE);
+                    }
                 }
             } else {
+                if let Some(budget) = &self.budget {
+                    budget.release(Pool::Cache, PAGE_SIZE);
+                }
                 eyre::bail!(
                     "cache shard full and all pages pinned (capacity={})",
                     guard.capacity
@@ -474,6 +506,56 @@ impl PageCache {
     pub fn capacity(&self) -> usize {
         self.capacity_per_shard * SHARD_COUNT
     }
+
+    pub fn budget(&self) -> Option<&Arc<MemoryBudget>> {
+        self.budget.as_ref()
+    }
+
+    pub fn memory_used(&self) -> usize {
+        self.len() * PAGE_SIZE
+    }
+
+    pub fn clear(&self) {
+        let page_count = self.len();
+
+        for shard in &self.shards {
+            let mut guard = shard.write();
+            guard.entries.clear();
+            guard.index.clear();
+            guard.hand = 0;
+        }
+
+        if let Some(budget) = &self.budget {
+            budget.release(Pool::Cache, page_count * PAGE_SIZE);
+        }
+    }
+
+    pub fn evict_all_unpinned(&self) -> usize {
+        let mut evicted = 0;
+
+        for shard in &self.shards {
+            let mut guard = shard.write();
+
+            let mut to_remove = Vec::new();
+            for (i, entry) in guard.entries.iter().enumerate() {
+                if !entry.is_pinned() {
+                    to_remove.push(i);
+                }
+            }
+
+            to_remove.sort_unstable_by(|a, b| b.cmp(a));
+
+            for idx in to_remove {
+                guard.remove(idx);
+                evicted += 1;
+                if let Some(budget) = &self.budget {
+                    budget.release(Pool::Cache, PAGE_SIZE);
+                }
+            }
+        }
+
+        evicted
+    }
 }
 
 pub struct PageRef<'a> {
@@ -510,5 +592,125 @@ impl<'a> PageRef<'a> {
 impl Drop for PageRef<'_> {
     fn drop(&mut self) {
         self.cache.unpin(&self.key);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_page_cache_basic_operations() {
+        let cache = PageCache::new(64).unwrap();
+        let key = PageKey::new(1, 0);
+
+        let page_ref = cache.get_or_insert(key, |data| {
+            data[0] = 42;
+            Ok(())
+        }).unwrap();
+
+        assert_eq!(page_ref.data()[0], 42);
+        drop(page_ref);
+
+        let page_ref = cache.get(&key).unwrap();
+        assert_eq!(page_ref.data()[0], 42);
+    }
+
+    #[test]
+    fn test_page_cache_with_budget() {
+        let budget = Arc::new(MemoryBudget::with_limit(4 * 1024 * 1024));
+        let cache = PageCache::with_budget(64, Some(Arc::clone(&budget))).unwrap();
+
+        let initial_used = budget.stats().cache_used;
+
+        let key = PageKey::new(1, 0);
+        let page_ref = cache.get_or_insert(key, |data| {
+            data[0] = 1;
+            Ok(())
+        }).unwrap();
+
+        let after_insert = budget.stats().cache_used;
+        assert_eq!(after_insert - initial_used, PAGE_SIZE);
+
+        drop(page_ref);
+    }
+
+    #[test]
+    fn test_page_cache_budget_release_on_clear() {
+        let budget = Arc::new(MemoryBudget::with_limit(4 * 1024 * 1024));
+        let cache = PageCache::with_budget(64, Some(Arc::clone(&budget))).unwrap();
+
+        for i in 0..10 {
+            let key = PageKey::new(1, i);
+            let _ref = cache.get_or_insert(key, |_| Ok(())).unwrap();
+        }
+
+        let before_clear = budget.stats().cache_used;
+        assert!(before_clear >= 10 * PAGE_SIZE);
+
+        cache.clear();
+
+        let after_clear = budget.stats().cache_used;
+        assert_eq!(after_clear, 0);
+    }
+
+    #[test]
+    fn test_page_cache_evict_all_unpinned() {
+        let budget = Arc::new(MemoryBudget::with_limit(4 * 1024 * 1024));
+        let cache = PageCache::with_budget(64, Some(Arc::clone(&budget))).unwrap();
+
+        for i in 0..5 {
+            let key = PageKey::new(1, i);
+            let _ref = cache.get_or_insert(key, |_| Ok(())).unwrap();
+        }
+
+        let before_evict = cache.len();
+        assert_eq!(before_evict, 5);
+
+        let evicted = cache.evict_all_unpinned();
+        assert_eq!(evicted, 5);
+        assert_eq!(cache.len(), 0);
+    }
+
+    #[test]
+    fn test_page_cache_memory_used() {
+        let cache = PageCache::new(64).unwrap();
+
+        for i in 0..3 {
+            let key = PageKey::new(1, i);
+            let _ref = cache.get_or_insert(key, |_| Ok(())).unwrap();
+        }
+
+        assert_eq!(cache.memory_used(), 3 * PAGE_SIZE);
+    }
+
+    #[test]
+    fn test_page_cache_budget_accessor() {
+        let budget = Arc::new(MemoryBudget::with_limit(4 * 1024 * 1024));
+        let cache = PageCache::with_budget(64, Some(Arc::clone(&budget))).unwrap();
+
+        assert!(cache.budget().is_some());
+        assert_eq!(cache.budget().unwrap().total_limit(), 4 * 1024 * 1024);
+    }
+
+    #[test]
+    fn test_page_cache_no_budget() {
+        let cache = PageCache::new(64).unwrap();
+        assert!(cache.budget().is_none());
+    }
+
+    #[test]
+    fn test_page_cache_eviction_releases_budget() {
+        let budget = Arc::new(MemoryBudget::with_limit(4 * 1024 * 1024));
+        let capacity = 64;
+        let cache = PageCache::with_budget(capacity, Some(Arc::clone(&budget))).unwrap();
+
+        for i in 0..(capacity + 10) as u32 {
+            let key = PageKey::new(1, i);
+            let _ref = cache.get_or_insert(key, |_| Ok(())).unwrap();
+        }
+
+        let used = budget.stats().cache_used;
+        assert!(used <= capacity * PAGE_SIZE);
     }
 }

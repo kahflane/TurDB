@@ -96,6 +96,7 @@
 use crate::records::types::DataType;
 use crate::schema::{Catalog, TableDef};
 use crate::sql::ast::{Expr, JoinType, Literal, Statement};
+use crate::sql::optimizer::Optimizer;
 use bumpalo::Bump;
 use eyre::{bail, Result};
 
@@ -368,6 +369,8 @@ pub enum PhysicalOperator<'a> {
     ProjectExec(PhysicalProjectExec<'a>),
     NestedLoopJoin(PhysicalNestedLoopJoin<'a>),
     GraceHashJoin(PhysicalGraceHashJoin<'a>),
+    HashSemiJoin(PhysicalHashSemiJoin<'a>),
+    HashAntiJoin(PhysicalHashAntiJoin<'a>),
     HashAggregate(PhysicalHashAggregate<'a>),
     SortedAggregate(PhysicalSortedAggregate<'a>),
     SortExec(PhysicalSortExec<'a>),
@@ -376,6 +379,9 @@ pub enum PhysicalOperator<'a> {
     SubqueryExec(PhysicalSubqueryExec<'a>),
     SetOpExec(PhysicalSetOpExec<'a>),
     WindowExec(PhysicalWindowExec<'a>),
+    ScalarSubqueryExec(PhysicalScalarSubqueryExec<'a>),
+    ExistsSubqueryExec(PhysicalExistsSubqueryExec<'a>),
+    InListSubqueryExec(PhysicalInListSubqueryExec<'a>),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -458,6 +464,41 @@ pub struct PhysicalGraceHashJoin<'a> {
     pub join_type: JoinType,
     pub join_keys: &'a [(&'a Expr<'a>, &'a Expr<'a>)],
     pub num_partitions: u8,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct PhysicalHashSemiJoin<'a> {
+    pub left: &'a PhysicalOperator<'a>,
+    pub right: &'a PhysicalOperator<'a>,
+    pub join_keys: &'a [(&'a Expr<'a>, &'a Expr<'a>)],
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct PhysicalHashAntiJoin<'a> {
+    pub left: &'a PhysicalOperator<'a>,
+    pub right: &'a PhysicalOperator<'a>,
+    pub join_keys: &'a [(&'a Expr<'a>, &'a Expr<'a>)],
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct PhysicalScalarSubqueryExec<'a> {
+    pub subquery: &'a PhysicalOperator<'a>,
+    pub is_correlated: bool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct PhysicalExistsSubqueryExec<'a> {
+    pub subquery: &'a PhysicalOperator<'a>,
+    pub negated: bool,
+    pub is_correlated: bool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct PhysicalInListSubqueryExec<'a> {
+    pub expr: &'a Expr<'a>,
+    pub subquery: &'a PhysicalOperator<'a>,
+    pub negated: bool,
+    pub is_correlated: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -624,6 +665,40 @@ impl<'a> PhysicalPlan<'a> {
             PhysicalOperator::WindowExec(window) => {
                 let _ = writeln!(output, "{}-> Window", prefix);
                 self.format_operator(window.input, indent + 1, output);
+            }
+            PhysicalOperator::HashSemiJoin(join) => {
+                let _ = writeln!(output, "{}-> HashSemiJoin", prefix);
+                self.format_operator(join.left, indent + 1, output);
+                self.format_operator(join.right, indent + 1, output);
+            }
+            PhysicalOperator::HashAntiJoin(join) => {
+                let _ = writeln!(output, "{}-> HashAntiJoin", prefix);
+                self.format_operator(join.left, indent + 1, output);
+                self.format_operator(join.right, indent + 1, output);
+            }
+            PhysicalOperator::ScalarSubqueryExec(subq) => {
+                let _ = writeln!(
+                    output,
+                    "{}-> ScalarSubquery (correlated={})",
+                    prefix, subq.is_correlated
+                );
+                self.format_operator(subq.subquery, indent + 1, output);
+            }
+            PhysicalOperator::ExistsSubqueryExec(subq) => {
+                let _ = writeln!(
+                    output,
+                    "{}-> ExistsSubquery (negated={}, correlated={})",
+                    prefix, subq.negated, subq.is_correlated
+                );
+                self.format_operator(subq.subquery, indent + 1, output);
+            }
+            PhysicalOperator::InListSubqueryExec(subq) => {
+                let _ = writeln!(
+                    output,
+                    "{}-> InListSubquery (negated={}, correlated={})",
+                    prefix, subq.negated, subq.is_correlated
+                );
+                self.format_operator(subq.subquery, indent + 1, output);
             }
         }
     }
@@ -1699,7 +1774,10 @@ impl<'a> Planner<'a> {
     }
 
     fn optimize_to_physical(&self, logical: &LogicalPlan<'a>) -> Result<PhysicalPlan<'a>> {
-        let physical_root = self.logical_to_physical(logical.root)?;
+        let optimizer = Optimizer::new();
+        let optimized_root = optimizer.optimize(logical.root, self.arena)?;
+
+        let physical_root = self.logical_to_physical(optimized_root)?;
         let output_schema = self.compute_output_schema(physical_root)?;
         Ok(PhysicalPlan {
             root: physical_root,
@@ -1912,6 +1990,46 @@ impl<'a> Planner<'a> {
                     });
                 }
 
+                Ok(OutputSchema {
+                    columns: columns.into_bump_slice(),
+                })
+            }
+            PhysicalOperator::HashSemiJoin(join) => {
+                self.compute_output_schema(join.left)
+            }
+            PhysicalOperator::HashAntiJoin(join) => {
+                self.compute_output_schema(join.left)
+            }
+            PhysicalOperator::ScalarSubqueryExec(subq) => {
+                let subq_schema = self.compute_output_schema(subq.subquery)?;
+                if subq_schema.columns.is_empty() {
+                    Ok(OutputSchema { columns: &[] })
+                } else {
+                    let mut columns = bumpalo::collections::Vec::new_in(self.arena);
+                    columns.push(subq_schema.columns[0]);
+                    Ok(OutputSchema {
+                        columns: columns.into_bump_slice(),
+                    })
+                }
+            }
+            PhysicalOperator::ExistsSubqueryExec(_) => {
+                let mut columns = bumpalo::collections::Vec::new_in(self.arena);
+                columns.push(OutputColumn {
+                    name: "exists_result",
+                    data_type: crate::records::types::DataType::Bool,
+                    nullable: false,
+                });
+                Ok(OutputSchema {
+                    columns: columns.into_bump_slice(),
+                })
+            }
+            PhysicalOperator::InListSubqueryExec(_) => {
+                let mut columns = bumpalo::collections::Vec::new_in(self.arena);
+                columns.push(OutputColumn {
+                    name: "in_result",
+                    data_type: crate::records::types::DataType::Bool,
+                    nullable: false,
+                });
                 Ok(OutputSchema {
                     columns: columns.into_bump_slice(),
                 })
@@ -2216,29 +2334,81 @@ impl<'a> Planner<'a> {
                 let left = self.logical_to_physical(join.left)?;
                 let right = self.logical_to_physical(join.right)?;
 
-                if self.has_equi_join_keys(join.condition) {
-                    let equi_keys = self.extract_equi_join_keys(join.condition);
-                    let join_keys = self.convert_equi_keys_to_join_keys(equi_keys);
-                    let physical =
-                        self.arena
-                            .alloc(PhysicalOperator::GraceHashJoin(PhysicalGraceHashJoin {
-                                left,
-                                right,
-                                join_type: join.join_type,
-                                join_keys,
-                                num_partitions: 16,
-                            }));
-                    Ok(physical)
-                } else {
-                    let physical = self.arena.alloc(PhysicalOperator::NestedLoopJoin(
-                        PhysicalNestedLoopJoin {
-                            left,
-                            right,
-                            join_type: join.join_type,
-                            condition: join.condition,
-                        },
-                    ));
-                    Ok(physical)
+                match join.join_type {
+                    JoinType::Semi => {
+                        if self.has_equi_join_keys(join.condition) {
+                            let equi_keys = self.extract_equi_join_keys(join.condition);
+                            let join_keys = self.convert_equi_keys_to_join_keys(equi_keys);
+                            let physical = self.arena.alloc(PhysicalOperator::HashSemiJoin(
+                                PhysicalHashSemiJoin {
+                                    left,
+                                    right,
+                                    join_keys,
+                                },
+                            ));
+                            Ok(physical)
+                        } else {
+                            let physical = self.arena.alloc(PhysicalOperator::NestedLoopJoin(
+                                PhysicalNestedLoopJoin {
+                                    left,
+                                    right,
+                                    join_type: join.join_type,
+                                    condition: join.condition,
+                                },
+                            ));
+                            Ok(physical)
+                        }
+                    }
+                    JoinType::Anti => {
+                        if self.has_equi_join_keys(join.condition) {
+                            let equi_keys = self.extract_equi_join_keys(join.condition);
+                            let join_keys = self.convert_equi_keys_to_join_keys(equi_keys);
+                            let physical = self.arena.alloc(PhysicalOperator::HashAntiJoin(
+                                PhysicalHashAntiJoin {
+                                    left,
+                                    right,
+                                    join_keys,
+                                },
+                            ));
+                            Ok(physical)
+                        } else {
+                            let physical = self.arena.alloc(PhysicalOperator::NestedLoopJoin(
+                                PhysicalNestedLoopJoin {
+                                    left,
+                                    right,
+                                    join_type: join.join_type,
+                                    condition: join.condition,
+                                },
+                            ));
+                            Ok(physical)
+                        }
+                    }
+                    _ => {
+                        if self.has_equi_join_keys(join.condition) {
+                            let equi_keys = self.extract_equi_join_keys(join.condition);
+                            let join_keys = self.convert_equi_keys_to_join_keys(equi_keys);
+                            let physical = self.arena.alloc(PhysicalOperator::GraceHashJoin(
+                                PhysicalGraceHashJoin {
+                                    left,
+                                    right,
+                                    join_type: join.join_type,
+                                    join_keys,
+                                    num_partitions: 16,
+                                },
+                            ));
+                            Ok(physical)
+                        } else {
+                            let physical = self.arena.alloc(PhysicalOperator::NestedLoopJoin(
+                                PhysicalNestedLoopJoin {
+                                    left,
+                                    right,
+                                    join_type: join.join_type,
+                                    condition: join.condition,
+                                },
+                            ));
+                            Ok(physical)
+                        }
+                    }
                 }
             }
             LogicalOperator::Sort(sort) => {

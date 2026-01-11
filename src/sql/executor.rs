@@ -77,8 +77,8 @@ use crate::sql::decoder::SimpleDecoder;
 use crate::sql::predicate::CompiledPredicate;
 use crate::sql::partition_spiller::PartitionSpiller;
 use crate::sql::state::{
-    AggregateState, GraceHashJoinState, HashAggregateState, IndexScanState, LimitState,
-    NestedLoopJoinState, SortState, TopKState, WindowState,
+    AggregateState, GraceHashJoinState, HashAggregateState, HashAntiJoinState, HashSemiJoinState,
+    IndexScanState, LimitState, NestedLoopJoinState, SortState, TopKState, WindowState,
 };
 use crate::sql::util::{
     allocate_value_to_arena, clone_value_owned, clone_value_ref_to_arena, compare_values_for_sort,
@@ -1775,6 +1775,8 @@ pub enum DynamicExecutor<'a, S: RowSource> {
     TopK(TopKState<'a, S>),
     NestedLoopJoin(NestedLoopJoinState<'a, S>),
     GraceHashJoin(GraceHashJoinState<'a, S>),
+    HashSemiJoin(HashSemiJoinState<'a, S>),
+    HashAntiJoin(HashAntiJoinState<'a, S>),
     HashAggregate(HashAggregateState<'a, S>),
     Window(WindowState<'a, S>),
 }
@@ -1941,6 +1943,32 @@ impl<'a, S: RowSource> Executor<'a> for DynamicExecutor<'a, S> {
                 state.unmatched_build_partition = 0;
                 state.unmatched_build_idx = 0;
                 Ok(())
+            }
+            DynamicExecutor::HashSemiJoin(state) => {
+                if !state.built {
+                    state.right.open()?;
+                    state.hash_table.clear();
+                    while let Some(row) = state.right.next()? {
+                        let hash = hash_keys(&row, &state.right_key_indices);
+                        state.hash_table.insert(hash);
+                    }
+                    state.right.close()?;
+                    state.built = true;
+                }
+                state.left.open()
+            }
+            DynamicExecutor::HashAntiJoin(state) => {
+                if !state.built {
+                    state.right.open()?;
+                    state.hash_table.clear();
+                    while let Some(row) = state.right.next()? {
+                        let hash = hash_keys(&row, &state.right_key_indices);
+                        state.hash_table.insert(hash);
+                    }
+                    state.right.close()?;
+                    state.built = true;
+                }
+                state.left.open()
             }
             DynamicExecutor::HashAggregate(state) => {
                 state.groups.clear();
@@ -2526,6 +2554,42 @@ impl<'a, S: RowSource> Executor<'a> for DynamicExecutor<'a, S> {
                 state.current_matches.clear();
                 state.probe_row_matched = false;
             },
+            DynamicExecutor::HashSemiJoin(state) => loop {
+                match state.left.next()? {
+                    Some(row) => {
+                        let hash = hash_keys(&row, &state.left_key_indices);
+                        if state.hash_table.contains(&hash) {
+                            let left_values: Vec<Value<'a>> = row
+                                .values
+                                .iter()
+                                .take(state.left_col_count)
+                                .map(|v| clone_value_ref_to_arena(v, state.arena))
+                                .collect();
+                            let allocated = state.arena.alloc_slice_fill_iter(left_values);
+                            return Ok(Some(ExecutorRow::new(allocated)));
+                        }
+                    }
+                    None => return Ok(None),
+                }
+            },
+            DynamicExecutor::HashAntiJoin(state) => loop {
+                match state.left.next()? {
+                    Some(row) => {
+                        let hash = hash_keys(&row, &state.left_key_indices);
+                        if !state.hash_table.contains(&hash) {
+                            let left_values: Vec<Value<'a>> = row
+                                .values
+                                .iter()
+                                .take(state.left_col_count)
+                                .map(|v| clone_value_ref_to_arena(v, state.arena))
+                                .collect();
+                            let allocated = state.arena.alloc_slice_fill_iter(left_values);
+                            return Ok(Some(ExecutorRow::new(allocated)));
+                        }
+                    }
+                    None => return Ok(None),
+                }
+            },
             DynamicExecutor::HashAggregate(state) => {
                 if !state.computed {
                     while let Some(row) = state.child.next()? {
@@ -2647,6 +2711,8 @@ impl<'a, S: RowSource> Executor<'a> for DynamicExecutor<'a, S> {
                 }
                 Ok(())
             }
+            DynamicExecutor::HashSemiJoin(state) => state.left.close(),
+            DynamicExecutor::HashAntiJoin(state) => state.left.close(),
             DynamicExecutor::HashAggregate(state) => state.child.close(),
             DynamicExecutor::Window(state) => state.child.close(),
         }

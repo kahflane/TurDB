@@ -43,7 +43,14 @@
       "Bash(timeout 30 cargo test:*)",
       "Bash(timeout 20 cargo test:*)",
       "Bash(tokei:*)",
-      "Bash(xxd:*)"
+      "Bash(xxd:*)",
+      "Bash(pnpm install)",
+      "Bash(pnpm build:*)",
+      "Bash(pnpm add:*)",
+      "Bash(pnpm exec napi build:*)",
+      "Bash(pnpm tsc:*)",
+      "Bash(napi build:*)",
+      "Bash(pnpm run build:*)"
     ]
   }
 }

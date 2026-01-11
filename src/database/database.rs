@@ -42,6 +42,7 @@ use crate::database::dirty_tracker::ShardedDirtyTracker;
 use crate::database::row::Row;
 use crate::database::transaction::ActiveTransaction;
 use crate::database::{CheckpointInfo, ExecuteResult, RecoveryInfo};
+use crate::memory::{MemoryBudget, Pool};
 use crate::mvcc::TransactionManager;
 
 use crate::schema::Catalog;
@@ -95,6 +96,10 @@ pub(crate) struct SharedDatabase {
     /// Cached HNSW indexes for vector operations
     pub(crate) hnsw_indexes:
         RwLock<hashbrown::HashMap<FileKey, Arc<RwLock<crate::hnsw::PersistentHnswIndex>>>>,
+    /// Global memory budget for the database (default: 25% of system RAM, minimum 4MB)
+    pub(crate) memory_budget: Arc<MemoryBudget>,
+    /// Current database operating mode (ReadWrite or ReadOnlyDegraded)
+    pub(crate) mode: RwLock<super::DatabaseMode>,
 }
 
 pub struct Database {
@@ -187,20 +192,34 @@ impl Database {
 
         let wal_dir = path.join("wal");
 
+        let memory_budget = Arc::new(MemoryBudget::auto_detect());
+        let recovery_available = memory_budget.available(Pool::Recovery);
 
-        let max_segment = Wal::find_latest_segment(&wal_dir).unwrap_or(1);
-        let mut wal_size_bytes = 0;
-        for i in 1..=max_segment {
-            let p = wal_dir.join(format!("wal.{:06}", i));
-            if let Ok(m) = std::fs::metadata(&p) {
-                wal_size_bytes += m.len();
+        let estimate = Self::estimate_recovery_cost(&wal_dir)?;
+
+        let (frames_recovered, mode) = if estimate.frame_count > 0 {
+
+            if estimate.estimated_bytes <= recovery_available {
+                let frames = Self::recover_all_tables(&path, &wal_dir)?;
+                (frames, super::DatabaseMode::ReadWrite)
+            } else {
+                eprintln!(
+                    "[turdb] WAL recovery requires ~{}MB but only {}MB available in recovery pool.",
+                    estimate.estimated_bytes / 1_000_000,
+                    recovery_available / 1_000_000
+                );
+                eprintln!(
+                    "[turdb] Opening in read-only degraded mode. Run PRAGMA recover_wal to recover."
+                );
+                (
+                    0,
+                    super::DatabaseMode::ReadOnlyDegraded {
+                        pending_wal_frames: estimate.frame_count,
+                    },
+                )
             }
-        }
-
-        let frames_recovered = if wal_size_bytes > 0 {
-            Self::recover_all_tables(&path, &wal_dir)?
         } else {
-            0
+            (0, super::DatabaseMode::ReadWrite)
         };
 
         let shared = Arc::new(SharedDatabase {
@@ -222,6 +241,8 @@ impl Database {
             page_locks: super::page_locks::PageLockManager::new(),
             join_memory_budget: std::sync::atomic::AtomicUsize::new(10 * 1024 * 1024),
             hnsw_indexes: RwLock::new(hashbrown::HashMap::new()),
+            memory_budget,
+            mode: RwLock::new(mode),
         });
 
         let db = Self {
@@ -231,10 +252,11 @@ impl Database {
         };
 
         db.ensure_catalog()?;
+        db.ensure_system_tables()?;
 
         let recovery_info = RecoveryInfo {
             frames_recovered,
-            wal_size_bytes,
+            wal_size_bytes: estimate.wal_size_bytes,
         };
 
         Ok((db, recovery_info))
@@ -292,13 +314,19 @@ impl Database {
             page_locks: super::page_locks::PageLockManager::new(),
             join_memory_budget: std::sync::atomic::AtomicUsize::new(10 * 1024 * 1024),
             hnsw_indexes: RwLock::new(hashbrown::HashMap::new()),
+            memory_budget: Arc::new(MemoryBudget::auto_detect()),
+            mode: RwLock::new(super::DatabaseMode::ReadWrite),
         });
 
-        Ok(Self {
+        let db = Self {
             shared,
             active_txn: Mutex::new(None),
             foreign_keys_enabled: AtomicBool::new(true),
-        })
+        };
+
+        db.ensure_system_tables()?;
+
+        Ok(db)
     }
 
     pub fn open_or_create<P: AsRef<Path>>(path: P) -> Result<Self> {
@@ -333,14 +361,133 @@ impl Database {
         let mut guard = self.shared.catalog.write();
         if guard.is_none() {
             let catalog = Self::load_catalog(&self.shared.path)?;
+
             self.populate_table_id_cache(&catalog);
+
+            let table_count = catalog
+                .schemas()
+                .iter()
+                .map(|(_, schema)| schema.tables().len())
+                .sum::<usize>();
+            let estimated_schema_memory = table_count * 1024;
+            let _ = self
+                .shared
+                .memory_budget
+                .allocate(Pool::Schema, estimated_schema_memory);
+
             *guard = Some(catalog);
         }
         Ok(())
     }
 
+    /// Ensures system tables exist in both catalog and storage.
+    /// Creates memory_stats and wal_stats tables in the turdb_catalog schema.
+    fn ensure_system_tables(&self) -> Result<()> {
+        use crate::schema::system_tables::{
+            create_memory_stats_table_def, create_wal_stats_table_def, MEMORY_STATS_TABLE,
+            SYSTEM_SCHEMA, WAL_STATS_TABLE,
+        };
+
+        self.ensure_catalog()?;
+        self.ensure_file_manager()?;
+
+        // Create schema directory if it doesn't exist
+        {
+            let mut file_manager_guard = self.shared.file_manager.write();
+            let file_manager = file_manager_guard.as_mut().unwrap();
+            if !file_manager.schema_exists(SYSTEM_SCHEMA) {
+                file_manager.create_schema(SYSTEM_SCHEMA)?;
+            }
+        }
+
+        // Collect info about which tables need to be created
+        let tables_to_create: Vec<(u64, String, usize)> = {
+            let mut catalog_guard = self.shared.catalog.write();
+            let catalog = catalog_guard.as_mut().unwrap();
+
+            let schema = catalog.get_schema(SYSTEM_SCHEMA).ok_or_else(|| {
+                eyre::eyre!("system schema '{}' not found", SYSTEM_SCHEMA)
+            })?;
+
+            let mut tables = Vec::new();
+
+            if !schema.table_exists(MEMORY_STATS_TABLE) {
+                // Use allocate_table_id() to stay in sync with SharedDatabase's counter
+                let table_id = self.allocate_table_id();
+                let table_def = create_memory_stats_table_def(table_id);
+                let column_count = table_def.columns().len();
+                catalog
+                    .get_schema_mut(SYSTEM_SCHEMA)
+                    .unwrap()
+                    .add_table(table_def);
+                tables.push((table_id, MEMORY_STATS_TABLE.to_string(), column_count));
+            }
+
+            // Re-check schema after potential modification
+            let schema = catalog.get_schema(SYSTEM_SCHEMA).unwrap();
+            if !schema.table_exists(WAL_STATS_TABLE) {
+                let table_id = self.allocate_table_id();
+                let table_def = create_wal_stats_table_def(table_id);
+                let column_count = table_def.columns().len();
+                catalog
+                    .get_schema_mut(SYSTEM_SCHEMA)
+                    .unwrap()
+                    .add_table(table_def);
+                tables.push((table_id, WAL_STATS_TABLE.to_string(), column_count));
+            }
+
+            tables
+        };
+
+        // Create storage for each new system table
+        if !tables_to_create.is_empty() {
+            let mut file_manager_guard = self.shared.file_manager.write();
+            let file_manager = file_manager_guard.as_mut().unwrap();
+
+            for (table_id, table_name, column_count) in &tables_to_create {
+                // Only create storage if it doesn't already exist
+                if !file_manager.table_exists(SYSTEM_SCHEMA, table_name) {
+                    // Create storage file
+                    file_manager.create_table(
+                        SYSTEM_SCHEMA,
+                        table_name,
+                        *table_id,
+                        *column_count as u32,
+                    )?;
+
+                    // Initialize storage with BTree
+                    let storage_arc = file_manager.table_data_mut(SYSTEM_SCHEMA, table_name)?;
+                    let mut storage = storage_arc.write();
+                    storage.grow(2)?;
+                    crate::btree::BTree::create(&mut *storage, 1)?;
+                }
+
+                // Add to table ID lookup
+                self.shared.table_id_lookup.write().insert(
+                    *table_id as u32,
+                    (SYSTEM_SCHEMA.to_string(), table_name.clone()),
+                );
+            }
+
+            // Persist catalog with system tables
+            drop(file_manager_guard);
+            self.save_catalog()?;
+        }
+
+        Ok(())
+    }
+
     pub fn checkpoint_wal(&self) -> Result<u32> {
         self.shared.checkpoint()
+    }
+
+    pub fn checkpoint_wal_with_stats(&self) -> Result<u32> {
+        let frames = self.shared.checkpoint()?;
+        if frames > 0 {
+            let _ = self.persist_memory_stats();
+            let _ = self.persist_wal_stats();
+        }
+        Ok(frames)
     }
 
     fn populate_table_id_cache(&self, catalog: &Catalog) {
@@ -411,6 +558,7 @@ impl Database {
             table_id,
         )
         .wrap_err("failed to flush WAL")?;
+
         Ok(frames_written as usize)
     }
 
@@ -906,6 +1054,8 @@ impl Database {
             Subquery(&'a crate::sql::planner::PhysicalSubqueryExec<'a>),
             NestedLoopJoin(&'a crate::sql::planner::PhysicalNestedLoopJoin<'a>),
             GraceHashJoin(&'a crate::sql::planner::PhysicalGraceHashJoin<'a>),
+            HashSemiJoin(&'a crate::sql::planner::PhysicalHashSemiJoin<'a>),
+            HashAntiJoin(&'a crate::sql::planner::PhysicalHashAntiJoin<'a>),
             SetOp(&'a crate::sql::planner::PhysicalSetOpExec<'a>),
             DualScan,
         }
@@ -933,6 +1083,11 @@ impl Database {
                 PhysicalOperator::HashAggregate(agg) => find_plan_source(agg.input),
                 PhysicalOperator::SortedAggregate(agg) => find_plan_source(agg.input),
                 PhysicalOperator::WindowExec(window) => find_plan_source(window.input),
+                PhysicalOperator::HashSemiJoin(join) => Some(PlanSource::HashSemiJoin(join)),
+                PhysicalOperator::HashAntiJoin(join) => Some(PlanSource::HashAntiJoin(join)),
+                PhysicalOperator::ScalarSubqueryExec(subq) => find_plan_source(subq.subquery),
+                PhysicalOperator::ExistsSubqueryExec(subq) => find_plan_source(subq.subquery),
+                PhysicalOperator::InListSubqueryExec(subq) => find_plan_source(subq.subquery),
             }
         }
 
@@ -1135,7 +1290,7 @@ impl Database {
                 let table_name = inner_scan.table;
 
                 let inner_table_def = catalog
-                    .resolve_table(table_name)
+                    .resolve_table_in_schema(inner_scan.schema, table_name)
                     .wrap_err_with(|| format!("table '{}' not found", table_name))?;
 
                 let column_types: Vec<_> = inner_table_def
@@ -1291,7 +1446,7 @@ impl Database {
                 toast_table_info = Some((schema_name.to_string(), table_name.to_string()));
 
                 let table_def = catalog
-                    .resolve_table(table_name)
+                    .resolve_table_in_schema(scan.schema, table_name)
                     .wrap_err_with(|| format!("table '{}' not found", table_name))?;
 
                 let column_types: Vec<_> =
@@ -1392,7 +1547,7 @@ impl Database {
                 toast_table_info = Some((schema_name.to_string(), table_name.to_string()));
 
                 let table_def = catalog
-                    .resolve_table(table_name)
+                    .resolve_table_in_schema(scan.schema, table_name)
                     .wrap_err_with(|| format!("table '{}' not found", table_name))?;
 
                 let column_types: Vec<_> =
@@ -1765,7 +1920,10 @@ impl Database {
                 executor.close()?;
                 rows
             }
-            Some(PlanSource::NestedLoopJoin(_)) | Some(PlanSource::GraceHashJoin(_)) => {
+            Some(PlanSource::NestedLoopJoin(_))
+            | Some(PlanSource::GraceHashJoin(_))
+            | Some(PlanSource::HashSemiJoin(_))
+            | Some(PlanSource::HashAntiJoin(_)) => {
                 fn find_subquery_in_join<'a>(
                     op: &'a crate::sql::planner::PhysicalOperator<'a>,
                 ) -> Option<&'a crate::sql::planner::PhysicalSubqueryExec<'a>> {
@@ -1817,6 +1975,12 @@ impl Database {
                     Some(PlanSource::GraceHashJoin(j)) => {
                         (j.left, j.right, j.join_type, None, j.join_keys)
                     }
+                    Some(PlanSource::HashSemiJoin(j)) => {
+                        (j.left, j.right, crate::sql::ast::JoinType::Semi, None, j.join_keys)
+                    }
+                    Some(PlanSource::HashAntiJoin(j)) => {
+                        (j.left, j.right, crate::sql::ast::JoinType::Anti, None, j.join_keys)
+                    }
                     _ => unreachable!(),
                 };
 
@@ -1831,28 +1995,32 @@ impl Database {
 
                 let mut left_table_name: Option<&str> = None;
                 let mut left_alias: Option<&str> = None;
+                let mut left_schema: Option<&str> = None;
                 let mut right_table_name: Option<&str> = None;
                 let mut right_alias: Option<&str> = None;
+                let mut right_schema: Option<&str> = None;
 
                 if let Some(subq) = left_subq {
                     left_rows = execute_subquery_recursive(subq, catalog, file_manager)?;
                 } else if let Some(scan_info) = &left_scan {
-                    let (schema_name, table_name, alias) = match scan_info {
+                    let (schema_opt, schema_name, table_name, alias) = match scan_info {
                         JoinScan::Table(scan) => (
+                            scan.schema,
                             scan.schema.unwrap_or(DEFAULT_SCHEMA),
                             scan.table,
                             scan.alias,
                         ),
                         JoinScan::Index(scan) => {
-                            (scan.schema.unwrap_or(DEFAULT_SCHEMA), scan.table, None)
+                            (scan.schema, scan.schema.unwrap_or(DEFAULT_SCHEMA), scan.table, None)
                         }
                         JoinScan::SecondaryIndex(scan) => {
-                            (scan.schema.unwrap_or(DEFAULT_SCHEMA), scan.table, None)
+                            (scan.schema, scan.schema.unwrap_or(DEFAULT_SCHEMA), scan.table, None)
                         }
                     };
                     left_table_name = Some(table_name);
                     left_alias = alias;
-                    let table_def = catalog.resolve_table(table_name)?;
+                    left_schema = schema_opt;
+                    let table_def = catalog.resolve_table_in_schema(schema_opt, table_name)?;
                     let column_types: Vec<_> =
                         table_def.columns().iter().map(|c| c.data_type()).collect();
                     let storage_arc = file_manager.table_data(schema_name, table_name)?;
@@ -1873,22 +2041,24 @@ impl Database {
                     right_rows = execute_subquery_recursive(subq, catalog, file_manager)?;
                     right_col_count = subq.output_schema.columns.len();
                 } else if let Some(scan_info) = &right_scan {
-                    let (schema_name, table_name, alias) = match scan_info {
+                    let (schema_opt, schema_name, table_name, alias) = match scan_info {
                         JoinScan::Table(scan) => (
+                            scan.schema,
                             scan.schema.unwrap_or(DEFAULT_SCHEMA),
                             scan.table,
                             scan.alias,
                         ),
                         JoinScan::Index(scan) => {
-                            (scan.schema.unwrap_or(DEFAULT_SCHEMA), scan.table, None)
+                            (scan.schema, scan.schema.unwrap_or(DEFAULT_SCHEMA), scan.table, None)
                         }
                         JoinScan::SecondaryIndex(scan) => {
-                            (scan.schema.unwrap_or(DEFAULT_SCHEMA), scan.table, None)
+                            (scan.schema, scan.schema.unwrap_or(DEFAULT_SCHEMA), scan.table, None)
                         }
                     };
                     right_table_name = Some(table_name);
                     right_alias = alias;
-                    let table_def = catalog.resolve_table(table_name)?;
+                    right_schema = schema_opt;
+                    let table_def = catalog.resolve_table_in_schema(schema_opt, table_name)?;
                     let column_types: Vec<_> =
                         table_def.columns().iter().map(|c| c.data_type()).collect();
                     let storage_arc = file_manager.table_data(schema_name, table_name)?;
@@ -1917,7 +2087,7 @@ impl Database {
                         idx += 1;
                     }
                 } else if let Some(table_name) = left_table_name {
-                    let table_def = catalog.resolve_table(table_name)?;
+                    let table_def = catalog.resolve_table_in_schema(left_schema, table_name)?;
                     for col in table_def.columns() {
                         join_column_map.push((col.name().to_lowercase(), idx));
                         join_column_map
@@ -1938,7 +2108,7 @@ impl Database {
                         idx += 1;
                     }
                 } else if let Some(table_name) = right_table_name {
-                    let table_def = catalog.resolve_table(table_name)?;
+                    let table_def = catalog.resolve_table_in_schema(right_schema, table_name)?;
                     for col in table_def.columns() {
                         join_column_map.push((col.name().to_lowercase(), idx));
                         join_column_map
@@ -1972,7 +2142,7 @@ impl Database {
                 let left_col_count = if let Some(subq) = left_subq {
                     subq.output_schema.columns.len()
                 } else if let Some(table_name) = left_table_name {
-                    catalog.resolve_table(table_name).map(|t| t.columns().len()).unwrap_or(0)
+                    catalog.resolve_table_in_schema(left_schema, table_name).map(|t| t.columns().len()).unwrap_or(0)
                 } else {
                     0
                 };
@@ -2195,8 +2365,19 @@ impl Database {
                                         continue;
                                     }
 
+                                    let was_matched = left_matched[left_idx];
                                     left_matched[left_idx] = true;
                                     right_matched[right_idx] = true;
+
+                                    // For Semi join: skip if already matched (output once per left row)
+                                    // For Anti join: don't output during matching phase
+                                    if matches!(join_type, crate::sql::ast::JoinType::Semi) {
+                                        if was_matched {
+                                            continue;
+                                        }
+                                    } else if matches!(join_type, crate::sql::ast::JoinType::Anti) {
+                                        continue;
+                                    }
 
                                     let owned: Vec<OwnedValue> = output_source_indices
                                         .iter()
@@ -2273,8 +2454,19 @@ impl Database {
                                     continue;
                                 }
 
+                                let was_matched = left_matched[left_idx];
                                 left_matched[left_idx] = true;
                                 right_matched[right_idx] = true;
+
+                                // For Semi join: skip if already matched (output once per left row)
+                                // For Anti join: don't output during matching phase
+                                if matches!(join_type, crate::sql::ast::JoinType::Semi) {
+                                    if was_matched {
+                                        continue;
+                                    }
+                                } else if matches!(join_type, crate::sql::ast::JoinType::Anti) {
+                                    continue;
+                                }
 
                                 let owned: Vec<OwnedValue> = output_source_indices
                                     .iter()
@@ -2409,6 +2601,58 @@ impl Database {
                                     .cloned()
                                     .unwrap_or(OwnedValue::Null);
                                 convert_value_with_type(&val.to_value(), col.data_type)
+                            })
+                            .collect();
+
+                        if is_distinct {
+                            let key: Vec<u64> = owned
+                                .iter()
+                                .map(|v| {
+                                    use std::hash::{Hash, Hasher};
+                                    let mut hasher =
+                                        std::collections::hash_map::DefaultHasher::new();
+                                    format!("{:?}", v).hash(&mut hasher);
+                                    hasher.finish()
+                                })
+                                .collect();
+                            if !seen.insert(key) {
+                                continue;
+                            }
+                        }
+
+                        if skipped < offset {
+                            skipped += 1;
+                            continue;
+                        }
+
+                        result_rows.push(Row::new(owned));
+
+                        if let Some(lim) = limit {
+                            if result_rows.len() >= lim {
+                                break;
+                            }
+                        }
+                    }
+                }
+
+                // Anti join: output left rows that weren't matched
+                if matches!(join_type, crate::sql::ast::JoinType::Anti) {
+                    for (left_idx, left_row) in left_rows.iter().enumerate() {
+                        if left_matched[left_idx] {
+                            continue;
+                        }
+
+                        combined_buf.clear();
+                        combined_buf.extend(left_row.iter().cloned());
+
+                        let owned: Vec<OwnedValue> = output_source_indices
+                            .iter()
+                            .map(|(source_idx, data_type)| {
+                                let val = combined_buf
+                                    .get(*source_idx)
+                                    .cloned()
+                                    .unwrap_or(OwnedValue::Null);
+                                convert_value_with_type(&val.to_value(), *data_type)
                             })
                             .collect();
 
@@ -2935,7 +3179,7 @@ impl Database {
                     let table_name = scan.table;
 
                     let table_def = catalog
-                        .resolve_table(table_name)
+                        .resolve_table_in_schema(scan.schema, table_name)
                         .wrap_err_with(|| format!("table '{}' not found", table_name))?;
 
                     let column_types: Vec<_> =
@@ -3055,7 +3299,7 @@ impl Database {
             let table_name = scan.table;
 
             let table_def = catalog
-                .resolve_table(table_name)
+                .resolve_table_in_schema(scan.schema, table_name)
                 .wrap_err_with(|| format!("table '{}' not found", table_name))?;
 
             let column_types: Vec<_> = table_def.columns().iter().map(|c| c.data_type()).collect();
@@ -3223,7 +3467,7 @@ impl Database {
                 .schema
                 .unwrap_or(crate::storage::DEFAULT_SCHEMA);
 
-            if let Ok(table_def) = catalog.resolve_table(table_name) {
+            if let Ok(table_def) = catalog.resolve_table_in_schema(insert.table.schema, table_name) {
                 let column_types: Vec<_> =
                     table_def.columns().iter().map(|c| c.data_type()).collect();
 
@@ -3323,7 +3567,7 @@ impl Database {
                 .schema
                 .unwrap_or(crate::storage::DEFAULT_SCHEMA);
 
-            if let Ok(table_def) = catalog.resolve_table(table_name) {
+            if let Ok(table_def) = catalog.resolve_table_in_schema(update.table.schema, table_name) {
                 let column_types: Vec<_> =
                     table_def.columns().iter().map(|c| c.data_type()).collect();
 
@@ -3450,17 +3694,36 @@ impl Database {
     ) -> Result<ExecuteResult> {
         use crate::sql::ast::Statement;
         match stmt {
-            Statement::CreateTable(create) => self.execute_create_table(create, arena),
-            Statement::CreateSchema(create) => self.execute_create_schema(create),
-            Statement::CreateIndex(create) => self.execute_create_index(create, arena),
-            Statement::Insert(insert) => self.execute_insert(insert, arena, params),
-            Statement::Update(update) => self.execute_update(update, params.unwrap_or(&[]), arena),
-            Statement::Delete(delete) => self.execute_delete(delete, params.unwrap_or(&[]), arena),
+            Statement::CreateTable(create) => {
+                self.check_writable()?;
+                self.execute_create_table(create, arena)
+            }
+            Statement::CreateSchema(create) => {
+                self.check_writable()?;
+                self.execute_create_schema(create)
+            }
+            Statement::CreateIndex(create) => {
+                self.check_writable()?;
+                self.execute_create_index(create, arena)
+            }
+            Statement::Insert(insert) => {
+                self.check_writable()?;
+                self.execute_insert(insert, arena, params)
+            }
+            Statement::Update(update) => {
+                self.check_writable()?;
+                self.execute_update(update, params.unwrap_or(&[]), arena)
+            }
+            Statement::Delete(delete) => {
+                self.check_writable()?;
+                self.execute_delete(delete, params.unwrap_or(&[]), arena)
+            }
             Statement::Select(_) => {
                 let (columns, rows) = self.query_with_columns(sql)?;
                 Ok(ExecuteResult::Select { columns, rows })
             }
             Statement::Drop(drop) => {
+                self.check_writable()?;
                 use crate::sql::ast::ObjectType;
                 match drop.object_type {
                     ObjectType::Table => self.execute_drop_table(drop),
@@ -3475,8 +3738,14 @@ impl Database {
             Statement::Rollback(rollback) => self.execute_rollback(rollback),
             Statement::Savepoint(savepoint) => self.execute_savepoint(savepoint),
             Statement::Release(release) => self.execute_release(release),
-            Statement::Truncate(truncate) => self.execute_truncate(truncate),
-            Statement::AlterTable(alter) => self.execute_alter_table(alter),
+            Statement::Truncate(truncate) => {
+                self.check_writable()?;
+                self.execute_truncate(truncate)
+            }
+            Statement::AlterTable(alter) => {
+                self.check_writable()?;
+                self.execute_alter_table(alter)
+            }
             Statement::Set(set) => self.execute_set(set),
             Statement::Explain(explain) => self.execute_explain(explain, arena),
             _ => bail!("unsupported statement type"),
@@ -3502,12 +3771,12 @@ impl Database {
         if explain.verbose {
             if let crate::sql::ast::Statement::Select(select) = explain.statement {
                 if let Some(from_clause) = select.from {
-                    let table_name = match from_clause {
-                        crate::sql::ast::FromClause::Table(table_ref) => Some(table_ref.name),
-                        _ => None,
+                    let (table_schema, table_name) = match from_clause {
+                        crate::sql::ast::FromClause::Table(table_ref) => (table_ref.schema, Some(table_ref.name)),
+                        _ => (None, None),
                     };
                     if let Some(table_name) = table_name {
-                        if let Ok(table_def) = catalog.resolve_table(table_name) {
+                        if let Ok(table_def) = catalog.resolve_table_in_schema(table_schema, table_name) {
                             plan_text.push_str("\nTable Info:\n");
                             plan_text.push_str(&format!("  Table: {}\n", table_name));
                             plan_text.push_str("  Indexes:\n");
@@ -3657,6 +3926,174 @@ impl Database {
                     value: Some(current.to_string()),
                 })
             }
+            "MEMORY_BUDGET" => {
+                let budget = self.shared.memory_budget.total_limit();
+                Ok(ExecuteResult::Pragma {
+                    name: name.clone(),
+                    value: Some(budget.to_string()),
+                })
+            }
+            "MEMORY_STATS" => {
+                let stats = self.shared.memory_budget.stats();
+                Ok(ExecuteResult::Pragma {
+                    name: name.clone(),
+                    value: Some(stats.to_string()),
+                })
+            }
+            "PERSISTED_MEMORY_STATS" => {
+                use crate::schema::system_tables::{MEMORY_STATS_TABLE, SYSTEM_SCHEMA};
+
+                let result = self.execute(&format!(
+                    "SELECT stat_name, stat_value, updated_at FROM {}.{}",
+                    SYSTEM_SCHEMA, MEMORY_STATS_TABLE
+                ));
+
+                match result {
+                    Ok(ExecuteResult::Select { rows, .. }) => {
+                        if rows.is_empty() {
+                            Ok(ExecuteResult::Pragma {
+                                name: name.clone(),
+                                value: Some("(no persisted stats - run checkpoint first)".to_string()),
+                            })
+                        } else {
+                            let stats_str: Vec<String> = rows
+                                .iter()
+                                .map(|r| {
+                                    let stat_name = r.values.first().map(|v| format!("{:?}", v)).unwrap_or_default();
+                                    let stat_value = r.values.get(1).map(|v| format!("{:?}", v)).unwrap_or_default();
+                                    format!("{}={}", stat_name, stat_value)
+                                })
+                                .collect();
+                            Ok(ExecuteResult::Pragma {
+                                name: name.clone(),
+                                value: Some(stats_str.join(",")),
+                            })
+                        }
+                    }
+                    _ => Ok(ExecuteResult::Pragma {
+                        name: name.clone(),
+                        value: Some("(unable to read persisted stats)".to_string()),
+                    }),
+                }
+            }
+            "WAL_CHECKPOINT" => {
+                let frames = self.shared.checkpoint()?;
+                Ok(ExecuteResult::Pragma {
+                    name: name.clone(),
+                    value: Some(format!("checkpointed {} frames", frames)),
+                })
+            }
+            "WAL_CHECKPOINT_STATS" => {
+                let frames = self.checkpoint_wal_with_stats()?;
+                Ok(ExecuteResult::Pragma {
+                    name: name.clone(),
+                    value: Some(format!("checkpointed {} frames (stats persisted)", frames)),
+                })
+            }
+            "WAL_CHECKPOINT_THRESHOLD" => {
+                let wal_guard = self.shared.wal.lock();
+                if let Some(ref wal) = *wal_guard {
+                    if let Some(ref val) = value {
+                        let threshold: u32 = val.parse().map_err(|_| {
+                            eyre::eyre!(
+                                "invalid PRAGMA wal_checkpoint_threshold value: {} (use a number)",
+                                val
+                            )
+                        })?;
+                        wal.set_checkpoint_threshold(threshold);
+                    }
+                    let current = wal.checkpoint_threshold();
+                    drop(wal_guard);
+                    Ok(ExecuteResult::Pragma {
+                        name: name.clone(),
+                        value: Some(current.to_string()),
+                    })
+                } else {
+                    drop(wal_guard);
+                    Ok(ExecuteResult::Pragma {
+                        name: name.clone(),
+                        value: Some("1000".to_string()),
+                    })
+                }
+            }
+            "WAL_FRAME_COUNT" => {
+                let wal_guard = self.shared.wal.lock();
+                let frame_count = if let Some(ref wal) = *wal_guard {
+                    wal.frame_count()
+                } else {
+                    0
+                };
+                drop(wal_guard);
+                Ok(ExecuteResult::Pragma {
+                    name: name.clone(),
+                    value: Some(frame_count.to_string()),
+                })
+            }
+            "WAL_SIZE" => {
+                let wal_guard = self.shared.wal.lock();
+                let wal_size = if let Some(ref wal) = *wal_guard {
+                    wal.total_wal_size_bytes()
+                } else {
+                    0
+                };
+                drop(wal_guard);
+                Ok(ExecuteResult::Pragma {
+                    name: name.clone(),
+                    value: Some(wal_size.to_string()),
+                })
+            }
+            "DATABASE_MODE" => {
+                let mode = *self.shared.mode.read();
+                let mode_str = match mode {
+                    super::DatabaseMode::ReadWrite => "read_write",
+                    super::DatabaseMode::ReadOnlyDegraded { pending_wal_frames } => {
+                        return Ok(ExecuteResult::Pragma {
+                            name: name.clone(),
+                            value: Some(format!(
+                                "read_only_degraded (pending {} WAL frames)",
+                                pending_wal_frames
+                            )),
+                        });
+                    }
+                };
+                Ok(ExecuteResult::Pragma {
+                    name: name.clone(),
+                    value: Some(mode_str.to_string()),
+                })
+            }
+            "RECOVER_WAL" => {
+                let mode = *self.shared.mode.read();
+                match mode {
+                    super::DatabaseMode::ReadWrite => {
+                        Ok(ExecuteResult::Pragma {
+                            name: name.clone(),
+                            value: Some("already in read_write mode, no recovery needed".to_string()),
+                        })
+                    }
+                    super::DatabaseMode::ReadOnlyDegraded { pending_wal_frames } => {
+                        eprintln!(
+                            "[turdb] Starting streaming WAL recovery for {} frames...",
+                            pending_wal_frames
+                        );
+
+                        let frames = Self::streaming_recovery(
+                            &self.shared.path,
+                            &self.shared.wal_dir,
+                            super::recovery::DEFAULT_RECOVERY_BATCH_SIZE,
+                            Some(Arc::clone(&self.shared.memory_budget)),
+                        )?;
+
+                        *self.shared.mode.write() = super::DatabaseMode::ReadWrite;
+
+                        eprintln!("[turdb] WAL recovery complete! Recovered {} frames.", frames);
+
+                        Ok(ExecuteResult::Pragma {
+                            name: name.clone(),
+                            value: Some(format!("recovered {} frames, now in read_write mode", frames)),
+                        })
+                    }
+                }
+            }
             _ => bail!("unknown PRAGMA: {}", name),
         }
     }
@@ -3665,6 +4102,136 @@ impl Database {
         self.shared
             .join_memory_budget
             .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    pub fn memory_budget(&self) -> Arc<MemoryBudget> {
+        Arc::clone(&self.shared.memory_budget)
+    }
+
+    pub fn memory_budget_ref(&self) -> &MemoryBudget {
+        &self.shared.memory_budget
+    }
+
+    pub fn memory_stats(&self) -> crate::memory::BudgetStats {
+        self.shared.memory_budget.stats()
+    }
+
+    pub fn persist_memory_stats(&self) -> Result<()> {
+        use crate::schema::system_tables::{memory_stat_names, MEMORY_STATS_TABLE, SYSTEM_SCHEMA};
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let stats = self.shared.memory_budget.stats();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs().to_string())
+            .unwrap_or_else(|_| "0".to_string());
+
+        let stats_to_write = [
+            (memory_stat_names::BUDGET_TOTAL, stats.total_limit as i64),
+            (memory_stat_names::USED_CACHE, stats.cache_used as i64),
+            (memory_stat_names::USED_QUERY, stats.query_used as i64),
+            (memory_stat_names::USED_RECOVERY, stats.recovery_used as i64),
+            (memory_stat_names::USED_SCHEMA, stats.schema_used as i64),
+            (memory_stat_names::USED_SHARED, stats.shared_used as i64),
+            (memory_stat_names::USED_TOTAL, stats.total_used as i64),
+            (memory_stat_names::AVAILABLE_SHARED, stats.shared_available as i64),
+        ];
+
+        for (stat_name, stat_value) in &stats_to_write {
+            let delete_sql = format!(
+                "DELETE FROM {}.{} WHERE stat_name = '{}'",
+                SYSTEM_SCHEMA, MEMORY_STATS_TABLE, stat_name
+            );
+            let _ = self.execute(&delete_sql);
+
+            let insert_sql = format!(
+                "INSERT INTO {}.{} (stat_name, stat_value, updated_at) VALUES ('{}', {}, '{}')",
+                SYSTEM_SCHEMA, MEMORY_STATS_TABLE, stat_name, stat_value, now
+            );
+            self.execute(&insert_sql)?;
+        }
+
+        Ok(())
+    }
+
+    pub fn persist_wal_stats(&self) -> Result<()> {
+        use crate::schema::system_tables::{wal_stat_names, SYSTEM_SCHEMA, WAL_STATS_TABLE};
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let frame_count = self.wal_frame_count()? as i64;
+        let size_bytes = self.wal_size_bytes()? as i64;
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs().to_string())
+            .unwrap_or_else(|_| "0".to_string());
+
+        let stats_to_write = [
+            (wal_stat_names::FRAME_COUNT, frame_count),
+            (wal_stat_names::SIZE_BYTES, size_bytes),
+        ];
+
+        for (stat_name, stat_value) in &stats_to_write {
+            let delete_sql = format!(
+                "DELETE FROM {}.{} WHERE stat_name = '{}'",
+                SYSTEM_SCHEMA, WAL_STATS_TABLE, stat_name
+            );
+            let _ = self.execute(&delete_sql);
+
+            let insert_sql = format!(
+                "INSERT INTO {}.{} (stat_name, stat_value, updated_at) VALUES ('{}', {}, '{}')",
+                SYSTEM_SCHEMA, WAL_STATS_TABLE, stat_name, stat_value, now
+            );
+            self.execute(&insert_sql)?;
+        }
+
+        Ok(())
+    }
+
+    pub fn wal_frame_count(&self) -> Result<u32> {
+        let wal_guard = self.shared.wal.lock();
+        if let Some(ref wal) = *wal_guard {
+            Ok(wal.frame_count())
+        } else {
+            Ok(0)
+        }
+    }
+
+    pub fn wal_size_bytes(&self) -> Result<u64> {
+        let wal_guard = self.shared.wal.lock();
+        if let Some(ref wal) = *wal_guard {
+            Ok(wal.total_wal_size_bytes())
+        } else {
+            Ok(0)
+        }
+    }
+
+    /// Returns the current database operating mode.
+    pub fn mode(&self) -> super::DatabaseMode {
+        *self.shared.mode.read()
+    }
+
+    /// Returns true if the database is in read-write mode.
+    pub fn is_read_write(&self) -> bool {
+        matches!(self.mode(), super::DatabaseMode::ReadWrite)
+    }
+
+    /// Returns true if the database is in degraded read-only mode.
+    pub fn is_degraded(&self) -> bool {
+        matches!(self.mode(), super::DatabaseMode::ReadOnlyDegraded { .. })
+    }
+
+    /// Check if the database is writable. Returns an error if in degraded mode.
+    pub(crate) fn check_writable(&self) -> Result<()> {
+        match self.mode() {
+            super::DatabaseMode::ReadWrite => Ok(()),
+            super::DatabaseMode::ReadOnlyDegraded { pending_wal_frames } => {
+                bail!(
+                    "Database is in read-only degraded mode with {} pending WAL frames. \
+                     Run PRAGMA recover_wal to recover and enable writes.",
+                    pending_wal_frames
+                )
+            }
+        }
     }
 
     pub(crate) fn evaluate_check_expression(
@@ -3964,9 +4531,31 @@ impl Drop for SharedDatabase {
             return;
         }
 
-        // We can't easily call self.checkpoint() because we don't have a Database wrapper and internal methods might require it?
-        // Actually checkpoint code is on Database, but it mostly uses shared fields.
-        // We can implement a simplified save/sync here.
+        // On clean close, do a full checkpoint (apply WAL + truncate)
+        // This ensures all data is persisted to storage files before closing
+        if !std::thread::panicking() {
+            // Checkpoint: rotate current segment and apply all closed segments
+            let closed_segments = {
+                let guard = self.wal.lock();
+                if let Some(wal) = guard.as_ref() {
+                    let _ = wal.rotate_segment();
+                    wal.get_closed_segments()
+                } else {
+                    vec![]
+                }
+            };
+
+            if !closed_segments.is_empty() {
+                let root_dir = self.path.join(crate::storage::DEFAULT_SCHEMA);
+                let _ = Database::replay_schema_tables_from_segments(&root_dir, &closed_segments);
+
+                // Remove closed segments (full checkpoint = truncate)
+                let guard = self.wal.lock();
+                if let Some(wal) = guard.as_ref() {
+                    let _ = wal.remove_closed_segments(&closed_segments);
+                }
+            }
+        }
 
         let _ = self.save_catalog();
 

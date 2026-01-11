@@ -83,6 +83,7 @@ pub mod constraints;
 pub mod database;
 pub mod encoding;
 pub mod hnsw;
+pub mod memory;
 pub mod mvcc;
 pub mod parsing;
 pub mod records;
