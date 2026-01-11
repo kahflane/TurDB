@@ -73,9 +73,13 @@ use parking_lot::{Mutex, RwLock};
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering as AtomicOrdering;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::database::timing::{INSERT_TIME_NS, PARSE_TIME_NS};
+
+/// Aggregate group state: group key hashes -> (accumulated group values, (count, sum) pairs for AVG)
+type AggregateGroups = HashMap<Vec<u64>, (Vec<OwnedValue>, Vec<(i64, f64)>)>;
 
 pub(crate) struct SharedDatabase {
     pub(crate) path: PathBuf,
@@ -2177,9 +2181,7 @@ impl Database {
                         })
                         .collect();
 
-                    #[allow(clippy::type_complexity)]
-                    let mut groups: HashMap<Vec<u64>, (Vec<OwnedValue>, Vec<(i64, f64)>)> =
-                        HashMap::new();
+                    let mut groups: AggregateGroups = HashMap::new();
 
                     for row in &result_rows {
                         let group_key: Vec<u64> = group_by_indices
