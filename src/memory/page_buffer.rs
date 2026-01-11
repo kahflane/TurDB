@@ -13,8 +13,8 @@
 //! ```ignore
 //! let pool = PageBufferPool::new(16); // Pre-allocate 16 buffers
 //!
-//! // Acquire a buffer (from pool or newly allocated if pool empty)
-//! let mut buffer = pool.acquire();
+//! // Acquire a buffer (returns None if pool exhausted)
+//! let mut buffer = pool.acquire().expect("buffer pool exhausted");
 //! buffer.copy_from_slice(page_data);
 //!
 //! // Buffer automatically returns to pool when dropped
@@ -28,6 +28,13 @@
 //!
 //! `PooledPageBuffer` uses `ManuallyDrop` instead of `Option` to make invalid
 //! states unrepresentable at the type level, eliminating potential panics.
+//!
+//! ## Zero-Allocation Guarantee
+//!
+//! Unlike traditional pools that allocate on exhaustion, this pool returns `None`
+//! when all buffers are in use. This enforces the zero-allocation requirement
+//! during CRUD operations. Size the pool appropriately at startup based on
+//! expected concurrent commit load.
 
 use crate::storage::PAGE_SIZE;
 use parking_lot::Mutex;
@@ -89,27 +96,46 @@ impl PageBufferPool {
     /// Acquire a buffer from the pool.
     ///
     /// Uses round-robin shard selection to distribute load. If the selected
-    /// shard is empty, allocates a new buffer. The buffer is automatically
-    /// returned to its shard when dropped.
-    pub fn acquire(&self) -> PooledPageBuffer {
+    /// shard is empty, attempts work-stealing from other shards before giving up.
+    ///
+    /// Returns `None` if all shards are empty (pool exhausted). This enforces
+    /// the zero-allocation guarantee - callers should handle exhaustion as an
+    /// error rather than silently allocating.
+    ///
+    /// The buffer is automatically returned to its originating shard when dropped.
+    pub fn acquire(&self) -> Option<PooledPageBuffer> {
         // Round-robin shard selection
-        let shard_idx = self.inner.next_shard.fetch_add(1, Ordering::Relaxed) % BUFFER_POOL_SHARD_COUNT;
+        let start_shard = self.inner.next_shard.fetch_add(1, Ordering::Relaxed) % BUFFER_POOL_SHARD_COUNT;
 
-        let buffer = {
-            let mut shard = self.inner.shards[shard_idx].lock();
-            shard.pop()
-        };
-
-        let buffer = buffer.unwrap_or_else(|| Box::new([0u8; PAGE_SIZE]));
-
-        PooledPageBuffer {
-            buffer: ManuallyDrop::new(buffer),
-            pool: Arc::clone(&self.inner),
-            shard_idx,
+        // Try the primary shard first
+        if let Some(buffer) = self.inner.shards[start_shard].lock().pop() {
+            return Some(PooledPageBuffer {
+                buffer: ManuallyDrop::new(buffer),
+                pool: Arc::clone(&self.inner),
+                shard_idx: start_shard,
+            });
         }
+
+        // Work-stealing: try all other shards before giving up
+        for offset in 1..BUFFER_POOL_SHARD_COUNT {
+            let shard_idx = (start_shard + offset) % BUFFER_POOL_SHARD_COUNT;
+            if let Some(buffer) = self.inner.shards[shard_idx].lock().pop() {
+                return Some(PooledPageBuffer {
+                    buffer: ManuallyDrop::new(buffer),
+                    pool: Arc::clone(&self.inner),
+                    shard_idx,
+                });
+            }
+        }
+
+        // Pool exhausted - fail fast rather than allocate
+        None
     }
 
     /// Returns the current number of available buffers in the pool (across all shards).
+    ///
+    /// **Performance note**: This method acquires all 16 shard locks sequentially.
+    /// It is intended for monitoring/debugging only, not for hot paths.
     pub fn available(&self) -> usize {
         self.inner
             .shards
@@ -192,9 +218,18 @@ impl Drop for PooledPageBuffer {
     }
 }
 
-// PooledPageBuffer cannot be Send/Sync automatically due to the Arc<PageBufferPoolInner>
-// but since PageBufferPoolInner only contains Mutex<Vec<...>>, it's safe.
+// SAFETY: PooledPageBuffer is Send because:
+// - `buffer` (ManuallyDrop<Box<[u8; PAGE_SIZE]>>) is Send (owned heap data)
+// - `pool` (Arc<PageBufferPoolInner>) is Send (Arc of Send+Sync inner)
+// - `shard_idx` (usize) is Send (Copy type)
+// The automatic impl is blocked by the raw pointer-like semantics of ManuallyDrop,
+// but our usage is safe: we only call ManuallyDrop::take once in Drop.
 unsafe impl Send for PooledPageBuffer {}
+
+// SAFETY: PooledPageBuffer is Sync because:
+// - All fields are Sync: ManuallyDrop<Box<T>> where T: Sync, Arc<T> where T: Sync, usize
+// - PageBufferPoolInner contains only Mutex<Vec<...>> which is Sync
+// - No interior mutability is exposed through &PooledPageBuffer (Deref returns &[u8])
 unsafe impl Sync for PooledPageBuffer {}
 
 #[cfg(test)]
@@ -206,14 +241,14 @@ mod tests {
         let pool = PageBufferPool::new(2);
         assert_eq!(pool.available(), 2);
 
-        let buf1 = pool.acquire();
+        let buf1 = pool.acquire().expect("should have buffer");
         assert_eq!(pool.available(), 1);
 
-        let buf2 = pool.acquire();
+        let buf2 = pool.acquire().expect("should have buffer");
         assert_eq!(pool.available(), 0);
 
-        // Pool empty, this will allocate
-        let _buf3 = pool.acquire();
+        // Pool exhausted - returns None (zero-allocation guarantee)
+        assert!(pool.acquire().is_none());
         assert_eq!(pool.available(), 0);
 
         drop(buf1);
@@ -226,7 +261,7 @@ mod tests {
     #[test]
     fn test_buffer_copy_from_page() {
         let pool = PageBufferPool::new(1);
-        let mut buf = pool.acquire();
+        let mut buf = pool.acquire().expect("should have buffer");
 
         let data = [0xABu8; 100];
         buf.copy_from_page(&data);
@@ -240,7 +275,27 @@ mod tests {
         let pool1 = PageBufferPool::new(2);
         let pool2 = pool1.clone();
 
-        let _buf = pool1.acquire();
+        let _buf = pool1.acquire().expect("should have buffer");
         assert_eq!(pool2.available(), 1);
+    }
+
+    #[test]
+    fn test_work_stealing() {
+        // Create pool with buffers distributed across shards
+        let pool = PageBufferPool::new(BUFFER_POOL_SHARD_COUNT);
+
+        // Acquire all buffers - work-stealing should find them across shards
+        let mut buffers = Vec::new();
+        for _ in 0..BUFFER_POOL_SHARD_COUNT {
+            buffers.push(pool.acquire().expect("work-stealing should find buffer"));
+        }
+
+        // Now pool should be exhausted
+        assert!(pool.acquire().is_none());
+        assert_eq!(pool.available(), 0);
+
+        // Return all buffers
+        drop(buffers);
+        assert_eq!(pool.available(), BUFFER_POOL_SHARD_COUNT);
     }
 }

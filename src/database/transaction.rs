@@ -333,7 +333,8 @@ impl Database {
 
                         for page_no in pages_to_flush {
                             if let Ok(data) = storage.page(page_no) {
-                                let mut buffer = self.shared.page_buffer_pool.acquire();
+                                let mut buffer = self.shared.page_buffer_pool.acquire()
+                                    .ok_or_else(|| eyre::eyre!("page buffer pool exhausted"))?;
                                 buffer.copy_from_page(data);
                                 payload.push((table_id, page_no, buffer, db_size));
                             }
