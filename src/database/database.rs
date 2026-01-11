@@ -47,7 +47,7 @@ use crate::database::query::{
 use crate::database::row::Row;
 use crate::database::transaction::ActiveTransaction;
 use crate::database::{ExecuteResult, RecoveryInfo};
-use crate::memory::{MemoryBudget, Pool};
+use crate::memory::{MemoryBudget, PageBufferPool, Pool};
 use crate::mvcc::TransactionManager;
 
 use crate::schema::Catalog;
@@ -109,6 +109,8 @@ pub(crate) struct SharedDatabase {
     pub(crate) memory_budget: Arc<MemoryBudget>,
     /// Current database operating mode (ReadWrite or ReadOnlyDegraded)
     pub(crate) mode: RwLock<super::DatabaseMode>,
+    /// Pre-allocated buffer pool for zero-allocation commit operations
+    pub(crate) page_buffer_pool: PageBufferPool,
 }
 
 pub struct Database {
@@ -252,6 +254,7 @@ impl Database {
             hnsw_indexes: RwLock::new(hashbrown::HashMap::new()),
             memory_budget,
             mode: RwLock::new(mode),
+            page_buffer_pool: PageBufferPool::new(16), // Pre-allocate 16 page buffers
         });
 
         let db = Self {
@@ -325,6 +328,7 @@ impl Database {
             hnsw_indexes: RwLock::new(hashbrown::HashMap::new()),
             memory_budget: Arc::new(MemoryBudget::auto_detect()),
             mode: RwLock::new(super::DatabaseMode::ReadWrite),
+            page_buffer_pool: PageBufferPool::new(16), // Pre-allocate 16 page buffers
         });
 
         let db = Self {

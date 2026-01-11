@@ -26,14 +26,18 @@
 //!    - Buffer -> WAL File.
 //!    - No Storage Locks required.
 
+use crate::memory::PooledPageBuffer;
 use parking_lot::{Condvar, Mutex};
 use smallvec::SmallVec;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-/// Payload type for dirty pages: (table_id, page_id, data, db_size)
-pub type CommitPayload = SmallVec<[(u32, u32, Vec<u8>, u32); 4]>;
+/// Payload type for dirty pages: (table_id, page_id, pooled_buffer, db_size)
+///
+/// Uses `PooledPageBuffer` instead of `Vec<u8>` to avoid heap allocation on every
+/// commit. Buffers are returned to the pool when the payload is dropped.
+pub type CommitPayload = SmallVec<[(u32, u32, PooledPageBuffer, u32); 4]>;
 
 /// Configuration for group commit behavior
 #[derive(Debug, Clone, Copy)]
@@ -405,7 +409,15 @@ impl Default for GroupCommitQueue {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::memory::PageBufferPool;
     use smallvec::smallvec;
+
+    /// Helper to create a test payload with the given data byte
+    fn test_payload(pool: &PageBufferPool, table_id: u32, page_no: u32, data_byte: u8, db_size: u32) -> CommitPayload {
+        let mut buffer = pool.acquire();
+        buffer[0] = data_byte;
+        smallvec![(table_id, page_no, buffer, db_size)]
+    }
 
     #[test]
     fn test_group_commit_config_default() {
@@ -417,7 +429,8 @@ mod tests {
 
     #[test]
     fn test_pending_commit_lifecycle() {
-        let payload = smallvec![(1, 100, vec![1, 2, 3], 10)];
+        let pool = PageBufferPool::new(4);
+        let payload = test_payload(&pool, 1, 100, 1, 10);
         let pending = PendingCommit::new(1, payload);
         assert!(!pending.is_completed());
         assert!(pending.take_error().is_none());
@@ -463,23 +476,25 @@ mod tests {
 
     #[test]
     fn test_queue_submit_async() {
+        let pool = PageBufferPool::new(4);
         let queue = GroupCommitQueue::with_default_config();
 
-        let pending = queue.submit_async(smallvec![(1, 0, vec![1], 10)]);
+        let pending = queue.submit_async(test_payload(&pool, 1, 0, 1, 10));
         assert_eq!(pending.batch_id, 1);
         assert_eq!(queue.pending_count(), 1);
 
-        let pending2 = queue.submit_async(smallvec![(1, 0, vec![2], 10)]);
+        let pending2 = queue.submit_async(test_payload(&pool, 1, 0, 2, 10));
         assert_eq!(pending2.batch_id, 2);
         assert_eq!(queue.pending_count(), 2);
     }
 
     #[test]
     fn test_queue_take_pending() {
+        let pool = PageBufferPool::new(4);
         let queue = GroupCommitQueue::with_default_config();
 
-        queue.submit_async(smallvec![(1, 0, vec![1], 10)]);
-        queue.submit_async(smallvec![(1, 0, vec![2], 10)]);
+        queue.submit_async(test_payload(&pool, 1, 0, 1, 10));
+        queue.submit_async(test_payload(&pool, 1, 0, 2, 10));
 
         let pending = queue.take_pending().unwrap();
         assert_eq!(pending.len(), 2);
@@ -488,10 +503,11 @@ mod tests {
 
     #[test]
     fn test_queue_complete_batch() {
+        let pool = PageBufferPool::new(4);
         let queue = GroupCommitQueue::with_default_config();
 
-        let p1 = queue.submit_async(smallvec![(1, 0, vec![1], 10)]);
-        let p2 = queue.submit_async(smallvec![(1, 0, vec![2], 10)]);
+        let p1 = queue.submit_async(test_payload(&pool, 1, 0, 1, 10));
+        let p2 = queue.submit_async(test_payload(&pool, 1, 0, 2, 10));
 
         let pending = queue.take_pending().unwrap();
         queue.complete_batch(&pending);
@@ -503,10 +519,11 @@ mod tests {
 
     #[test]
     fn test_queue_disabled() {
+        let pool = PageBufferPool::new(4);
         let queue = GroupCommitQueue::with_default_config();
         queue.set_enabled(false);
 
-        let result = queue.submit_and_wait(smallvec![(1, 0, vec![1], 10)]);
+        let result = queue.submit_and_wait(test_payload(&pool, 1, 0, 1, 10));
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), 0);
         assert_eq!(queue.pending_count(), 0);

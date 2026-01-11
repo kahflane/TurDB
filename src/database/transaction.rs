@@ -333,7 +333,9 @@ impl Database {
 
                         for page_no in pages_to_flush {
                             if let Ok(data) = storage.page(page_no) {
-                                payload.push((table_id, page_no, data.to_vec(), db_size));
+                                let mut buffer = self.shared.page_buffer_pool.acquire();
+                                buffer.copy_from_page(data);
+                                payload.push((table_id, page_no, buffer, db_size));
                             }
                         }
                     }
@@ -374,8 +376,8 @@ impl Database {
                     .as_mut()
                     .ok_or_else(|| eyre::eyre!("WAL not initialized but WAL mode is enabled"))?;
 
-                for (table_id, page_no, data, db_size) in payload {
-                    wal.write_frame_with_file_id(page_no, db_size, &data, table_id as u64)
+                for (table_id, page_no, buffer, db_size) in payload {
+                    wal.write_frame_with_file_id(page_no, db_size, buffer.as_slice(), table_id as u64)
                         .wrap_err("failed to write WAL frame in direct commit")?;
                 }
             }
@@ -396,8 +398,8 @@ impl Database {
             .ok_or_else(|| eyre::eyre!("WAL not initialized but WAL mode is enabled"))?;
 
         for commit in pending_commits {
-            for (table_id, page_no, data, db_size) in &commit.payload {
-                wal.write_frame_with_file_id(*page_no, *db_size, data, *table_id as u64)
+            for (table_id, page_no, buffer, db_size) in &commit.payload {
+                wal.write_frame_with_file_id(*page_no, *db_size, buffer.as_slice(), *table_id as u64)
                     .wrap_err("failed to write WAL frame in group commit")?;
             }
         }
