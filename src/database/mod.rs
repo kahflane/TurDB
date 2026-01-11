@@ -101,8 +101,13 @@ pub mod prepared;
 mod recovery;
 pub mod row;
 pub mod timing;
+mod batch;
+mod config;
+mod lifecycle;
+mod pragma;
 mod toast;
 mod transaction;
+pub(crate) mod query;
 
 pub use database::Database;
 pub use prepared::{BoundStatement, PreparedStatement};
