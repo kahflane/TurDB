@@ -364,3 +364,17 @@ pub fn materialize_table_rows_with_def<'a>(
 
     Ok((rows, column_types, table_def))
 }
+
+/// Builds a column map from a TableDef for predicate evaluation.
+///
+/// This helper creates a mapping from lowercase column names to their indices,
+/// used throughout query execution for column lookups. Centralizing this logic
+/// ensures consistent case-insensitive matching across all query operators.
+pub fn build_simple_column_map(table_def: &TableDef) -> Vec<(String, usize)> {
+    table_def
+        .columns()
+        .iter()
+        .enumerate()
+        .map(|(idx, col)| (col.name().to_lowercase(), idx))
+        .collect()
+}

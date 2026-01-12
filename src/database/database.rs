@@ -40,10 +40,10 @@
 use crate::database::convert::convert_value_with_type;
 use crate::database::dirty_tracker::ShardedDirtyTracker;
 use crate::database::query::{
-    compare_owned_values, find_limit, find_nested_subquery, find_plan_source, find_projections,
-    find_sort_exec, find_table_scan, has_aggregate, has_filter, has_order_by_expression,
-    has_window, is_simple_count_star, materialize_table_rows, materialize_table_rows_with_def,
-    PlanSource,
+    build_simple_column_map, compare_owned_values, find_limit, find_nested_subquery,
+    find_plan_source, find_projections, find_sort_exec, find_table_scan, has_aggregate,
+    has_filter, has_order_by_expression, has_window, is_simple_count_star, materialize_table_rows,
+    materialize_table_rows_with_def, PlanSource,
 };
 use crate::database::row::Row;
 use crate::database::transaction::ActiveTransaction;
@@ -743,7 +743,7 @@ impl Database {
 
         fn collect_scalar_subqueries<'a>(
             expr: &'a crate::sql::ast::Expr<'a>,
-            subqueries: &mut Vec<&'a crate::sql::ast::SelectStmt<'a>>,
+            subqueries: &mut smallvec::SmallVec<[&'a crate::sql::ast::SelectStmt<'a>; 4]>,
         ) {
             use crate::sql::ast::Expr;
             match expr {
@@ -799,7 +799,7 @@ impl Database {
 
         fn find_filter_predicates<'a>(
             op: &'a crate::sql::planner::PhysicalOperator<'a>,
-            predicates: &mut Vec<&'a crate::sql::ast::Expr<'a>>,
+            predicates: &mut smallvec::SmallVec<[&'a crate::sql::ast::Expr<'a>; 8]>,
         ) {
             use crate::sql::planner::PhysicalOperator;
             match op {
@@ -859,12 +859,7 @@ impl Database {
                     None,
                 )?;
 
-                let column_map: Vec<(String, usize)> = table_def
-                    .columns()
-                    .iter()
-                    .enumerate()
-                    .map(|(idx, col)| (col.name().to_lowercase(), idx))
-                    .collect();
+                let column_map = build_simple_column_map(table_def);
 
                 let ctx = ExecutionContext::new(arena);
                 let builder = ExecutorBuilder::new(&ctx);
@@ -886,15 +881,17 @@ impl Database {
 
         let mut scalar_subquery_results: Option<hashbrown::HashMap<usize, OwnedValue>> = None;
         {
-            let mut filter_predicates: Vec<&crate::sql::ast::Expr> = Vec::new();
+            let mut filter_predicates: smallvec::SmallVec<[&crate::sql::ast::Expr; 8]> =
+                smallvec::SmallVec::new();
             find_filter_predicates(physical_plan.root, &mut filter_predicates);
 
             for predicate in filter_predicates {
-                let mut subqueries: Vec<&crate::sql::ast::SelectStmt> = Vec::new();
+                let mut subqueries: smallvec::SmallVec<[&crate::sql::ast::SelectStmt; 4]> =
+                    smallvec::SmallVec::new();
                 collect_scalar_subqueries(predicate, &mut subqueries);
 
                 for subq in subqueries {
-                    let key = subq as *const _ as usize;
+                    let key = std::ptr::from_ref(subq) as usize;
                     let map = scalar_subquery_results.get_or_insert_with(hashbrown::HashMap::new);
                     if let hashbrown::hash_map::Entry::Vacant(entry) = map.entry(key) {
                         let result = execute_scalar_subquery(subq, catalog, file_manager, &arena)?;
@@ -908,12 +905,12 @@ impl Database {
             subq: &'a crate::sql::planner::PhysicalSubqueryExec<'a>,
             catalog: &crate::schema::catalog::Catalog,
             file_manager: &mut FileManager,
+            arena: &'a Bump,
         ) -> Result<Vec<Vec<OwnedValue>>> {
             if let Some(nested_subq) = find_nested_subquery(subq.child_plan) {
-                let nested_rows = execute_subquery_recursive(nested_subq, catalog, file_manager)?;
+                let nested_rows = execute_subquery_recursive(nested_subq, catalog, file_manager, arena)?;
 
                 let nested_source = MaterializedRowSource::new(nested_rows);
-                let nested_arena = Bump::new();
 
                 let nested_column_map: Vec<(String, usize)> = nested_subq
                     .output_schema
@@ -928,7 +925,7 @@ impl Database {
                     output_schema: subq.output_schema.clone(),
                 };
 
-                let inner_ctx = ExecutionContext::new(&nested_arena);
+                let inner_ctx = ExecutionContext::new(arena);
                 let inner_builder = ExecutorBuilder::new(&inner_ctx);
                 let mut inner_executor = inner_builder
                     .build_with_source_and_column_map(
@@ -1008,12 +1005,7 @@ impl Database {
                     output_schema: subq.output_schema.clone(),
                 };
 
-                let inner_table_column_map: Vec<(String, usize)> = inner_table_def
-                    .columns()
-                    .iter()
-                    .enumerate()
-                    .map(|(idx, col)| (col.name().to_lowercase(), idx))
-                    .collect();
+                let inner_table_column_map = build_simple_column_map(inner_table_def);
 
                 let inner_ctx = ExecutionContext::new(&inner_arena);
                 let inner_builder = ExecutorBuilder::new(&inner_ctx);
@@ -1340,12 +1332,7 @@ impl Database {
                 };
                 let builder = ExecutorBuilder::new(&ctx);
 
-                let all_columns_map: Vec<(String, usize)> = table_def
-                    .columns()
-                    .iter()
-                    .enumerate()
-                    .map(|(idx, col)| (col.name().to_lowercase(), idx))
-                    .collect();
+                let all_columns_map = build_simple_column_map(table_def);
 
                 let mut executor = if needs_all_columns {
                     builder
@@ -1727,7 +1714,7 @@ impl Database {
                 rows
             }
             Some(PlanSource::Subquery(subq)) => {
-                let inner_rows = execute_subquery_recursive(subq, catalog, file_manager)?;
+                let inner_rows = execute_subquery_recursive(subq, catalog, file_manager, &arena)?;
 
                 let materialized_source = MaterializedRowSource::new(inner_rows);
 
@@ -2003,7 +1990,7 @@ impl Database {
                 let mut right_nested_join_column_map: Vec<(String, usize)> = Vec::new();
 
                 if let Some(subq) = left_subq {
-                    left_rows = execute_subquery_recursive(subq, catalog, file_manager)?;
+                    left_rows = execute_subquery_recursive(subq, catalog, file_manager, &arena)?;
                 } else if let Some(scan_info) = &left_scan {
                     let (schema_opt, table_name, alias) = match scan_info {
                         JoinScan::Table(scan) => (scan.schema, scan.table, scan.alias),
@@ -2021,7 +2008,7 @@ impl Database {
                 }
 
                 if let Some(subq) = right_subq {
-                    right_rows = execute_subquery_recursive(subq, catalog, file_manager)?;
+                    right_rows = execute_subquery_recursive(subq, catalog, file_manager, &arena)?;
                     right_col_count = subq.output_schema.columns.len();
                 } else if let Some(scan_info) = &right_scan {
                     let (schema_opt, table_name, alias) = match scan_info {

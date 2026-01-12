@@ -6,8 +6,8 @@ use std::borrow::Cow;
 
 pub struct CompiledPredicate<'a> {
     expr: &'a crate::sql::ast::Expr<'a>,
-    column_map: Vec<(String, usize)>,
-    params: Option<Vec<OwnedValue>>,
+    column_map: Cow<'a, [(String, usize)]>,
+    params: Option<Cow<'a, [OwnedValue]>>,
     set_param_count: usize,
     scalar_subquery_results: Option<hashbrown::HashMap<usize, OwnedValue>>,
 }
@@ -16,7 +16,20 @@ impl<'a> CompiledPredicate<'a> {
     pub fn new(expr: &'a crate::sql::ast::Expr<'a>, column_map: Vec<(String, usize)>) -> Self {
         Self {
             expr,
-            column_map,
+            column_map: Cow::Owned(column_map),
+            params: None,
+            set_param_count: 0,
+            scalar_subquery_results: None,
+        }
+    }
+
+    pub fn with_column_map_ref(
+        expr: &'a crate::sql::ast::Expr<'a>,
+        column_map: &'a [(String, usize)],
+    ) -> Self {
+        Self {
+            expr,
+            column_map: Cow::Borrowed(column_map),
             params: None,
             set_param_count: 0,
             scalar_subquery_results: None,
@@ -26,13 +39,13 @@ impl<'a> CompiledPredicate<'a> {
     pub fn with_params(
         expr: &'a crate::sql::ast::Expr<'a>,
         column_map: Vec<(String, usize)>,
-        params: &[OwnedValue],
+        params: &'a [OwnedValue],
         set_param_count: usize,
     ) -> Self {
         Self {
             expr,
-            column_map,
-            params: Some(params.to_vec()),
+            column_map: Cow::Owned(column_map),
+            params: Some(Cow::Borrowed(params)),
             set_param_count,
             scalar_subquery_results: None,
         }
@@ -45,7 +58,7 @@ impl<'a> CompiledPredicate<'a> {
     ) -> Self {
         Self {
             expr,
-            column_map,
+            column_map: Cow::Owned(column_map),
             params: None,
             set_param_count: 0,
             scalar_subquery_results: Some(scalar_results),
@@ -391,13 +404,11 @@ impl<'a> CompiledPredicate<'a> {
     }
 
     fn like_match(&self, text: &str, pattern: &str, case_insensitive: bool) -> bool {
-        let (text, pattern) = if case_insensitive {
-            (text.to_lowercase(), pattern.to_lowercase())
+        if case_insensitive {
+            self.like_match_case_insensitive(text.as_bytes(), pattern.as_bytes())
         } else {
-            (text.to_string(), pattern.to_string())
-        };
-
-        self.like_match_impl(text.as_bytes(), pattern.as_bytes())
+            self.like_match_impl(text.as_bytes(), pattern.as_bytes())
+        }
     }
 
     fn like_match_impl(&self, text: &[u8], pattern: &[u8]) -> bool {
@@ -408,6 +419,38 @@ impl<'a> CompiledPredicate<'a> {
 
         while ti < text.len() {
             if pi < pattern.len() && (pattern[pi] == b'_' || pattern[pi] == text[ti]) {
+                ti += 1;
+                pi += 1;
+            } else if pi < pattern.len() && pattern[pi] == b'%' {
+                star_pi = Some(pi);
+                star_ti = ti;
+                pi += 1;
+            } else if let Some(sp) = star_pi {
+                pi = sp + 1;
+                star_ti += 1;
+                ti = star_ti;
+            } else {
+                return false;
+            }
+        }
+
+        while pi < pattern.len() && pattern[pi] == b'%' {
+            pi += 1;
+        }
+
+        pi == pattern.len()
+    }
+
+    fn like_match_case_insensitive(&self, text: &[u8], pattern: &[u8]) -> bool {
+        let mut ti = 0;
+        let mut pi = 0;
+        let mut star_pi = None;
+        let mut star_ti = 0;
+
+        while ti < text.len() {
+            if pi < pattern.len()
+                && (pattern[pi] == b'_' || pattern[pi].eq_ignore_ascii_case(&text[ti]))
+            {
                 ti += 1;
                 pi += 1;
             } else if pi < pattern.len() && pattern[pi] == b'%' {

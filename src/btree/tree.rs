@@ -1402,20 +1402,15 @@ impl<'a, S: Storage + ?Sized> Cursor<'a, S> {
             }
         }
 
-        // Verify we ended up at the expected page. If not, the B-tree structure
-        // may be inconsistent, likely due to a corrupted root_page header.
-        // In this case, try to find our page in the path we built.
         if current_page != self.current_page {
-            #[cfg(debug_assertions)]
-            eprintln!(
-                "[turdb warn] B-tree navigation inconsistency: expected page {} but reached {}. \
-                 root_page={}, path_len={}. This may indicate B-tree corruption.",
+            bail!(
+                "B-tree navigation inconsistency: expected page {} but reached {}. \
+                 root_page={}, path_len={}. This indicates B-tree corruption.",
                 self.current_page,
                 current_page,
                 self.root_page,
                 path.len()
             );
-            return Ok(None);
         }
 
         while let Some((parent_page, child_idx)) = path.pop() {
