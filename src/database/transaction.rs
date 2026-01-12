@@ -120,6 +120,8 @@ use smallvec::SmallVec;
 use super::group_commit::CommitPayload;
 use super::{Database, ExecuteResult};
 
+const COMMIT_BATCH_SIZE: usize = 12;
+
 /// Named checkpoint within a transaction for partial rollback.
 #[derive(Debug, Clone)]
 pub struct Savepoint {
@@ -286,100 +288,18 @@ impl Database {
         self.finalize_transaction_commit(txn)?;
 
         if wal_enabled {
-            // [Deadlock Fix - Push-Based] Capture dirty data before queuing
-            // We read all dirty pages while holding storage locks, then release them,
-            // then submit the data to the group commit queue.
-
             let dirty_table_ids = self.shared.dirty_tracker.all_dirty_table_ids();
-            let mut payload: CommitPayload = SmallVec::new();
 
             if !dirty_table_ids.is_empty() {
-                // To safely capture data, we need file manager access to get storage
-                let mut file_manager_guard = self.shared.file_manager.write();
-                let file_manager = file_manager_guard
-                    .as_mut()
-                    .ok_or_else(|| eyre::eyre!("file manager not available for commit"))?;
+                let total_dirty_pages: u64 = dirty_table_ids
+                    .iter()
+                    .map(|&tid| self.shared.dirty_tracker.dirty_count(tid))
+                    .sum();
 
-                let mut table_infos: Vec<(u32, String, String)> = {
-                    let lookup = self.shared.table_id_lookup.read();
-                    dirty_table_ids
-                        .iter()
-                        .filter_map(|&table_id| {
-                            lookup
-                                .get(&table_id)
-                                .map(|(s, t)| (table_id, s.clone(), t.clone()))
-                        })
-                        .collect()
-                };
-                table_infos.sort_by_key(|(id, _, _)| *id);
-
-                // Acquire locks and capture data
-                for (table_id, schema_name, table_name) in table_infos {
-                    let _table_lock = self.shared.page_locks.table_intent_exclusive(table_id);
-                    let dirty_pages = self.shared.dirty_tracker.dirty_pages_for_table(table_id);
-
-                    if dirty_pages.is_empty() {
-                        continue;
-                    }
-
-                    let page_tuples: Vec<(u32, u32)> =
-                        dirty_pages.iter().map(|&p| (table_id, p)).collect();
-                    let _page_locks = self.shared.page_locks.page_write_multi(&page_tuples);
-
-                    if let Ok(storage_arc) = file_manager.table_data(&schema_name, &table_name) {
-                        let storage = storage_arc.read();
-                        let db_size = storage.page_count();
-                        let pages_to_flush = self.shared.dirty_tracker.drain_for_table(table_id);
-
-                        for page_no in pages_to_flush {
-                            if let Ok(data) = storage.page(page_no) {
-                                let mut buffer = self.shared.page_buffer_pool.acquire()
-                                    .ok_or_else(|| eyre::eyre!("page buffer pool exhausted"))?;
-                                buffer.copy_from_page(data);
-                                payload.push((table_id, page_no, buffer, db_size));
-                            }
-                        }
-                    }
-                }
-            }
-
-            if self.shared.group_commit_queue.is_enabled() {
-                match self.shared.group_commit_queue.submit_and_wait(payload) {
-                    Ok(_batch_id) => {
-                        if let Some(pending_commits) = self.shared.group_commit_queue.take_pending()
-                        {
-                            let result = self.execute_group_wal_flush(&pending_commits);
-                            match &result {
-                                Ok(()) => self
-                                    .shared
-                                    .group_commit_queue
-                                    .complete_batch(&pending_commits),
-                                Err(e) => self
-                                    .shared
-                                    .group_commit_queue
-                                    .fail_batch(&pending_commits, &e.to_string()),
-                            }
-                            result?;
-                        }
-
-                        self.maybe_auto_checkpoint();
-
-                        return Ok(ExecuteResult::Commit);
-                    }
-                    Err(e) => {
-                        bail!("group commit failed: {}", e);
-                    }
-                }
-            } else if !payload.is_empty() {
-                // If group commit is disabled but WAL is on, we flush directly.
-                let mut wal_guard = self.shared.wal.lock();
-                let wal = wal_guard
-                    .as_mut()
-                    .ok_or_else(|| eyre::eyre!("WAL not initialized but WAL mode is enabled"))?;
-
-                for (table_id, page_no, buffer, db_size) in payload {
-                    wal.write_frame_with_file_id(page_no, db_size, buffer.as_slice(), table_id as u64)
-                        .wrap_err("failed to write WAL frame in direct commit")?;
+                if total_dirty_pages as usize > COMMIT_BATCH_SIZE {
+                    self.execute_chunked_wal_commit(&dirty_table_ids)?;
+                } else {
+                    self.execute_small_commit(&dirty_table_ids)?;
                 }
             }
 
@@ -387,6 +307,167 @@ impl Database {
         }
 
         Ok(ExecuteResult::Commit)
+    }
+
+    fn execute_small_commit(&self, dirty_table_ids: &[u32]) -> Result<()> {
+        let mut payload: CommitPayload = SmallVec::new();
+
+        let mut file_manager_guard = self.shared.file_manager.write();
+        let file_manager = file_manager_guard
+            .as_mut()
+            .ok_or_else(|| eyre::eyre!("file manager not available for commit"))?;
+
+        let mut table_infos: Vec<(u32, String, String)> = {
+            let lookup = self.shared.table_id_lookup.read();
+            dirty_table_ids
+                .iter()
+                .filter_map(|&table_id| {
+                    lookup
+                        .get(&table_id)
+                        .map(|(s, t)| (table_id, s.clone(), t.clone()))
+                })
+                .collect()
+        };
+        table_infos.sort_by_key(|(id, _, _)| *id);
+
+        for (table_id, schema_name, table_name) in table_infos {
+            let _table_lock = self.shared.page_locks.table_intent_exclusive(table_id);
+            let dirty_pages = self.shared.dirty_tracker.dirty_pages_for_table(table_id);
+
+            if dirty_pages.is_empty() {
+                continue;
+            }
+
+            let page_tuples: Vec<(u32, u32)> =
+                dirty_pages.iter().map(|&p| (table_id, p)).collect();
+            let _page_locks = self.shared.page_locks.page_write_multi(&page_tuples);
+
+            if let Ok(storage_arc) = file_manager.table_data(&schema_name, &table_name) {
+                let storage = storage_arc.read();
+                let db_size = storage.page_count();
+                let pages_to_flush = self.shared.dirty_tracker.drain_for_table(table_id);
+
+                for page_no in pages_to_flush {
+                    if let Ok(data) = storage.page(page_no) {
+                        let mut buffer = self.shared.page_buffer_pool.acquire()
+                            .ok_or_else(|| eyre::eyre!("page buffer pool exhausted"))?;
+                        buffer.copy_from_page(data);
+                        payload.push((table_id, page_no, buffer, db_size));
+                    }
+                }
+            }
+        }
+
+        drop(file_manager_guard);
+
+        if self.shared.group_commit_queue.is_enabled() {
+            match self.shared.group_commit_queue.submit_and_wait(payload) {
+                Ok(_batch_id) => {
+                    if let Some(pending_commits) = self.shared.group_commit_queue.take_pending() {
+                        let result = self.execute_group_wal_flush(&pending_commits);
+                        match &result {
+                            Ok(()) => self
+                                .shared
+                                .group_commit_queue
+                                .complete_batch(&pending_commits),
+                            Err(e) => self
+                                .shared
+                                .group_commit_queue
+                                .fail_batch(&pending_commits, &e.to_string()),
+                        }
+                        result?;
+                    }
+                }
+                Err(e) => {
+                    bail!("group commit failed: {}", e);
+                }
+            }
+        } else if !payload.is_empty() {
+            let mut wal_guard = self.shared.wal.lock();
+            let wal = wal_guard
+                .as_mut()
+                .ok_or_else(|| eyre::eyre!("WAL not initialized but WAL mode is enabled"))?;
+
+            for (table_id, page_no, buffer, db_size) in payload {
+                wal.write_frame_with_file_id(page_no, db_size, buffer.as_slice(), table_id as u64)
+                    .wrap_err("failed to write WAL frame in direct commit")?;
+            }
+        }
+
+        Ok(())
+    }
+
+    fn execute_chunked_wal_commit(&self, dirty_table_ids: &[u32]) -> Result<()> {
+        let mut wal_guard = self.shared.wal.lock();
+        let wal = wal_guard
+            .as_mut()
+            .ok_or_else(|| eyre::eyre!("WAL not initialized but WAL mode is enabled"))?;
+
+        let mut file_manager_guard = self.shared.file_manager.write();
+        let file_manager = file_manager_guard
+            .as_mut()
+            .ok_or_else(|| eyre::eyre!("file manager not available for commit"))?;
+
+        let mut table_infos: Vec<(u32, String, String)> = {
+            let lookup = self.shared.table_id_lookup.read();
+            dirty_table_ids
+                .iter()
+                .filter_map(|&table_id| {
+                    lookup
+                        .get(&table_id)
+                        .map(|(s, t)| (table_id, s.clone(), t.clone()))
+                })
+                .collect()
+        };
+        table_infos.sort_by_key(|(id, _, _)| *id);
+
+        for (table_id, schema_name, table_name) in table_infos {
+            let pages_to_flush = self.shared.dirty_tracker.drain_for_table(table_id);
+
+            if pages_to_flush.is_empty() {
+                continue;
+            }
+
+            let storage_arc = file_manager
+                .table_data(&schema_name, &table_name)
+                .wrap_err_with(|| {
+                    format!(
+                        "failed to get storage for table '{}.{}'",
+                        schema_name, table_name
+                    )
+                })?;
+
+            for chunk in pages_to_flush.chunks(COMMIT_BATCH_SIZE) {
+                let _table_lock = self.shared.page_locks.table_intent_exclusive(table_id);
+
+                let page_tuples: Vec<(u32, u32)> =
+                    chunk.iter().map(|&p| (table_id, p)).collect();
+                let _page_locks = self.shared.page_locks.page_write_multi(&page_tuples);
+
+                let storage = storage_arc.read();
+                let db_size = storage.page_count();
+
+                let mut chunk_payload: CommitPayload = SmallVec::new();
+
+                for &page_no in chunk {
+                    if let Ok(data) = storage.page(page_no) {
+                        let mut buffer = self.shared.page_buffer_pool.acquire()
+                            .ok_or_else(|| eyre::eyre!("page buffer pool exhausted during chunked commit"))?;
+                        buffer.copy_from_page(data);
+                        chunk_payload.push((table_id, page_no, buffer, db_size));
+                    }
+                }
+
+                drop(storage);
+
+                for (tid, page_no, buffer, db_sz) in chunk_payload {
+                    wal.write_frame_with_file_id(page_no, db_sz, buffer.as_slice(), tid as u64)
+                        .wrap_err("failed to write WAL frame in chunked commit")?;
+                }
+            }
+        }
+
+        Ok(())
     }
 
     fn execute_group_wal_flush(
