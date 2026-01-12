@@ -254,7 +254,7 @@ impl<'a> CompiledPredicate<'a> {
             }
             Expr::Subquery(subq) => {
                 if let Some(ref results) = self.scalar_subquery_results {
-                    let key = (*subq) as *const _ as usize;
+                    let key = std::ptr::from_ref(*subq) as usize;
                     results.get(&key).map(|v| self.owned_value_to_value(v))
                 } else {
                     None

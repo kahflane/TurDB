@@ -651,7 +651,7 @@ impl Database {
                         .get(index_key)
                         .ok_or_else(|| eyre::eyre!("index storage not found"))?;
                     let mut index_storage = index_storage_arc.write();
-                    let index_rp = *index_root_pages.get(index_key).unwrap_or(&1);
+                    let index_rp = *index_root_pages.get(index_key).expect("index root page should be initialized");
                     let index_btree = BTree::new(&mut *index_storage, index_rp)?;
 
                     buffers.key_buffer.clear();
@@ -685,7 +685,7 @@ impl Database {
                     if all_non_null && storage_map.contains_key(key) {
                         let index_storage_arc = storage_map.get(key).unwrap();
                         let mut index_storage = index_storage_arc.write();
-                        let index_rp = *index_root_pages.get(key).unwrap_or(&1);
+                        let index_rp = *index_root_pages.get(key).expect("index root page should be initialized");
                         let index_btree = BTree::new(&mut *index_storage, index_rp)?;
 
                         buffers.key_buffer.clear();
@@ -988,7 +988,7 @@ impl Database {
                     let row_id_bytes = row_id.to_be_bytes();
 
                     let hint = index_rightmost_hints.get(index_key).copied().flatten();
-                    let index_rp = *index_root_pages.get(index_key).unwrap_or(&1);
+                    let index_rp = *index_root_pages.get(index_key).expect("index root page should be initialized");
                     let mut index_btree =
                         BTree::with_rightmost_hint(&mut *index_storage, index_rp, hint)?;
                     index_btree.insert(&buffers.key_buffer, &row_id_bytes)?;
@@ -1021,7 +1021,7 @@ impl Database {
                     let row_id_bytes = row_id.to_be_bytes();
 
                     let hint = index_rightmost_hints.get(key).copied().flatten();
-                    let index_rp = *index_root_pages.get(key).unwrap_or(&1);
+                    let index_rp = *index_root_pages.get(key).expect("index root page should be initialized");
                     let mut index_btree =
                         BTree::with_rightmost_hint(&mut *index_storage, index_rp, hint)?;
                     index_btree.insert(&buffers.key_buffer, &row_id_bytes)?;
@@ -1051,7 +1051,7 @@ impl Database {
 
                     let row_id_bytes = row_id.to_be_bytes();
                     let hint = index_rightmost_hints.get(key).copied().flatten();
-                    let index_rp = *index_root_pages.get(key).unwrap_or(&1);
+                    let index_rp = *index_root_pages.get(key).expect("index root page should be initialized");
                     let mut index_btree =
                         BTree::with_rightmost_hint(&mut *index_storage, index_rp, hint)?;
                     index_btree.insert(&buffers.key_buffer, &row_id_bytes)?;

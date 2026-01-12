@@ -1249,7 +1249,7 @@ impl Database {
 
         let predicate = update
             .where_clause
-            .map(|expr| CompiledPredicate::new(expr, combined_column_map.clone()));
+            .map(|expr| CompiledPredicate::with_column_map_ref(expr, &combined_column_map));
 
         let assignment_indices: Vec<(usize, &crate::sql::ast::Expr<'_>)> = update
             .assignments

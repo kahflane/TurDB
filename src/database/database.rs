@@ -1926,7 +1926,7 @@ impl Database {
                     }
 
                     let condition_predicate = nested_join.condition.map(|c| {
-                        crate::sql::predicate::CompiledPredicate::new(c, column_map.clone())
+                        crate::sql::predicate::CompiledPredicate::with_column_map_ref(c, &column_map)
                     });
 
                     let mut result_rows: Vec<Vec<OwnedValue>> = Vec::new();
