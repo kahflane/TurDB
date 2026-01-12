@@ -384,6 +384,346 @@ fn test_order_by_limit_correctness() {
 }
 
 #[test]
+fn test_debug_q84() {
+    let db_path = std::path::Path::new("./.worktrees/bismillah");
+    if !db_path.exists() {
+        eprintln!("Test database not found, skipping test");
+        return;
+    }
+
+    println!("\nDebugging Q84...\n");
+
+    // First test direct BTreeReader reverse iteration BEFORE opening the database
+    {
+        use turdb::storage::{MmapStorage, TableFileHeader};
+        use turdb::btree::BTreeReader;
+
+        let storage_path = db_path.join("root").join("organizations.tbd");
+        let storage = MmapStorage::open(&storage_path).expect("Failed to open storage");
+
+        let root_page = {
+            let page0 = storage.page(0).expect("Failed to read page 0");
+            let header = TableFileHeader::from_bytes(page0).expect("Failed to parse header");
+            header.root_page()
+        };
+        println!("File header root_page: {}", root_page);
+
+        let reader = BTreeReader::new(&storage, root_page).expect("Failed to create reader");
+
+        println!("Testing cursor_last()...");
+        let mut cursor = reader.cursor_last().expect("Failed to get cursor_last");
+        println!("cursor_last() returned, valid: {}", cursor.valid());
+
+        if cursor.valid() {
+            let key = cursor.key().expect("Failed to get key");
+            println!("Last key (first 20 bytes): {:?}", &key[..key.len().min(20)]);
+        }
+
+        println!("Testing prev() calls (max 10)...");
+        let mut count = 0;
+        let max_count = 10;
+        while count < max_count && cursor.valid() {
+            let result = cursor.prev();
+            match result {
+                Ok(true) => {
+                    count += 1;
+                    println!("  prev() #{} succeeded", count);
+                }
+                Ok(false) => {
+                    println!("  reached beginning");
+                    break;
+                }
+                Err(e) => {
+                    println!("  error: {}", e);
+                    break;
+                }
+            }
+        }
+        println!("Completed {} prev() calls", count);
+    }
+
+    let db = Database::open(db_path).expect("Failed to open database");
+
+    let count_result = db.query("SELECT COUNT(*) FROM organizations").unwrap();
+    let total_rows: i64 = match &count_result[0].values[0] {
+        turdb::OwnedValue::Int(v) => *v,
+        _ => panic!("Expected integer for COUNT(*)"),
+    };
+    println!("Total rows in organizations: {}", total_rows);
+
+    // Test various cases to understand the issue
+    let test_cases = [
+        ("No ORDER BY, no LIMIT", "SELECT id FROM organizations"),
+        ("Just LIMIT 100", "SELECT id FROM organizations LIMIT 100"),
+        ("ORDER BY ASC", "SELECT id FROM organizations ORDER BY id ASC"),
+        ("ORDER BY ASC LIMIT 100", "SELECT id FROM organizations ORDER BY id ASC LIMIT 100"),
+        ("ORDER BY DESC", "SELECT id FROM organizations ORDER BY id DESC"),
+        ("ORDER BY DESC LIMIT 100", "SELECT id FROM organizations ORDER BY id DESC LIMIT 100"),
+        ("LIMIT 10 OFFSET 0", "SELECT id FROM organizations ORDER BY id DESC LIMIT 10 OFFSET 0"),
+        ("LIMIT 10 OFFSET 50", "SELECT id FROM organizations ORDER BY id DESC LIMIT 10 OFFSET 50"),
+        ("LIMIT 10 OFFSET 60", "SELECT id FROM organizations ORDER BY id DESC LIMIT 10 OFFSET 60"),
+        ("LIMIT 10 OFFSET 100", "SELECT id FROM organizations ORDER BY id DESC LIMIT 10 OFFSET 100"),
+    ];
+
+    for (name, query) in test_cases {
+        let result = db.query(query);
+        match result {
+            Ok(rows) => {
+                let first_id = rows.first().map(|r| format!("{:?}", r.values[0])).unwrap_or_default();
+                println!("{}: {} rows (first: {})", name, rows.len(), first_id);
+            }
+            Err(e) => println!("{}: ERROR - {}", name, e),
+        }
+    }
+
+    // Original tests
+    let inner = db.query("SELECT id FROM organizations ORDER BY id DESC LIMIT 50 OFFSET 700");
+    match &inner {
+        Ok(rows) => {
+            println!("\nInner query (no wrapper): {} rows", rows.len());
+            if let Some(first) = rows.first() {
+                println!("  First row: {:?}", first.values);
+            }
+        }
+        Err(e) => println!("Inner query error: {}", e),
+    }
+
+    let q84 = db.query("SELECT * FROM (SELECT id FROM organizations ORDER BY id DESC LIMIT 50 OFFSET 700)");
+    match &q84 {
+        Ok(rows) => {
+            println!("Q84 (wrapped): {} rows", rows.len());
+            if let Some(first) = rows.first() {
+                println!("  First row: {:?}", first.values);
+            }
+        }
+        Err(e) => println!("Q84 error: {}", e),
+    }
+
+    let q83 = db.query("SELECT * FROM (SELECT id, name FROM organizations ORDER BY id DESC LIMIT 10 OFFSET 5)");
+    match &q83 {
+        Ok(rows) => println!("Q83 (smaller offset): {} rows", rows.len()),
+        Err(e) => println!("Q83 error: {}", e),
+    }
+
+    // Test raw cursor behavior
+    // Test direct reverse iteration with BTreeReader
+    println!("\n--- Testing direct BTreeReader reverse iteration ---");
+    {
+        use turdb::storage::MmapStorage;
+        use turdb::btree::BTreeReader;
+        use turdb::storage::TableFileHeader;
+
+        let storage_path = db_path.join("root").join("organizations.tbd");
+        let storage = MmapStorage::open(&storage_path).expect("Failed to open storage");
+
+        let root_page = {
+            let page0 = storage.page(0).expect("Failed to read page 0");
+            let header = TableFileHeader::from_bytes(page0).expect("Failed to parse header");
+            header.root_page()
+        };
+        println!("Using root_page: {}", root_page);
+
+        let reader = BTreeReader::new(&storage, root_page).expect("Failed to create reader");
+
+        // Test cursor_last
+        println!("Testing cursor_last()...");
+        let mut cursor = reader.cursor_last().expect("Failed to get cursor_last");
+        println!("cursor_last() returned, valid: {}", cursor.valid());
+
+        if cursor.valid() {
+            let key = cursor.key().expect("Failed to get key");
+            println!("Last key: {:?}", &key[..key.len().min(20)]);
+        }
+
+        // Test a few prev() calls with timeout protection
+        println!("Testing prev() calls...");
+        let mut count = 0;
+        let max_count = 10;
+        while count < max_count && cursor.valid() {
+            println!("  prev() call {}...", count);
+            let result = cursor.prev();
+            match result {
+                Ok(true) => {
+                    count += 1;
+                    let key = cursor.key().expect("Failed to get key");
+                    println!("    success, new key: {:?}", &key[..key.len().min(20)]);
+                }
+                Ok(false) => {
+                    println!("    reached beginning");
+                    break;
+                }
+                Err(e) => {
+                    println!("    error: {}", e);
+                    break;
+                }
+            }
+        }
+        println!("Completed {} prev() calls", count);
+    }
+
+    println!("\n--- Testing raw cursor reverse iteration ---");
+    use turdb::storage::MmapStorage;
+    use turdb::btree::BTreeReader;
+    use turdb::storage::TableFileHeader;
+
+    let storage_path = db_path.join("root").join("organizations.tbd");
+    if storage_path.exists() {
+        let storage = MmapStorage::open(&storage_path).expect("Failed to open storage");
+
+        // Read the actual root page from file header
+        let root_page = {
+            let page0 = storage.page(0).expect("Failed to read page 0");
+            let header = TableFileHeader::from_bytes(page0).expect("Failed to read header");
+            header.root_page()
+        };
+        println!("Actual root_page from header: {}", root_page);
+        println!("Total page count: {}", storage.page_count());
+
+        // Check page types
+        for page_no in 1..storage.page_count().min(10) {
+            let page_data = storage.page(page_no).expect("Failed to read page");
+            let page_type = page_data[0];
+            let cell_count = u16::from_le_bytes([page_data[2], page_data[3]]);
+            let next_leaf = u32::from_le_bytes([page_data[12], page_data[13], page_data[14], page_data[15]]);
+            println!("Page {}: type={}, cell_count={}, next_leaf={}", page_no, page_type, cell_count, next_leaf);
+        }
+
+        let reader = BTreeReader::new(&storage, root_page).expect("Failed to create reader");
+
+        // Test cursor_last and prev()
+        let mut cursor = reader.cursor_last().expect("Failed to get cursor_last");
+        let mut count = 0;
+        let max_count = 100; // Just count first 100 to debug
+
+        if cursor.valid() {
+            count += 1;
+            while count < max_count && cursor.prev().expect("prev failed") {
+                count += 1;
+            }
+        }
+        println!("Raw cursor reverse count (max {}): {}", max_count, count);
+
+        // Try full reverse iteration
+        let mut cursor = reader.cursor_last().expect("Failed to get cursor_last");
+        let mut full_count = 0;
+        if cursor.valid() {
+            full_count += 1;
+            while cursor.prev().expect("prev failed") {
+                full_count += 1;
+            }
+        }
+        println!("Raw cursor full reverse count: {}", full_count);
+    }
+
+    assert!(q84.is_ok() && !q84.unwrap().is_empty(), "Q84 should return rows");
+}
+
+#[test]
+fn test_trace_leaf_chain() {
+    use turdb::storage::MmapStorage;
+
+    let db_path = std::path::Path::new("./.worktrees/bismillah");
+    if !db_path.exists() {
+        eprintln!("Test database not found, skipping test");
+        return;
+    }
+
+    let storage_path = db_path.join("root").join("organizations.tbd");
+    let storage = MmapStorage::open(&storage_path).expect("Failed to open storage");
+    let page_count = storage.page_count();
+
+    // Trace from page 1 following next_leaf
+    println!("\nTracing leaf chain from page 1...");
+    let mut current_page: u32 = 1;
+    let mut total_cells = 0u64;
+    let mut chain: Vec<(u32, u16)> = Vec::new();
+
+    while current_page != 0 && current_page < page_count {
+        let page_data = storage.page(current_page).expect("Failed to read page");
+        let page_type = page_data[0];
+        let cell_count = u16::from_le_bytes([page_data[2], page_data[3]]);
+        let next_leaf = u32::from_le_bytes([page_data[12], page_data[13], page_data[14], page_data[15]]);
+
+        if page_type != 2 {
+            println!("  Page {} is not a leaf (type={}), stopping", current_page, page_type);
+            break;
+        }
+
+        chain.push((current_page, cell_count));
+        total_cells += cell_count as u64;
+
+        if chain.len() <= 30 {
+            println!("  Page {}: {} cells -> next_leaf={}", current_page, cell_count, next_leaf);
+        }
+
+        current_page = next_leaf;
+    }
+
+    println!("Total leaf pages in chain: {}", chain.len());
+    println!("Total cells: {}", total_cells);
+}
+
+#[test]
+fn test_order_by_desc_fresh_database() {
+    // Create a fresh temporary database to test ORDER BY DESC with proper structure
+    let temp_dir = tempfile::tempdir().expect("Failed to create temp dir");
+    let db_path = temp_dir.path();
+
+    // Create database and insert test data
+    {
+        let db = Database::create(db_path).expect("Failed to create database");
+
+        db.execute("CREATE TABLE test_table (id INTEGER PRIMARY KEY, value TEXT)")
+            .expect("Failed to create table");
+
+        // Insert 200 rows to ensure multiple pages and B-tree splits
+        for i in 1..=200 {
+            db.execute(&format!("INSERT INTO test_table (id, value) VALUES ({}, 'value_{}')", i, i))
+                .expect("Failed to insert row");
+        }
+    }
+
+    // Reopen and test
+    let db = Database::open(db_path).expect("Failed to open database");
+
+    // Test forward scan
+    let forward = db.query("SELECT id FROM test_table ORDER BY id ASC").unwrap();
+    println!("Forward scan: {} rows", forward.len());
+    assert_eq!(forward.len(), 200, "Forward scan should return 200 rows");
+
+    let first_forward = match &forward[0].values[0] {
+        turdb::OwnedValue::Int(v) => *v,
+        _ => panic!("Expected Int"),
+    };
+    assert_eq!(first_forward, 1, "First row should be id=1");
+
+    // Test reverse scan (ORDER BY DESC)
+    let reverse = db.query("SELECT id FROM test_table ORDER BY id DESC").unwrap();
+    println!("Reverse scan: {} rows", reverse.len());
+    assert_eq!(reverse.len(), 200, "Reverse scan should return 200 rows");
+
+    let first_reverse = match &reverse[0].values[0] {
+        turdb::OwnedValue::Int(v) => *v,
+        _ => panic!("Expected Int"),
+    };
+    assert_eq!(first_reverse, 200, "First row of DESC should be id=200");
+
+    // Test with LIMIT and OFFSET
+    let limited = db.query("SELECT id FROM test_table ORDER BY id DESC LIMIT 10 OFFSET 50").unwrap();
+    println!("Limited reverse: {} rows", limited.len());
+    assert_eq!(limited.len(), 10, "Should return 10 rows");
+
+    let first_limited = match &limited[0].values[0] {
+        turdb::OwnedValue::Int(v) => *v,
+        _ => panic!("Expected Int"),
+    };
+    // ORDER BY DESC LIMIT 10 OFFSET 50 should return ids 150, 149, 148, ...
+    assert_eq!(first_limited, 150, "First row of DESC with OFFSET 50 should be id=150");
+
+    println!("All ORDER BY DESC tests passed with fresh database!");
+}
+
+#[test]
 fn test_subquery_performance_benchmark() {
     let db_path = std::path::Path::new("./.worktrees/bismillah");
     if !db_path.exists() {
@@ -445,4 +785,60 @@ fn test_subquery_performance_benchmark() {
     }
 
     println!("{}", "=".repeat(60));
+}
+
+#[test]
+#[ignore] // Run manually with: cargo test test_repair_root_page --release -- --nocapture --ignored
+fn test_repair_root_page() {
+    use turdb::storage::MmapStorage;
+    use turdb::btree::BTreeReader;
+    use turdb::storage::TableFileHeader;
+
+    let db_path = std::path::Path::new("./.worktrees/bismillah");
+    let storage_path = db_path.join("root").join("organizations.tbd");
+
+    if !storage_path.exists() {
+        eprintln!("Storage file not found");
+        return;
+    }
+
+    // Open storage (mutable operations available via page_mut)
+    let mut storage = MmapStorage::open(&storage_path).expect("Failed to open storage");
+    let page_count = storage.page_count();
+    println!("Total pages: {}", page_count);
+
+    // Find all interior pages (type=1)
+    let mut interior_pages: Vec<u32> = Vec::new();
+    for page_no in 1..page_count {
+        let page_data = storage.page(page_no).expect("Failed to read page");
+        if page_data[0] == 1 { // Interior node
+            interior_pages.push(page_no);
+        }
+    }
+    println!("Found {} interior pages: {:?}", interior_pages.len(), &interior_pages[..interior_pages.len().min(10)]);
+
+    // With the linear split pattern observed in this B-tree, the root is the highest interior page
+    // Each split creates: new_leaf, new_interior where new_interior becomes the new root
+    let best_root = *interior_pages.last().expect("No interior pages found");
+    println!("Using highest interior page as root: {}", best_root);
+
+    // Verify with forward iteration (which works with any interior page)
+    let reader = BTreeReader::new(&storage, best_root).expect("Failed to create reader");
+    let mut cursor = reader.cursor_first().expect("Failed to get cursor");
+    let mut best_count = 0;
+    while cursor.valid() {
+        best_count += 1;
+        if cursor.advance().is_err() { break; }
+    }
+    println!("Forward iteration count with root {}: {}", best_root, best_count);
+
+    // Update the header with the correct root page
+    if best_count > 0 {
+        let page0 = storage.page_mut(0).expect("Failed to get page 0 for writing");
+        let header = TableFileHeader::from_bytes_mut(page0).expect("Failed to parse header");
+        let old_root = header.root_page();
+        header.set_root_page(best_root);
+        storage.sync().expect("Failed to sync storage");
+        println!("Updated root_page from {} to {}", old_root, best_root);
+    }
 }

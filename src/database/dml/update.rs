@@ -307,7 +307,11 @@ impl Database {
             columns.iter().map(|c| c.data_type()).collect();
         let decoder = crate::sql::decoder::SimpleDecoder::new(column_types.clone());
 
-        let root_page = 1u32;
+        let root_page = {
+            use crate::storage::TableFileHeader;
+            let page = storage.page(0)?;
+            TableFileHeader::from_bytes(page)?.root_page()
+        };
         let btree = BTree::new(&mut *storage, root_page)?;
 
         let mut pk_lookup_info: Option<(Vec<u8>, OwnedValue)> = 'pk_analysis: {
@@ -1245,7 +1249,7 @@ impl Database {
 
         let predicate = update
             .where_clause
-            .map(|expr| CompiledPredicate::new(expr, combined_column_map.clone()));
+            .map(|expr| CompiledPredicate::with_column_map_ref(expr, &combined_column_map));
 
         let assignment_indices: Vec<(usize, &crate::sql::ast::Expr<'_>)> = update
             .assignments
@@ -1287,7 +1291,11 @@ impl Database {
 
         let storage_arc = file_manager.table_data_mut(schema_name, table_name)?;
         let mut storage = storage_arc.write();
-        let root_page = 1u32;
+        let root_page = {
+            use crate::storage::TableFileHeader;
+            let page = storage.page(0)?;
+            TableFileHeader::from_bytes(page)?.root_page()
+        };
         let btree = BTree::new(&mut *storage, root_page)?;
         let mut cursor = btree.cursor_first()?;
 

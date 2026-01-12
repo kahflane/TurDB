@@ -355,7 +355,8 @@ impl Database {
             }
         };
 
-        let root_page = 1u32;
+        let mut root_page: u32;
+        let initial_root_page: u32;
         let validator = ConstraintValidator::new(&table_def_for_validator);
 
         let mut file_manager_guard = self.shared.file_manager.write();
@@ -373,6 +374,8 @@ impl Database {
             let storage = main_storage_arc.write();
             let page = storage.page(0)?;
             let header = TableFileHeader::from_bytes(page)?;
+            root_page = header.root_page();
+            initial_root_page = root_page;
             let ai = if auto_increment_col_idx.is_some() {
                 header.auto_increment()
             } else {
@@ -501,6 +504,20 @@ impl Database {
         }
         for (_, key) in &secondary_indexes {
             index_rightmost_hints.insert(key.clone(), None);
+        }
+
+        let mut index_root_pages: hashbrown::HashMap<FileKey, u32> = hashbrown::HashMap::new();
+        let mut index_initial_root_pages: hashbrown::HashMap<FileKey, u32> =
+            hashbrown::HashMap::new();
+        for key in index_rightmost_hints.keys() {
+            if let Some(storage_arc) = storage_map.get(key) {
+                let storage = storage_arc.read();
+                let page = storage.page(0)?;
+                let header = crate::storage::IndexFileHeader::from_bytes(page)?;
+                let rp = header.root_page();
+                index_root_pages.insert(key.clone(), rp);
+                index_initial_root_pages.insert(key.clone(), rp);
+            }
         }
 
         drop(file_manager_guard);
@@ -634,7 +651,8 @@ impl Database {
                         .get(index_key)
                         .ok_or_else(|| eyre::eyre!("index storage not found"))?;
                     let mut index_storage = index_storage_arc.write();
-                    let index_btree = BTree::new(&mut *index_storage, root_page)?;
+                    let index_rp = *index_root_pages.get(index_key).expect("index root page should be initialized");
+                    let index_btree = BTree::new(&mut *index_storage, index_rp)?;
 
                     buffers.key_buffer.clear();
                     Self::encode_value_as_key(value, &mut buffers.key_buffer);
@@ -667,7 +685,8 @@ impl Database {
                     if all_non_null && storage_map.contains_key(key) {
                         let index_storage_arc = storage_map.get(key).unwrap();
                         let mut index_storage = index_storage_arc.write();
-                        let index_btree = BTree::new(&mut *index_storage, root_page)?;
+                        let index_rp = *index_root_pages.get(key).expect("index root page should be initialized");
+                        let index_btree = BTree::new(&mut *index_storage, index_rp)?;
 
                         buffers.key_buffer.clear();
                         for &col_idx in col_indices {
@@ -928,11 +947,13 @@ impl Database {
                     BTree::with_rightmost_hint(&mut wal_storage, root_page, rightmost_hint)?;
                 btree.insert(&row_key, &buffers.mvcc_buffer)?;
                 rightmost_hint = btree.rightmost_hint();
+                root_page = btree.root_page();
             } else {
                 let mut btree =
                     BTree::with_rightmost_hint(&mut *table_storage, root_page, rightmost_hint)?;
                 btree.insert(&row_key, &buffers.mvcc_buffer)?;
                 rightmost_hint = btree.rightmost_hint();
+                root_page = btree.root_page();
             }
 
             {
@@ -967,11 +988,16 @@ impl Database {
                     let row_id_bytes = row_id.to_be_bytes();
 
                     let hint = index_rightmost_hints.get(index_key).copied().flatten();
+                    let index_rp = *index_root_pages.get(index_key).expect("index root page should be initialized");
                     let mut index_btree =
-                        BTree::with_rightmost_hint(&mut *index_storage, root_page, hint)?;
+                        BTree::with_rightmost_hint(&mut *index_storage, index_rp, hint)?;
                     index_btree.insert(&buffers.key_buffer, &row_id_bytes)?;
                     if let Some(entry) = index_rightmost_hints.get_mut(index_key) {
                         *entry = index_btree.rightmost_hint();
+                    }
+                    let new_rp = index_btree.root_page();
+                    if new_rp != index_rp {
+                        index_root_pages.insert(index_key.clone(), new_rp);
                     }
                 }
             }
@@ -995,11 +1021,16 @@ impl Database {
                     let row_id_bytes = row_id.to_be_bytes();
 
                     let hint = index_rightmost_hints.get(key).copied().flatten();
+                    let index_rp = *index_root_pages.get(key).expect("index root page should be initialized");
                     let mut index_btree =
-                        BTree::with_rightmost_hint(&mut *index_storage, root_page, hint)?;
+                        BTree::with_rightmost_hint(&mut *index_storage, index_rp, hint)?;
                     index_btree.insert(&buffers.key_buffer, &row_id_bytes)?;
                     if let Some(entry) = index_rightmost_hints.get_mut(key) {
                         *entry = index_btree.rightmost_hint();
+                    }
+                    let new_rp = index_btree.root_page();
+                    if new_rp != index_rp {
+                        index_root_pages.insert(key.clone(), new_rp);
                     }
                 }
             }
@@ -1020,11 +1051,16 @@ impl Database {
 
                     let row_id_bytes = row_id.to_be_bytes();
                     let hint = index_rightmost_hints.get(key).copied().flatten();
+                    let index_rp = *index_root_pages.get(key).expect("index root page should be initialized");
                     let mut index_btree =
-                        BTree::with_rightmost_hint(&mut *index_storage, root_page, hint)?;
+                        BTree::with_rightmost_hint(&mut *index_storage, index_rp, hint)?;
                     index_btree.insert(&buffers.key_buffer, &row_id_bytes)?;
                     if let Some(entry) = index_rightmost_hints.get_mut(key) {
                         *entry = index_btree.rightmost_hint();
+                    }
+                    let new_rp = index_btree.root_page();
+                    if new_rp != index_rp {
+                        index_root_pages.insert(key.clone(), new_rp);
                     }
                 }
             }
@@ -1095,6 +1131,15 @@ impl Database {
             }
         }
 
+        if root_page != initial_root_page {
+            if let Some(storage_arc) = storage_map.get(&table_file_key) {
+                let mut storage = storage_arc.write();
+                let page = storage.page_mut(0)?;
+                let header = TableFileHeader::from_bytes_mut(page)?;
+                header.set_root_page(root_page);
+            }
+        }
+
         if has_toast && toast_root_page != toast_initial_root_page {
             if let Some(ref key) = toast_file_key {
                 if let Some(toast_storage_arc) = storage_map.get(key) {
@@ -1102,6 +1147,18 @@ impl Database {
                     let page0 = toast_storage.page_mut(0)?;
                     let header = crate::storage::TableFileHeader::from_bytes_mut(page0)?;
                     header.set_root_page(toast_root_page);
+                }
+            }
+        }
+
+        for (key, new_rp) in &index_root_pages {
+            let initial_rp = index_initial_root_pages.get(key).copied().unwrap_or(*new_rp);
+            if *new_rp != initial_rp {
+                if let Some(storage_arc) = storage_map.get(key) {
+                    let mut storage = storage_arc.write();
+                    let page = storage.page_mut(0)?;
+                    let header = crate::storage::IndexFileHeader::from_bytes_mut(page)?;
+                    header.set_root_page(*new_rp);
                 }
             }
         }

@@ -203,7 +203,11 @@ fn execute_branch_for_set_op<'a>(
                 })?;
             let storage = storage_arc.read();
 
-            let root_page = 1u32;
+            let root_page = {
+                use crate::storage::TableFileHeader;
+                let page = storage.page(0)?;
+                TableFileHeader::from_bytes(page)?.root_page()
+            };
             let source = StreamingBTreeSource::from_btree_scan_with_projections(
                 &storage,
                 root_page,

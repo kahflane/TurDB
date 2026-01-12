@@ -70,12 +70,14 @@ impl PageBufferPool {
     /// # Arguments
     /// * `initial_capacity` - Number of buffers to pre-allocate
     pub fn new(initial_capacity: usize) -> Self {
-        let shards: [Mutex<Vec<Box<[u8; PAGE_SIZE]>>>; BUFFER_POOL_SHARD_COUNT] =
-            std::array::from_fn(|_| Mutex::new(Vec::new()));
-
-        // Distribute buffers evenly across shards
         let per_shard = initial_capacity / BUFFER_POOL_SHARD_COUNT;
         let remainder = initial_capacity % BUFFER_POOL_SHARD_COUNT;
+
+        let shards: [Mutex<Vec<Box<[u8; PAGE_SIZE]>>>; BUFFER_POOL_SHARD_COUNT] =
+            std::array::from_fn(|i| {
+                let capacity = per_shard + if i < remainder { 1 } else { 0 };
+                Mutex::new(Vec::with_capacity(capacity))
+            });
 
         for (i, shard) in shards.iter().enumerate() {
             let count = per_shard + if i < remainder { 1 } else { 0 };

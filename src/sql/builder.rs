@@ -62,7 +62,22 @@ impl<'a> ExecutorBuilder<'a> {
             ))),
             PhysicalOperator::FilterExec(filter) => {
                 let child = self.build_operator(filter.input, source, column_map)?;
-                let predicate = CompiledPredicate::new(filter.predicate, column_map.to_vec());
+                let effective_column_map = if let Some((group_by, aggregates)) =
+                    self.get_aggregate_info(filter.input)
+                {
+                    self.build_aggregate_column_map(group_by, aggregates, column_map)
+                } else {
+                    column_map.to_vec()
+                };
+                let predicate = if !self.ctx.scalar_subquery_results.is_empty() {
+                    CompiledPredicate::with_scalar_subqueries(
+                        filter.predicate,
+                        effective_column_map,
+                        self.ctx.scalar_subquery_results.clone(),
+                    )
+                } else {
+                    CompiledPredicate::new(filter.predicate, effective_column_map)
+                };
                 Ok(DynamicExecutor::Filter(Box::new(child), predicate))
             }
             PhysicalOperator::ProjectExec(project) => {
@@ -337,20 +352,37 @@ impl<'a> ExecutorBuilder<'a> {
             )),
             PhysicalOperator::HashAggregate(agg) => {
                 let child = self.build_operator(agg.input, source, column_map)?;
-                let group_by_indices: Vec<usize> = agg
+
+                let has_expr_group_by = agg
                     .group_by
                     .iter()
-                    .filter_map(|expr| {
-                        if let crate::sql::ast::Expr::Column(col) = expr {
-                            column_map
-                                .iter()
-                                .find(|(n, _)| n.eq_ignore_ascii_case(col.column))
-                                .map(|(_, i)| *i)
-                        } else {
-                            None
-                        }
-                    })
-                    .collect();
+                    .any(|expr| !matches!(expr, crate::sql::ast::Expr::Column(_)));
+
+                let (group_by_indices, group_by_exprs) = if has_expr_group_by {
+                    let exprs: Vec<CompiledPredicate<'a>> = agg
+                        .group_by
+                        .iter()
+                        .map(|expr| CompiledPredicate::new(expr, column_map.to_vec()))
+                        .collect();
+                    (Vec::new(), Some(exprs))
+                } else {
+                    let indices: Vec<usize> = agg
+                        .group_by
+                        .iter()
+                        .filter_map(|expr| {
+                            if let crate::sql::ast::Expr::Column(col) = expr {
+                                column_map
+                                    .iter()
+                                    .find(|(n, _)| n.eq_ignore_ascii_case(col.column))
+                                    .map(|(_, i)| *i)
+                            } else {
+                                None
+                            }
+                        })
+                        .collect();
+                    (indices, None)
+                };
+
                 let agg_funcs: Vec<AggregateFunction> = agg
                     .aggregates
                     .iter()
@@ -392,6 +424,7 @@ impl<'a> ExecutorBuilder<'a> {
                 Ok(DynamicExecutor::HashAggregate(HashAggregateState {
                     child: Box::new(child),
                     group_by: group_by_indices,
+                    group_by_exprs,
                     aggregates: agg_funcs,
                     arena: self.ctx.arena,
                     groups: hashbrown::HashMap::new(),
@@ -401,20 +434,37 @@ impl<'a> ExecutorBuilder<'a> {
             }
             PhysicalOperator::SortedAggregate(agg) => {
                 let child = self.build_operator(agg.input, source, column_map)?;
-                let group_by_indices: Vec<usize> = agg
+
+                let has_expr_group_by = agg
                     .group_by
                     .iter()
-                    .filter_map(|expr| {
-                        if let crate::sql::ast::Expr::Column(col) = expr {
-                            column_map
-                                .iter()
-                                .find(|(n, _)| n.eq_ignore_ascii_case(col.column))
-                                .map(|(_, i)| *i)
-                        } else {
-                            None
-                        }
-                    })
-                    .collect();
+                    .any(|expr| !matches!(expr, crate::sql::ast::Expr::Column(_)));
+
+                let (group_by_indices, group_by_exprs) = if has_expr_group_by {
+                    let exprs: Vec<CompiledPredicate<'a>> = agg
+                        .group_by
+                        .iter()
+                        .map(|expr| CompiledPredicate::new(expr, column_map.to_vec()))
+                        .collect();
+                    (Vec::new(), Some(exprs))
+                } else {
+                    let indices: Vec<usize> = agg
+                        .group_by
+                        .iter()
+                        .filter_map(|expr| {
+                            if let crate::sql::ast::Expr::Column(col) = expr {
+                                column_map
+                                    .iter()
+                                    .find(|(n, _)| n.eq_ignore_ascii_case(col.column))
+                                    .map(|(_, i)| *i)
+                            } else {
+                                None
+                            }
+                        })
+                        .collect();
+                    (indices, None)
+                };
+
                 let agg_funcs: Vec<AggregateFunction> = agg
                     .aggregates
                     .iter()
@@ -456,6 +506,7 @@ impl<'a> ExecutorBuilder<'a> {
                 Ok(DynamicExecutor::HashAggregate(HashAggregateState {
                     child: Box::new(child),
                     group_by: group_by_indices,
+                    group_by_exprs,
                     aggregates: agg_funcs,
                     arena: self.ctx.arena,
                     groups: hashbrown::HashMap::new(),
@@ -658,6 +709,7 @@ impl<'a> ExecutorBuilder<'a> {
         HashAggregateState {
             child: Box::new(child),
             group_by,
+            group_by_exprs: None,
             aggregates,
             arena: self.ctx.arena,
             groups: hashbrown::HashMap::new(),
@@ -813,7 +865,7 @@ impl<'a> ExecutorBuilder<'a> {
                         .columns()
                         .iter()
                         .enumerate()
-                        .map(|(idx, col)| (col.name().to_string(), idx))
+                        .map(|(idx, col)| (col.name().to_lowercase(), idx))
                         .collect()
                 } else {
                     Vec::new()
@@ -832,9 +884,9 @@ impl<'a> ExecutorBuilder<'a> {
                 .enumerate()
                 .filter_map(|(idx, (expr, alias))| {
                     if let Some(name) = alias {
-                        Some((name.to_string(), idx))
+                        Some((name.to_lowercase(), idx))
                     } else if let crate::sql::ast::Expr::Column(col) = expr {
-                        Some((col.column.to_string(), idx))
+                        Some((col.column.to_lowercase(), idx))
                     } else {
                         None
                     }

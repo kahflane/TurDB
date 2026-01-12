@@ -1,9 +1,14 @@
 use bumpalo::Bump;
+use crate::types::OwnedValue;
+use smallvec::SmallVec;
+
+pub type ScalarSubqueryResults = SmallVec<[(usize, OwnedValue); 4]>;
 
 pub struct ExecutionContext<'a> {
     pub arena: &'a Bump,
     pub file_manager: Option<&'a mut crate::storage::FileManager>,
     pub catalog: Option<&'a crate::schema::Catalog>,
+    pub scalar_subquery_results: ScalarSubqueryResults,
 }
 
 impl<'a> ExecutionContext<'a> {
@@ -12,6 +17,16 @@ impl<'a> ExecutionContext<'a> {
             arena,
             file_manager: None,
             catalog: None,
+            scalar_subquery_results: SmallVec::new(),
+        }
+    }
+
+    pub fn with_scalar_subqueries(arena: &'a Bump, results: ScalarSubqueryResults) -> Self {
+        Self {
+            arena,
+            file_manager: None,
+            catalog: None,
+            scalar_subquery_results: results,
         }
     }
 
@@ -24,6 +39,7 @@ impl<'a> ExecutionContext<'a> {
             arena,
             file_manager: Some(file_manager),
             catalog: Some(catalog),
+            scalar_subquery_results: SmallVec::new(),
         }
     }
 

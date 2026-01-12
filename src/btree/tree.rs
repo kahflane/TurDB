@@ -1364,7 +1364,23 @@ impl<'a, S: Storage + ?Sized> Cursor<'a, S> {
     }
 
     fn find_prev_leaf(&self) -> Result<Option<(u32, usize)>> {
-        let current_key = self.key()?;
+        let page_data = self.storage.page(self.current_page)?;
+        let leaf = LeafNode::from_page(page_data)?;
+        let cell_count = leaf.cell_count() as usize;
+        if cell_count == 0 {
+            if self.current_page == self.root_page {
+                return Ok(None);
+            }
+            bail!(
+                "empty non-root leaf page {} detected during reverse iteration. \
+                 root_page={}. This indicates B-tree corruption.",
+                self.current_page,
+                self.root_page
+            );
+        }
+        let last_idx = cell_count - 1;
+        let nav_key = leaf.key_at(last_idx)?;
+
         let mut current_page = self.root_page;
         let mut path: SmallVec<[(u32, usize); MAX_TREE_DEPTH]> = SmallVec::new();
 
@@ -1376,7 +1392,7 @@ impl<'a, S: Storage + ?Sized> Cursor<'a, S> {
                 PageType::BTreeLeaf => break,
                 PageType::BTreeInterior => {
                     let interior = InteriorNode::from_page(page_data)?;
-                    let (child_page, slot_idx) = interior.find_child(current_key)?;
+                    let (child_page, slot_idx) = interior.find_child(nav_key)?;
                     let idx = slot_idx.unwrap_or(interior.cell_count() as usize);
                     path.push((current_page, idx));
                     current_page = child_page;
@@ -1387,6 +1403,17 @@ impl<'a, S: Storage + ?Sized> Cursor<'a, S> {
                     current_page
                 ),
             }
+        }
+
+        if current_page != self.current_page {
+            bail!(
+                "B-tree navigation inconsistency: expected page {} but reached {}. \
+                 root_page={}, path_len={}. This indicates B-tree corruption.",
+                self.current_page,
+                current_page,
+                self.root_page,
+                path.len()
+            );
         }
 
         while let Some((parent_page, child_idx)) = path.pop() {

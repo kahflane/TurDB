@@ -40,6 +40,7 @@ pub struct TopKState<'a, S: RowSource> {
 pub struct HashAggregateState<'a, S: RowSource> {
     pub child: Box<DynamicExecutor<'a, S>>,
     pub group_by: Vec<usize>,
+    pub group_by_exprs: Option<Vec<CompiledPredicate<'a>>>,
     pub aggregates: Vec<AggregateFunction>,
     pub arena: &'a Bump,
     pub groups: hashbrown::HashMap<Vec<u8>, (Vec<Value<'static>>, Vec<AggregateState>)>,

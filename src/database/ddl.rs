@@ -589,7 +589,10 @@ impl Database {
             let storage_arc = file_manager.table_data_mut(schema_name, table_name)?;
             let mut storage = storage_arc.write();
 
-            let root_page = 1u32;
+            let root_page = {
+                let page = storage.page(0)?;
+                TableFileHeader::from_bytes(page)?.root_page()
+            };
             let btree = BTree::new(&mut *storage, root_page)?;
             let mut cursor = btree.cursor_first()?;
 
@@ -806,7 +809,11 @@ impl Database {
                 let index_storage_arc =
                     file_manager.index_data_mut(schema_name, table_name, index_name)?;
                 let mut index_storage = index_storage_arc.write();
-                let root_page = 1u32;
+                let root_page = {
+                    use crate::storage::IndexFileHeader;
+                    let page = index_storage.page(0)?;
+                    IndexFileHeader::from_bytes(page)?.root_page()
+                };
                 let index_btree = BTree::new(&mut *index_storage, root_page)?;
                 let mut index_cursor = index_btree.cursor_first()?;
 
@@ -837,7 +844,10 @@ impl Database {
             let file_manager = file_manager_guard.as_mut().unwrap();
             let storage_arc = file_manager.table_data_mut(schema_name, table_name)?;
             let mut storage = storage_arc.write();
-            let root_page = 1u32;
+            let root_page = {
+                let page = storage.page(0)?;
+                TableFileHeader::from_bytes(page)?.root_page()
+            };
 
             let all_keys: Vec<Vec<u8>> = {
                 let btree = BTree::new(&mut *storage, root_page)?;
