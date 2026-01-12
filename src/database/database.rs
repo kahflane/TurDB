@@ -3042,7 +3042,7 @@ impl Database {
                 .columns()
                 .iter()
                 .enumerate()
-                .map(|(idx, col)| (col.name().to_string(), idx))
+                .map(|(idx, col)| (col.name().to_lowercase(), idx))
                 .collect();
 
             let ctx = ExecutionContext::new(&arena);

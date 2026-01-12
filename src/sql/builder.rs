@@ -865,7 +865,7 @@ impl<'a> ExecutorBuilder<'a> {
                         .columns()
                         .iter()
                         .enumerate()
-                        .map(|(idx, col)| (col.name().to_string(), idx))
+                        .map(|(idx, col)| (col.name().to_lowercase(), idx))
                         .collect()
                 } else {
                     Vec::new()
@@ -884,9 +884,9 @@ impl<'a> ExecutorBuilder<'a> {
                 .enumerate()
                 .filter_map(|(idx, (expr, alias))| {
                     if let Some(name) = alias {
-                        Some((name.to_string(), idx))
+                        Some((name.to_lowercase(), idx))
                     } else if let crate::sql::ast::Expr::Column(col) = expr {
-                        Some((col.column.to_string(), idx))
+                        Some((col.column.to_lowercase(), idx))
                     } else {
                         None
                     }
