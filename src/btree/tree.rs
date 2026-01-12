@@ -1371,7 +1371,11 @@ impl<'a, S: Storage + ?Sized> Cursor<'a, S> {
         // Using the last key ensures we navigate back to this page correctly.
         let page_data = self.storage.page(self.current_page)?;
         let leaf = LeafNode::from_page(page_data)?;
-        let last_idx = leaf.cell_count() as usize - 1;
+        let cell_count = leaf.cell_count() as usize;
+        if cell_count == 0 {
+            return Ok(None);
+        }
+        let last_idx = cell_count - 1;
         let nav_key = leaf.key_at(last_idx)?;
 
         let mut current_page = self.root_page;
@@ -1402,13 +1406,15 @@ impl<'a, S: Storage + ?Sized> Cursor<'a, S> {
         // may be inconsistent, likely due to a corrupted root_page header.
         // In this case, try to find our page in the path we built.
         if current_page != self.current_page {
-            // Navigation didn't reach the expected page. This can happen if:
-            // 1. The root_page is incorrect (pointing to wrong interior node)
-            // 2. The B-tree has structural inconsistencies
-            //
-            // We'll try a fallback: if we can find self.current_page mentioned
-            // anywhere in the path, use that. Otherwise, this is the leftmost leaf.
-            // For now, treat this as if we've reached the beginning.
+            #[cfg(debug_assertions)]
+            eprintln!(
+                "[turdb warn] B-tree navigation inconsistency: expected page {} but reached {}. \
+                 root_page={}, path_len={}. This may indicate B-tree corruption.",
+                self.current_page,
+                current_page,
+                self.root_page,
+                path.len()
+            );
             return Ok(None);
         }
 

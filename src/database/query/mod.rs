@@ -25,5 +25,6 @@ mod set_ops;
 pub use helpers::{
     compare_owned_values, find_limit, find_nested_subquery, find_plan_source, find_projections,
     find_sort_exec, find_table_scan, has_aggregate, has_filter, has_order_by_expression,
-    has_window, is_simple_count_star, PlanSource,
+    has_window, is_simple_count_star, materialize_table_rows, materialize_table_rows_with_def,
+    PlanSource,
 };

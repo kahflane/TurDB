@@ -42,7 +42,8 @@ use crate::database::dirty_tracker::ShardedDirtyTracker;
 use crate::database::query::{
     compare_owned_values, find_limit, find_nested_subquery, find_plan_source, find_projections,
     find_sort_exec, find_table_scan, has_aggregate, has_filter, has_order_by_expression,
-    has_window, is_simple_count_star, PlanSource,
+    has_window, is_simple_count_star, materialize_table_rows, materialize_table_rows_with_def,
+    PlanSource,
 };
 use crate::database::row::Row;
 use crate::database::transaction::ActiveTransaction;
@@ -883,7 +884,7 @@ impl Database {
             }
         }
 
-        let mut scalar_subquery_results: hashbrown::HashMap<usize, OwnedValue> = hashbrown::HashMap::new();
+        let mut scalar_subquery_results: Option<hashbrown::HashMap<usize, OwnedValue>> = None;
         {
             let mut filter_predicates: Vec<&crate::sql::ast::Expr> = Vec::new();
             find_filter_predicates(physical_plan.root, &mut filter_predicates);
@@ -894,9 +895,10 @@ impl Database {
 
                 for subq in subqueries {
                     let key = subq as *const _ as usize;
-                    if !scalar_subquery_results.contains_key(&key) {
+                    let map = scalar_subquery_results.get_or_insert_with(hashbrown::HashMap::new);
+                    if let hashbrown::hash_map::Entry::Vacant(entry) = map.entry(key) {
                         let result = execute_scalar_subquery(subq, catalog, file_manager, &arena)?;
-                        scalar_subquery_results.insert(key, result);
+                        entry.insert(result);
                     }
                 }
             }
@@ -1332,10 +1334,9 @@ impl Database {
                     )
                 };
 
-                let ctx = if scalar_subquery_results.is_empty() {
-                    ExecutionContext::new(&arena)
-                } else {
-                    ExecutionContext::with_scalar_subqueries(&arena, scalar_subquery_results.clone())
+                let ctx = match scalar_subquery_results.as_ref() {
+                    None => ExecutionContext::new(&arena),
+                    Some(results) => ExecutionContext::with_scalar_subqueries(&arena, results.clone()),
                 };
                 let builder = ExecutorBuilder::new(&ctx);
 
@@ -1445,10 +1446,9 @@ impl Database {
                 )
                 .wrap_err("failed to create range scan for index scan")?;
 
-                let ctx = if scalar_subquery_results.is_empty() {
-                    ExecutionContext::new(&arena)
-                } else {
-                    ExecutionContext::with_scalar_subqueries(&arena, scalar_subquery_results.clone())
+                let ctx = match scalar_subquery_results.as_ref() {
+                    None => ExecutionContext::new(&arena),
+                    Some(results) => ExecutionContext::with_scalar_subqueries(&arena, results.clone()),
                 };
                 let builder = ExecutorBuilder::new(&ctx);
 
@@ -1683,10 +1683,9 @@ impl Database {
 
                 let materialized_source = MaterializedRowSource::new(materialized_rows);
 
-                let ctx = if scalar_subquery_results.is_empty() {
-                    ExecutionContext::new(&arena)
-                } else {
-                    ExecutionContext::with_scalar_subqueries(&arena, scalar_subquery_results.clone())
+                let ctx = match scalar_subquery_results.as_ref() {
+                    None => ExecutionContext::new(&arena),
+                    Some(results) => ExecutionContext::with_scalar_subqueries(&arena, results.clone()),
                 };
                 let builder = ExecutorBuilder::new(&ctx);
 
@@ -1740,10 +1739,9 @@ impl Database {
                     .map(|(idx, col)| (col.name.to_lowercase(), idx))
                     .collect();
 
-                let ctx = if scalar_subquery_results.is_empty() {
-                    ExecutionContext::new(&arena)
-                } else {
-                    ExecutionContext::with_scalar_subqueries(&arena, scalar_subquery_results.clone())
+                let ctx = match scalar_subquery_results.as_ref() {
+                    None => ExecutionContext::new(&arena),
+                    Some(results) => ExecutionContext::with_scalar_subqueries(&arena, results.clone()),
                 };
                 let builder = ExecutorBuilder::new(&ctx);
                 let mut executor = builder
@@ -1883,28 +1881,10 @@ impl Database {
                     let right_nested = get_nested_join_from_op(nested_join.right);
 
                     if let Some(scan) = left_scan {
-                        let schema_name = scan.schema.unwrap_or(DEFAULT_SCHEMA);
                         let table_name = scan.table;
                         let alias = scan.alias.unwrap_or(table_name);
-                        let table_def = catalog.resolve_table_in_schema(scan.schema, table_name)?;
-                        let column_types: Vec<_> =
-                            table_def.columns().iter().map(|c| c.data_type()).collect();
-                        let storage_arc = file_manager.table_data(schema_name, table_name)?;
-                        let storage = storage_arc.read();
-                        let root_page = {
-                            use crate::storage::TableFileHeader;
-                            let page = storage.page(0)?;
-                            TableFileHeader::from_bytes(page)?.root_page()
-                        };
-                        let mut source = StreamingBTreeSource::from_btree_scan_with_projections(
-                            &storage,
-                            root_page,
-                            column_types,
-                            None,
-                        )?;
-                        while let Some(row) = source.next_row()? {
-                            left_rows.push(row.iter().map(OwnedValue::from).collect());
-                        }
+                        let (rows, _, table_def) = materialize_table_rows_with_def(catalog, file_manager, scan.schema, table_name)?;
+                        left_rows = rows;
                         for col in table_def.columns() {
                             column_map.push((col.name().to_lowercase(), idx));
                             column_map.push((format!("{}.{}", alias, col.name()).to_lowercase(), idx));
@@ -1916,37 +1896,24 @@ impl Database {
                     } else if let Some(nested) = left_nested {
                         let (rows, nested_col_map) = execute_nested_join_recursive(nested, catalog, file_manager)?;
                         left_rows = rows;
+                        let row_width = left_rows.first().map(|r| r.len()).unwrap_or(0);
                         for (name, nested_idx) in nested_col_map {
+                            eyre::ensure!(
+                                nested_idx < row_width || row_width == 0,
+                                "column index {} out of bounds for row width {} in nested join",
+                                nested_idx,
+                                row_width
+                            );
                             column_map.push((name, idx + nested_idx));
                         }
-                        if let Some(row) = left_rows.first() {
-                            idx += row.len();
-                        }
+                        idx += row_width;
                     }
 
                     if let Some(scan) = right_scan {
-                        let schema_name = scan.schema.unwrap_or(DEFAULT_SCHEMA);
                         let table_name = scan.table;
                         let alias = scan.alias.unwrap_or(table_name);
-                        let table_def = catalog.resolve_table_in_schema(scan.schema, table_name)?;
-                        let column_types: Vec<_> =
-                            table_def.columns().iter().map(|c| c.data_type()).collect();
-                        let storage_arc = file_manager.table_data(schema_name, table_name)?;
-                        let storage = storage_arc.read();
-                        let root_page = {
-                            use crate::storage::TableFileHeader;
-                            let page = storage.page(0)?;
-                            TableFileHeader::from_bytes(page)?.root_page()
-                        };
-                        let mut source = StreamingBTreeSource::from_btree_scan_with_projections(
-                            &storage,
-                            root_page,
-                            column_types,
-                            None,
-                        )?;
-                        while let Some(row) = source.next_row()? {
-                            right_rows.push(row.iter().map(OwnedValue::from).collect());
-                        }
+                        let (rows, _, table_def) = materialize_table_rows_with_def(catalog, file_manager, scan.schema, table_name)?;
+                        right_rows = rows;
                         for col in table_def.columns() {
                             column_map.push((col.name().to_lowercase(), idx));
                             column_map.push((format!("{}.{}", alias, col.name()).to_lowercase(), idx));
@@ -1958,7 +1925,14 @@ impl Database {
                     } else if let Some(nested) = right_nested {
                         let (rows, nested_col_map) = execute_nested_join_recursive(nested, catalog, file_manager)?;
                         right_rows = rows;
+                        let row_width = right_rows.first().map(|r| r.len()).unwrap_or(0);
                         for (name, nested_idx) in nested_col_map {
+                            eyre::ensure!(
+                                nested_idx < row_width || row_width == 0,
+                                "column index {} out of bounds for row width {} in nested join",
+                                nested_idx,
+                                row_width
+                            );
                             column_map.push((name, idx + nested_idx));
                         }
                     }
@@ -2031,43 +2005,16 @@ impl Database {
                 if let Some(subq) = left_subq {
                     left_rows = execute_subquery_recursive(subq, catalog, file_manager)?;
                 } else if let Some(scan_info) = &left_scan {
-                    let (schema_opt, schema_name, table_name, alias) = match scan_info {
-                        JoinScan::Table(scan) => (
-                            scan.schema,
-                            scan.schema.unwrap_or(DEFAULT_SCHEMA),
-                            scan.table,
-                            scan.alias,
-                        ),
-                        JoinScan::Index(scan) => {
-                            (scan.schema, scan.schema.unwrap_or(DEFAULT_SCHEMA), scan.table, None)
-                        }
-                        JoinScan::SecondaryIndex(scan) => {
-                            (scan.schema, scan.schema.unwrap_or(DEFAULT_SCHEMA), scan.table, None)
-                        }
+                    let (schema_opt, table_name, alias) = match scan_info {
+                        JoinScan::Table(scan) => (scan.schema, scan.table, scan.alias),
+                        JoinScan::Index(scan) => (scan.schema, scan.table, None),
+                        JoinScan::SecondaryIndex(scan) => (scan.schema, scan.table, None),
                     };
                     left_table_name = Some(table_name);
                     left_alias = alias;
                     left_schema = schema_opt;
-                    let table_def = catalog.resolve_table_in_schema(schema_opt, table_name)?;
-                    let column_types: Vec<_> =
-                        table_def.columns().iter().map(|c| c.data_type()).collect();
-                    let storage_arc = file_manager.table_data(schema_name, table_name)?;
-                    let storage = storage_arc.read();
-                    let root_page = {
-                        use crate::storage::TableFileHeader;
-                        let page = storage.page(0)?;
-                        TableFileHeader::from_bytes(page)?.root_page()
-                    };
-                    let source = StreamingBTreeSource::from_btree_scan_with_projections(
-                        &storage,
-                        root_page,
-                        column_types.clone(),
-                        None,
-                    )?;
-                    let mut cursor = source;
-                    while let Some(row) = cursor.next_row()? {
-                        left_rows.push(row.iter().map(OwnedValue::from).collect());
-                    }
+                    let (rows, _) = materialize_table_rows(catalog, file_manager, schema_opt, table_name)?;
+                    left_rows = rows;
                 } else if let Some(nested_join) = left_nested_join {
                     (left_rows, left_nested_join_column_map) =
                         execute_nested_join_recursive(nested_join, catalog, file_manager)?;
@@ -2077,43 +2024,16 @@ impl Database {
                     right_rows = execute_subquery_recursive(subq, catalog, file_manager)?;
                     right_col_count = subq.output_schema.columns.len();
                 } else if let Some(scan_info) = &right_scan {
-                    let (schema_opt, schema_name, table_name, alias) = match scan_info {
-                        JoinScan::Table(scan) => (
-                            scan.schema,
-                            scan.schema.unwrap_or(DEFAULT_SCHEMA),
-                            scan.table,
-                            scan.alias,
-                        ),
-                        JoinScan::Index(scan) => {
-                            (scan.schema, scan.schema.unwrap_or(DEFAULT_SCHEMA), scan.table, None)
-                        }
-                        JoinScan::SecondaryIndex(scan) => {
-                            (scan.schema, scan.schema.unwrap_or(DEFAULT_SCHEMA), scan.table, None)
-                        }
+                    let (schema_opt, table_name, alias) = match scan_info {
+                        JoinScan::Table(scan) => (scan.schema, scan.table, scan.alias),
+                        JoinScan::Index(scan) => (scan.schema, scan.table, None),
+                        JoinScan::SecondaryIndex(scan) => (scan.schema, scan.table, None),
                     };
                     right_table_name = Some(table_name);
                     right_alias = alias;
                     right_schema = schema_opt;
-                    let table_def = catalog.resolve_table_in_schema(schema_opt, table_name)?;
-                    let column_types: Vec<_> =
-                        table_def.columns().iter().map(|c| c.data_type()).collect();
-                    let storage_arc = file_manager.table_data(schema_name, table_name)?;
-                    let storage = storage_arc.read();
-                    let root_page = {
-                        use crate::storage::TableFileHeader;
-                        let page = storage.page(0)?;
-                        TableFileHeader::from_bytes(page)?.root_page()
-                    };
-                    let source = StreamingBTreeSource::from_btree_scan_with_projections(
-                        &storage,
-                        root_page,
-                        column_types.clone(),
-                        None,
-                    )?;
-                    let mut cursor = source;
-                    while let Some(row) = cursor.next_row()? {
-                        right_rows.push(row.iter().map(OwnedValue::from).collect());
-                    }
+                    let (rows, column_types) = materialize_table_rows(catalog, file_manager, schema_opt, table_name)?;
+                    right_rows = rows;
                     right_col_count = column_types.len();
                 } else if let Some(nested_join) = right_nested_join {
                     (right_rows, right_nested_join_column_map) =

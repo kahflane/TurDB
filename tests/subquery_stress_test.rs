@@ -615,7 +615,7 @@ fn test_debug_q84() {
         println!("Raw cursor full reverse count: {}", full_count);
     }
 
-    assert!(q84.is_ok() && q84.unwrap().len() > 0, "Q84 should return rows");
+    assert!(q84.is_ok() && !q84.unwrap().is_empty(), "Q84 should return rows");
 }
 
 #[test]

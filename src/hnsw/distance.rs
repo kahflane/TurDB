@@ -284,6 +284,8 @@ pub unsafe fn cosine_avx2(a: &[f32], b: &[f32]) -> f32 {
     1.0 - (dot / norm_product)
 }
 
+/// # Safety
+/// Slices `a` and `b` must have the same length and be properly aligned for NEON operations.
 #[cfg(target_arch = "aarch64")]
 pub unsafe fn dot_product_neon(a: &[f32], b: &[f32]) -> f32 {
     use std::arch::aarch64::*;
@@ -309,11 +311,15 @@ pub unsafe fn dot_product_neon(a: &[f32], b: &[f32]) -> f32 {
     result
 }
 
+/// # Safety
+/// Slices `a` and `b` must have the same length and be properly aligned for NEON operations.
 #[cfg(target_arch = "aarch64")]
 pub unsafe fn inner_product_neon(a: &[f32], b: &[f32]) -> f32 {
     -dot_product_neon(a, b)
 }
 
+/// # Safety
+/// Slices `a` and `b` must have the same length and be properly aligned for NEON operations.
 #[cfg(target_arch = "aarch64")]
 pub unsafe fn cosine_neon(a: &[f32], b: &[f32]) -> f32 {
     use std::arch::aarch64::*;

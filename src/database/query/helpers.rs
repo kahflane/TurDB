@@ -12,14 +12,17 @@
 //! - Optimization: `is_simple_count_star`
 //! - Value comparison: `compare_owned_values`
 
-use crate::schema::TableDef;
+use crate::schema::{Catalog, TableDef};
 use crate::sql::ast::Expr;
+use crate::sql::executor::{RowSource, StreamingBTreeSource};
 use crate::sql::planner::{
     AggregateFunction, PhysicalGraceHashJoin, PhysicalHashAntiJoin, PhysicalHashSemiJoin,
     PhysicalIndexScan, PhysicalNestedLoopJoin, PhysicalOperator, PhysicalSecondaryIndexScan,
     PhysicalSetOpExec, PhysicalSortExec, PhysicalSubqueryExec, PhysicalTableScan,
 };
-use crate::types::OwnedValue;
+use crate::storage::{FileManager, TableFileHeader, DEFAULT_SCHEMA};
+use crate::types::{DataType, OwnedValue};
+use eyre::Result;
 use std::cmp::Ordering;
 
 /// Represents the source of data in a physical query plan.
@@ -303,4 +306,61 @@ pub fn compare_owned_values(a: &OwnedValue, b: &OwnedValue) -> Ordering {
         (OwnedValue::Timestamp(a), OwnedValue::Timestamp(b)) => a.cmp(b),
         _ => Ordering::Equal,
     }
+}
+
+/// Materializes all rows from a table into owned values.
+///
+/// This helper extracts the common table scan pattern used across join execution:
+/// 1. Resolves table definition from catalog
+/// 2. Gets storage handle from file manager
+/// 3. Reads root page from table header
+/// 4. Scans all rows via StreamingBTreeSource
+/// 5. Converts to owned values
+///
+/// Returns the materialized rows along with column types for further processing.
+pub fn materialize_table_rows(
+    catalog: &Catalog,
+    file_manager: &mut FileManager,
+    schema: Option<&str>,
+    table_name: &str,
+) -> Result<(Vec<Vec<OwnedValue>>, Vec<DataType>)> {
+    let (rows, column_types, _) = materialize_table_rows_with_def(catalog, file_manager, schema, table_name)?;
+    Ok((rows, column_types))
+}
+
+/// Materializes all rows from a table, also returning the table definition.
+///
+/// Use this variant when you need access to the TableDef for building column maps
+/// or other metadata operations after materializing rows.
+#[allow(clippy::type_complexity)]
+pub fn materialize_table_rows_with_def<'a>(
+    catalog: &'a Catalog,
+    file_manager: &mut FileManager,
+    schema: Option<&str>,
+    table_name: &str,
+) -> Result<(Vec<Vec<OwnedValue>>, Vec<DataType>, &'a TableDef)> {
+    let schema_name = schema.unwrap_or(DEFAULT_SCHEMA);
+    let table_def = catalog.resolve_table_in_schema(schema, table_name)?;
+    let column_types: Vec<DataType> = table_def.columns().iter().map(|c| c.data_type()).collect();
+
+    let storage_arc = file_manager.table_data(schema_name, table_name)?;
+    let storage = storage_arc.read();
+    let root_page = {
+        let page = storage.page(0)?;
+        TableFileHeader::from_bytes(page)?.root_page()
+    };
+
+    let mut source = StreamingBTreeSource::from_btree_scan_with_projections(
+        &storage,
+        root_page,
+        column_types.clone(),
+        None,
+    )?;
+
+    let mut rows = Vec::new();
+    while let Some(row) = source.next_row()? {
+        rows.push(row.iter().map(OwnedValue::from).collect());
+    }
+
+    Ok((rows, column_types, table_def))
 }
