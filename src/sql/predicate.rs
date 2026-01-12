@@ -1,5 +1,6 @@
 use crate::parsing::{parse_json_path, JsonNavigator};
 use crate::records::jsonb::{JsonbValue, JsonbView};
+use crate::sql::context::ScalarSubqueryResults;
 use crate::sql::executor::ExecutorRow;
 use crate::types::{OwnedValue, Value};
 use hashbrown::HashMap as FastHashMap;
@@ -10,7 +11,7 @@ pub struct CompiledPredicate<'a> {
     column_map: FastHashMap<String, usize>,
     params: Option<Cow<'a, [OwnedValue]>>,
     set_param_count: usize,
-    scalar_subquery_results: Option<FastHashMap<usize, OwnedValue>>,
+    scalar_subquery_results: ScalarSubqueryResults,
 }
 
 impl<'a> CompiledPredicate<'a> {
@@ -20,7 +21,7 @@ impl<'a> CompiledPredicate<'a> {
             column_map: column_map.into_iter().collect(),
             params: None,
             set_param_count: 0,
-            scalar_subquery_results: None,
+            scalar_subquery_results: ScalarSubqueryResults::new(),
         }
     }
 
@@ -33,7 +34,7 @@ impl<'a> CompiledPredicate<'a> {
             column_map: column_map.iter().cloned().collect(),
             params: None,
             set_param_count: 0,
-            scalar_subquery_results: None,
+            scalar_subquery_results: ScalarSubqueryResults::new(),
         }
     }
 
@@ -48,21 +49,21 @@ impl<'a> CompiledPredicate<'a> {
             column_map: column_map.into_iter().collect(),
             params: Some(Cow::Borrowed(params)),
             set_param_count,
-            scalar_subquery_results: None,
+            scalar_subquery_results: ScalarSubqueryResults::new(),
         }
     }
 
     pub fn with_scalar_subqueries(
         expr: &'a crate::sql::ast::Expr<'a>,
         column_map: Vec<(String, usize)>,
-        scalar_results: FastHashMap<usize, OwnedValue>,
+        scalar_results: ScalarSubqueryResults,
     ) -> Self {
         Self {
             expr,
             column_map: column_map.into_iter().collect(),
             params: None,
             set_param_count: 0,
-            scalar_subquery_results: Some(scalar_results),
+            scalar_subquery_results: scalar_results,
         }
     }
 
@@ -75,12 +76,12 @@ impl<'a> CompiledPredicate<'a> {
             column_map: column_map.clone(),
             params: None,
             set_param_count: 0,
-            scalar_subquery_results: None,
+            scalar_subquery_results: ScalarSubqueryResults::new(),
         }
     }
 
-    pub fn set_scalar_subquery_results(&mut self, results: FastHashMap<usize, OwnedValue>) {
-        self.scalar_subquery_results = Some(results);
+    pub fn set_scalar_subquery_results(&mut self, results: ScalarSubqueryResults) {
+        self.scalar_subquery_results = results;
     }
 
     pub fn evaluate(&self, row: &ExecutorRow<'a>) -> bool {
@@ -253,12 +254,11 @@ impl<'a> CompiledPredicate<'a> {
                 }
             }
             Expr::Subquery(subq) => {
-                if let Some(ref results) = self.scalar_subquery_results {
-                    let key = std::ptr::from_ref(*subq) as usize;
-                    results.get(&key).map(|v| self.owned_value_to_value(v))
-                } else {
-                    None
-                }
+                let key = std::ptr::from_ref(*subq) as usize;
+                self.scalar_subquery_results
+                    .iter()
+                    .find(|(k, _)| *k == key)
+                    .map(|(_, v)| self.owned_value_to_value(v))
             }
             _ => None,
         }

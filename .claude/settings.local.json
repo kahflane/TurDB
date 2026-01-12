@@ -54,7 +54,53 @@
       "Bash(pnpm exec napi build:*)",
       "Bash(pnpm tsc:*)",
       "Bash(napi build:*)",
-      "Bash(pnpm run build:*)"
+      "Bash(pnpm run build:*)",
+      "Skill(superpowers:receiving-code-review)",
+      "Bash(chmod:*)",
+      "Bash(.claude/hooks/*.sh:*)"
+    ]
+  },
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Edit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": ".claude/hooks/pre-edit.sh"
+          }
+        ]
+      },
+      {
+        "matcher": "Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": ".claude/hooks/pre-write.sh"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Bash(cargo test:*)",
+        "hooks": [
+          {
+            "type": "command",
+            "command": ".claude/hooks/test-reminder.sh"
+          }
+        ]
+      }
+    ],
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": ".claude/hooks/session-start.sh"
+          }
+        ]
+      }
     ]
   }
 }

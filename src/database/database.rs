@@ -40,10 +40,10 @@
 use crate::database::convert::convert_value_with_type;
 use crate::database::dirty_tracker::ShardedDirtyTracker;
 use crate::database::query::{
-    build_simple_column_map, compare_owned_values, find_limit, find_nested_subquery,
-    find_plan_source, find_projections, find_sort_exec, find_table_scan, has_aggregate,
-    has_filter, has_order_by_expression, has_window, is_simple_count_star, materialize_table_rows,
-    materialize_table_rows_with_def, PlanSource,
+    build_column_map_with_alias, build_simple_column_map, compare_owned_values, find_limit,
+    find_nested_subquery, find_plan_source, find_projections, find_sort_exec, find_table_scan,
+    has_aggregate, has_filter, has_order_by_expression, has_window, is_simple_count_star,
+    materialize_table_rows, materialize_table_rows_with_def, PlanSource,
 };
 use crate::database::row::Row;
 use crate::database::transaction::ActiveTransaction;
@@ -54,7 +54,7 @@ use crate::mvcc::TransactionManager;
 use crate::schema::Catalog;
 
 use crate::sql::builder::ExecutorBuilder;
-use crate::sql::context::ExecutionContext;
+use crate::sql::context::{ExecutionContext, ScalarSubqueryResults};
 use crate::sql::executor::{
     BTreeSource, Executor, ExecutorRow, MaterializedRowSource, ReverseBTreeSource, RowSource,
     StreamingBTreeSource,
@@ -887,7 +887,7 @@ impl Database {
             }
         }
 
-        let mut scalar_subquery_results: Option<hashbrown::HashMap<usize, OwnedValue>> = None;
+        let mut scalar_subquery_results: ScalarSubqueryResults = ScalarSubqueryResults::new();
         {
             let mut filter_predicates: smallvec::SmallVec<[&crate::sql::ast::Expr; 8]> =
                 smallvec::SmallVec::new();
@@ -900,10 +900,9 @@ impl Database {
 
                 for subq in subqueries {
                     let key = std::ptr::from_ref(subq) as usize;
-                    let map = scalar_subquery_results.get_or_insert_with(hashbrown::HashMap::new);
-                    if let hashbrown::hash_map::Entry::Vacant(entry) = map.entry(key) {
+                    if !scalar_subquery_results.iter().any(|(k, _)| *k == key) {
                         let result = execute_scalar_subquery(subq, catalog, file_manager, &arena)?;
-                        entry.insert(result);
+                        scalar_subquery_results.push((key, result));
                     }
                 }
             }
@@ -1176,14 +1175,13 @@ impl Database {
                 while let Some(row) = source.next_row()? {
                     rows.push(row.iter().map(OwnedValue::from).collect());
                 }
-                for col in table_def.columns() {
-                    column_map.push((col.name().to_lowercase(), idx));
-                    column_map.push((format!("{}.{}", alias, col.name()).to_lowercase(), idx));
-                    if scan.alias.is_some() && alias != table_name {
-                        column_map.push((format!("{}.{}", table_name, col.name()).to_lowercase(), idx));
-                    }
-                    idx += 1;
-                }
+                let extra_table_name = if scan.alias.is_some() && alias != table_name {
+                    Some(table_name)
+                } else {
+                    None
+                };
+                build_column_map_with_alias(table_def, alias, extra_table_name, idx, &mut column_map);
+                idx += table_def.columns().len();
                 rows
             } else {
                 Vec::new()
@@ -1210,14 +1208,12 @@ impl Database {
                 while let Some(row) = source.next_row()? {
                     rows.push(row.iter().map(OwnedValue::from).collect());
                 }
-                for col in table_def.columns() {
-                    column_map.push((col.name().to_lowercase(), idx));
-                    column_map.push((format!("{}.{}", alias, col.name()).to_lowercase(), idx));
-                    if scan.alias.is_some() && alias != table_name {
-                        column_map.push((format!("{}.{}", table_name, col.name()).to_lowercase(), idx));
-                    }
-                    idx += 1;
-                }
+                let extra_table_name = if scan.alias.is_some() && alias != table_name {
+                    Some(table_name)
+                } else {
+                    None
+                };
+                build_column_map_with_alias(table_def, alias, extra_table_name, idx, &mut column_map);
                 rows
             } else {
                 Vec::new()
@@ -1341,9 +1337,10 @@ impl Database {
                     )
                 };
 
-                let ctx = match scalar_subquery_results.as_ref() {
-                    None => ExecutionContext::new(&arena),
-                    Some(results) => ExecutionContext::with_scalar_subqueries(&arena, results.clone()),
+                let ctx = if scalar_subquery_results.is_empty() {
+                    ExecutionContext::new(&arena)
+                } else {
+                    ExecutionContext::with_scalar_subqueries(&arena, scalar_subquery_results.clone())
                 };
                 let builder = ExecutorBuilder::new(&ctx);
 
@@ -1444,9 +1441,10 @@ impl Database {
                 )
                 .wrap_err("failed to create range scan for index scan")?;
 
-                let ctx = match scalar_subquery_results.as_ref() {
-                    None => ExecutionContext::new(&arena),
-                    Some(results) => ExecutionContext::with_scalar_subqueries(&arena, results.clone()),
+                let ctx = if scalar_subquery_results.is_empty() {
+                    ExecutionContext::new(&arena)
+                } else {
+                    ExecutionContext::with_scalar_subqueries(&arena, scalar_subquery_results.clone())
                 };
                 let builder = ExecutorBuilder::new(&ctx);
 
@@ -1671,9 +1669,10 @@ impl Database {
 
                 let materialized_source = MaterializedRowSource::new(materialized_rows);
 
-                let ctx = match scalar_subquery_results.as_ref() {
-                    None => ExecutionContext::new(&arena),
-                    Some(results) => ExecutionContext::with_scalar_subqueries(&arena, results.clone()),
+                let ctx = if scalar_subquery_results.is_empty() {
+                    ExecutionContext::new(&arena)
+                } else {
+                    ExecutionContext::with_scalar_subqueries(&arena, scalar_subquery_results.clone())
                 };
                 let builder = ExecutorBuilder::new(&ctx);
 
@@ -1727,9 +1726,10 @@ impl Database {
                     .map(|(idx, col)| (col.name.to_lowercase(), idx))
                     .collect();
 
-                let ctx = match scalar_subquery_results.as_ref() {
-                    None => ExecutionContext::new(&arena),
-                    Some(results) => ExecutionContext::with_scalar_subqueries(&arena, results.clone()),
+                let ctx = if scalar_subquery_results.is_empty() {
+                    ExecutionContext::new(&arena)
+                } else {
+                    ExecutionContext::with_scalar_subqueries(&arena, scalar_subquery_results.clone())
                 };
                 let builder = ExecutorBuilder::new(&ctx);
                 let mut executor = builder

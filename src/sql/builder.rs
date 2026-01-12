@@ -69,11 +69,11 @@ impl<'a> ExecutorBuilder<'a> {
                 } else {
                     column_map.to_vec()
                 };
-                let predicate = if let Some(ref results) = self.ctx.scalar_subquery_results {
+                let predicate = if !self.ctx.scalar_subquery_results.is_empty() {
                     CompiledPredicate::with_scalar_subqueries(
                         filter.predicate,
                         effective_column_map,
-                        results.clone(),
+                        self.ctx.scalar_subquery_results.clone(),
                     )
                 } else {
                     CompiledPredicate::new(filter.predicate, effective_column_map)

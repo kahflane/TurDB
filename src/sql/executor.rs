@@ -767,6 +767,49 @@ impl<'storage> RowSource for BTreeSource<'storage> {
     }
 }
 
+pub struct DynamicExecutorSource<'a, S: RowSource> {
+    executor: DynamicExecutor<'a, S>,
+    opened: bool,
+}
+
+impl<'a, S: RowSource> DynamicExecutorSource<'a, S> {
+    pub fn new(executor: DynamicExecutor<'a, S>) -> Self {
+        Self {
+            executor,
+            opened: false,
+        }
+    }
+}
+
+impl<'a, S: RowSource> RowSource for DynamicExecutorSource<'a, S> {
+    fn reset(&mut self) -> Result<()> {
+        if self.opened {
+            self.executor.close()?;
+        }
+        self.executor.open()?;
+        self.opened = true;
+        Ok(())
+    }
+
+    fn next_row(&mut self) -> Result<Option<Vec<Value<'static>>>> {
+        if !self.opened {
+            self.executor.open()?;
+            self.opened = true;
+        }
+        match self.executor.next()? {
+            Some(row) => {
+                let values: Vec<Value<'static>> = row
+                    .values
+                    .iter()
+                    .map(|v| clone_value_owned(v))
+                    .collect();
+                Ok(Some(values))
+            }
+            None => Ok(None),
+        }
+    }
+}
+
 pub struct TableScanExecutor<'a, S: RowSource> {
     source: S,
     arena: &'a Bump,

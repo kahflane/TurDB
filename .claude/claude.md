@@ -1,1123 +1,161 @@
-# TurDB Rust Implementation - Development Guidelines
+# TurDB Development Guidelines
 
-## CRITICAL: AI Testing Integrity Rules
+> **STOP. READ THIS ENTIRE FILE BEFORE ANY ACTION.**
+> These rules are NON-NEGOTIABLE. Violations = rejected code.
 
-**READ THIS FIRST. These rules override all other instructions.**
+## Pre-Action Checklist (MANDATORY)
 
-### The Problem This Solves
+Before writing ANY code, confirm:
 
-AI assistants (including Claude) have a tendency to write tests that "pass" without actually verifying correctness. This happens because:
-1. AI optimizes for "green tests" not "correct code"
-2. AI can see the implementation while writing tests (circular reasoning)
-3. AI writes tests that describe what code does, not what it should do
+- [ ] **Zero-copy?** Returning `&[u8]`, never `Vec<u8>` or `.to_vec()`
+- [ ] **Zero-alloc?** Reusing buffers, not allocating in CRUD paths
+- [ ] **eyre errors?** Using `bail!`/`ensure!` with rich context, no custom enums
+- [ ] **TDD?** Test written FIRST, test FAILS before implementation exists
+- [ ] **Expected values?** Independently computed, not from the function being tested
+- [ ] **No inline comments?** Documentation at file top only (80-100 lines)
 
-### MANDATORY Rules for AI Writing Tests
+---
 
-**RULE 1: Specification-First Testing**
-- Tests must be derived from REQUIREMENTS, not from reading the implementation
-- Before writing a test, state: "This function SHOULD [behavior] because [requirement]"
-- If you can't state the requirement, you don't understand what to test
+## FORBIDDEN - INSTANT REJECTION
 
-**RULE 2: The "Delete Implementation" Mental Test**
-- Before finalizing a test, ask: "If I deleted the implementation and wrote it wrong, would this test catch it?"
-- If the answer is no, the test is worthless
+These patterns are NEVER acceptable:
 
-**RULE 3: No Reverse-Engineering Tests**
-- FORBIDDEN: Reading implementation, then writing test that matches it
-- REQUIRED: Write test from spec, THEN verify implementation passes
+### Memory/Performance
+1. `Vec<u8>` returns from page access - use `&[u8]`
+2. `.to_vec()` or `.clone()` on page data
+3. Allocating in CRUD hot paths
+4. Single global lock for page cache - use sharding (64 shards)
+5. Async runtime (`tokio`, `async-std`)
 
-**RULE 4: Mutation Testing Mindset**
-- For every test, identify at least ONE mutation that would break it
-- Example: "If I changed `<` to `<=`, this test would fail because..."
-- If you can't identify a breaking mutation, the test is too weak
+### Testing
+6. `assert!(result.is_ok())` - must check actual contents
+7. `assert_eq!(f(x), f(x))` - tautology, tests nothing
+8. Tests derived from reading implementation
+9. Tests without specific expected values
+10. Vague test names like `test_insert` or `test_1`
 
-**RULE 5: Expected Values Must Be Independently Computed**
-```rust
-// FORBIDDEN: Using the function to compute expected value
-let expected = encode_int(42);
-assert_eq!(encode_int(42), expected); // Tautology!
+### Code Style
+11. Inline comments anywhere in code
+12. Custom error enums - use `eyre` only
+13. Error messages without context (operation, resource, reason)
+14. `pub` when `pub(crate)` suffices
+15. Files over 800 lines
 
-// REQUIRED: Independently derived expected value
-// 42 in big-endian with POS_INT prefix = [0x16, 0, 0, 0, 0, 0, 0, 0, 42]
-let expected = vec![0x16, 0, 0, 0, 0, 0, 0, 0, 42];
-assert_eq!(encode_int(42), expected);
-```
-
-**RULE 6: Prove Test Can Fail**
-- After writing a test, INTENTIONALLY break the implementation
-- Run the test - it MUST fail
-- If it doesn't fail, the test doesn't test anything
-- Revert the break, verify test passes again
-
-### AI Self-Check Before Every Test
-
-Ask yourself:
-1. "What REQUIREMENT does this test verify?" (not "what does the code do")
-2. "What specific bug would this test catch?"
-3. "What's the expected value and HOW did I compute it?"
-4. "If I made a common mistake in implementation, would this fail?"
-
-If you cannot answer all four questions, DO NOT write the test.
+### Dependencies
+16. `serde` - use custom zero-copy serialization
+17. `regex` - too heavy
+18. Any dep > 50KB without justification
 
 ---
 
 ## Project Overview
 
-TurDB is an embedded database combining SQLite-inspired row storage with native vector search (HNSW). This Rust implementation prioritizes zero-copy operations, zero allocation during CRUD, and extreme memory efficiency.
-
-# Coding Style & File Structure Rules
-
-## 1. File Structure
-- **Max Length:** Strictly aim for files under 800 lines.
-- **Modularity:** Prefer many small modules over one large module.
-- **The "One Struct" Rule:** Major structs should usually have their own file.
-- **Barrels:** Use `mod.rs` (or file-named modules) primarily for `pub mod` and `pub use` re-exports to create a clean public API. Avoid putting core logic in the root of a module.
-
-## 2. Idiomatic Separation
-- **Tests:** Unit tests (`#[cfg(test)]`) go at the bottom of the file. If tests exceed 200 lines, move them to a `tests/` directory (integration style) or a separate `_tests.rs` submodule.
-
-
-## Core Principles
-
-### 1. Zero-Copy Architecture
-
-All data access MUST use zero-copy patterns:
-- Use `&[u8]` slices pointing directly into mmap'd regions
-- Parse data in-place without intermediate buffers
-- Return references to page data, never cloned copies
-- Use `zerocopy` crate for safe transmutation of bytes to structs
-
-```rust
-// CORRECT: Zero-copy access
-fn get_key(&self, page: &Page) -> &[u8] {
-    &page.data()[self.key_offset..self.key_end]
-}
-
-// WRONG: Copies data
-fn get_key(&self, page: &Page) -> Vec<u8> {
-    page.data()[self.key_offset..self.key_end].to_vec()
-}
-```
-
-### Mmap Safety via Borrow Checker
-
-MmapStorage uses Rust's borrow checker to prevent use-after-unmap at **compile time** with **zero runtime overhead**:
-
-```rust
-pub struct MmapStorage {
-    file: File,
-    mmap: MmapMut,
-    page_size: usize,
-    page_count: u32,
-}
-
-impl MmapStorage {
-    /// Returns page slice. Borrows &self, preventing grow() while borrowed.
-    pub fn page(&self, page_no: u32) -> Result<&[u8]> {
-        ensure!(page_no < self.page_count, "page out of bounds");
-        let offset = page_no as usize * self.page_size;
-        Ok(&self.mmap[offset..offset + self.page_size])
-    }
-
-    /// Requires &mut self - impossible if any page is borrowed.
-    pub fn grow(&mut self, new_page_count: u32) -> Result<()> {
-        let new_size = new_page_count as u64 * self.page_size as u64;
-        self.file.set_len(new_size)?;
-        self.mmap = unsafe { MmapMut::map_mut(&self.file)? };
-        self.page_count = new_page_count;
-        Ok(())
-    }
-}
-```
-
-**Compile-time enforcement:**
-```rust
-// This compiles - page reference dropped before grow
-let val = {
-    let page = storage.page(5)?;
-    page[0]
-};
-storage.grow(100)?;  // ✅ OK
-
-// This FAILS to compile - borrow checker prevents use-after-unmap
-let page = storage.page(5)?;
-storage.grow(100)?;  // ❌ ERROR: cannot borrow as mutable
-let byte = page[0];  //    because it is also borrowed as immutable
-```
-
-**Benefits:**
-- Zero runtime cost (no locks, guards, or epoch tracking)
-- Zero-copy (returns `&[u8]` directly into mmap)
-- Compile-time safety (borrow checker prevents dangling pointers)
-- Idiomatic Rust (uses the language's core safety mechanism)
-
-### 2. Zero Allocation During CRUD
-
-CRUD operations MUST NOT allocate heap memory:
-- Pre-allocate all buffers during database open
-- Use arena allocators for temporary data
-- Reuse cursor structs across operations
-- Stack-allocate small fixed-size buffers
-
-```rust
-// CORRECT: Reuse pre-allocated cursor
-fn scan(&self, cursor: &mut Cursor) -> Result<()>
-
-// WRONG: Allocates new cursor each call
-fn scan(&self) -> Result<Cursor>
-```
-
-### 3. Page Size
-
-All implementations MUST use 16KB (16384 bytes) page size:
-- **Page header**: 16 bytes (every page)
-- **Usable space**: 16368 bytes per page
-- **File header**: 128 bytes (page 0 of each file only)
-- **Page 0 usable**: 16256 bytes (128-byte file header eats into it)
-
-```
-Regular Page (1+):          Page 0 (file header):
-+------------------+        +------------------+
-| Page Hdr (16B)   |        | File Hdr (128B)  |
-+------------------+        +------------------+
-| Usable (16368B)  |        | Usable (16256B)  |
-+------------------+        +------------------+
-```
-
-### 4. Memory Budget: Hard Limits with Auto-Detection
-
-TurDB uses a **hard memory budget** system suitable for embedded/IoT devices:
-
-**Default**: 25% of system RAM (minimum floor: 4MB)
-
-**Reserved Pool Allocation**:
-- Cache: 512 KB (guaranteed minimum for page cache)
-- Query: 256 KB (sort buffers, hash tables)
-- Recovery: 256 KB (WAL frame processing)
-- Schema: 128 KB (catalog metadata)
-- Shared: Remainder available for dynamic allocation
-
-**MemoryBudget API** (in `src/memory/budget.rs`):
-```rust
-let budget = MemoryBudget::auto_detect(); // 25% RAM, 4MB floor
-let budget = MemoryBudget::with_limit(16 * 1024 * 1024); // 16 MB
-
-budget.allocate(Pool::Cache, PAGE_SIZE)?; // Returns Err if exceeds
-budget.release(Pool::Cache, PAGE_SIZE);
-budget.can_allocate(Pool::Cache, bytes); // Check without committing
-```
-
-**PRAGMA Commands**:
-- `PRAGMA memory_budget` - Query total budget in bytes
-- `PRAGMA memory_stats` - Query per-pool usage
-- `PRAGMA wal_checkpoint` - Force checkpoint now
-- `PRAGMA wal_checkpoint_threshold` - Get/set auto-checkpoint frame count (default: 1000)
-- `PRAGMA wal_frame_count` - Query current WAL frame count
-
-**WAL Auto-Checkpoint**: Triggers at 1000 frames (~16MB) or on clean close
-
-### 5. File-Per-Table Architecture (MySQL-Style)
-
-```
-database_dir/
-├── turdb.meta           # Global metadata and catalog
-├── root/                # Default schema
-│   ├── table_name.tbd   # Table data file
-│   ├── table_name.idx   # B-tree indexes
-│   └── table_name.hnsw  # HNSW vector indexes (if any)
-├── custom_schema/       # User-created schema
-│   └── ...
-└── wal/
-    └── wal.000001       # Write-ahead log segments
-```
-
-### 6. Multi-Schema Support
-
-Support multiple schemas (like PostgreSQL):
-- Default schema: `root`
-- System schema: `turdb_catalog`
-- User schemas: Created via `CREATE SCHEMA`
-- Fully qualified names: `schema.table.column`
-
-## Error Handling
-
-### Use `eyre` Exclusively
-
-All error handling MUST use `eyre`:
-
-```rust
-use eyre::{Result, WrapErr, bail, ensure};
-
-fn open_page(&self, page_no: u32) -> Result<&Page> {
-    let page = self.cache.get(page_no)
-        .wrap_err_with(|| format!("failed to load page {}", page_no))?;
-    Ok(page)
-}
-```
-
-### Error Context Requirements
-
-Every error MUST include:
-1. What operation was being performed
-2. What resource was involved (page number, table name, etc.)
-3. Why it failed (if known)
-
-```rust
-// CORRECT: Rich context
-.wrap_err_with(|| format!("failed to insert row into table '{}' at page {}", table, page_no))
-
-// WRONG: No context
-.wrap_err("insert failed")
-```
-
-### No Custom Error Types
-
-Do NOT create custom error enums. Use `eyre::Report` with context:
-
-```rust
-// WRONG
-enum DbError {
-    PageNotFound(u32),
-    TableNotFound(String),
-}
-
-// CORRECT
-bail!("page {} not found in table '{}'", page_no, table_name)
-```
-
-## Code Documentation Style
-
-### No Inline Comments
-
-NEVER write inline comments in code:
-
-```rust
-// WRONG
-fn insert(&mut self, key: &[u8], value: &[u8]) -> Result<()> {
-    // Find the right leaf page
-    let leaf = self.find_leaf(key)?;
-    // Insert into the leaf
-    leaf.insert(key, value)?;
-    Ok(())
-}
-```
-
-### Block Documentation at File Top
-
-Each file MUST start with 80-100 lines of block documentation explaining:
-1. Purpose of this module
-2. Architecture and design decisions
-3. Key data structures
-4. Usage patterns
-5. Performance characteristics
-6. Safety considerations
-
-```rust
-//! # B-Tree Implementation
-//!
-//! This module implements the core B-tree structure for TurDB's row storage.
-//!
-//! ## Architecture
-//!
-//! The B-tree uses a page-based design where each node occupies exactly one
-//! 16KB page. Interior nodes contain keys and child page pointers, while
-//! leaf nodes contain keys and row data (or overflow pointers for large rows).
-//!
-//! ## Page Layout
-//!
-//! ```text
-//! +------------------+
-//! | Header (16 bytes)|
-//! +------------------+
-//! | Cell Pointers    |
-//! | (2 bytes each)   |
-//! +------------------+
-//! | Free Space       |
-//! +------------------+
-//! | Cell Content     |
-//! | (grows upward)   |
-//! +------------------+
-//! ```
-//!
-//! ... (continue to 80-100 lines)
-```
-
-### Doc Comments for Public API Only
-
-Use `///` only for public functions, structs, and traits. Keep them concise (1-3 lines):
-
-```rust
-/// Opens a database at the specified path.
-pub fn open(path: &Path) -> Result<Database>
-
-/// Returns the number of rows in this table.
-pub fn row_count(&self) -> u64
-```
-
-### Visibility Rules
-
-- Minimize pub usage
-- Use `pub(crate)` for internal APIs
-- Only `pub` for user-facing API
-- Never `pub use` internal modules at crate root
-
-## Memory Management
-
-### Arena Allocators for Queries
-
-Use `bumpalo` for per-query allocations:
-
-```rust
-fn execute_query<'a>(&self, arena: &'a Bump, sql: &str) -> Result<Rows<'a>>
-```
-
-### No Global Allocators
-
-Never use global state or singleton patterns. All state flows through explicit parameters.
-
-### Drop Order
-
-Implement Drop carefully to ensure:
-1. Dirty pages flushed before pager drops
-2. WAL synced before file closes
-3. Locks released in reverse acquisition order
-
-## Concurrency Model
-
-### Send + Sync Requirements
-
-All public types that cross thread boundaries MUST be `Send + Sync`:
-- `Database`: `Send + Sync` (can be shared across threads)
-- `Transaction`: `Send + !Sync` (bound to one thread, movable)
-- `Cursor`: `!Send + !Sync` (thread-local only)
-
-### Locking Strategy - Lock Sharding
-
-NEVER use a single global lock for the page cache. Use **lock sharding**:
-
-```rust
-const SHARD_COUNT: usize = 64;
-
-struct PageCache {
-    shards: [RwLock<CacheShard>; SHARD_COUNT],
-}
-
-impl PageCache {
-    fn shard_for(&self, page_no: u32) -> &RwLock<CacheShard> {
-        &self.shards[(page_no as usize) % SHARD_COUNT]
-    }
-}
-```
-
-Use `parking_lot` for all synchronization:
-- Sharded `RwLock` for page cache (64 shards minimum)
-- `RwLock` for catalog (single lock OK - read-heavy, rarely written)
-- `Mutex` for WAL, dirty list
-
-### Lock Ordering
-
-Strict lock order to prevent deadlocks:
+TurDB is an embedded database combining SQLite-inspired row storage with native HNSW vector search. Priorities:
+
+1. **Zero-copy** - `&[u8]` slices into mmap'd regions
+2. **Zero-allocation** - No heap allocs during CRUD
+3. **16KB pages** - Fixed size, 16-byte headers
+4. **Hard memory budget** - 25% RAM, 4MB floor
+
+---
+
+## Quick Reference
+
+| Aspect | Rule |
+|--------|------|
+| Page size | 16384 bytes (16KB) |
+| Page header | 16 bytes |
+| File header | 128 bytes (page 0 only) |
+| Cache algorithm | SIEVE (not LRU) |
+| Lock sharding | 64 shards minimum |
+| Memory budget | 25% RAM, 4MB floor |
+| Error handling | `eyre` exclusively |
+| Sync primitives | `parking_lot` only |
+
+---
+
+## Detailed Rules (READ BEFORE RELEVANT TASKS)
+
+**Before writing tests:** Read `.claude/rules/TESTING.md`
+
+**Before memory/page work:** Read `.claude/rules/MEMORY.md`
+
+**Before error handling:** Read `.claude/rules/ERRORS.md`
+
+**Before key encoding:** Read `.claude/rules/ENCODING.md`
+
+**Before any code:** Read `.claude/rules/STYLE.md`
+
+**Before file format work:** Read `.claude/rules/FILE_FORMATS.md`
+
+---
+
+## AI Self-Check Protocol
+
+Before EVERY implementation, answer these questions:
+
+### For Tests:
+1. "What REQUIREMENT does this test verify?" (not "what does the code do")
+2. "What specific bug would this test catch?"
+3. "What's the expected value and HOW did I compute it?"
+4. "If I made a common mistake, would this fail?"
+
+### For Code:
+1. "Am I returning a reference or copying data?"
+2. "Does this allocate on the heap?"
+3. "Does my error message include operation + resource + reason?"
+4. "Did I write the test FIRST?"
+
+**If you cannot answer all questions, STOP and reconsider.**
+
+---
+
+## Lock Ordering (Prevent Deadlocks)
+
+Always acquire in this order:
 1. Database lock
 2. Schema lock
-3. Table lock (alphabetical order if multiple)
+3. Table lock (alphabetical if multiple)
 4. Page cache shard lock (by shard index)
 5. WAL lock
 
-### No Async Runtime
+---
 
-The core engine is synchronous. Avoid `tokio`/`async-std`:
-- mmap page faults block threads regardless of async
-- Embedded use case has no network I/O in hot path
-- Async adds ~100-500ns latency per await point
+## Performance Targets
 
-For server mode, use a separate `turdb-server` crate with `spawn_blocking`.
+| Operation | Target |
+|-----------|--------|
+| Point read (cached) | < 1µs |
+| Point read (disk) | < 50µs |
+| Sequential scan | > 1M rows/sec |
+| Insert | > 100K rows/sec |
+| k-NN (1M vectors, k=10) | < 10ms |
 
-## Performance Requirements
+---
 
-### Benchmarks
+## Git Workflow
 
-All CRUD operations MUST meet these targets:
-- Point read: < 1µs (cached), < 50µs (disk)
-- Sequential scan: > 1M rows/sec
-- Insert: > 100K rows/sec
-- k-NN search (1M vectors, k=10): < 10ms
+**Branches:** `feature/`, `fix/`, `perf/`, `refactor/`
 
-### Profiling
+**Commits:**
+```
+type(scope): description
 
-Use `criterion` for benchmarks. Every PR touching performance-critical code must include benchmark results.
-
-## Algorithmic Optimizations
-
-### Cache Eviction: SIEVE (Not LRU)
-
-Standard LRU is bad for database scans (sequential scan flushes entire cache). Use **SIEVE** algorithm:
-
-```rust
-struct SieveCache {
-    entries: Vec<CacheEntry>,
-    hand: usize,
-}
-
-struct CacheEntry {
-    page_no: u32,
-    visited: AtomicBool,
-    data: *mut [u8; PAGE_SIZE],
-}
-
-impl SieveCache {
-    fn evict(&mut self) -> u32 {
-        loop {
-            let entry = &self.entries[self.hand];
-            if entry.visited.swap(false, Ordering::Relaxed) {
-                self.hand = (self.hand + 1) % self.entries.len();
-            } else {
-                return entry.page_no;
-            }
-        }
-    }
-
-    fn access(&self, idx: usize) {
-        self.entries[idx].visited.store(true, Ordering::Relaxed);
-    }
-}
+- Bullet points for details
 ```
 
-### B+Tree: Slot Array with Prefix Hints
+Types: `feat`, `fix`, `perf`, `refactor`, `test`, `docs`, `chore`
 
-Store first 4 bytes of each key in a compact slot array for fast SIMD comparison:
-
-```rust
-struct LeafPage {
-    header: PageHeader,
-    slot_count: u16,
-    slots: [Slot; MAX_SLOTS],
-    data: [u8],
-}
-
-#[repr(C)]
-struct Slot {
-    prefix: [u8; 4],
-    offset: u16,
-    len: u16,
-}
-
-impl LeafPage {
-    fn find_key(&self, key: &[u8]) -> SearchResult {
-        let target_prefix = key.get(..4).map(|s| u32::from_be_bytes(s.try_into().unwrap()));
-
-        for (i, slot) in self.slots[..self.slot_count as usize].iter().enumerate() {
-            let slot_prefix = u32::from_be_bytes(slot.prefix);
-            if slot_prefix > target_prefix.unwrap_or(0) {
-                return SearchResult::NotFound(i);
-            }
-            if slot_prefix == target_prefix.unwrap_or(0) {
-                let full_key = self.get_key(slot);
-                match full_key.cmp(key) {
-                    Ordering::Equal => return SearchResult::Found(i),
-                    Ordering::Greater => return SearchResult::NotFound(i),
-                    Ordering::Less => continue,
-                }
-            }
-        }
-        SearchResult::NotFound(self.slot_count as usize)
-    }
-}
-```
-
-### B+Tree: Suffix Truncation for Interior Nodes
-
-Interior nodes only need enough key bytes to distinguish children:
-
-```rust
-fn compute_separator(left_max: &[u8], right_min: &[u8]) -> Vec<u8> {
-    let mut sep = Vec::new();
-    for (l, r) in left_max.iter().zip(right_min.iter()) {
-        if l < r {
-            sep.push(*l + 1);
-            return sep;
-        }
-        sep.push(*l);
-    }
-    sep
-}
-```
-
-### Key Encoding: Comprehensive Type Prefix Scheme
-
-All keys MUST be encoded in big-endian byte-comparable format with type prefixes.
-This allows multi-column keys of any type to be compared with single `memcmp`.
-
-#### Type Prefix Constants
-
-```rust
-pub mod TypePrefix {
-    // Special values
-    pub const NULL: u8 = 0x01;
-    pub const FALSE: u8 = 0x02;
-    pub const TRUE: u8 = 0x03;
-
-    // Numbers (ordered: negative < zero < positive)
-    pub const NEG_INFINITY: u8 = 0x10;
-    pub const NEG_BIG_INT: u8 = 0x11;   // Arbitrary precision negative
-    pub const NEG_INT: u8 = 0x12;       // i64 negative
-    pub const NEG_FLOAT: u8 = 0x13;     // f64 negative
-    pub const ZERO: u8 = 0x14;
-    pub const POS_FLOAT: u8 = 0x15;     // f64 positive
-    pub const POS_INT: u8 = 0x16;       // i64 positive
-    pub const POS_BIG_INT: u8 = 0x17;   // Arbitrary precision positive
-    pub const POS_INFINITY: u8 = 0x18;
-    pub const NAN: u8 = 0x19;           // NaN sorts after all numbers
-
-    // Strings/Binary
-    pub const TEXT: u8 = 0x20;
-    pub const BLOB: u8 = 0x21;
-
-    // Date/Time
-    pub const DATE: u8 = 0x30;
-    pub const TIME: u8 = 0x31;
-    pub const TIMESTAMP: u8 = 0x32;
-    pub const TIMESTAMPTZ: u8 = 0x33;
-    pub const INTERVAL: u8 = 0x34;
-
-    // Special types
-    pub const UUID: u8 = 0x40;
-    pub const INET: u8 = 0x41;          // IP addresses
-    pub const MACADDR: u8 = 0x42;
-
-    // JSON types (RFC 7159 ordering)
-    pub const JSON_NULL: u8 = 0x50;
-    pub const JSON_FALSE: u8 = 0x51;
-    pub const JSON_TRUE: u8 = 0x52;
-    pub const JSON_NUMBER: u8 = 0x53;
-    pub const JSON_STRING: u8 = 0x54;
-    pub const JSON_ARRAY: u8 = 0x55;
-    pub const JSON_OBJECT: u8 = 0x56;
-
-    // Composite/Custom types
-    pub const ARRAY: u8 = 0x60;         // SQL arrays
-    pub const TUPLE: u8 = 0x61;         // Row/Record types
-    pub const RANGE: u8 = 0x62;         // PostgreSQL range types
-    pub const ENUM: u8 = 0x63;          // Enum types
-    pub const COMPOSITE: u8 = 0x64;     // User-defined composite
-    pub const DOMAIN: u8 = 0x65;        // Domain types
-
-    // Vectors
-    pub const VECTOR: u8 = 0x70;
-
-    // Extension point
-    pub const CUSTOM_START: u8 = 0x80;  // 0x80-0xFE for custom types
-    pub const MAX_KEY: u8 = 0xFF;       // Sentinel for range queries
-}
-```
-
-#### Integer Encoding (Sign-Split)
-
-```rust
-fn encode_int(n: i64, buf: &mut Vec<u8>) {
-    if n < 0 {
-        buf.push(TypePrefix::NEG_INT);
-        buf.extend((n as u64).to_be_bytes()); // Two's complement preserves order
-    } else if n == 0 {
-        buf.push(TypePrefix::ZERO);
-    } else {
-        buf.push(TypePrefix::POS_INT);
-        buf.extend((n as u64).to_be_bytes());
-    }
-}
-```
-
-#### Float Encoding (IEEE Bit Manipulation)
-
-```rust
-fn encode_float(f: f64, buf: &mut Vec<u8>) {
-    if f.is_nan() {
-        buf.push(TypePrefix::NAN);
-    } else if f == f64::NEG_INFINITY {
-        buf.push(TypePrefix::NEG_INFINITY);
-    } else if f == f64::INFINITY {
-        buf.push(TypePrefix::POS_INFINITY);
-    } else if f < 0.0 {
-        buf.push(TypePrefix::NEG_FLOAT);
-        buf.extend((!f.to_bits()).to_be_bytes()); // Invert all bits
-    } else if f == 0.0 {
-        buf.push(TypePrefix::ZERO);
-    } else {
-        buf.push(TypePrefix::POS_FLOAT);
-        buf.extend((f.to_bits() ^ (1u64 << 63)).to_be_bytes()); // Flip sign bit
-    }
-}
-```
-
-#### Text Encoding (Escaped + Null-Terminated)
-
-```rust
-fn encode_text(s: &str, buf: &mut Vec<u8>) {
-    buf.push(TypePrefix::TEXT);
-    for byte in s.as_bytes() {
-        match byte {
-            0x00 => { buf.push(0x00); buf.push(0xFF); }  // Escape null
-            0xFF => { buf.push(0xFF); buf.push(0x00); }  // Escape 0xFF
-            _ => buf.push(*byte),
-        }
-    }
-    buf.push(0x00);
-    buf.push(0x00); // Double-null terminator
-}
-```
-
-#### JSON Encoding (Recursive)
-
-```rust
-fn encode_json(json: &JsonValue, buf: &mut Vec<u8>) {
-    match json {
-        JsonValue::Null => buf.push(TypePrefix::JSON_NULL),
-        JsonValue::Bool(false) => buf.push(TypePrefix::JSON_FALSE),
-        JsonValue::Bool(true) => buf.push(TypePrefix::JSON_TRUE),
-        JsonValue::Number(n) => {
-            buf.push(TypePrefix::JSON_NUMBER);
-            encode_json_number(n, buf);
-        }
-        JsonValue::String(s) => {
-            buf.push(TypePrefix::JSON_STRING);
-            encode_text_body(s, buf);
-        }
-        JsonValue::Array(arr) => {
-            buf.push(TypePrefix::JSON_ARRAY);
-            for elem in arr { encode_json(elem, buf); buf.push(0x01); }
-            buf.push(0x00);
-        }
-        JsonValue::Object(obj) => {
-            buf.push(TypePrefix::JSON_OBJECT);
-            let mut keys: Vec<_> = obj.keys().collect();
-            keys.sort(); // Deterministic key order
-            for key in keys {
-                encode_text_body(key, buf);
-                buf.push(0x02);
-                encode_json(&obj[key], buf);
-                buf.push(0x01);
-            }
-            buf.push(0x00);
-        }
-    }
-}
-```
-
-#### Composite/Custom Types
-
-```rust
-fn encode_composite(fields: &[Value], type_id: u32, buf: &mut Vec<u8>) {
-    buf.push(TypePrefix::COMPOSITE);
-    buf.extend(type_id.to_be_bytes()); // Type OID
-    for field in fields {
-        encode_value(field, buf);
-        buf.push(0x01); // Field separator
-    }
-    buf.push(0x00); // Terminator
-}
-
-fn encode_enum(variant_ordinal: u32, type_id: u32, buf: &mut Vec<u8>) {
-    buf.push(TypePrefix::ENUM);
-    buf.extend(type_id.to_be_bytes());
-    buf.extend(variant_ordinal.to_be_bytes()); // Ordinal preserves declaration order
-}
-
-fn encode_array(elements: &[Value], buf: &mut Vec<u8>) {
-    buf.push(TypePrefix::ARRAY);
-    for elem in elements {
-        encode_value(elem, buf);
-        buf.push(0x01);
-    }
-    buf.push(0x00);
-}
-```
-
-#### Date/Time Encoding
-
-```rust
-fn encode_timestamp(micros_since_epoch: i64, buf: &mut Vec<u8>) {
-    buf.push(TypePrefix::TIMESTAMP);
-    buf.extend((micros_since_epoch ^ i64::MIN).to_be_bytes()); // XOR flip for signed
-}
-
-fn encode_uuid(uuid: &[u8; 16], buf: &mut Vec<u8>) {
-    buf.push(TypePrefix::UUID);
-    buf.extend(uuid); // Already byte-comparable
-}
-```
-
-#### Type Ordering Summary
-
-```
-NULL < FALSE < TRUE < -∞ < negative numbers < 0 < positive numbers < +∞ < NaN
-< TEXT < BLOB < DATE < TIME < TIMESTAMP < UUID < JSON_* < ARRAY < COMPOSITE < CUSTOM
-```
-
-### Range Scans: madvise Prefetching
-
-When scanning leaf pages sequentially, prefetch ahead:
-
-```rust
-impl Cursor {
-    fn next(&mut self) -> Result<bool> {
-        if self.at_page_end() {
-            let next_page = self.current_leaf.next_leaf;
-            let prefetch_page = self.current_leaf.next_leaf + 2;
-
-            unsafe {
-                libc::madvise(
-                    self.mmap.page_ptr(prefetch_page),
-                    PAGE_SIZE * 2,
-                    libc::MADV_WILLNEED,
-                );
-            }
-
-            self.current_leaf = self.load_page(next_page)?;
-        }
-        self.advance_within_page()
-    }
-}
-```
-
-### Joins: Grace Hash Join for Memory-Constrained
-
-With 256KB working memory, use partitioned hash join:
-
-```rust
-impl GraceHashJoin {
-    fn execute(&mut self) -> Result<()> {
-        let partition_count = 16;
-
-        for row in self.build_side.scan()? {
-            let hash = self.hash_key(&row);
-            let partition = hash % partition_count;
-            self.partitions[partition].write(&row)?;
-        }
-
-        for partition_id in 0..partition_count {
-            let build_partition = self.partitions[partition_id].read_all()?;
-            let hash_table = self.build_hash_table(&build_partition);
-
-            for row in self.probe_side.scan_partition(partition_id)? {
-                if let Some(match_row) = hash_table.probe(&row) {
-                    self.emit_result(&row, match_row)?;
-                }
-            }
-        }
-        Ok(())
-    }
-}
-```
-
-### SIMD Distance Functions
-
-Use AVX2/NEON for vector distance calculations:
-
-```rust
-#[cfg(target_arch = "x86_64")]
-pub fn euclidean_avx2(a: &[f32], b: &[f32]) -> f32 {
-    use std::arch::x86_64::*;
-
-    unsafe {
-        let mut sum = _mm256_setzero_ps();
-        for i in (0..a.len()).step_by(8) {
-            let va = _mm256_loadu_ps(a.as_ptr().add(i));
-            let vb = _mm256_loadu_ps(b.as_ptr().add(i));
-            let diff = _mm256_sub_ps(va, vb);
-            sum = _mm256_fmadd_ps(diff, diff, sum);
-        }
-        horizontal_sum_avx2(sum).sqrt()
-    }
-}
-```
-
-### Vector Quantization: SQ8
-
-Compress float32 vectors to uint8 for 4x memory reduction:
-
-```rust
-struct SQ8Vector {
-    min: f32,
-    scale: f32,
-    data: Vec<u8>,
-}
-
-impl SQ8Vector {
-    fn from_f32(vec: &[f32]) -> Self {
-        let min = vec.iter().cloned().fold(f32::INFINITY, f32::min);
-        let max = vec.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-        let scale = (max - min) / 255.0;
-
-        let data = vec.iter()
-            .map(|&v| ((v - min) / scale) as u8)
-            .collect();
-
-        Self { min, scale, data }
-    }
-
-    fn distance_sq8(&self, other: &Self) -> f32 {
-        let mut sum: u32 = 0;
-        for (a, b) in self.data.iter().zip(&other.data) {
-            let diff = (*a as i32) - (*b as i32);
-            sum += (diff * diff) as u32;
-        }
-        (sum as f32) * self.scale * self.scale
-    }
-}
-```
-
-## Testing Requirements - STRICT TDD ENFORCEMENT
-
-### MANDATORY: Test-Driven Development (RED-GREEN-REFACTOR)
-
-**This is NON-NEGOTIABLE. Every implementation MUST follow this exact sequence:**
-
-1. **RED**: Write test FIRST. Run it. It MUST FAIL.
-   - If the test passes before implementation exists, the test is WORTHLESS
-   - A test that never fails proves nothing
-
-2. **GREEN**: Write MINIMAL code to make test pass.
-   - No extra features, no "while I'm here" additions
-
-3. **REFACTOR**: Clean up while tests stay green.
-
-**VIOLATION = REJECTED CODE. No exceptions.**
-
-### FORBIDDEN: Tautological Tests (Tests That Test Nothing)
-
-**NEVER write tests that:**
-
-```rust
-// FORBIDDEN: Testing that function returns what function returns
-#[test]
-fn test_parse() {
-    let result = parse("input");
-    assert_eq!(result, parse("input")); // USELESS - comparing function to itself
-}
-
-// FORBIDDEN: Testing implementation, not behavior
-#[test]
-fn test_insert() {
-    let mut tree = BTree::new();
-    tree.insert(b"key", b"value");
-    assert!(tree.root.is_some()); // WRONG - tests internal state, not behavior
-}
-
-// FORBIDDEN: Tests with no meaningful assertions
-#[test]
-fn test_something() {
-    let x = do_thing();
-    assert!(true); // USELESS
-}
-
-// FORBIDDEN: Tests that just check "doesn't panic"
-#[test]
-fn test_create() {
-    let _ = Widget::new(); // No assertion = no test
-}
-```
-
-### REQUIRED: Tests Must Verify BEHAVIOR, Not Implementation
-
-**CORRECT pattern - test observable behavior:**
-
-```rust
-// CORRECT: Tests actual behavior with specific expected values
-#[test]
-fn test_insert_and_retrieve() {
-    let mut tree = BTree::new();
-    tree.insert(b"key", b"value").unwrap();
-
-    // Test RETRIEVAL behavior, not internal state
-    let result = tree.get(b"key").unwrap();
-    assert_eq!(result, b"value");
-}
-
-// CORRECT: Test boundary behavior
-#[test]
-fn test_insert_causes_split_at_capacity() {
-    let mut tree = BTree::new();
-    // Fill to capacity
-    for i in 0..MAX_KEYS {
-        tree.insert(&[i as u8], &[i as u8]).unwrap();
-    }
-    // Insert one more - should still work (split happens internally)
-    tree.insert(&[255], &[255]).unwrap();
-
-    // Verify ALL keys still retrievable (behavior preserved)
-    for i in 0..MAX_KEYS {
-        assert_eq!(tree.get(&[i as u8]).unwrap(), &[i as u8]);
-    }
-    assert_eq!(tree.get(&[255]).unwrap(), &[255]);
-}
-```
-
-### REQUIRED: Edge Cases Are MANDATORY
-
-Every function MUST have tests for:
-
-1. **Empty/Zero inputs**: `""`, `[]`, `0`, `None`
-2. **Single element**: Minimum valid input
-3. **Boundary conditions**: `MAX-1`, `MAX`, `MAX+1`
-4. **Error conditions**: Invalid inputs that SHOULD fail
-5. **Negative cases**: What should NOT happen
-
-```rust
-// REQUIRED edge case coverage example
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn get_empty_key_returns_error() {
-        let tree = BTree::new();
-        assert!(tree.get(b"").is_err());
-    }
-
-    #[test]
-    fn get_nonexistent_key_returns_none() {
-        let tree = BTree::new();
-        assert!(tree.get(b"missing").unwrap().is_none());
-    }
-
-    #[test]
-    fn insert_max_size_key_succeeds() {
-        let mut tree = BTree::new();
-        let max_key = vec![0u8; MAX_KEY_SIZE];
-        assert!(tree.insert(&max_key, b"v").is_ok());
-    }
-
-    #[test]
-    fn insert_oversized_key_returns_error() {
-        let mut tree = BTree::new();
-        let big_key = vec![0u8; MAX_KEY_SIZE + 1];
-        assert!(tree.insert(&big_key, b"v").is_err());
-    }
-}
-```
-
-### REQUIRED: Bug Fix Tests
-
-**For EVERY bug fix:**
-
-1. Write a test that REPRODUCES the bug FIRST
-2. Run test - it MUST FAIL (proving bug exists)
-3. Fix the bug
-4. Run test - it MUST PASS
-5. The test stays forever as regression protection
-
-```rust
-// Bug fix test example
-#[test]
-fn test_issue_42_off_by_one_in_split() {
-    // This specific sequence triggered the bug
-    let mut tree = BTree::new();
-    for i in (0..100).rev() {
-        tree.insert(&[i], &[i]).unwrap();
-    }
-    // Bug caused key 50 to be lost after split
-    assert_eq!(tree.get(&[50]).unwrap(), Some(&[50][..]));
-}
-```
-
-### FORBIDDEN: Test Anti-Patterns
-
-1. **NO mocking unless absolutely necessary**
-   - Mocks test your mocks, not your code
-   - Only mock: file systems, network, time, randomness
-   - NEVER mock your own code to make tests pass
-
-2. **NO test-only methods in production code**
-   ```rust
-   // FORBIDDEN
-   impl BTree {
-       #[cfg(test)]
-       pub fn get_internal_state(&self) -> &Node { ... } // NO!
-   }
-   ```
-
-3. **NO changing implementation to pass tests**
-   - If test fails, either the test or implementation is wrong
-   - Figure out WHICH before changing anything
-
-4. **NO snapshot tests for logic**
-   - Snapshots are for UI/output format only
-   - Logic must have explicit assertions
-
-5. **NO ignoring flaky tests**
-   - Flaky test = bug in test or code
-   - Fix it or delete it
-
-### REQUIRED: Assertions Must Be Specific
-
-```rust
-// FORBIDDEN: Vague assertions
-assert!(result.is_ok()); // What's in the Ok?
-assert!(list.len() > 0); // How many exactly?
-assert!(value != 0);     // What should it be?
-
-// REQUIRED: Specific assertions
-assert_eq!(result.unwrap(), expected_value);
-assert_eq!(list.len(), 3);
-assert_eq!(value, 42);
-```
-
-### REQUIRED: Test Naming Convention
-
-Test names MUST describe:
-1. What is being tested
-2. Under what conditions
-3. What the expected outcome is
-
-```rust
-// CORRECT naming
-#[test]
-fn insert_duplicate_key_overwrites_existing_value() { }
-
-#[test]
-fn delete_nonexistent_key_returns_not_found_error() { }
-
-#[test]
-fn split_preserves_all_keys_when_node_full() { }
-
-// FORBIDDEN: Vague names
-#[test]
-fn test_insert() { }  // Insert what? Expected result?
-
-#[test]
-fn test_1() { }  // Meaningless
-```
-
-### Test Coverage Requirements
-
-- **Minimum 80% line coverage** for all modules
-- **100% coverage** for: serialization, encoding, public API
-- Coverage alone is NOT sufficient - tests must be meaningful
-
-### Integration Tests
-
-- Full CRUD cycles with real files (not mocks)
-- Crash recovery scenarios (kill process mid-operation)
-- Concurrent access patterns (multiple threads/processes)
-
-### Fuzz Testing
-
-Use `cargo-fuzz` for:
-- SQL parser (malformed input)
-- Record serialization (random bytes)
-- B-tree operations (random key sequences)
-- HNSW graph operations (edge cases in graph structure)
-
-### Pre-Commit Test Verification
-
-Before ANY commit:
-1. `cargo test` - ALL tests must pass
+**Pre-commit:**
+1. `cargo test` - ALL pass
 2. `cargo clippy` - No warnings
-3. Review each test: "Would this catch a bug?"
+3. Review: "Would each test catch a bug?"
 
-## Dependencies
+---
 
-### Allowed Dependencies
+## Allowed Dependencies
 
 ```toml
-[dependencies]
 eyre = "0.6"
 parking_lot = "0.12"
 memmap2 = "0.9"
@@ -1127,164 +165,12 @@ smallvec = "1.11"
 hashbrown = "0.14"
 ```
 
-### Forbidden Dependencies
+---
 
-- `tokio`, `async-std`: No async runtime (sync-only design)
-- `serde`: Use custom zero-copy serialization
-- `regex`: Too heavy for simple parsing needs
-- Any dependency > 50KB compiled size without justification
+## When Unsure
 
-## Unsafe Code Policy
+1. Check the relevant `.claude/rules/*.md` file
+2. Default to the more restrictive interpretation
+3. Ask for clarification rather than guessing
 
-### When Unsafe is Allowed
-
-1. mmap operations (inherently unsafe)
-2. Zero-copy transmutation with `zerocopy`
-3. SIMD intrinsics for vector distance calculations
-4. Custom allocator implementations
-
-### Unsafe Requirements
-
-Every `unsafe` block MUST have:
-1. A comment block explaining why it's safe
-2. Tests that verify the safety invariants
-3. Miri compatibility (no undefined behavior)
-
-```rust
-unsafe {
-    // SAFETY: We verified page_no < page_count in the check above,
-    // and the mmap region is valid for the entire file lifetime.
-    // The returned slice's lifetime is tied to &self, ensuring
-    // the mmap stays valid.
-    std::slice::from_raw_parts(ptr, PAGE_SIZE)
-}
-```
-
-## Git Workflow
-
-### Branch Naming
-
-- `feature/description` for new features
-- `fix/description` for bug fixes
-- `perf/description` for performance improvements
-- `refactor/description` for refactoring
-
-### Commit Messages
-
-```
-type(scope): description
-
-- Bullet points for details
-- Reference issue numbers
-```
-
-Types: `feat`, `fix`, `perf`, `refactor`, `test`, `docs`, `chore`
-
-## File Format Specifications
-
-### Global Metadata File (`turdb.meta`)
-
-```
-Offset  Size  Description
-0       16    Magic: "TurDB Rust v1\x00\x00\x00"
-16      4     Version: 1
-20      4     Page size: 16384
-24      8     Schema count
-32      8     Default schema ID
-40      8     Next table ID
-48      8     Next index ID
-56      8     Flags
-64      64    Reserved
-```
-
-### Table Data File Header (`.tbd`)
-
-```
-Offset  Size  Description
-0       16    Magic: "TurDB Table\x00\x00\x00\x00"
-16      8     Table ID
-24      8     Row count
-32      4     Root page number
-36      4     Column count
-40      8     First free page
-48      8     Auto-increment value
-56      72    Reserved
-```
-
-### Index File Header (`.idx`)
-
-```
-Offset  Size  Description
-0       16    Magic: "TurDB Index\x00\x00\x00\x00"
-16      8     Index ID
-24      8     Table ID
-32      4     Root page number
-36      4     Key column count
-40      1     Is unique
-41      1     Index type (0=btree)
-42      86    Reserved
-```
-
-### HNSW File Header (`.hnsw`)
-
-```
-Offset  Size  Description
-0       16    Magic: "TurDB HNSW\x00\x00\x00\x00\x00"
-16      8     Index ID
-24      8     Table ID
-32      4     Dimension
-36      4     M (max connections)
-40      4     EfConstruction
-44      4     Entry point node
-48      8     Node count
-56      8     Vector count
-64      64    Reserved
-```
-
-## Build Configuration
-
-### Release Profile
-
-```toml
-[profile.release]
-opt-level = 3
-lto = "fat"
-codegen-units = 1
-panic = "abort"
-strip = true
-```
-
-### Dev Profile
-
-```toml
-[profile.dev]
-opt-level = 1
-debug = true
-```
-
-## API Design
-
-### Builder Pattern for Options
-
-```rust
-let db = Database::builder()
-    .path("./mydb")
-    .page_cache_size(64)
-    .read_only(false)
-    .open()?;
-```
-
-### Fluent Query Interface
-
-```rust
-let rows = db.query("SELECT * FROM users WHERE age > ?")
-    .bind(18)
-    .fetch_all()?;
-```
-
-### Resource Management
-
-All resources use RAII:
-- `Database` closes files on drop
-- `Transaction` rolls back if not committed
-- `Cursor` releases page pins on drop
+**Remember: These rules exist because violations cause real problems. Zero-copy isn't a preference - it's a performance requirement. TDD isn't bureaucracy - it catches bugs AI tends to miss.**

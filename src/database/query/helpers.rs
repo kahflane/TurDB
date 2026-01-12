@@ -378,3 +378,40 @@ pub fn build_simple_column_map(table_def: &TableDef) -> Vec<(String, usize)> {
         .map(|(idx, col)| (col.name().to_lowercase(), idx))
         .collect()
 }
+
+/// Builds a column map with alias/table name qualified entries.
+/// More efficient than allocating per-column - reuses a format buffer.
+pub fn build_column_map_with_alias(
+    table_def: &TableDef,
+    alias: &str,
+    table_name: Option<&str>,
+    start_idx: usize,
+    output: &mut Vec<(String, usize)>,
+) {
+    let mut buf = String::with_capacity(64);
+    let alias_lower = alias.to_lowercase();
+    let table_lower = table_name.map(|t| t.to_lowercase());
+
+    for (i, col) in table_def.columns().iter().enumerate() {
+        let idx = start_idx + i;
+        let col_lower = col.name().to_lowercase();
+
+        output.push((col_lower.clone(), idx));
+
+        buf.clear();
+        buf.push_str(&alias_lower);
+        buf.push('.');
+        buf.push_str(&col_lower);
+        output.push((buf.clone(), idx));
+
+        if let Some(ref tbl) = table_lower {
+            if tbl != &alias_lower {
+                buf.clear();
+                buf.push_str(tbl);
+                buf.push('.');
+                buf.push_str(&col_lower);
+                output.push((buf.clone(), idx));
+            }
+        }
+    }
+}
