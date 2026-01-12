@@ -1364,16 +1364,19 @@ impl<'a, S: Storage + ?Sized> Cursor<'a, S> {
     }
 
     fn find_prev_leaf(&self) -> Result<Option<(u32, usize)>> {
-        // IMPORTANT: We must use the LAST key on the current page for navigation,
-        // not the current key. If we're at the first entry (index 0) of a page,
-        // self.key() returns the smallest key which might be smaller than separators
-        // in interior nodes, causing the navigation to go to the wrong subtree.
-        // Using the last key ensures we navigate back to this page correctly.
         let page_data = self.storage.page(self.current_page)?;
         let leaf = LeafNode::from_page(page_data)?;
         let cell_count = leaf.cell_count() as usize;
         if cell_count == 0 {
-            return Ok(None);
+            if self.current_page == self.root_page {
+                return Ok(None);
+            }
+            bail!(
+                "empty non-root leaf page {} detected during reverse iteration. \
+                 root_page={}. This indicates B-tree corruption.",
+                self.current_page,
+                self.root_page
+            );
         }
         let last_idx = cell_count - 1;
         let nav_key = leaf.key_at(last_idx)?;

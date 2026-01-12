@@ -741,6 +741,18 @@ impl Database {
         let mut file_manager_guard = self.shared.file_manager.write();
         let file_manager = file_manager_guard.as_mut().unwrap();
 
+        fn read_root_page(storage: &crate::storage::MmapStorage) -> Result<u32> {
+            use crate::storage::TableFileHeader;
+            let page = storage.page(0)?;
+            Ok(TableFileHeader::from_bytes(page)?.root_page())
+        }
+
+        fn read_index_root_page(storage: &crate::storage::MmapStorage) -> Result<u32> {
+            use crate::storage::IndexFileHeader;
+            let page = storage.page(0)?;
+            Ok(IndexFileHeader::from_bytes(page)?.root_page())
+        }
+
         fn collect_scalar_subqueries<'a>(
             expr: &'a crate::sql::ast::Expr<'a>,
             subqueries: &mut smallvec::SmallVec<[&'a crate::sql::ast::SelectStmt<'a>; 4]>,
@@ -847,11 +859,7 @@ impl Database {
                 let storage_arc = file_manager.table_data(schema_name, table_name)?;
                 let storage = storage_arc.read();
 
-                let root_page = {
-                    use crate::storage::TableFileHeader;
-                    let page = storage.page(0)?;
-                    TableFileHeader::from_bytes(page)?.root_page()
-                };
+                let root_page = read_root_page(&storage)?;
                 let source = StreamingBTreeSource::from_btree_scan_with_projections(
                     &storage,
                     root_page,
@@ -972,11 +980,7 @@ impl Database {
                     })?;
                 let storage = storage_arc.read();
 
-                let root_page = {
-                    use crate::storage::TableFileHeader;
-                    let page = storage.page(0)?;
-                    TableFileHeader::from_bytes(page)?.root_page()
-                };
+                let root_page = read_root_page(&storage)?;
                 let inner_source = if inner_scan.reverse {
                     BTreeSource::Reverse(
                         ReverseBTreeSource::from_btree_scan_reverse_with_projections(
@@ -1071,7 +1075,7 @@ impl Database {
                     let project_arena = Bump::new();
                     let compiled_projections: Vec<crate::sql::predicate::CompiledPredicate> = projections
                         .iter()
-                        .map(|expr| crate::sql::predicate::CompiledPredicate::new(expr, join_column_map.clone()))
+                        .map(|expr| crate::sql::predicate::CompiledPredicate::with_column_map_ref(expr, &join_column_map))
                         .collect();
 
                     let _ctx = ExecutionContext::new(&project_arena);
@@ -1154,11 +1158,7 @@ impl Database {
                     table_def.columns().iter().map(|c| c.data_type()).collect();
                 let storage_arc = file_manager.table_data(schema_name, table_name)?;
                 let storage = storage_arc.read();
-                let root_page = {
-                    use crate::storage::TableFileHeader;
-                    let page = storage.page(0)?;
-                    TableFileHeader::from_bytes(page)?.root_page()
-                };
+                let root_page = read_root_page(&storage)?;
                 let mut source = StreamingBTreeSource::from_btree_scan_with_projections(
                     &storage,
                     root_page,
@@ -1171,7 +1171,7 @@ impl Database {
                 for col in table_def.columns() {
                     column_map.push((col.name().to_lowercase(), idx));
                     column_map.push((format!("{}.{}", alias, col.name()).to_lowercase(), idx));
-                    if scan.alias.is_some() {
+                    if scan.alias.is_some() && alias != table_name {
                         column_map.push((format!("{}.{}", table_name, col.name()).to_lowercase(), idx));
                     }
                     idx += 1;
@@ -1187,11 +1187,7 @@ impl Database {
                     table_def.columns().iter().map(|c| c.data_type()).collect();
                 let storage_arc = file_manager.table_data(schema_name, table_name)?;
                 let storage = storage_arc.read();
-                let root_page = {
-                    use crate::storage::TableFileHeader;
-                    let page = storage.page(0)?;
-                    TableFileHeader::from_bytes(page)?.root_page()
-                };
+                let root_page = read_root_page(&storage)?;
                 let mut source = StreamingBTreeSource::from_btree_scan_with_projections(
                     &storage,
                     root_page,
@@ -1204,7 +1200,7 @@ impl Database {
                 for col in table_def.columns() {
                     column_map.push((col.name().to_lowercase(), idx));
                     column_map.push((format!("{}.{}", alias, col.name()).to_lowercase(), idx));
-                    if scan.alias.is_some() {
+                    if scan.alias.is_some() && alias != table_name {
                         column_map.push((format!("{}.{}", table_name, col.name()).to_lowercase(), idx));
                     }
                     idx += 1;
@@ -1212,18 +1208,20 @@ impl Database {
             }
 
             let condition_predicate = join.condition.map(|c| {
-                crate::sql::predicate::CompiledPredicate::new(c, column_map.clone())
+                crate::sql::predicate::CompiledPredicate::with_column_map_ref(c, &column_map)
             });
 
+            let mut combined_buf: smallvec::SmallVec<[OwnedValue; 16]> = smallvec::SmallVec::new();
             let mut result_rows: Vec<Vec<OwnedValue>> = Vec::new();
             for left_row in &left_rows {
                 for right_row in &right_rows {
-                    let mut combined: Vec<OwnedValue> = left_row.clone();
-                    combined.extend(right_row.iter().cloned());
+                    combined_buf.clear();
+                    combined_buf.extend(left_row.iter().cloned());
+                    combined_buf.extend(right_row.iter().cloned());
 
                     let passes = if let Some(ref pred) = condition_predicate {
                         let values: smallvec::SmallVec<[Value<'_>; 16]> =
-                            combined.iter().map(|v| v.to_value()).collect();
+                            combined_buf.iter().map(|v| v.to_value()).collect();
                         let row_ref = ExecutorRow::new(&values);
                         pred.evaluate(&row_ref)
                     } else {
@@ -1231,7 +1229,7 @@ impl Database {
                     };
 
                     if passes {
-                        result_rows.push(combined);
+                        result_rows.push(combined_buf.to_vec());
                     }
                 }
             }
@@ -1299,11 +1297,7 @@ impl Database {
                     })?;
                 let storage = storage_arc.read();
 
-                let root_page = {
-                    use crate::storage::TableFileHeader;
-                    let page = storage.page(0)?;
-                    TableFileHeader::from_bytes(page)?.root_page()
-                };
+                let root_page = read_root_page(&storage)?;
                 let source: BTreeSource = if scan.reverse {
                     BTreeSource::Reverse(
                         ReverseBTreeSource::from_btree_scan_reverse_with_projections(
@@ -1391,11 +1385,7 @@ impl Database {
                     })?;
                 let storage = storage_arc.read();
 
-                let root_page = {
-                    use crate::storage::TableFileHeader;
-                    let page = storage.page(0)?;
-                    TableFileHeader::from_bytes(page)?.root_page()
-                };
+                let root_page = read_root_page(&storage)?;
 
                 let (start_key, end_key): (Option<&[u8]>, Option<&[u8]>) = match &scan.key_range {
                     ScanRange::FullScan => (None, None),
@@ -1503,12 +1493,7 @@ impl Database {
                         })?;
                     let index_storage = index_storage_arc.read();
 
-                    let root_page = {
-                        use crate::storage::IndexFileHeader;
-                        let page = index_storage.page(0)?;
-                        let header = IndexFileHeader::from_bytes(page)?;
-                        header.root_page()
-                    };
+                    let root_page = read_index_root_page(&index_storage)?;
                     let index_reader = BTreeReader::new(&index_storage, root_page)?;
 
                     let mut keys = Vec::new();
@@ -1649,12 +1634,7 @@ impl Database {
                         })?;
                     let table_storage = table_storage_arc.read();
 
-                    let root_page = {
-                        use crate::storage::TableFileHeader;
-                        let page = table_storage.page(0)?;
-                        let header = TableFileHeader::from_bytes(page)?;
-                        header.root_page()
-                    };
+                    let root_page = read_root_page(&table_storage)?;
                     let table_reader = BTreeReader::new(&table_storage, root_page)?;
 
                     for row_key in &row_keys {
@@ -1875,7 +1855,7 @@ impl Database {
                         for col in table_def.columns() {
                             column_map.push((col.name().to_lowercase(), idx));
                             column_map.push((format!("{}.{}", alias, col.name()).to_lowercase(), idx));
-                            if scan.alias.is_some() {
+                            if scan.alias.is_some() && alias != table_name {
                                 column_map.push((format!("{}.{}", table_name, col.name()).to_lowercase(), idx));
                             }
                             idx += 1;
@@ -1904,7 +1884,7 @@ impl Database {
                         for col in table_def.columns() {
                             column_map.push((col.name().to_lowercase(), idx));
                             column_map.push((format!("{}.{}", alias, col.name()).to_lowercase(), idx));
-                            if scan.alias.is_some() {
+                            if scan.alias.is_some() && alias != table_name {
                                 column_map.push((format!("{}.{}", table_name, col.name()).to_lowercase(), idx));
                             }
                             idx += 1;
@@ -2083,7 +2063,7 @@ impl Database {
                 }
 
                 let condition_predicate = condition.map(|c| {
-                    crate::sql::predicate::CompiledPredicate::new(c, join_column_map.clone())
+                    crate::sql::predicate::CompiledPredicate::with_column_map_ref(c, &join_column_map)
                 });
 
                 fn find_filter_for_join<'a>(
@@ -2111,7 +2091,7 @@ impl Database {
                 };
 
                 let where_predicate = find_filter_for_join(physical_plan.root).map(|expr| {
-                    crate::sql::predicate::CompiledPredicate::new(expr, join_column_map.clone())
+                    crate::sql::predicate::CompiledPredicate::with_column_map_ref(expr, &join_column_map)
                 });
 
                 let key_indices: Vec<(usize, usize)> = join_keys
