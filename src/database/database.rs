@@ -1072,15 +1072,12 @@ impl Database {
                 }
 
                 if let Some(projections) = get_project_from_plan(subq.child_plan) {
-                    let project_arena = Bump::new();
                     let compiled_projections: Vec<crate::sql::predicate::CompiledPredicate> = projections
                         .iter()
                         .map(|expr| crate::sql::predicate::CompiledPredicate::with_column_map_ref(expr, &join_column_map))
                         .collect();
 
-                    let _ctx = ExecutionContext::new(&project_arena);
-
-                    let mut projected_rows: Vec<Vec<OwnedValue>> = Vec::new();
+                    let mut projected_rows: Vec<Vec<OwnedValue>> = Vec::with_capacity(join_rows.len());
                     for row_owned in &join_rows {
                         let values: smallvec::SmallVec<[Value<'_>; 16]> =
                             row_owned.iter().map(|v| v.to_value()).collect();
@@ -1144,29 +1141,40 @@ impl Database {
             let left_scan = get_table_scan(join.left);
             let right_scan = get_table_scan(join.right);
 
-            let mut left_rows: Vec<Vec<OwnedValue>> = Vec::new();
-            let mut right_rows: Vec<Vec<OwnedValue>> = Vec::new();
-            let mut column_map: Vec<(String, usize)> = Vec::new();
+            let left_table_def = left_scan
+                .map(|scan| catalog.resolve_table_in_schema(scan.schema, scan.table))
+                .transpose()?;
+            let right_table_def = right_scan
+                .map(|scan| catalog.resolve_table_in_schema(scan.schema, scan.table))
+                .transpose()?;
+
+            let left_col_count = left_table_def.as_ref().map_or(0, |t| t.columns().len());
+            let right_col_count = right_table_def.as_ref().map_or(0, |t| t.columns().len());
+            let column_map_capacity = (left_col_count + right_col_count) * 3;
+
+            let mut column_map: Vec<(String, usize)> = Vec::with_capacity(column_map_capacity);
             let mut idx = 0usize;
 
-            if let Some(scan) = left_scan {
+            let left_rows: Vec<Vec<OwnedValue>> = if let (Some(scan), Some(table_def)) = (left_scan, &left_table_def) {
                 let schema_name = scan.schema.unwrap_or(DEFAULT_SCHEMA);
                 let table_name = scan.table;
                 let alias = scan.alias.unwrap_or(table_name);
-                let table_def = catalog.resolve_table_in_schema(scan.schema, table_name)?;
                 let column_types: Vec<_> =
                     table_def.columns().iter().map(|c| c.data_type()).collect();
                 let storage_arc = file_manager.table_data(schema_name, table_name)?;
                 let storage = storage_arc.read();
-                let root_page = read_root_page(&storage)?;
+                let header = TableFileHeader::from_bytes(storage.page(0)?)?;
+                let row_count_estimate = header.row_count() as usize;
+                let root_page = header.root_page();
                 let mut source = StreamingBTreeSource::from_btree_scan_with_projections(
                     &storage,
                     root_page,
                     column_types,
                     None,
                 )?;
+                let mut rows = Vec::with_capacity(row_count_estimate);
                 while let Some(row) = source.next_row()? {
-                    left_rows.push(row.iter().map(OwnedValue::from).collect());
+                    rows.push(row.iter().map(OwnedValue::from).collect());
                 }
                 for col in table_def.columns() {
                     column_map.push((col.name().to_lowercase(), idx));
@@ -1176,26 +1184,31 @@ impl Database {
                     }
                     idx += 1;
                 }
-            }
+                rows
+            } else {
+                Vec::new()
+            };
 
-            if let Some(scan) = right_scan {
+            let right_rows: Vec<Vec<OwnedValue>> = if let (Some(scan), Some(table_def)) = (right_scan, &right_table_def) {
                 let schema_name = scan.schema.unwrap_or(DEFAULT_SCHEMA);
                 let table_name = scan.table;
                 let alias = scan.alias.unwrap_or(table_name);
-                let table_def = catalog.resolve_table_in_schema(scan.schema, table_name)?;
                 let column_types: Vec<_> =
                     table_def.columns().iter().map(|c| c.data_type()).collect();
                 let storage_arc = file_manager.table_data(schema_name, table_name)?;
                 let storage = storage_arc.read();
-                let root_page = read_root_page(&storage)?;
+                let header = TableFileHeader::from_bytes(storage.page(0)?)?;
+                let row_count_estimate = header.row_count() as usize;
+                let root_page = header.root_page();
                 let mut source = StreamingBTreeSource::from_btree_scan_with_projections(
                     &storage,
                     root_page,
                     column_types,
                     None,
                 )?;
+                let mut rows = Vec::with_capacity(row_count_estimate);
                 while let Some(row) = source.next_row()? {
-                    right_rows.push(row.iter().map(OwnedValue::from).collect());
+                    rows.push(row.iter().map(OwnedValue::from).collect());
                 }
                 for col in table_def.columns() {
                     column_map.push((col.name().to_lowercase(), idx));
@@ -1205,14 +1218,22 @@ impl Database {
                     }
                     idx += 1;
                 }
-            }
+                rows
+            } else {
+                Vec::new()
+            };
 
             let condition_predicate = join.condition.map(|c| {
                 crate::sql::predicate::CompiledPredicate::with_column_map_ref(c, &column_map)
             });
 
             let mut combined_buf: smallvec::SmallVec<[OwnedValue; 16]> = smallvec::SmallVec::new();
-            let mut result_rows: Vec<Vec<OwnedValue>> = Vec::new();
+            let result_capacity = if condition_predicate.is_some() {
+                std::cmp::min(left_rows.len(), right_rows.len())
+            } else {
+                left_rows.len().saturating_mul(right_rows.len())
+            };
+            let mut result_rows: Vec<Vec<OwnedValue>> = Vec::with_capacity(result_capacity);
             for left_row in &left_rows {
                 for right_row in &right_rows {
                     combined_buf.clear();

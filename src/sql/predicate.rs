@@ -2,21 +2,22 @@ use crate::parsing::{parse_json_path, JsonNavigator};
 use crate::records::jsonb::{JsonbValue, JsonbView};
 use crate::sql::executor::ExecutorRow;
 use crate::types::{OwnedValue, Value};
+use hashbrown::HashMap as FastHashMap;
 use std::borrow::Cow;
 
 pub struct CompiledPredicate<'a> {
     expr: &'a crate::sql::ast::Expr<'a>,
-    column_map: Cow<'a, [(String, usize)]>,
+    column_map: FastHashMap<String, usize>,
     params: Option<Cow<'a, [OwnedValue]>>,
     set_param_count: usize,
-    scalar_subquery_results: Option<hashbrown::HashMap<usize, OwnedValue>>,
+    scalar_subquery_results: Option<FastHashMap<usize, OwnedValue>>,
 }
 
 impl<'a> CompiledPredicate<'a> {
     pub fn new(expr: &'a crate::sql::ast::Expr<'a>, column_map: Vec<(String, usize)>) -> Self {
         Self {
             expr,
-            column_map: Cow::Owned(column_map),
+            column_map: column_map.into_iter().collect(),
             params: None,
             set_param_count: 0,
             scalar_subquery_results: None,
@@ -29,7 +30,7 @@ impl<'a> CompiledPredicate<'a> {
     ) -> Self {
         Self {
             expr,
-            column_map: Cow::Borrowed(column_map),
+            column_map: column_map.iter().cloned().collect(),
             params: None,
             set_param_count: 0,
             scalar_subquery_results: None,
@@ -44,7 +45,7 @@ impl<'a> CompiledPredicate<'a> {
     ) -> Self {
         Self {
             expr,
-            column_map: Cow::Owned(column_map),
+            column_map: column_map.into_iter().collect(),
             params: Some(Cow::Borrowed(params)),
             set_param_count,
             scalar_subquery_results: None,
@@ -54,18 +55,31 @@ impl<'a> CompiledPredicate<'a> {
     pub fn with_scalar_subqueries(
         expr: &'a crate::sql::ast::Expr<'a>,
         column_map: Vec<(String, usize)>,
-        scalar_results: hashbrown::HashMap<usize, OwnedValue>,
+        scalar_results: FastHashMap<usize, OwnedValue>,
     ) -> Self {
         Self {
             expr,
-            column_map: Cow::Owned(column_map),
+            column_map: column_map.into_iter().collect(),
             params: None,
             set_param_count: 0,
             scalar_subquery_results: Some(scalar_results),
         }
     }
 
-    pub fn set_scalar_subquery_results(&mut self, results: hashbrown::HashMap<usize, OwnedValue>) {
+    pub fn from_hashmap(
+        expr: &'a crate::sql::ast::Expr<'a>,
+        column_map: &FastHashMap<String, usize>,
+    ) -> Self {
+        Self {
+            expr,
+            column_map: column_map.clone(),
+            params: None,
+            set_param_count: 0,
+            scalar_subquery_results: None,
+        }
+    }
+
+    pub fn set_scalar_subquery_results(&mut self, results: FastHashMap<usize, OwnedValue>) {
         self.scalar_subquery_results = Some(results);
     }
 
@@ -112,21 +126,17 @@ impl<'a> CompiledPredicate<'a> {
 
         match expr {
             Expr::Column(col_ref) => {
-                let lookup_name = if let Some(table) = col_ref.table {
-                    format!("{}.{}", table, col_ref.column)
+                let col_idx = if let Some(table) = col_ref.table {
+                    let lookup_name = format!("{}.{}", table, col_ref.column).to_lowercase();
+                    self.column_map
+                        .get(&lookup_name)
+                        .or_else(|| self.column_map.get(&col_ref.column.to_lowercase()))
+                        .copied()
                 } else {
-                    col_ref.column.to_string()
-                };
-                let col_idx = self
-                    .column_map
-                    .iter()
-                    .find(|(name, _)| name.eq_ignore_ascii_case(&lookup_name))
-                    .or_else(|| {
-                        self.column_map
-                            .iter()
-                            .find(|(name, _)| name.eq_ignore_ascii_case(col_ref.column))
-                    })
-                    .map(|(_, idx)| *idx)?;
+                    self.column_map
+                        .get(&col_ref.column.to_lowercase())
+                        .copied()
+                }?;
                 row.get(col_idx).cloned()
             }
             Expr::Literal(lit) => Some(match lit {
@@ -933,14 +943,9 @@ impl<'a> CompiledPredicate<'a> {
 
             let col_idx = self
                 .column_map
-                .iter()
-                .find(|(name, _)| name.eq_ignore_ascii_case(&lookup_name))
-                .or_else(|| {
-                    self.column_map
-                        .iter()
-                        .find(|(name, _)| name.eq_ignore_ascii_case(&func_name.to_lowercase()))
-                })
-                .map(|(_, idx)| *idx)?;
+                .get(&lookup_name)
+                .or_else(|| self.column_map.get(&func_name.to_lowercase()))
+                .copied()?;
 
             return row.get(col_idx).cloned();
         }
@@ -1739,7 +1744,7 @@ impl<'a> CompiledPredicate<'a> {
 
 pub struct CompiledProjection<'a> {
     expressions: Vec<&'a crate::sql::ast::Expr<'a>>,
-    column_map: Vec<(String, usize)>,
+    column_map: FastHashMap<String, usize>,
 }
 
 impl<'a> CompiledProjection<'a> {
@@ -1749,7 +1754,7 @@ impl<'a> CompiledProjection<'a> {
     ) -> Self {
         Self {
             expressions,
-            column_map,
+            column_map: column_map.into_iter().collect(),
         }
     }
 
@@ -1757,7 +1762,7 @@ impl<'a> CompiledProjection<'a> {
         self.expressions
             .iter()
             .map(|expr| {
-                let pred = CompiledPredicate::new(expr, self.column_map.clone());
+                let pred = CompiledPredicate::from_hashmap(expr, &self.column_map);
                 pred.evaluate_to_value(row)
             })
             .collect()
