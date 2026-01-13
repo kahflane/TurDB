@@ -310,20 +310,14 @@ impl Database {
             .as_mut()
             .ok_or_else(|| eyre::eyre!("file manager not available for commit"))?;
 
-        let mut table_infos: Vec<(u32, String, String)> = {
-            let lookup = self.shared.table_id_lookup.read();
-            dirty_table_ids
-                .iter()
-                .filter_map(|&table_id| {
-                    lookup
-                        .get(&table_id)
-                        .map(|(s, t)| (table_id, s.clone(), t.clone()))
-                })
-                .collect()
-        };
-        table_infos.sort_by_key(|(id, _, _)| *id);
+        let lookup = self.shared.table_id_lookup.read();
+        let mut sorted_table_ids: SmallVec<[u32; 16]> = dirty_table_ids.iter().copied().collect();
+        sorted_table_ids.sort_unstable();
 
-        for (table_id, schema_name, table_name) in table_infos {
+        for &table_id in &sorted_table_ids {
+            let Some((schema_name, table_name)) = lookup.get(&table_id) else {
+                continue;
+            };
             let _table_lock = self.shared.page_locks.table_intent_exclusive(table_id);
             let dirty_pages = self.shared.dirty_tracker.dirty_pages_for_table(table_id);
 
@@ -335,7 +329,7 @@ impl Database {
                 dirty_pages.iter().map(|&p| (table_id, p)).collect();
             let _page_locks = self.shared.page_locks.page_write_multi(&page_tuples);
 
-            if let Ok(storage_arc) = file_manager.table_data(&schema_name, &table_name) {
+            if let Ok(storage_arc) = file_manager.table_data(schema_name, table_name) {
                 let storage = storage_arc.read();
                 let db_size = storage.page_count();
                 let pages_to_flush = self.shared.dirty_tracker.drain_for_table(table_id);
@@ -350,6 +344,7 @@ impl Database {
             }
         }
 
+        drop(lookup);
         drop(file_manager_guard);
 
         if self.shared.group_commit_queue.is_enabled() {
@@ -400,20 +395,15 @@ impl Database {
             .as_mut()
             .ok_or_else(|| eyre::eyre!("file manager not available for commit"))?;
 
-        let mut table_infos: Vec<(u32, String, String)> = {
-            let lookup = self.shared.table_id_lookup.read();
-            dirty_table_ids
-                .iter()
-                .filter_map(|&table_id| {
-                    lookup
-                        .get(&table_id)
-                        .map(|(s, t)| (table_id, s.clone(), t.clone()))
-                })
-                .collect()
-        };
-        table_infos.sort_by_key(|(id, _, _)| *id);
+        let lookup = self.shared.table_id_lookup.read();
+        let mut sorted_table_ids: SmallVec<[u32; 16]> = dirty_table_ids.iter().copied().collect();
+        sorted_table_ids.sort_unstable();
 
-        for (table_id, schema_name, table_name) in table_infos {
+        for &table_id in &sorted_table_ids {
+            let Some((schema_name, table_name)) = lookup.get(&table_id) else {
+                continue;
+            };
+
             let pages_to_flush = self.shared.dirty_tracker.drain_for_table(table_id);
 
             if pages_to_flush.is_empty() {
@@ -421,7 +411,7 @@ impl Database {
             }
 
             let storage_arc = file_manager
-                .table_data(&schema_name, &table_name)
+                .table_data(schema_name, table_name)
                 .wrap_err_with(|| {
                     format!(
                         "failed to get storage for table '{}.{}'",
@@ -580,12 +570,11 @@ impl Database {
             return Ok(ExecuteResult::Rollback);
         }
 
-        let txn = active_txn
+        let mut txn = active_txn
             .take()
             .ok_or_else(|| eyre::eyre!("no transaction in progress"))?;
 
-        let write_entries: Vec<WriteEntry> = txn.write_entries.iter().cloned().collect();
-        let undo_data: Vec<Option<Vec<u8>>> = txn.undo_data.iter().cloned().collect();
+        let (write_entries, undo_data) = txn.take_write_entries();
 
         drop(active_txn);
         self.undo_write_entries(&write_entries, &undo_data)?;
@@ -598,14 +587,20 @@ impl Database {
         entries: &[WriteEntry],
         undo_data: &[Option<Vec<u8>>],
     ) -> Result<()> {
+        let mut key_buf: SmallVec<[u8; 64]> = SmallVec::new();
         for (i, entry) in entries.iter().enumerate().rev() {
             let undo = undo_data.get(i).and_then(|o| o.as_ref());
-            self.undo_write_entry(entry, undo)?;
+            self.undo_write_entry(entry, undo, &mut key_buf)?;
         }
         Ok(())
     }
 
-    fn undo_write_entry(&self, entry: &WriteEntry, undo_data: Option<&Vec<u8>>) -> Result<()> {
+    fn undo_write_entry(
+        &self,
+        entry: &WriteEntry,
+        undo_data: Option<&Vec<u8>>,
+        key_buf: &mut SmallVec<[u8; 64]>,
+    ) -> Result<()> {
         use crate::btree::BTree;
         use crate::database::dml::mvcc_helpers::get_user_data;
         use crate::records::RecordView;
@@ -697,8 +692,6 @@ impl Database {
             drop(table_storage);
 
             if let Some(row_values) = row_values {
-                let mut key_buf: SmallVec<[u8; 64]> = SmallVec::new();
-
                 for (col_idx, index_name, _is_pk) in &unique_columns {
                     if file_manager.index_exists(&schema_name, &table_name, index_name) {
                         if let Some(value) = row_values.get(*col_idx) {
@@ -719,8 +712,8 @@ impl Database {
                                 let mut index_btree =
                                     BTree::new(&mut *index_storage, index_root_page)?;
                                 key_buf.clear();
-                                Self::encode_value_as_key(value, &mut key_buf);
-                                let _ = index_btree.delete(&key_buf);
+                                Self::encode_value_as_key(value, key_buf);
+                                let _ = index_btree.delete(key_buf);
                             }
                         }
                     }
@@ -753,10 +746,10 @@ impl Database {
                             key_buf.clear();
                             for &col_idx in col_indices {
                                 if let Some(value) = row_values.get(col_idx) {
-                                    Self::encode_value_as_key(value, &mut key_buf);
+                                    Self::encode_value_as_key(value, key_buf);
                                 }
                             }
-                            let _ = index_btree.delete(&key_buf);
+                            let _ = index_btree.delete(key_buf);
                         }
                     }
                 }
@@ -776,8 +769,6 @@ impl Database {
             };
 
             if let Some(row_values) = old_row_values {
-                let mut key_buf: SmallVec<[u8; 64]> = SmallVec::new();
-
                 for (col_idx, index_name, _is_pk) in &unique_columns {
                     if file_manager.index_exists(&schema_name, &table_name, index_name) {
                         if let Some(value) = row_values.get(*col_idx) {
@@ -798,7 +789,7 @@ impl Database {
                                 let mut index_btree =
                                     BTree::new(&mut *index_storage, index_root_page)?;
                                 key_buf.clear();
-                                Self::encode_value_as_key(value, &mut key_buf);
+                                Self::encode_value_as_key(value, key_buf);
 
                                 let pk_idx = columns
                                     .iter()
@@ -806,7 +797,7 @@ impl Database {
                                 if let Some(pk_idx) = pk_idx {
                                     if let Some(OwnedValue::Int(pk_val)) = row_values.get(pk_idx) {
                                         let row_id_bytes = (*pk_val as u64).to_be_bytes();
-                                        let _ = index_btree.insert(&key_buf, &row_id_bytes);
+                                        let _ = index_btree.insert(key_buf, &row_id_bytes);
                                     }
                                 }
                             }
@@ -841,7 +832,7 @@ impl Database {
                             key_buf.clear();
                             for &col_idx in col_indices {
                                 if let Some(value) = row_values.get(col_idx) {
-                                    Self::encode_value_as_key(value, &mut key_buf);
+                                    Self::encode_value_as_key(value, key_buf);
                                 }
                             }
 
@@ -851,7 +842,7 @@ impl Database {
                             if let Some(pk_idx) = pk_idx {
                                 if let Some(OwnedValue::Int(pk_val)) = row_values.get(pk_idx) {
                                     let row_id_bytes = (*pk_val as u64).to_be_bytes();
-                                    let _ = index_btree.insert(&key_buf, &row_id_bytes);
+                                    let _ = index_btree.insert(key_buf, &row_id_bytes);
                                 }
                             }
                         }
@@ -902,9 +893,8 @@ impl Database {
             active_txn.take()
         };
 
-        if let Some(txn) = txn {
-            let write_entries: Vec<WriteEntry> = txn.write_entries.iter().cloned().collect();
-            let undo_data: Vec<Option<Vec<u8>>> = txn.undo_data.iter().cloned().collect();
+        if let Some(mut txn) = txn {
+            let (write_entries, undo_data) = txn.take_write_entries();
 
             let _ = self.undo_write_entries(&write_entries, &undo_data);
         }

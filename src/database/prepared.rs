@@ -231,7 +231,7 @@ impl PreparedStatement {
 #[derive(Debug)]
 pub struct BoundStatement<'a> {
     prepared: &'a PreparedStatement,
-    pub(crate) params: SmallVec<[OwnedValue; 8]>,
+    pub(crate) params: SmallVec<[OwnedValue; 16]>,
 }
 
 impl<'a> BoundStatement<'a> {
