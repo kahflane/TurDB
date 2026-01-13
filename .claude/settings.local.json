@@ -59,7 +59,9 @@
       "Bash(chmod:*)",
       "Bash(.claude/hooks/*.sh:*)",
       "WebFetch(domain:github.com)",
-      "WebFetch(domain:raw.githubusercontent.com)"
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "Bash(gh pr view:*)",
+      "Bash(gh api:*)"
     ]
   },
   "hooks": {

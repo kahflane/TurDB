@@ -414,7 +414,10 @@ impl Database {
             {
                 let mut wal_guard = self.shared.wal.lock();
                 let wal = wal_guard.as_mut().ok_or_else(|| {
-                    eyre::eyre!("WAL enabled but not initialized - this indicates a bug")
+                    eyre::eyre!(
+                        "WAL enabled but not initialized during insert into table '{}' (table_id={}) - this indicates a bug in ensure_wal()",
+                        plan.table_name, plan.table_id
+                    )
                 })?;
                 WalStoragePerTable::flush_wal_for_table(
                     &self.shared.dirty_tracker,
