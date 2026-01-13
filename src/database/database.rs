@@ -77,6 +77,7 @@ use std::sync::atomic::Ordering as AtomicOrdering;
 use std::collections::HashMap;
 use std::sync::Arc;
 
+#[cfg(feature = "timing")]
 use crate::database::timing::{INSERT_TIME_NS, PARSE_TIME_NS};
 
 /// Aggregate group state: group key hashes -> (accumulated group values, (count, sum) pairs for AVG)
@@ -101,6 +102,9 @@ pub(crate) struct SharedDatabase {
     pub(crate) next_index_id: std::sync::atomic::AtomicU64,
     pub(crate) closed: std::sync::atomic::AtomicBool,
     pub(crate) wal_enabled: std::sync::atomic::AtomicBool,
+    pub(crate) wal_autoflush: std::sync::atomic::AtomicBool,
+    pub(crate) file_manager_ready: std::sync::atomic::AtomicBool,
+    pub(crate) wal_ready: std::sync::atomic::AtomicBool,
     pub(crate) dirty_tracker: ShardedDirtyTracker,
     pub(crate) txn_manager: TransactionManager,
     pub(crate) table_id_lookup: RwLock<hashbrown::HashMap<u32, (String, String)>>,
@@ -253,6 +257,9 @@ impl Database {
             next_index_id: AtomicU64::new(next_index_id),
             closed: AtomicBool::new(false),
             wal_enabled: AtomicBool::new(false),
+            wal_autoflush: AtomicBool::new(true),
+            file_manager_ready: AtomicBool::new(false),
+            wal_ready: AtomicBool::new(false),
             dirty_tracker: ShardedDirtyTracker::new(),
             txn_manager: TransactionManager::new(),
             table_id_lookup: RwLock::new(hashbrown::HashMap::new()),
@@ -327,6 +334,9 @@ impl Database {
             next_index_id: AtomicU64::new(1),
             closed: AtomicBool::new(false),
             wal_enabled: AtomicBool::new(false),
+            wal_autoflush: AtomicBool::new(true),
+            file_manager_ready: AtomicBool::new(false),
+            wal_ready: AtomicBool::new(false),
             dirty_tracker: ShardedDirtyTracker::new(),
             txn_manager: TransactionManager::new(),
             table_id_lookup: RwLock::new(hashbrown::HashMap::new()),
@@ -362,7 +372,8 @@ impl Database {
     }
 
     pub(crate) fn ensure_file_manager(&self) -> Result<()> {
-        if self.shared.file_manager.read().is_some() {
+        use std::sync::atomic::Ordering;
+        if self.shared.file_manager_ready.load(Ordering::Acquire) {
             return Ok(());
         }
         let mut guard = self.shared.file_manager.write();
@@ -372,6 +383,7 @@ impl Database {
             })?;
             *guard = Some(fm);
         }
+        self.shared.file_manager_ready.store(true, Ordering::Release);
         Ok(())
     }
 
@@ -515,6 +527,10 @@ impl Database {
     }
 
     pub fn ensure_wal(&self) -> Result<()> {
+        use std::sync::atomic::Ordering;
+        if self.shared.wal_ready.load(Ordering::Acquire) {
+            return Ok(());
+        }
         let mut guard = self.shared.wal.lock();
         if guard.is_none() {
             let wal = if self.shared.wal_dir.exists() {
@@ -527,6 +543,7 @@ impl Database {
             };
             *guard = Some(wal);
         }
+        self.shared.wal_ready.store(true, Ordering::Release);
         Ok(())
     }
 
@@ -3099,12 +3116,16 @@ impl Database {
     }
 
     pub fn execute(&self, sql: &str) -> Result<ExecuteResult> {
+        #[cfg(feature = "timing")]
         let parse_start = std::time::Instant::now();
+
         let arena = Bump::new();
         let mut parser = Parser::new(sql, &arena);
         let stmt = parser
             .parse_statement()
             .wrap_err("failed to parse SQL statement")?;
+
+        #[cfg(feature = "timing")]
         PARSE_TIME_NS.fetch_add(
             parse_start.elapsed().as_nanos() as u64,
             AtomicOrdering::Relaxed,
@@ -3114,12 +3135,16 @@ impl Database {
     }
 
     pub fn execute_with_params(&self, sql: &str, params: &[OwnedValue]) -> Result<ExecuteResult> {
+        #[cfg(feature = "timing")]
         let parse_start = std::time::Instant::now();
+
         let arena = Bump::new();
         let mut parser = Parser::new(sql, &arena);
         let stmt = parser
             .parse_statement()
             .wrap_err("failed to parse SQL statement")?;
+
+        #[cfg(feature = "timing")]
         PARSE_TIME_NS.fetch_add(
             parse_start.elapsed().as_nanos() as u64,
             AtomicOrdering::Relaxed,
@@ -3133,6 +3158,7 @@ impl Database {
         prepared: &super::PreparedStatement,
         params: &[OwnedValue],
     ) -> Result<ExecuteResult> {
+        #[cfg(feature = "timing")]
         if let Some(result) = prepared.with_cached_plan(|plan| {
             let insert_start = std::time::Instant::now();
             let result = self.execute_insert_cached(plan, params);
@@ -3145,18 +3171,29 @@ impl Database {
             return result;
         }
 
+        #[cfg(not(feature = "timing"))]
+        if let Some(result) =
+            prepared.with_cached_plan(|plan| self.execute_insert_cached(plan, params))
+        {
+            return result;
+        }
+
         if let Some(result) =
             prepared.with_cached_update_plan(|plan| self.execute_update_cached(plan, params))
         {
             return result;
         }
 
+        #[cfg(feature = "timing")]
         let parse_start = std::time::Instant::now();
+
         let arena = Bump::new();
         let mut parser = Parser::new(prepared.sql(), &arena);
         let stmt = parser
             .parse_statement()
             .wrap_err("failed to parse SQL statement")?;
+
+        #[cfg(feature = "timing")]
         PARSE_TIME_NS.fetch_add(
             parse_start.elapsed().as_nanos() as u64,
             AtomicOrdering::Relaxed,
@@ -3206,6 +3243,9 @@ impl Database {
                                     is_unique: true,
                                     col_indices: vec![idx],
                                     storage: std::cell::RefCell::new(None),
+                                    key_buffer: std::cell::RefCell::new(Vec::with_capacity(64)),
+                                    root_page: std::cell::Cell::new(0),
+                                    rightmost_hint: std::cell::Cell::new(None),
                                 });
                             }
                         }
@@ -3235,17 +3275,23 @@ impl Database {
                                 is_unique: idx_def.is_unique(),
                                 col_indices,
                                 storage: std::cell::RefCell::new(None),
+                                key_buffer: std::cell::RefCell::new(Vec::with_capacity(64)),
+                                root_page: std::cell::Cell::new(0),
+                                rightmost_hint: std::cell::Cell::new(None),
                             });
                         }
                     }
 
+                    let record_schema = create_record_schema(table_def.columns());
+                    let builder_state =
+                        crate::records::RecordBuilderState::new(&record_schema);
                     let cached_plan = super::prepared::CachedInsertPlan {
                         table_id: table_def.id(),
                         schema_name: schema_name.to_string(),
                         table_name: table_name.to_string(),
                         column_count: column_types.len(),
                         column_types,
-                        record_schema: create_record_schema(table_def.columns()),
+                        record_schema,
                         root_page: std::cell::Cell::new(0),
                         rightmost_hint: std::cell::Cell::new(None),
                         row_count: std::cell::Cell::new(None),
@@ -3253,6 +3299,8 @@ impl Database {
                             &storage_arc,
                         ))),
                         record_buffer: std::cell::RefCell::new(Vec::with_capacity(256)),
+                        mvcc_buffer: std::cell::RefCell::new(Vec::with_capacity(256)),
+                        record_builder_state: std::cell::RefCell::new(Some(builder_state)),
                         indexes,
                     };
 

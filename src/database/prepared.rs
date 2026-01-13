@@ -97,6 +97,7 @@
 use crate::types::OwnedValue;
 
 use parking_lot::RwLock;
+use smallvec::SmallVec;
 
 use crate::storage::MmapStorage;
 use std::cell::RefCell;
@@ -114,6 +115,8 @@ pub struct CachedInsertPlan {
     pub row_count: std::cell::Cell<Option<u64>>,
     pub storage: std::cell::RefCell<Option<std::sync::Weak<RwLock<MmapStorage>>>>,
     pub record_buffer: std::cell::RefCell<Vec<u8>>,
+    pub mvcc_buffer: std::cell::RefCell<Vec<u8>>,
+    pub record_builder_state: std::cell::RefCell<Option<crate::records::RecordBuilderState>>,
     pub indexes: Vec<CachedIndexPlan>,
 }
 
@@ -124,6 +127,9 @@ pub struct CachedIndexPlan {
     pub is_unique: bool,
     pub col_indices: Vec<usize>,
     pub storage: std::cell::RefCell<Option<std::sync::Weak<RwLock<MmapStorage>>>>,
+    pub key_buffer: std::cell::RefCell<Vec<u8>>,
+    pub root_page: std::cell::Cell<u32>,
+    pub rightmost_hint: std::cell::Cell<Option<u32>>,
 }
 
 #[derive(Debug, Clone)]
@@ -225,14 +231,14 @@ impl PreparedStatement {
 #[derive(Debug)]
 pub struct BoundStatement<'a> {
     prepared: &'a PreparedStatement,
-    pub(crate) params: Vec<OwnedValue>,
+    pub(crate) params: SmallVec<[OwnedValue; 16]>,
 }
 
 impl<'a> BoundStatement<'a> {
     fn new(prepared: &'a PreparedStatement) -> Self {
         Self {
             prepared,
-            params: Vec::with_capacity(prepared.param_count as usize),
+            params: SmallVec::new(),
         }
     }
 

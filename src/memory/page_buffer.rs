@@ -37,7 +37,7 @@
 //! expected concurrent commit load.
 
 use crate::storage::PAGE_SIZE;
-use parking_lot::Mutex;
+use parking_lot::{Condvar, Mutex};
 use std::mem::ManuallyDrop;
 use std::ops::{Deref, DerefMut};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -52,6 +52,7 @@ const BUFFER_POOL_SHARD_COUNT: usize = 16;
 /// commit operations after initial pool creation.
 ///
 /// Uses 16-way lock sharding to reduce contention under high concurrency.
+/// When exhausted, `acquire_blocking` waits on a condition variable (PostgreSQL-style).
 pub struct PageBufferPool {
     inner: Arc<PageBufferPoolInner>,
 }
@@ -60,6 +61,10 @@ struct PageBufferPoolInner {
     shards: [Mutex<Vec<Box<[u8; PAGE_SIZE]>>>; BUFFER_POOL_SHARD_COUNT],
     /// Round-robin counter for distributing acquire requests across shards
     next_shard: AtomicUsize,
+    /// Condition variable for blocking acquire (PostgreSQL-style wait)
+    buffer_available: Condvar,
+    /// Mutex for the condition variable (protects nothing, just for Condvar API)
+    wait_lock: Mutex<()>,
 }
 
 impl PageBufferPool {
@@ -91,6 +96,8 @@ impl PageBufferPool {
             inner: Arc::new(PageBufferPoolInner {
                 shards,
                 next_shard: AtomicUsize::new(0),
+                buffer_available: Condvar::new(),
+                wait_lock: Mutex::new(()),
             }),
         }
     }
@@ -132,6 +139,29 @@ impl PageBufferPool {
 
         // Pool exhausted - fail fast rather than allocate
         None
+    }
+
+    /// Acquire a buffer from the pool, blocking if none available.
+    ///
+    /// This follows PostgreSQL's buffer pool semantics - when exhausted, the
+    /// caller waits on a condition variable until a buffer is returned.
+    /// This applies backpressure without wasting CPU or violating memory budget.
+    ///
+    /// # Blocking
+    /// Will block indefinitely if buffers are never returned. Ensure all acquired
+    /// buffers are dropped promptly to avoid deadlock.
+    pub fn acquire_blocking(&self) -> PooledPageBuffer {
+        if let Some(buffer) = self.acquire() {
+            return buffer;
+        }
+
+        let mut guard = self.inner.wait_lock.lock();
+        loop {
+            if let Some(buffer) = self.acquire() {
+                return buffer;
+            }
+            self.inner.buffer_available.wait(&mut guard);
+        }
     }
 
     /// Returns the current number of available buffers in the pool (across all shards).
@@ -217,6 +247,7 @@ impl Drop for PooledPageBuffer {
         // This is safe because drop() is only called once.
         let buffer = unsafe { ManuallyDrop::take(&mut self.buffer) };
         self.pool.shards[self.shard_idx].lock().push(buffer);
+        self.pool.buffer_available.notify_one();
     }
 }
 

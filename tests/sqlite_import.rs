@@ -912,7 +912,7 @@ fn import_all_tables() {
     let sqlite_conn = Connection::open(SQLITE_DB_PATH).expect("Failed to open SQLite DB");
     let db = Database::create(TURDB_PATH).unwrap();
 
-    db.execute("PRAGMA WAL=ON").expect("Failed to enable WAL");
+    db.execute("PRAGMA WAL=OFF").expect("Failed to enable WAL");
     db.execute("PRAGMA synchronous=NORMAL")
         .expect("Failed to set synchronous mode");
     db.execute("SET foreign_keys = OFF")
@@ -1019,8 +1019,8 @@ fn import_small_tables() {
 
     let sqlite_conn = Connection::open(SQLITE_DB_PATH).expect("Failed to open SQLite DB");
     let db = Database::create(TURDB_PATH).unwrap();
-    db.execute("PRAGMA WAL=ON").expect("Failed to enable WAL");
-    db.execute("PRAGMA synchronous=NORMAL")
+    db.execute("PRAGMA WAL=OFF").expect("Failed to enable WAL");
+    db.execute("PRAGMA synchronous=FULL")
         .expect("Failed to set synchronous mode");
 
     print_memory_stats(&db, "Initial state");

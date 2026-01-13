@@ -49,6 +49,7 @@ impl Database {
 
         match name.as_str() {
             "WAL" => self.pragma_wal(&name, value.as_deref()),
+            "WAL_AUTOFLUSH" => self.pragma_wal_autoflush(&name, value.as_deref()),
             "SYNCHRONOUS" => self.pragma_synchronous(&name, value.as_deref()),
             "JOIN_MEMORY_BUDGET" => self.pragma_join_memory_budget(&name, value.as_deref()),
             "MEMORY_BUDGET" => self.pragma_memory_budget(&name),
@@ -71,8 +72,8 @@ impl Database {
         if let Some(val) = value {
             match val {
                 "ON" | "TRUE" | "1" => {
-                    self.shared.wal_enabled.store(true, Ordering::Release);
                     self.ensure_wal()?;
+                    self.shared.wal_enabled.store(true, Ordering::Release);
                 }
                 "OFF" | "FALSE" | "0" => {
                     self.shared.wal_enabled.store(false, Ordering::Release);
@@ -81,6 +82,25 @@ impl Database {
             }
         }
         let current = self.shared.wal_enabled.load(Ordering::Acquire);
+        Ok(ExecuteResult::Pragma {
+            name: name.to_string(),
+            value: Some(if current { "ON" } else { "OFF" }.to_string()),
+        })
+    }
+
+    fn pragma_wal_autoflush(&self, name: &str, value: Option<&str>) -> Result<ExecuteResult> {
+        if let Some(val) = value {
+            match val {
+                "ON" | "TRUE" | "1" => {
+                    self.shared.wal_autoflush.store(true, Ordering::Release);
+                }
+                "OFF" | "FALSE" | "0" => {
+                    self.shared.wal_autoflush.store(false, Ordering::Release);
+                }
+                _ => bail!("invalid PRAGMA WAL_AUTOFLUSH value: {} (use ON or OFF)", val),
+            }
+        }
+        let current = self.shared.wal_autoflush.load(Ordering::Acquire);
         Ok(ExecuteResult::Pragma {
             name: name.to_string(),
             value: Some(if current { "ON" } else { "OFF" }.to_string()),

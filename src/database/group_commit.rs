@@ -35,8 +35,8 @@ use std::time::{Duration, Instant};
 
 /// Payload type for dirty pages: (table_id, page_id, pooled_buffer, db_size)
 ///
-/// Uses `PooledPageBuffer` instead of `Vec<u8>` to avoid heap allocation on every
-/// commit. Buffers are returned to the pool when the payload is dropped.
+/// Uses `PooledPageBuffer` for zero-allocation commits. When pool is exhausted,
+/// `acquire_blocking` waits (PostgreSQL-style) until a buffer is returned.
 pub type CommitPayload = SmallVec<[(u32, u32, PooledPageBuffer, u32); 4]>;
 
 /// Configuration for group commit behavior

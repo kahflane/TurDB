@@ -27,10 +27,15 @@
 //! - `bulk_insert`: Best throughput for large loads (100K+ rows)
 
 use crate::btree::BTree;
+#[cfg(feature = "timing")]
+use crate::database::timing::{
+    BTREE_INSERT_NS, INDEX_UPDATE_NS, INSERT_COUNT, MVCC_WRAP_NS, PAGE0_READ_NS, PAGE0_UPDATE_NS,
+    RECORD_BUILD_NS, STORAGE_LOCK_NS, TXN_LOOKUP_NS, WAL_FLUSH_NS,
+};
 use crate::database::Database;
 use crate::storage::{TableFileHeader, WalStoragePerTable, DEFAULT_SCHEMA};
 use crate::types::{create_record_schema, OwnedValue};
-use eyre::Result;
+use eyre::{Result, WrapErr};
 use std::sync::atomic::Ordering;
 
 impl Database {
@@ -167,7 +172,10 @@ impl Database {
         plan: &crate::database::prepared::CachedInsertPlan,
         params: &[OwnedValue],
     ) -> Result<usize> {
-        use crate::database::dml::mvcc_helpers::wrap_record_for_insert;
+        use crate::database::dml::mvcc_helpers::wrap_record_into_buffer;
+
+        #[cfg(feature = "timing")]
+        INSERT_COUNT.fetch_add(1, Ordering::Relaxed);
 
         self.ensure_file_manager()?;
 
@@ -175,6 +183,9 @@ impl Database {
         if wal_enabled {
             self.ensure_wal()?;
         }
+
+        #[cfg(feature = "timing")]
+        let storage_lock_start = std::time::Instant::now();
 
         let storage_arc = if let Some(weak) = plan.storage.borrow().as_ref() {
             weak.upgrade()
@@ -194,20 +205,52 @@ impl Database {
 
         let mut storage_guard = storage_arc.write();
 
-        let (mut root_page, mut rightmost_hint) = {
+        #[cfg(feature = "timing")]
+        STORAGE_LOCK_NS.fetch_add(storage_lock_start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+
+        #[cfg(feature = "timing")]
+        let page0_start = std::time::Instant::now();
+
+        let cached_root = plan.root_page.get();
+        let cached_hint = plan.rightmost_hint.get();
+        let (mut root_page, mut rightmost_hint) = if cached_root > 0 {
+            (cached_root, cached_hint.or(Some(cached_root)))
+        } else {
             let page = storage_guard.page(0)?;
             let header = TableFileHeader::from_bytes(page)?;
             let stored_root = header.root_page();
             let hint = header.rightmost_hint();
             let root = if stored_root > 0 { stored_root } else { 1 };
-            (root, if hint > 0 { Some(hint) } else { Some(root) })
+            let hint_opt = if hint > 0 { Some(hint) } else { Some(root) };
+            plan.root_page.set(root);
+            plan.rightmost_hint.set(hint_opt);
+            (root, hint_opt)
         };
 
-        let mut record_builder = crate::records::RecordBuilder::new(&plan.record_schema);
+        #[cfg(feature = "timing")]
+        PAGE0_READ_NS.fetch_add(page0_start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+
+        #[cfg(feature = "timing")]
+        let record_start = std::time::Instant::now();
+
+        let state = plan
+            .record_builder_state
+            .borrow_mut()
+            .take()
+            .expect("record_builder_state must be initialized in CachedInsertPlan");
+        let mut record_builder = state.into_builder(&plan.record_schema);
 
         let mut buffer_guard = plan.record_buffer.borrow_mut();
         buffer_guard.clear();
         OwnedValue::build_record_into_buffer(params, &mut record_builder, &mut buffer_guard)?;
+
+        *plan.record_builder_state.borrow_mut() = Some(record_builder.into_state());
+
+        #[cfg(feature = "timing")]
+        RECORD_BUILD_NS.fetch_add(record_start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+
+        #[cfg(feature = "timing")]
+        let txn_start = std::time::Instant::now();
 
         let (txn_id, in_transaction) = {
             let active_txn = self.active_txn.lock();
@@ -223,10 +266,24 @@ impl Database {
                 )
             }
         };
-        let mvcc_record = wrap_record_for_insert(txn_id, &buffer_guard, in_transaction);
+
+        #[cfg(feature = "timing")]
+        TXN_LOOKUP_NS.fetch_add(txn_start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+
+        #[cfg(feature = "timing")]
+        let mvcc_start = std::time::Instant::now();
+
+        let mut mvcc_buffer_guard = plan.mvcc_buffer.borrow_mut();
+        wrap_record_into_buffer(txn_id, &buffer_guard, in_transaction, &mut mvcc_buffer_guard);
+
+        #[cfg(feature = "timing")]
+        MVCC_WRAP_NS.fetch_add(mvcc_start.elapsed().as_nanos() as u64, Ordering::Relaxed);
 
         let row_id = self.shared.next_row_id.fetch_add(1, Ordering::Relaxed);
         let row_key = Self::generate_row_key(row_id);
+
+        #[cfg(feature = "timing")]
+        let btree_start = std::time::Instant::now();
 
         if wal_enabled {
             let mut wal_storage = WalStoragePerTable::new(
@@ -236,16 +293,25 @@ impl Database {
             );
             let mut btree =
                 BTree::with_rightmost_hint(&mut wal_storage, root_page, rightmost_hint)?;
-            btree.insert_append(&row_key, &mvcc_record)?;
+            btree.insert_append(&row_key, &mvcc_buffer_guard)?;
             root_page = btree.root_page();
             rightmost_hint = btree.rightmost_hint();
         } else {
             let mut btree =
                 BTree::with_rightmost_hint(&mut storage_guard, root_page, rightmost_hint)?;
-            btree.insert_append(&row_key, &mvcc_record)?;
+            btree.insert_append(&row_key, &mvcc_buffer_guard)?;
             root_page = btree.root_page();
             rightmost_hint = btree.rightmost_hint();
         }
+
+        plan.root_page.set(root_page);
+        plan.rightmost_hint.set(rightmost_hint);
+
+        #[cfg(feature = "timing")]
+        BTREE_INSERT_NS.fetch_add(btree_start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+
+        #[cfg(feature = "timing")]
+        let index_start = std::time::Instant::now();
 
         let row_id_bytes = row_id.to_be_bytes();
         for index_plan in &plan.indexes {
@@ -260,45 +326,66 @@ impl Database {
             } else {
                 let mut file_manager_guard = self.shared.file_manager.write();
                 let file_manager = file_manager_guard.as_mut().unwrap();
-                if let Ok(arc) = file_manager.index_data_mut(
-                    &plan.schema_name,
-                    &plan.table_name,
-                    &index_plan.name,
-                ) {
-                    *index_plan.storage.borrow_mut() = Some(std::sync::Arc::downgrade(&arc));
-                    arc
-                } else {
-                    continue;
-                }
+                let arc = file_manager
+                    .index_data_mut(&plan.schema_name, &plan.table_name, &index_plan.name)
+                    .wrap_err_with(|| {
+                        format!(
+                            "failed to open index '{}' for table '{}.{}' during insert",
+                            index_plan.name, plan.schema_name, plan.table_name
+                        )
+                    })?;
+                *index_plan.storage.borrow_mut() = Some(std::sync::Arc::downgrade(&arc));
+                arc
             };
 
             let mut index_storage_guard = index_storage_arc.write();
 
-            let (index_root, _) = {
-                use crate::storage::IndexFileHeader;
-                let page = index_storage_guard.page(0)?;
-                let header = IndexFileHeader::from_bytes(page)?;
-                (header.root_page(), ())
+            let index_root = {
+                let cached_root = index_plan.root_page.get();
+                if cached_root > 0 {
+                    cached_root
+                } else {
+                    use crate::storage::IndexFileHeader;
+                    let page = index_storage_guard.page(0)?;
+                    let header = IndexFileHeader::from_bytes(page)?;
+                    let root = header.root_page();
+                    index_plan.root_page.set(root);
+                    root
+                }
             };
 
-            let mut key_buf = Vec::new();
+            let mut key_buf_guard = index_plan.key_buffer.borrow_mut();
+            key_buf_guard.clear();
             for &col_idx in &index_plan.col_indices {
                 if let Some(val) = params.get(col_idx) {
-                    Self::encode_value_as_key(val, &mut key_buf);
+                    Self::encode_value_as_key(val, &mut *key_buf_guard);
                 }
             }
 
-            let mut index_btree = BTree::new(&mut *index_storage_guard, index_root)?;
-            index_btree.insert(&key_buf, &row_id_bytes)?;
+            let index_rightmost = index_plan.rightmost_hint.get();
+            let mut index_btree =
+                BTree::with_rightmost_hint(&mut *index_storage_guard, index_root, index_rightmost)?;
+            index_btree.insert_append(&key_buf_guard, &row_id_bytes)?;
 
             let new_root = index_btree.root_page();
+            let new_rightmost = index_btree.rightmost_hint();
+
             if new_root != index_root {
                 use crate::storage::IndexFileHeader;
                 let page = index_storage_guard.page_mut(0)?;
                 let header = IndexFileHeader::from_bytes_mut(page)?;
                 header.set_root_page(new_root);
+                index_plan.root_page.set(new_root);
+            }
+            if new_rightmost != index_rightmost {
+                index_plan.rightmost_hint.set(new_rightmost);
             }
         }
+        #[cfg(feature = "timing")]
+        INDEX_UPDATE_NS.fetch_add(index_start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+
+        #[cfg(feature = "timing")]
+        let page0_update_start = std::time::Instant::now();
 
         {
             let page = storage_guard.page_mut(0)?;
@@ -311,7 +398,13 @@ impl Database {
             header.set_row_count(new_row_count);
         }
 
-        if wal_enabled {
+        #[cfg(feature = "timing")]
+        PAGE0_UPDATE_NS.fetch_add(page0_update_start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+
+        if wal_enabled && self.shared.wal_autoflush.load(Ordering::Acquire) {
+            #[cfg(feature = "timing")]
+            let wal_flush_start = std::time::Instant::now();
+
             let txn_active = self.active_txn.lock().is_some();
             if !txn_active
                 && self
@@ -320,15 +413,22 @@ impl Database {
                     .has_dirty_pages(plan.table_id as u32)
             {
                 let mut wal_guard = self.shared.wal.lock();
-                if let Some(wal) = wal_guard.as_mut() {
-                    WalStoragePerTable::flush_wal_for_table(
-                        &self.shared.dirty_tracker,
-                        &storage_guard,
-                        wal,
-                        plan.table_id as u32,
-                    )?;
-                }
+                let wal = wal_guard.as_mut().ok_or_else(|| {
+                    eyre::eyre!(
+                        "WAL enabled but not initialized during insert into table '{}' (table_id={}) - this indicates a bug in ensure_wal()",
+                        plan.table_name, plan.table_id
+                    )
+                })?;
+                WalStoragePerTable::flush_wal_for_table(
+                    &self.shared.dirty_tracker,
+                    &storage_guard,
+                    wal,
+                    plan.table_id as u32,
+                )?;
             }
+
+            #[cfg(feature = "timing")]
+            WAL_FLUSH_NS.fetch_add(wal_flush_start.elapsed().as_nanos() as u64, Ordering::Relaxed);
         }
 
         Ok(1)

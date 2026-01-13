@@ -54,7 +54,7 @@ pub mod types;
 pub mod view;
 
 pub use array::{ArrayBuilder, ArrayView};
-pub use builder::RecordBuilder;
+pub use builder::{RecordBuilder, RecordBuilderState};
 pub use composite::{CompositeView, MAX_NESTING_DEPTH};
 pub use jsonb::{JsonbBuilder, JsonbBuilderValue, JsonbValue, JsonbView};
 pub use schema::Schema;

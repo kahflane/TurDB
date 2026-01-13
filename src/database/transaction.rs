@@ -120,6 +120,8 @@ use smallvec::SmallVec;
 use super::group_commit::CommitPayload;
 use super::{Database, ExecuteResult};
 
+const COMMIT_BATCH_SIZE: usize = 12;
+
 /// Named checkpoint within a transaction for partial rollback.
 #[derive(Debug, Clone)]
 pub struct Savepoint {
@@ -271,13 +273,6 @@ impl Database {
             .wal_enabled
             .load(std::sync::atomic::Ordering::Acquire);
 
-        {
-            let active_txn = self.active_txn.lock();
-            active_txn
-                .as_ref()
-                .ok_or_else(|| eyre::eyre!("no transaction in progress"))?;
-        }
-
         let mut active_txn = self.active_txn.lock();
         let txn = active_txn
             .take()
@@ -286,100 +281,18 @@ impl Database {
         self.finalize_transaction_commit(txn)?;
 
         if wal_enabled {
-            // [Deadlock Fix - Push-Based] Capture dirty data before queuing
-            // We read all dirty pages while holding storage locks, then release them,
-            // then submit the data to the group commit queue.
-
             let dirty_table_ids = self.shared.dirty_tracker.all_dirty_table_ids();
-            let mut payload: CommitPayload = SmallVec::new();
 
             if !dirty_table_ids.is_empty() {
-                // To safely capture data, we need file manager access to get storage
-                let mut file_manager_guard = self.shared.file_manager.write();
-                let file_manager = file_manager_guard
-                    .as_mut()
-                    .ok_or_else(|| eyre::eyre!("file manager not available for commit"))?;
+                let total_dirty_pages: u64 = dirty_table_ids
+                    .iter()
+                    .map(|&tid| self.shared.dirty_tracker.dirty_count(tid))
+                    .sum();
 
-                let mut table_infos: Vec<(u32, String, String)> = {
-                    let lookup = self.shared.table_id_lookup.read();
-                    dirty_table_ids
-                        .iter()
-                        .filter_map(|&table_id| {
-                            lookup
-                                .get(&table_id)
-                                .map(|(s, t)| (table_id, s.clone(), t.clone()))
-                        })
-                        .collect()
-                };
-                table_infos.sort_by_key(|(id, _, _)| *id);
-
-                // Acquire locks and capture data
-                for (table_id, schema_name, table_name) in table_infos {
-                    let _table_lock = self.shared.page_locks.table_intent_exclusive(table_id);
-                    let dirty_pages = self.shared.dirty_tracker.dirty_pages_for_table(table_id);
-
-                    if dirty_pages.is_empty() {
-                        continue;
-                    }
-
-                    let page_tuples: Vec<(u32, u32)> =
-                        dirty_pages.iter().map(|&p| (table_id, p)).collect();
-                    let _page_locks = self.shared.page_locks.page_write_multi(&page_tuples);
-
-                    if let Ok(storage_arc) = file_manager.table_data(&schema_name, &table_name) {
-                        let storage = storage_arc.read();
-                        let db_size = storage.page_count();
-                        let pages_to_flush = self.shared.dirty_tracker.drain_for_table(table_id);
-
-                        for page_no in pages_to_flush {
-                            if let Ok(data) = storage.page(page_no) {
-                                let mut buffer = self.shared.page_buffer_pool.acquire()
-                                    .ok_or_else(|| eyre::eyre!("page buffer pool exhausted"))?;
-                                buffer.copy_from_page(data);
-                                payload.push((table_id, page_no, buffer, db_size));
-                            }
-                        }
-                    }
-                }
-            }
-
-            if self.shared.group_commit_queue.is_enabled() {
-                match self.shared.group_commit_queue.submit_and_wait(payload) {
-                    Ok(_batch_id) => {
-                        if let Some(pending_commits) = self.shared.group_commit_queue.take_pending()
-                        {
-                            let result = self.execute_group_wal_flush(&pending_commits);
-                            match &result {
-                                Ok(()) => self
-                                    .shared
-                                    .group_commit_queue
-                                    .complete_batch(&pending_commits),
-                                Err(e) => self
-                                    .shared
-                                    .group_commit_queue
-                                    .fail_batch(&pending_commits, &e.to_string()),
-                            }
-                            result?;
-                        }
-
-                        self.maybe_auto_checkpoint();
-
-                        return Ok(ExecuteResult::Commit);
-                    }
-                    Err(e) => {
-                        bail!("group commit failed: {}", e);
-                    }
-                }
-            } else if !payload.is_empty() {
-                // If group commit is disabled but WAL is on, we flush directly.
-                let mut wal_guard = self.shared.wal.lock();
-                let wal = wal_guard
-                    .as_mut()
-                    .ok_or_else(|| eyre::eyre!("WAL not initialized but WAL mode is enabled"))?;
-
-                for (table_id, page_no, buffer, db_size) in payload {
-                    wal.write_frame_with_file_id(page_no, db_size, buffer.as_slice(), table_id as u64)
-                        .wrap_err("failed to write WAL frame in direct commit")?;
+                if total_dirty_pages as usize > COMMIT_BATCH_SIZE {
+                    self.execute_chunked_wal_commit(&dirty_table_ids)?;
+                } else {
+                    self.execute_small_commit(&dirty_table_ids)?;
                 }
             }
 
@@ -387,6 +300,131 @@ impl Database {
         }
 
         Ok(ExecuteResult::Commit)
+    }
+
+    fn execute_small_commit(&self, dirty_table_ids: &[u32]) -> Result<()> {
+        let mut payload: CommitPayload = SmallVec::new();
+
+        let mut file_manager_guard = self.shared.file_manager.write();
+        let file_manager = file_manager_guard
+            .as_mut()
+            .ok_or_else(|| eyre::eyre!("file manager not available for commit"))?;
+
+        let lookup = self.shared.table_id_lookup.read();
+        let mut sorted_table_ids: SmallVec<[u32; 16]> = dirty_table_ids.iter().copied().collect();
+        sorted_table_ids.sort_unstable();
+
+        for &table_id in &sorted_table_ids {
+            let Some((schema_name, table_name)) = lookup.get(&table_id) else {
+                continue;
+            };
+            let _table_lock = self.shared.page_locks.table_intent_exclusive(table_id);
+            let dirty_pages = self.shared.dirty_tracker.dirty_pages_for_table(table_id);
+
+            if dirty_pages.is_empty() {
+                continue;
+            }
+
+            let page_tuples: Vec<(u32, u32)> =
+                dirty_pages.iter().map(|&p| (table_id, p)).collect();
+            let _page_locks = self.shared.page_locks.page_write_multi(&page_tuples);
+
+            let pages_to_flush = self.shared.dirty_tracker.drain_for_table(table_id);
+            let _ = self.collect_pages_for_table(
+                table_id,
+                schema_name,
+                table_name,
+                file_manager,
+                &pages_to_flush,
+                &mut payload,
+            );
+        }
+
+        drop(lookup);
+        drop(file_manager_guard);
+
+        if self.shared.group_commit_queue.is_enabled() {
+            match self.shared.group_commit_queue.submit_and_wait(payload) {
+                Ok(_batch_id) => {
+                    if let Some(pending_commits) = self.shared.group_commit_queue.take_pending() {
+                        let result = self.execute_group_wal_flush(&pending_commits);
+                        match &result {
+                            Ok(()) => self
+                                .shared
+                                .group_commit_queue
+                                .complete_batch(&pending_commits),
+                            Err(e) => self
+                                .shared
+                                .group_commit_queue
+                                .fail_batch(&pending_commits, &e.to_string()),
+                        }
+                        result?;
+                    }
+                }
+                Err(e) => {
+                    bail!("group commit failed: {}", e);
+                }
+            }
+        } else if !payload.is_empty() {
+            let mut wal_guard = self.shared.wal.lock();
+            let wal = wal_guard
+                .as_mut()
+                .ok_or_else(|| eyre::eyre!("WAL not initialized but WAL mode is enabled"))?;
+
+            Self::write_payload_to_wal(wal, &payload)?;
+        }
+
+        Ok(())
+    }
+
+    fn execute_chunked_wal_commit(&self, dirty_table_ids: &[u32]) -> Result<()> {
+        let mut wal_guard = self.shared.wal.lock();
+        let wal = wal_guard
+            .as_mut()
+            .ok_or_else(|| eyre::eyre!("WAL not initialized but WAL mode is enabled"))?;
+
+        let mut file_manager_guard = self.shared.file_manager.write();
+        let file_manager = file_manager_guard
+            .as_mut()
+            .ok_or_else(|| eyre::eyre!("file manager not available for commit"))?;
+
+        let lookup = self.shared.table_id_lookup.read();
+        let mut sorted_table_ids: SmallVec<[u32; 16]> = dirty_table_ids.iter().copied().collect();
+        sorted_table_ids.sort_unstable();
+
+        for &table_id in &sorted_table_ids {
+            let Some((schema_name, table_name)) = lookup.get(&table_id) else {
+                continue;
+            };
+
+            let pages_to_flush = self.shared.dirty_tracker.drain_for_table(table_id);
+
+            if pages_to_flush.is_empty() {
+                continue;
+            }
+
+            for chunk in pages_to_flush.chunks(COMMIT_BATCH_SIZE) {
+                let _table_lock = self.shared.page_locks.table_intent_exclusive(table_id);
+
+                let page_tuples: Vec<(u32, u32)> =
+                    chunk.iter().map(|&p| (table_id, p)).collect();
+                let _page_locks = self.shared.page_locks.page_write_multi(&page_tuples);
+
+                let mut chunk_payload: CommitPayload = SmallVec::new();
+                self.collect_pages_for_table(
+                    table_id,
+                    schema_name,
+                    table_name,
+                    file_manager,
+                    chunk,
+                    &mut chunk_payload,
+                )?;
+
+                Self::write_payload_to_wal(wal, &chunk_payload)?;
+            }
+        }
+
+        Ok(())
     }
 
     fn execute_group_wal_flush(
@@ -399,12 +437,48 @@ impl Database {
             .ok_or_else(|| eyre::eyre!("WAL not initialized but WAL mode is enabled"))?;
 
         for commit in pending_commits {
-            for (table_id, page_no, buffer, db_size) in &commit.payload {
-                wal.write_frame_with_file_id(*page_no, *db_size, buffer.as_slice(), *table_id as u64)
-                    .wrap_err("failed to write WAL frame in group commit")?;
+            Self::write_payload_to_wal(wal, &commit.payload)?;
+        }
+
+        Ok(())
+    }
+
+    fn collect_pages_for_table(
+        &self,
+        table_id: u32,
+        schema_name: &str,
+        table_name: &str,
+        file_manager: &mut crate::storage::FileManager,
+        pages: &[u32],
+        payload: &mut CommitPayload,
+    ) -> Result<()> {
+        if pages.is_empty() {
+            return Ok(());
+        }
+
+        let storage_arc = file_manager.table_data(schema_name, table_name)?;
+        let storage = storage_arc.read();
+        let db_size = storage.page_count();
+
+        for &page_no in pages {
+            if let Ok(data) = storage.page(page_no) {
+                let mut buffer = self.shared.page_buffer_pool.acquire_blocking();
+                buffer.copy_from_page(data);
+                payload.push((table_id, page_no, buffer, db_size));
             }
         }
 
+        Ok(())
+    }
+
+    fn write_payload_to_wal(
+        wal: &mut crate::storage::Wal,
+        payload: &CommitPayload,
+    ) -> Result<()> {
+        for (table_id, page_no, buffer, db_size) in payload {
+            wal.write_frame_with_file_id(*page_no, *db_size, buffer.as_slice(), *table_id as u64)
+                .wrap_err("failed to write WAL frame")?;
+        }
         Ok(())
     }
 
@@ -412,14 +486,20 @@ impl Database {
         let commit_ts = self.shared.txn_manager.commit_txn(txn.slot_idx);
         let (write_entries, _undo_data) = txn.take_write_entries();
 
+        let mut value_buffer = Vec::with_capacity(256);
         for entry in write_entries.iter() {
-            self.finalize_write_entry_commit(entry, commit_ts)?;
+            self.finalize_write_entry_commit(entry, commit_ts, &mut value_buffer)?;
         }
 
         Ok(())
     }
 
-    fn finalize_write_entry_commit(&self, entry: &WriteEntry, commit_ts: TxnId) -> Result<()> {
+    fn finalize_write_entry_commit(
+        &self,
+        entry: &WriteEntry,
+        commit_ts: TxnId,
+        value_buffer: &mut Vec<u8>,
+    ) -> Result<()> {
         use crate::btree::BTree;
         use crate::mvcc::RecordHeader;
         use crate::storage::DEFAULT_SCHEMA;
@@ -453,11 +533,12 @@ impl Database {
                 header.set_locked(false);
                 header.txn_id = commit_ts;
 
-                let mut new_value = raw_value.to_vec();
-                header.write_to(&mut new_value[..RecordHeader::SIZE]);
+                value_buffer.clear();
+                value_buffer.extend_from_slice(raw_value);
+                header.write_to(&mut value_buffer[..RecordHeader::SIZE]);
 
                 let mut btree_mut = BTree::new(&mut *table_storage, 1)?;
-                btree_mut.update(&entry.key, &new_value)?;
+                btree_mut.update(&entry.key, value_buffer)?;
             }
         }
 
@@ -501,12 +582,11 @@ impl Database {
             return Ok(ExecuteResult::Rollback);
         }
 
-        let txn = active_txn
+        let mut txn = active_txn
             .take()
             .ok_or_else(|| eyre::eyre!("no transaction in progress"))?;
 
-        let write_entries: Vec<WriteEntry> = txn.write_entries.iter().cloned().collect();
-        let undo_data: Vec<Option<Vec<u8>>> = txn.undo_data.iter().cloned().collect();
+        let (write_entries, undo_data) = txn.take_write_entries();
 
         drop(active_txn);
         self.undo_write_entries(&write_entries, &undo_data)?;
@@ -519,14 +599,20 @@ impl Database {
         entries: &[WriteEntry],
         undo_data: &[Option<Vec<u8>>],
     ) -> Result<()> {
+        let mut key_buf: SmallVec<[u8; 64]> = SmallVec::new();
         for (i, entry) in entries.iter().enumerate().rev() {
             let undo = undo_data.get(i).and_then(|o| o.as_ref());
-            self.undo_write_entry(entry, undo)?;
+            self.undo_write_entry(entry, undo, &mut key_buf)?;
         }
         Ok(())
     }
 
-    fn undo_write_entry(&self, entry: &WriteEntry, undo_data: Option<&Vec<u8>>) -> Result<()> {
+    fn undo_write_entry(
+        &self,
+        entry: &WriteEntry,
+        undo_data: Option<&Vec<u8>>,
+        key_buf: &mut SmallVec<[u8; 64]>,
+    ) -> Result<()> {
         use crate::btree::BTree;
         use crate::database::dml::mvcc_helpers::get_user_data;
         use crate::records::RecordView;
@@ -618,8 +704,6 @@ impl Database {
             drop(table_storage);
 
             if let Some(row_values) = row_values {
-                let mut key_buf: SmallVec<[u8; 64]> = SmallVec::new();
-
                 for (col_idx, index_name, _is_pk) in &unique_columns {
                     if file_manager.index_exists(&schema_name, &table_name, index_name) {
                         if let Some(value) = row_values.get(*col_idx) {
@@ -640,8 +724,8 @@ impl Database {
                                 let mut index_btree =
                                     BTree::new(&mut *index_storage, index_root_page)?;
                                 key_buf.clear();
-                                Self::encode_value_as_key(value, &mut key_buf);
-                                let _ = index_btree.delete(&key_buf);
+                                Self::encode_value_as_key(value, key_buf);
+                                let _ = index_btree.delete(key_buf);
                             }
                         }
                     }
@@ -674,10 +758,10 @@ impl Database {
                             key_buf.clear();
                             for &col_idx in col_indices {
                                 if let Some(value) = row_values.get(col_idx) {
-                                    Self::encode_value_as_key(value, &mut key_buf);
+                                    Self::encode_value_as_key(value, key_buf);
                                 }
                             }
-                            let _ = index_btree.delete(&key_buf);
+                            let _ = index_btree.delete(key_buf);
                         }
                     }
                 }
@@ -697,8 +781,6 @@ impl Database {
             };
 
             if let Some(row_values) = old_row_values {
-                let mut key_buf: SmallVec<[u8; 64]> = SmallVec::new();
-
                 for (col_idx, index_name, _is_pk) in &unique_columns {
                     if file_manager.index_exists(&schema_name, &table_name, index_name) {
                         if let Some(value) = row_values.get(*col_idx) {
@@ -719,7 +801,7 @@ impl Database {
                                 let mut index_btree =
                                     BTree::new(&mut *index_storage, index_root_page)?;
                                 key_buf.clear();
-                                Self::encode_value_as_key(value, &mut key_buf);
+                                Self::encode_value_as_key(value, key_buf);
 
                                 let pk_idx = columns
                                     .iter()
@@ -727,7 +809,7 @@ impl Database {
                                 if let Some(pk_idx) = pk_idx {
                                     if let Some(OwnedValue::Int(pk_val)) = row_values.get(pk_idx) {
                                         let row_id_bytes = (*pk_val as u64).to_be_bytes();
-                                        let _ = index_btree.insert(&key_buf, &row_id_bytes);
+                                        let _ = index_btree.insert(key_buf, &row_id_bytes);
                                     }
                                 }
                             }
@@ -762,7 +844,7 @@ impl Database {
                             key_buf.clear();
                             for &col_idx in col_indices {
                                 if let Some(value) = row_values.get(col_idx) {
-                                    Self::encode_value_as_key(value, &mut key_buf);
+                                    Self::encode_value_as_key(value, key_buf);
                                 }
                             }
 
@@ -772,7 +854,7 @@ impl Database {
                             if let Some(pk_idx) = pk_idx {
                                 if let Some(OwnedValue::Int(pk_val)) = row_values.get(pk_idx) {
                                     let row_id_bytes = (*pk_val as u64).to_be_bytes();
-                                    let _ = index_btree.insert(&key_buf, &row_id_bytes);
+                                    let _ = index_btree.insert(key_buf, &row_id_bytes);
                                 }
                             }
                         }
@@ -823,9 +905,8 @@ impl Database {
             active_txn.take()
         };
 
-        if let Some(txn) = txn {
-            let write_entries: Vec<WriteEntry> = txn.write_entries.iter().cloned().collect();
-            let undo_data: Vec<Option<Vec<u8>>> = txn.undo_data.iter().cloned().collect();
+        if let Some(mut txn) = txn {
+            let (write_entries, undo_data) = txn.take_write_entries();
 
             let _ = self.undo_write_entries(&write_entries, &undo_data);
         }

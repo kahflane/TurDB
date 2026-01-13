@@ -8,6 +8,7 @@ license = "MIT"
 [features]
 default = []
 cli = ["rustyline"]
+timing = []
 
 [dependencies]
 eyre = "0.6"
@@ -36,26 +37,6 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 ureq = { version = "2.9", features = ["json"] }
 
-[[bench]]
-name = "btree"
-harness = false
-
-[[bench]]
-name = "encoding"
-harness = false
-
-[[bench]]
-name = "records"
-harness = false
-
-[[bench]]
-name = "database"
-harness = false
-
-[[bench]]
-name = "string_constraints"
-harness = false
-
 [[bin]]
 name = "turdb"
 path = "src/bin/turdb.rs"
@@ -74,3 +55,7 @@ debug = true
 
 [profile.bench]
 debug = true
+
+[[bench]]
+name = "insertion"
+harness = false
