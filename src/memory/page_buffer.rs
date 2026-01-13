@@ -37,7 +37,7 @@
 //! expected concurrent commit load.
 
 use crate::storage::PAGE_SIZE;
-use parking_lot::Mutex;
+use parking_lot::{Condvar, Mutex};
 use std::mem::ManuallyDrop;
 use std::ops::{Deref, DerefMut};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -52,6 +52,7 @@ const BUFFER_POOL_SHARD_COUNT: usize = 16;
 /// commit operations after initial pool creation.
 ///
 /// Uses 16-way lock sharding to reduce contention under high concurrency.
+/// When exhausted, `acquire_blocking` waits on a condition variable (PostgreSQL-style).
 pub struct PageBufferPool {
     inner: Arc<PageBufferPoolInner>,
 }
@@ -60,6 +61,10 @@ struct PageBufferPoolInner {
     shards: [Mutex<Vec<Box<[u8; PAGE_SIZE]>>>; BUFFER_POOL_SHARD_COUNT],
     /// Round-robin counter for distributing acquire requests across shards
     next_shard: AtomicUsize,
+    /// Condition variable for blocking acquire (PostgreSQL-style wait)
+    buffer_available: Condvar,
+    /// Mutex for the condition variable (protects nothing, just for Condvar API)
+    wait_lock: Mutex<()>,
 }
 
 impl PageBufferPool {
@@ -91,6 +96,8 @@ impl PageBufferPool {
             inner: Arc::new(PageBufferPoolInner {
                 shards,
                 next_shard: AtomicUsize::new(0),
+                buffer_available: Condvar::new(),
+                wait_lock: Mutex::new(()),
             }),
         }
     }
@@ -134,18 +141,26 @@ impl PageBufferPool {
         None
     }
 
-    /// Acquire a buffer from the pool, falling back to heap allocation if exhausted.
+    /// Acquire a buffer from the pool, blocking if none available.
     ///
-    /// This method should be used in commit paths where failing due to pool
-    /// exhaustion is unacceptable but allocation overhead is tolerable.
-    /// For hot CRUD paths, use `acquire()` which enforces zero-allocation.
+    /// This follows PostgreSQL's buffer pool semantics - when exhausted, the
+    /// caller waits on a condition variable until a buffer is returned.
+    /// This applies backpressure without wasting CPU or violating memory budget.
     ///
-    /// Returns a FallbackBuffer that may be either pooled or heap-allocated.
-    pub fn acquire_or_alloc(&self) -> FallbackBuffer {
-        if let Some(pooled) = self.acquire() {
-            FallbackBuffer::Pooled(pooled)
-        } else {
-            FallbackBuffer::Allocated(Box::new([0u8; PAGE_SIZE]))
+    /// # Blocking
+    /// Will block indefinitely if buffers are never returned. Ensure all acquired
+    /// buffers are dropped promptly to avoid deadlock.
+    pub fn acquire_blocking(&self) -> PooledPageBuffer {
+        if let Some(buffer) = self.acquire() {
+            return buffer;
+        }
+
+        let mut guard = self.inner.wait_lock.lock();
+        loop {
+            if let Some(buffer) = self.acquire() {
+                return buffer;
+            }
+            self.inner.buffer_available.wait(&mut guard);
         }
     }
 
@@ -232,6 +247,7 @@ impl Drop for PooledPageBuffer {
         // This is safe because drop() is only called once.
         let buffer = unsafe { ManuallyDrop::take(&mut self.buffer) };
         self.pool.shards[self.shard_idx].lock().push(buffer);
+        self.pool.buffer_available.notify_one();
     }
 }
 
@@ -248,52 +264,6 @@ unsafe impl Send for PooledPageBuffer {}
 // - PageBufferPoolInner contains only Mutex<Vec<...>> which is Sync
 // - No interior mutability is exposed through &PooledPageBuffer (Deref returns &[u8])
 unsafe impl Sync for PooledPageBuffer {}
-
-/// A buffer that may be pooled or heap-allocated.
-///
-/// Used by `acquire_or_alloc()` to provide fallback allocation in commit paths
-/// while still preferring pooled buffers when available.
-pub enum FallbackBuffer {
-    Pooled(PooledPageBuffer),
-    Allocated(Box<[u8; PAGE_SIZE]>),
-}
-
-impl FallbackBuffer {
-    /// Copy data into the buffer, truncating or zero-padding to PAGE_SIZE.
-    pub fn copy_from_page(&mut self, data: &[u8]) {
-        let buf = self.as_mut_slice();
-        let copy_len = data.len().min(PAGE_SIZE);
-        buf[..copy_len].copy_from_slice(&data[..copy_len]);
-        if copy_len < PAGE_SIZE {
-            buf[copy_len..].fill(0);
-        }
-    }
-
-    /// Returns the buffer contents as a slice.
-    pub fn as_slice(&self) -> &[u8] {
-        match self {
-            FallbackBuffer::Pooled(p) => p.as_slice(),
-            FallbackBuffer::Allocated(b) => b.as_slice(),
-        }
-    }
-
-    /// Returns the buffer contents as a mutable slice.
-    pub fn as_mut_slice(&mut self) -> &mut [u8] {
-        match self {
-            FallbackBuffer::Pooled(p) => p.deref_mut().as_mut_slice(),
-            FallbackBuffer::Allocated(b) => b.as_mut_slice(),
-        }
-    }
-}
-
-impl std::fmt::Debug for FallbackBuffer {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            FallbackBuffer::Pooled(p) => f.debug_tuple("Pooled").field(p).finish(),
-            FallbackBuffer::Allocated(_) => f.debug_tuple("Allocated").finish(),
-        }
-    }
-}
 
 #[cfg(test)]
 mod tests {

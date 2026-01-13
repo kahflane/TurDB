@@ -75,4 +75,4 @@ mod budget;
 mod page_buffer;
 
 pub use budget::{BudgetStats, MemoryBudget, MemoryError, Pool};
-pub use page_buffer::{FallbackBuffer, PageBufferPool, PooledPageBuffer};
+pub use page_buffer::{PageBufferPool, PooledPageBuffer};
