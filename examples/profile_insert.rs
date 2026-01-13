@@ -41,7 +41,19 @@ fn main() {
     let wal_mode = std::env::var("WAL").unwrap_or_else(|_| "OFF".to_string());
     db.execute(&format!("PRAGMA WAL = {}", wal_mode))
         .expect("failed to set WAL mode");
-    println!("WAL mode: {}", wal_mode);
+
+    let sync_mode = std::env::var("SYNC").unwrap_or_else(|_| "FULL".to_string());
+    db.execute(&format!("PRAGMA synchronous = {}", sync_mode))
+        .expect("failed to set sync mode");
+
+    let autoflush = std::env::var("AUTOFLUSH").unwrap_or_else(|_| "ON".to_string());
+    db.execute(&format!("PRAGMA WAL_AUTOFLUSH = {}", autoflush))
+        .expect("failed to set autoflush mode");
+
+    println!(
+        "WAL: {}, Sync: {}, Autoflush: {}",
+        wal_mode, sync_mode, autoflush
+    );
 
     let stmt = db
         .prepare("INSERT INTO bench (id, name, value) VALUES (?, ?, ?)")

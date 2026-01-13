@@ -27,6 +27,7 @@
 //! - `bulk_insert`: Best throughput for large loads (100K+ rows)
 
 use crate::btree::BTree;
+#[cfg(feature = "timing")]
 use crate::database::timing::{
     BTREE_INSERT_NS, INDEX_UPDATE_NS, INSERT_COUNT, MVCC_WRAP_NS, PAGE0_READ_NS, PAGE0_UPDATE_NS,
     RECORD_BUILD_NS, STORAGE_LOCK_NS, TXN_LOOKUP_NS, WAL_FLUSH_NS,
@@ -173,6 +174,7 @@ impl Database {
     ) -> Result<usize> {
         use crate::database::dml::mvcc_helpers::wrap_record_for_insert;
 
+        #[cfg(feature = "timing")]
         INSERT_COUNT.fetch_add(1, Ordering::Relaxed);
 
         self.ensure_file_manager()?;
@@ -182,7 +184,9 @@ impl Database {
             self.ensure_wal()?;
         }
 
+        #[cfg(feature = "timing")]
         let storage_lock_start = std::time::Instant::now();
+
         let storage_arc = if let Some(weak) = plan.storage.borrow().as_ref() {
             weak.upgrade()
         } else {
@@ -200,9 +204,13 @@ impl Database {
         };
 
         let mut storage_guard = storage_arc.write();
+
+        #[cfg(feature = "timing")]
         STORAGE_LOCK_NS.fetch_add(storage_lock_start.elapsed().as_nanos() as u64, Ordering::Relaxed);
 
+        #[cfg(feature = "timing")]
         let page0_start = std::time::Instant::now();
+
         let (mut root_page, mut rightmost_hint) = {
             let page = storage_guard.page(0)?;
             let header = TableFileHeader::from_bytes(page)?;
@@ -211,17 +219,25 @@ impl Database {
             let root = if stored_root > 0 { stored_root } else { 1 };
             (root, if hint > 0 { Some(hint) } else { Some(root) })
         };
+
+        #[cfg(feature = "timing")]
         PAGE0_READ_NS.fetch_add(page0_start.elapsed().as_nanos() as u64, Ordering::Relaxed);
 
+        #[cfg(feature = "timing")]
         let record_start = std::time::Instant::now();
+
         let mut record_builder = crate::records::RecordBuilder::new(&plan.record_schema);
 
         let mut buffer_guard = plan.record_buffer.borrow_mut();
         buffer_guard.clear();
         OwnedValue::build_record_into_buffer(params, &mut record_builder, &mut buffer_guard)?;
+
+        #[cfg(feature = "timing")]
         RECORD_BUILD_NS.fetch_add(record_start.elapsed().as_nanos() as u64, Ordering::Relaxed);
 
+        #[cfg(feature = "timing")]
         let txn_start = std::time::Instant::now();
+
         let (txn_id, in_transaction) = {
             let active_txn = self.active_txn.lock();
             if let Some(ref txn) = *active_txn {
@@ -236,16 +252,24 @@ impl Database {
                 )
             }
         };
+
+        #[cfg(feature = "timing")]
         TXN_LOOKUP_NS.fetch_add(txn_start.elapsed().as_nanos() as u64, Ordering::Relaxed);
 
+        #[cfg(feature = "timing")]
         let mvcc_start = std::time::Instant::now();
+
         let mvcc_record = wrap_record_for_insert(txn_id, &buffer_guard, in_transaction);
+
+        #[cfg(feature = "timing")]
         MVCC_WRAP_NS.fetch_add(mvcc_start.elapsed().as_nanos() as u64, Ordering::Relaxed);
 
         let row_id = self.shared.next_row_id.fetch_add(1, Ordering::Relaxed);
         let row_key = Self::generate_row_key(row_id);
 
+        #[cfg(feature = "timing")]
         let btree_start = std::time::Instant::now();
+
         if wal_enabled {
             let mut wal_storage = WalStoragePerTable::new(
                 &mut storage_guard,
@@ -264,9 +288,13 @@ impl Database {
             root_page = btree.root_page();
             rightmost_hint = btree.rightmost_hint();
         }
+
+        #[cfg(feature = "timing")]
         BTREE_INSERT_NS.fetch_add(btree_start.elapsed().as_nanos() as u64, Ordering::Relaxed);
 
+        #[cfg(feature = "timing")]
         let index_start = std::time::Instant::now();
+
         let row_id_bytes = row_id.to_be_bytes();
         for index_plan in &plan.indexes {
             let index_storage_arc = if let Some(weak) = index_plan.storage.borrow().as_ref() {
@@ -319,9 +347,12 @@ impl Database {
                 header.set_root_page(new_root);
             }
         }
+        #[cfg(feature = "timing")]
         INDEX_UPDATE_NS.fetch_add(index_start.elapsed().as_nanos() as u64, Ordering::Relaxed);
 
+        #[cfg(feature = "timing")]
         let page0_update_start = std::time::Instant::now();
+
         {
             let page = storage_guard.page_mut(0)?;
             let header = TableFileHeader::from_bytes_mut(page)?;
@@ -332,10 +363,14 @@ impl Database {
             let new_row_count = header.row_count().saturating_add(1);
             header.set_row_count(new_row_count);
         }
+
+        #[cfg(feature = "timing")]
         PAGE0_UPDATE_NS.fetch_add(page0_update_start.elapsed().as_nanos() as u64, Ordering::Relaxed);
 
-        if wal_enabled {
+        if wal_enabled && self.shared.wal_autoflush.load(Ordering::Acquire) {
+            #[cfg(feature = "timing")]
             let wal_flush_start = std::time::Instant::now();
+
             let txn_active = self.active_txn.lock().is_some();
             if !txn_active
                 && self
@@ -353,6 +388,8 @@ impl Database {
                     )?;
                 }
             }
+
+            #[cfg(feature = "timing")]
             WAL_FLUSH_NS.fetch_add(wal_flush_start.elapsed().as_nanos() as u64, Ordering::Relaxed);
         }
 

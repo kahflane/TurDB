@@ -133,6 +133,8 @@ fn setup_turdb_wal_on(path: &Path) -> Database {
     db.execute("PRAGMA WAL = ON").expect("Failed to enable WAL");
     db.execute("PRAGMA SYNCHRONOUS = OFF")
         .expect("Failed to set synchronous mode");
+    db.execute("PRAGMA WAL_AUTOFLUSH = OFF")
+        .expect("Failed to disable autoflush");
 
     db.execute(
         "CREATE TABLE test_data (

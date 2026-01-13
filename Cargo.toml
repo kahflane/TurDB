@@ -8,6 +8,7 @@ license = "MIT"
 [features]
 default = []
 cli = ["rustyline"]
+timing = []
 
 [dependencies]
 eyre = "0.6"
