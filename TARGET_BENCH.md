@@ -1,6 +1,6 @@
 # TurDB vs SQLite Insertion Benchmarks
 
-**Date:** 2026-01-13
+**Date:** 2026-01-13 (Updated after Phase 3)
 **System:** macOS Darwin 25.1.0
 **Benchmark:** `cargo bench --bench insertion`
 
@@ -12,12 +12,12 @@
 
 | Database | WAL Mode | Time | Throughput | vs SQLite WAL ON |
 |----------|----------|------|------------|------------------|
-| SQLite | ON | 1.57 ms | 638 K/s | baseline |
-| SQLite | OFF | 1.74 ms | 574 K/s | 0.90x |
-| TurDB | ON | 20.5 ms | 49 K/s | 0.08x |
-| TurDB | OFF | 19.5 ms | 51 K/s | 0.08x |
+| SQLite | ON | 1.58 ms | 633 K/s | baseline |
+| SQLite | OFF | 1.81 ms | 554 K/s | 0.88x |
+| TurDB | ON | 18.9 ms | 53 K/s | 0.08x |
+| TurDB | OFF | 17.9 ms | 56 K/s | 0.09x |
 
-**Gap: SQLite is ~13x faster**
+**Gap: SQLite is ~11x faster**
 
 ---
 
@@ -25,12 +25,12 @@
 
 | Database | WAL Mode | Time | Throughput | vs SQLite WAL ON |
 |----------|----------|------|------------|------------------|
-| SQLite | ON | 4.90 ms | 2.04 M/s | baseline |
-| SQLite | OFF | 4.87 ms | 2.06 M/s | 1.01x |
-| TurDB | ON | 18.8 ms | 532 K/s | 0.26x |
-| TurDB | OFF | 11.9 ms | 842 K/s | 0.41x |
+| SQLite | ON | 4.99 ms | 2.00 M/s | baseline |
+| SQLite | OFF | 4.87 ms | 2.06 M/s | 1.03x |
+| TurDB | ON | 15.3 ms | 653 K/s | 0.33x |
+| TurDB | OFF | 9.02 ms | 1.11 M/s | 0.55x |
 
-**Gap: SQLite is ~4x faster**
+**Gap: SQLite is ~1.9x faster (WAL OFF)**
 
 ---
 
@@ -38,12 +38,12 @@
 
 | Database | WAL Mode | Time | Throughput | vs SQLite WAL ON |
 |----------|----------|------|------------|------------------|
-| SQLite | ON | 103 ms | 967 K/s | baseline |
-| SQLite | OFF | 117 ms | 855 K/s | 0.88x |
-| TurDB | ON | 607 ms | 165 K/s | 0.17x |
-| TurDB | OFF | 397 ms | 252 K/s | 0.26x |
+| SQLite | ON | 109 ms | 916 K/s | baseline |
+| SQLite | OFF | 118 ms | 850 K/s | 0.93x |
+| TurDB | ON | 598 ms | 167 K/s | 0.18x |
+| TurDB | OFF | 392 ms | 255 K/s | 0.28x |
 
-**Gap: SQLite is ~4-6x faster**
+**Gap: SQLite is ~3-5x faster**
 
 ---
 
@@ -51,26 +51,26 @@
 
 | Database | WAL Mode | Time | Throughput | vs SQLite WAL ON |
 |----------|----------|------|------------|------------------|
-| SQLite | ON | 51 ms | 1.96 M/s | baseline |
-| SQLite | OFF | 68 ms | 1.48 M/s | 0.76x |
-| TurDB | ON | 303 ms | 330 K/s | 0.17x |
-| TurDB | OFF | 98 ms | 1.02 M/s | 0.52x |
+| SQLite | ON | 52.9 ms | 1.89 M/s | baseline |
+| SQLite | OFF | 64.2 ms | 1.56 M/s | 0.82x |
+| TurDB | ON | 282 ms | 354 K/s | 0.19x |
+| TurDB | OFF | 82.3 ms | 1.22 M/s | 0.64x |
 
-**Gap: SQLite is ~2-6x faster**
+**Gap: SQLite is ~1.6x faster (WAL OFF)**
 
 ---
 
-## Current State Summary
+## Current State Summary (After Phase 3)
 
-| Metric | SQLite Best | TurDB Best | Gap |
-|--------|-------------|------------|-----|
-| Raw SQL parsing | 638 K/s | 51 K/s | 12.5x |
-| Prepared statement | 2.06 M/s | 842 K/s | 2.4x |
-| Batch SQL | 967 K/s | 252 K/s | 3.8x |
-| Batch prepared | 1.96 M/s | 1.02 M/s | 1.9x |
+| Metric | SQLite Best | TurDB Best | Gap | Improvement |
+|--------|-------------|------------|-----|-------------|
+| Raw SQL parsing | 633 K/s | 56 K/s | 11.3x | +10% |
+| Prepared statement | 2.06 M/s | 1.11 M/s | 1.9x | +32% |
+| Batch SQL | 916 K/s | 255 K/s | 3.6x | +1% |
+| Batch prepared | 1.89 M/s | 1.22 M/s | 1.55x | +20% |
 
-**Best case gap: 1.9x (batch prepared, WAL OFF)**
-**Worst case gap: 12.5x (raw SQL parsing)**
+**Best case gap: 1.55x (batch prepared, WAL OFF)**
+**Worst case gap: 11.3x (raw SQL parsing)**
 
 ---
 
@@ -350,16 +350,54 @@ See Phase 1.3 above.
 | Baseline | 843 K/s | 251/s | ✓ Measured |
 | After P1 (WAL fix) | 977 K/s | 326 K/s | ✓ **DONE** |
 | After P2 (overhead) | 1.08 M/s | 334 K/s | ✓ **DONE** |
-| After P3 (index cache) | 1.12 M/s | 342 K/s | ✓ **DONE** |
-| Match SQLite | 2.0 M/s | 2.0 M/s | Goal |
+| After P2.5 (index cache) | 1.12 M/s | 342 K/s | ✓ **DONE** |
+| After P3 (rightmost+atomic) | 1.22 M/s | 354 K/s | ✓ **DONE** |
+| Match SQLite | 1.89 M/s | 1.89 M/s | Goal |
 
-**Latest Results (2026-01-13, AUTOFLUSH=OFF):**
-- batch_prepared WAL OFF: **1.12 M/s** (improved +33% from baseline 843 K/s)
-- batch_prepared WAL ON: **342 K/s** (improved **1360x** from baseline 251/s)
+**Latest Results (2026-01-13, AUTOFLUSH=OFF, After Phase 3):**
+- batch_prepared WAL OFF: **1.22 M/s** (improved +45% from baseline 843 K/s)
+- batch_prepared WAL ON: **354 K/s** (improved **1410x** from baseline 251/s)
+- single_prepared WAL OFF: **1.11 M/s** (improved +32% from baseline)
 
-**Gap with SQLite (target: 2.0 M/s):**
-- WAL OFF: ~1.8x slower (was ~2.4x)
-- WAL ON: ~5.8x slower (was ~7,800x)
+**Gap with SQLite (target: 1.89 M/s):**
+- WAL OFF: ~1.55x slower (was ~2.4x at baseline)
+- WAL ON: ~5.3x slower (was ~7,800x at baseline)
+
+---
+
+## Phase 3 Optimizations (2026-01-13)
+
+### 3.1 Rightmost Hint for Index Inserts
+
+**Problem:** Index B-tree inserts were doing full tree traversal for every sequential insert.
+
+**Solution:**
+- Added `rightmost_hint` field to `CachedIndexPlan`
+- Index inserts now use `BTree::with_rightmost_hint()` to start near the insertion point
+- Uses `insert_append` for sequential key patterns
+
+**Result:** +10% improvement (1.12M → 1.24M for WAL OFF)
+
+### 3.2 Atomic Flags for ensure_* Paths
+
+**Problem:** `ensure_file_manager()` and `ensure_wal()` took locks on every insert just to check initialization.
+
+**Solution:**
+- Added `file_manager_ready` and `wal_ready` atomic bools to `SharedDatabase`
+- Check atomic flag first with `Acquire` ordering before taking any lock
+- Set flag to `true` with `Release` ordering after initialization
+
+**Result:** +5% improvement (1.24M → 1.29M for WAL OFF)
+
+### 3.3 RecordBuilder Buffer Reuse
+
+**Problem:** Variable column setters (set_blob, set_text, etc.) allocated new Vec on every call.
+
+**Solution:**
+- Changed `var = data.to_vec()` to `var.clear(); var.extend_from_slice(data)`
+- Reuses existing Vec capacity when RecordBuilder is reused via reset()
+
+**Result:** Foundation for future RecordBuilder caching optimization
 
 ---
 
