@@ -35,7 +35,7 @@ use crate::database::timing::{
 use crate::database::Database;
 use crate::storage::{TableFileHeader, WalStoragePerTable, DEFAULT_SCHEMA};
 use crate::types::{create_record_schema, OwnedValue};
-use eyre::Result;
+use eyre::{Result, WrapErr};
 use std::sync::atomic::Ordering;
 
 impl Database {
@@ -237,7 +237,7 @@ impl Database {
             .record_builder_state
             .borrow_mut()
             .take()
-            .unwrap_or_else(|| crate::records::RecordBuilderState::new(&plan.record_schema));
+            .expect("record_builder_state must be initialized in CachedInsertPlan");
         let mut record_builder = state.into_builder(&plan.record_schema);
 
         let mut buffer_guard = plan.record_buffer.borrow_mut();
@@ -325,16 +325,16 @@ impl Database {
             } else {
                 let mut file_manager_guard = self.shared.file_manager.write();
                 let file_manager = file_manager_guard.as_mut().unwrap();
-                if let Ok(arc) = file_manager.index_data_mut(
-                    &plan.schema_name,
-                    &plan.table_name,
-                    &index_plan.name,
-                ) {
-                    *index_plan.storage.borrow_mut() = Some(std::sync::Arc::downgrade(&arc));
-                    arc
-                } else {
-                    continue;
-                }
+                let arc = file_manager
+                    .index_data_mut(&plan.schema_name, &plan.table_name, &index_plan.name)
+                    .wrap_err_with(|| {
+                        format!(
+                            "failed to open index '{}' for table '{}.{}' during insert",
+                            index_plan.name, plan.schema_name, plan.table_name
+                        )
+                    })?;
+                *index_plan.storage.borrow_mut() = Some(std::sync::Arc::downgrade(&arc));
+                arc
             };
 
             let mut index_storage_guard = index_storage_arc.write();
@@ -412,14 +412,15 @@ impl Database {
                     .has_dirty_pages(plan.table_id as u32)
             {
                 let mut wal_guard = self.shared.wal.lock();
-                if let Some(wal) = wal_guard.as_mut() {
-                    WalStoragePerTable::flush_wal_for_table(
-                        &self.shared.dirty_tracker,
-                        &storage_guard,
-                        wal,
-                        plan.table_id as u32,
-                    )?;
-                }
+                let wal = wal_guard.as_mut().ok_or_else(|| {
+                    eyre::eyre!("WAL enabled but not initialized - this indicates a bug")
+                })?;
+                WalStoragePerTable::flush_wal_for_table(
+                    &self.shared.dirty_tracker,
+                    &storage_guard,
+                    wal,
+                    plan.table_id as u32,
+                )?;
             }
 
             #[cfg(feature = "timing")]
