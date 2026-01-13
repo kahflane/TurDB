@@ -29,6 +29,62 @@ enum ColumnValue {
     Variable { idx: usize },
 }
 
+#[derive(Debug, Clone)]
+pub struct RecordBuilderState {
+    null_bitmap: Vec<u8>,
+    fixed_data: Vec<u8>,
+    var_data: Vec<Vec<u8>>,
+    column_values: Vec<ColumnValue>,
+}
+
+impl RecordBuilderState {
+    pub fn new(schema: &Schema) -> Self {
+        let bitmap_size = Schema::null_bitmap_size(schema.column_count());
+        let mut null_bitmap = vec![0u8; bitmap_size];
+        for i in 0..schema.column_count() {
+            let byte_idx = i / 8;
+            let bit_idx = i % 8;
+            null_bitmap[byte_idx] |= 1 << bit_idx;
+        }
+
+        let fixed_data = vec![0u8; schema.total_fixed_size()];
+        let var_data = vec![Vec::new(); schema.var_column_count()];
+        let column_values = vec![ColumnValue::Null; schema.column_count()];
+
+        Self {
+            null_bitmap,
+            fixed_data,
+            var_data,
+            column_values,
+        }
+    }
+
+    pub fn reset(&mut self, schema: &Schema) {
+        for i in 0..schema.column_count() {
+            let byte_idx = i / 8;
+            let bit_idx = i % 8;
+            self.null_bitmap[byte_idx] |= 1 << bit_idx;
+        }
+        self.fixed_data.fill(0);
+        for var in &mut self.var_data {
+            var.clear();
+        }
+        for val in &mut self.column_values {
+            *val = ColumnValue::Null;
+        }
+    }
+
+    pub fn into_builder(self, schema: &Schema) -> RecordBuilder<'_> {
+        RecordBuilder {
+            schema,
+            null_bitmap: self.null_bitmap,
+            fixed_data: self.fixed_data,
+            var_data: self.var_data,
+            column_values: self.column_values,
+        }
+    }
+}
+
 pub struct RecordBuilder<'a> {
     schema: &'a Schema,
     null_bitmap: Vec<u8>,
@@ -72,6 +128,15 @@ impl<'a> RecordBuilder<'a> {
         }
         for val in &mut self.column_values {
             *val = ColumnValue::Null;
+        }
+    }
+
+    pub fn into_state(self) -> RecordBuilderState {
+        RecordBuilderState {
+            null_bitmap: self.null_bitmap,
+            fixed_data: self.fixed_data,
+            var_data: self.var_data,
+            column_values: self.column_values,
         }
     }
 

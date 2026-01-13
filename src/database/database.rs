@@ -3282,13 +3282,16 @@ impl Database {
                         }
                     }
 
+                    let record_schema = create_record_schema(table_def.columns());
+                    let builder_state =
+                        crate::records::RecordBuilderState::new(&record_schema);
                     let cached_plan = super::prepared::CachedInsertPlan {
                         table_id: table_def.id(),
                         schema_name: schema_name.to_string(),
                         table_name: table_name.to_string(),
                         column_count: column_types.len(),
                         column_types,
-                        record_schema: create_record_schema(table_def.columns()),
+                        record_schema,
                         root_page: std::cell::Cell::new(0),
                         rightmost_hint: std::cell::Cell::new(None),
                         row_count: std::cell::Cell::new(None),
@@ -3296,6 +3299,7 @@ impl Database {
                             &storage_arc,
                         ))),
                         record_buffer: std::cell::RefCell::new(Vec::with_capacity(256)),
+                        record_builder_state: std::cell::RefCell::new(Some(builder_state)),
                         indexes,
                     };
 

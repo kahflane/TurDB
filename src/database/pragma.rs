@@ -72,8 +72,8 @@ impl Database {
         if let Some(val) = value {
             match val {
                 "ON" | "TRUE" | "1" => {
-                    self.shared.wal_enabled.store(true, Ordering::Release);
                     self.ensure_wal()?;
+                    self.shared.wal_enabled.store(true, Ordering::Release);
                 }
                 "OFF" | "FALSE" | "0" => {
                     self.shared.wal_enabled.store(false, Ordering::Release);

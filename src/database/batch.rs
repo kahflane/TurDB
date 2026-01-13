@@ -211,13 +211,20 @@ impl Database {
         #[cfg(feature = "timing")]
         let page0_start = std::time::Instant::now();
 
-        let (mut root_page, mut rightmost_hint) = {
+        let cached_root = plan.root_page.get();
+        let cached_hint = plan.rightmost_hint.get();
+        let (mut root_page, mut rightmost_hint) = if cached_root > 0 {
+            (cached_root, cached_hint.or(Some(cached_root)))
+        } else {
             let page = storage_guard.page(0)?;
             let header = TableFileHeader::from_bytes(page)?;
             let stored_root = header.root_page();
             let hint = header.rightmost_hint();
             let root = if stored_root > 0 { stored_root } else { 1 };
-            (root, if hint > 0 { Some(hint) } else { Some(root) })
+            let hint_opt = if hint > 0 { Some(hint) } else { Some(root) };
+            plan.root_page.set(root);
+            plan.rightmost_hint.set(hint_opt);
+            (root, hint_opt)
         };
 
         #[cfg(feature = "timing")]
@@ -226,11 +233,18 @@ impl Database {
         #[cfg(feature = "timing")]
         let record_start = std::time::Instant::now();
 
-        let mut record_builder = crate::records::RecordBuilder::new(&plan.record_schema);
+        let state = plan
+            .record_builder_state
+            .borrow_mut()
+            .take()
+            .unwrap_or_else(|| crate::records::RecordBuilderState::new(&plan.record_schema));
+        let mut record_builder = state.into_builder(&plan.record_schema);
 
         let mut buffer_guard = plan.record_buffer.borrow_mut();
         buffer_guard.clear();
         OwnedValue::build_record_into_buffer(params, &mut record_builder, &mut buffer_guard)?;
+
+        *plan.record_builder_state.borrow_mut() = Some(record_builder.into_state());
 
         #[cfg(feature = "timing")]
         RECORD_BUILD_NS.fetch_add(record_start.elapsed().as_nanos() as u64, Ordering::Relaxed);
@@ -288,6 +302,9 @@ impl Database {
             root_page = btree.root_page();
             rightmost_hint = btree.rightmost_hint();
         }
+
+        plan.root_page.set(root_page);
+        plan.rightmost_hint.set(rightmost_hint);
 
         #[cfg(feature = "timing")]
         BTREE_INSERT_NS.fetch_add(btree_start.elapsed().as_nanos() as u64, Ordering::Relaxed);
