@@ -273,13 +273,6 @@ impl Database {
             .wal_enabled
             .load(std::sync::atomic::Ordering::Acquire);
 
-        {
-            let active_txn = self.active_txn.lock();
-            active_txn
-                .as_ref()
-                .ok_or_else(|| eyre::eyre!("no transaction in progress"))?;
-        }
-
         let mut active_txn = self.active_txn.lock();
         let txn = active_txn
             .take()
