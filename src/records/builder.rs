@@ -215,7 +215,9 @@ impl<'a> RecordBuilder<'a> {
             .schema
             .var_column_index(col_idx)
             .ok_or_else(|| eyre::eyre!("column {} is not a variable column", col_idx))?;
-        self.var_data[var_idx] = data.to_vec();
+        let var = &mut self.var_data[var_idx];
+        var.clear();
+        var.extend_from_slice(data);
         self.column_values[col_idx] = ColumnValue::Variable { idx: var_idx };
         Ok(())
     }
@@ -290,7 +292,9 @@ impl<'a> RecordBuilder<'a> {
             .schema
             .var_column_index(col_idx)
             .ok_or_else(|| eyre::eyre!("column {} is not a variable column", col_idx))?;
-        self.var_data[var_idx] = data.to_vec();
+        let var = &mut self.var_data[var_idx];
+        var.clear();
+        var.extend_from_slice(data);
         self.column_values[col_idx] = ColumnValue::Variable { idx: var_idx };
         Ok(())
     }
@@ -491,7 +495,9 @@ impl<'a> RecordBuilder<'a> {
             .schema
             .var_column_index(col_idx)
             .ok_or_else(|| eyre::eyre!("column {} is not a variable column", col_idx))?;
-        self.var_data[var_idx] = data.to_vec();
+        let var = &mut self.var_data[var_idx];
+        var.clear();
+        var.extend_from_slice(data);
         self.column_values[col_idx] = ColumnValue::Variable { idx: var_idx };
         Ok(())
     }
@@ -502,7 +508,9 @@ impl<'a> RecordBuilder<'a> {
             .schema
             .var_column_index(col_idx)
             .ok_or_else(|| eyre::eyre!("column {} is not a variable column", col_idx))?;
-        self.var_data[var_idx] = data.to_vec();
+        let var = &mut self.var_data[var_idx];
+        var.clear();
+        var.extend_from_slice(data);
         self.column_values[col_idx] = ColumnValue::Variable { idx: var_idx };
         Ok(())
     }
