@@ -103,6 +103,8 @@ pub(crate) struct SharedDatabase {
     pub(crate) closed: std::sync::atomic::AtomicBool,
     pub(crate) wal_enabled: std::sync::atomic::AtomicBool,
     pub(crate) wal_autoflush: std::sync::atomic::AtomicBool,
+    pub(crate) file_manager_ready: std::sync::atomic::AtomicBool,
+    pub(crate) wal_ready: std::sync::atomic::AtomicBool,
     pub(crate) dirty_tracker: ShardedDirtyTracker,
     pub(crate) txn_manager: TransactionManager,
     pub(crate) table_id_lookup: RwLock<hashbrown::HashMap<u32, (String, String)>>,
@@ -256,6 +258,8 @@ impl Database {
             closed: AtomicBool::new(false),
             wal_enabled: AtomicBool::new(false),
             wal_autoflush: AtomicBool::new(true),
+            file_manager_ready: AtomicBool::new(false),
+            wal_ready: AtomicBool::new(false),
             dirty_tracker: ShardedDirtyTracker::new(),
             txn_manager: TransactionManager::new(),
             table_id_lookup: RwLock::new(hashbrown::HashMap::new()),
@@ -331,6 +335,8 @@ impl Database {
             closed: AtomicBool::new(false),
             wal_enabled: AtomicBool::new(false),
             wal_autoflush: AtomicBool::new(true),
+            file_manager_ready: AtomicBool::new(false),
+            wal_ready: AtomicBool::new(false),
             dirty_tracker: ShardedDirtyTracker::new(),
             txn_manager: TransactionManager::new(),
             table_id_lookup: RwLock::new(hashbrown::HashMap::new()),
@@ -366,7 +372,8 @@ impl Database {
     }
 
     pub(crate) fn ensure_file_manager(&self) -> Result<()> {
-        if self.shared.file_manager.read().is_some() {
+        use std::sync::atomic::Ordering;
+        if self.shared.file_manager_ready.load(Ordering::Acquire) {
             return Ok(());
         }
         let mut guard = self.shared.file_manager.write();
@@ -376,6 +383,7 @@ impl Database {
             })?;
             *guard = Some(fm);
         }
+        self.shared.file_manager_ready.store(true, Ordering::Release);
         Ok(())
     }
 
@@ -519,6 +527,10 @@ impl Database {
     }
 
     pub fn ensure_wal(&self) -> Result<()> {
+        use std::sync::atomic::Ordering;
+        if self.shared.wal_ready.load(Ordering::Acquire) {
+            return Ok(());
+        }
         let mut guard = self.shared.wal.lock();
         if guard.is_none() {
             let wal = if self.shared.wal_dir.exists() {
@@ -531,6 +543,7 @@ impl Database {
             };
             *guard = Some(wal);
         }
+        self.shared.wal_ready.store(true, Ordering::Release);
         Ok(())
     }
 
