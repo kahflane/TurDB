@@ -344,16 +344,23 @@ impl Database {
                 }
             }
 
-            let mut index_btree = BTree::new(&mut *index_storage_guard, index_root)?;
-            index_btree.insert(&key_buf_guard, &row_id_bytes)?;
+            let index_rightmost = index_plan.rightmost_hint.get();
+            let mut index_btree =
+                BTree::with_rightmost_hint(&mut *index_storage_guard, index_root, index_rightmost)?;
+            index_btree.insert_append(&key_buf_guard, &row_id_bytes)?;
 
             let new_root = index_btree.root_page();
+            let new_rightmost = index_btree.rightmost_hint();
+
             if new_root != index_root {
                 use crate::storage::IndexFileHeader;
                 let page = index_storage_guard.page_mut(0)?;
                 let header = IndexFileHeader::from_bytes_mut(page)?;
                 header.set_root_page(new_root);
                 index_plan.root_page.set(new_root);
+            }
+            if new_rightmost != index_rightmost {
+                index_plan.rightmost_hint.set(new_rightmost);
             }
         }
         #[cfg(feature = "timing")]

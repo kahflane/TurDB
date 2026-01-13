@@ -3232,6 +3232,7 @@ impl Database {
                                     storage: std::cell::RefCell::new(None),
                                     key_buffer: std::cell::RefCell::new(Vec::with_capacity(64)),
                                     root_page: std::cell::Cell::new(0),
+                                    rightmost_hint: std::cell::Cell::new(None),
                                 });
                             }
                         }
@@ -3263,6 +3264,7 @@ impl Database {
                                 storage: std::cell::RefCell::new(None),
                                 key_buffer: std::cell::RefCell::new(Vec::with_capacity(64)),
                                 root_page: std::cell::Cell::new(0),
+                                rightmost_hint: std::cell::Cell::new(None),
                             });
                         }
                     }

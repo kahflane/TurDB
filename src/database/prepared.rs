@@ -127,6 +127,7 @@ pub struct CachedIndexPlan {
     pub storage: std::cell::RefCell<Option<std::sync::Weak<RwLock<MmapStorage>>>>,
     pub key_buffer: std::cell::RefCell<Vec<u8>>,
     pub root_page: std::cell::Cell<u32>,
+    pub rightmost_hint: std::cell::Cell<Option<u32>>,
 }
 
 #[derive(Debug, Clone)]
