@@ -112,7 +112,10 @@ pub(crate) mod query;
 pub use database::Database;
 pub use prepared::{BoundStatement, PreparedStatement};
 pub use row::Row;
-pub use timing::{get_batch_timing_stats, get_timing_stats, reset_timing_stats};
+pub use timing::{
+    get_batch_timing_stats, get_insert_timing_breakdown, get_timing_stats, reset_timing_stats,
+    InsertTimingBreakdown,
+};
 pub use transaction::{ActiveTransaction, Savepoint};
 
 /// Database operating mode.

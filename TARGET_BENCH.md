@@ -225,6 +225,120 @@
 
 ---
 
+## Profiling Results (2026-01-13)
+
+### insert_cached Breakdown (WAL OFF, 10K inserts)
+
+| Component | Time/Insert | % of Total |
+|-----------|-------------|------------|
+| Index update | 322 ns | 27.2% |
+| B-tree insert | 168 ns | 14.2% |
+| Record build | 109 ns | 9.3% |
+| Txn lookup | 26 ns | 2.2% |
+| Storage lock | 25 ns | 2.1% |
+| MVCC wrap | 25 ns | 2.1% |
+| Page 0 update | 24 ns | 2.0% |
+| Page 0 read | 20 ns | 1.7% |
+| **Unaccounted** | **466 ns** | **39.3%** |
+| **Total** | **1,185 ns** | **100%** |
+
+**Throughput:** 843K inserts/sec (WAL OFF)
+
+### insert_cached Breakdown (WAL ON, 10K inserts)
+
+| Component | Time/Insert | % of Total |
+|-----------|-------------|------------|
+| **WAL flush** | **3,968,090 ns** | **99.5%** |
+| Index update | 5,710 ns | 0.1% |
+| B-tree insert | 3,068 ns | 0.1% |
+| Record build | 2,003 ns | 0.1% |
+| Other | ~1,400 ns | 0.0% |
+| **Total** | **3,986,314 ns** | **100%** |
+
+**Throughput:** 251 inserts/sec (WAL ON)
+
+### Key Findings
+
+1. **WAL flush is catastrophic:** 99.5% of time with WAL ON
+   - 3.97ms per insert just for WAL flushing
+   - TurDB flushes WAL after EVERY insert when not in a transaction
+   - SQLite batches WAL writes with group commit
+
+2. **"Unaccounted" time is significant:** 39% with WAL OFF
+   - Overhead in PreparedStatement bind/execute chain
+   - `with_cached_plan()` closure overhead
+   - `execute_insert_cached()` validation overhead
+   - Loop iteration and function call overhead
+
+3. **Index update dominates insert_cached:** 27.2%
+   - Even for just a PRIMARY KEY index
+   - Involves separate B-tree lookup and insert
+
+4. **B-tree insert is reasonable:** 14.2%
+   - Core data insertion is already fairly optimized
+
+5. **Record build is not the bottleneck:** 9.3%
+   - Much smaller than expected
+
+---
+
+## Updated Optimization Priority (Based on Profiling)
+
+### Priority 1: Fix WAL Flushing (CRITICAL)
+
+**Problem:** WAL flushes after every single insert (3.97ms overhead!)
+
+**Actions:**
+- [x] Profile WAL flush to confirm it's the bottleneck
+- [ ] **Implement batch/deferred WAL writes** for auto-commit mode
+- [ ] Add `flush_interval_ms` config (default: 100ms)
+- [ ] Implement group commit (batch multiple statements into single WAL write)
+- [ ] Only sync WAL on explicit COMMIT or flush interval
+
+**Expected gain:** 10-100x for WAL ON mode (from 251/s to 25K-100K/s)
+
+### Priority 2: Reduce Unaccounted Overhead
+
+**Problem:** 39% of time lost in PreparedStatement execution path
+
+**Actions:**
+- [ ] Profile bind() chain - may be allocating Vec
+- [ ] Inline `with_cached_plan` closure to eliminate overhead
+- [ ] Remove redundant checks in `execute_with_cached_plan`
+- [ ] Consider pre-allocated parameter slots
+
+**Expected gain:** 1.5x (reduce 466ns to ~150ns)
+
+### Priority 3: Optimize Index Updates
+
+**Problem:** 27% of time even for single PK index
+
+**Actions:**
+- [ ] Profile index B-tree operations
+- [ ] Consider combining PK index with main table storage
+- [ ] Skip index update if PK is auto-generated rowid
+- [ ] Batch index updates for multi-row inserts
+
+**Expected gain:** 1.3-1.5x for indexed tables
+
+### Priority 4: B-tree Insert Path (Already Planned)
+
+See Phase 1.3 above.
+
+---
+
+## Revised Success Metrics
+
+| Milestone | Target (WAL OFF) | Target (WAL ON) |
+|-----------|------------------|-----------------|
+| Current | 843 K/s | 251/s |
+| After P1 (WAL fix) | - | 100K+ /s |
+| After P2 (overhead) | 1.2 M/s | 150K+ /s |
+| After P3 (index) | 1.6 M/s | 200K+ /s |
+| Match SQLite | 2.0 M/s | 2.0 M/s |
+
+---
+
 ## Notes
 
 - SQLite has 20+ years of optimization; closing the gap requires systematic profiling
