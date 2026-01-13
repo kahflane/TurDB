@@ -302,29 +302,40 @@
 
 **Expected gain:** ~~10-100x~~ ACHIEVED: 1300x for WAL ON mode
 
-### Priority 2: Reduce Unaccounted Overhead
+### Priority 2: Reduce Unaccounted Overhead - PARTIALLY COMPLETE
 
 **Problem:** 39% of time lost in PreparedStatement execution path
 
 **Actions:**
-- [ ] Profile bind() chain - may be allocating Vec
+- [x] Profile bind() chain - may be allocating Vec
+- [x] Use SmallVec<[OwnedValue; 8]> for BoundStatement params (avoids heap alloc)
+- [x] Make timing instrumentation conditional with `#[cfg(feature = "timing")]`
 - [ ] Inline `with_cached_plan` closure to eliminate overhead
 - [ ] Remove redundant checks in `execute_with_cached_plan`
-- [ ] Consider pre-allocated parameter slots
 
-**Expected gain:** 1.5x (reduce 466ns to ~150ns)
+**Result (2026-01-13):**
+- SmallVec for params: ~5% improvement (avoids heap allocation for ≤8 params)
+- Conditional timing: ~4% improvement (removes Instant::now() overhead)
+- Combined: WAL OFF improved from 1.02M/s to 1.08M/s
 
-### Priority 3: Optimize Index Updates
+**Expected gain:** ~~1.5x~~ Partial: 1.1x achieved, more possible
+
+### Priority 3: Optimize Index Updates - PARTIALLY COMPLETE
 
 **Problem:** 27% of time even for single PK index
 
 **Actions:**
-- [ ] Profile index B-tree operations
+- [x] Cache key_buffer in CachedIndexPlan (avoids Vec allocation per insert)
+- [x] Cache root_page in CachedIndexPlan (avoids header read per insert)
 - [ ] Consider combining PK index with main table storage
 - [ ] Skip index update if PK is auto-generated rowid
 - [ ] Batch index updates for multi-row inserts
 
-**Expected gain:** 1.3-1.5x for indexed tables
+**Result (2026-01-13):**
+- Cached key_buffer and root_page: ~6% improvement
+- WAL OFF improved from 1.08M/s to 1.12M/s
+
+**Expected gain:** ~~1.3-1.5x~~ Partial: 1.06x achieved, more possible
 
 ### Priority 4: B-tree Insert Path (Already Planned)
 
@@ -338,13 +349,17 @@ See Phase 1.3 above.
 |-----------|------------------|-----------------|--------|
 | Baseline | 843 K/s | 251/s | ✓ Measured |
 | After P1 (WAL fix) | 977 K/s | 326 K/s | ✓ **DONE** |
-| After P2 (overhead) | 1.2 M/s | 500K+ /s | Pending |
-| After P3 (index) | 1.6 M/s | 800K+ /s | Pending |
+| After P2 (overhead) | 1.08 M/s | 334 K/s | ✓ **DONE** |
+| After P3 (index cache) | 1.12 M/s | 342 K/s | ✓ **DONE** |
 | Match SQLite | 2.0 M/s | 2.0 M/s | Goal |
 
 **Latest Results (2026-01-13, AUTOFLUSH=OFF):**
-- batch_prepared WAL OFF: 977 K/s (improved +16% from 843 K/s)
-- batch_prepared WAL ON: 326 K/s (improved **1300x** from 251/s)
+- batch_prepared WAL OFF: **1.12 M/s** (improved +33% from baseline 843 K/s)
+- batch_prepared WAL ON: **342 K/s** (improved **1360x** from baseline 251/s)
+
+**Gap with SQLite (target: 2.0 M/s):**
+- WAL OFF: ~1.8x slower (was ~2.4x)
+- WAL ON: ~5.8x slower (was ~7,800x)
 
 ---
 
