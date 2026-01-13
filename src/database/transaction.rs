@@ -329,19 +329,15 @@ impl Database {
                 dirty_pages.iter().map(|&p| (table_id, p)).collect();
             let _page_locks = self.shared.page_locks.page_write_multi(&page_tuples);
 
-            if let Ok(storage_arc) = file_manager.table_data(schema_name, table_name) {
-                let storage = storage_arc.read();
-                let db_size = storage.page_count();
-                let pages_to_flush = self.shared.dirty_tracker.drain_for_table(table_id);
-
-                for page_no in pages_to_flush {
-                    if let Ok(data) = storage.page(page_no) {
-                        let mut buffer = self.shared.page_buffer_pool.acquire_blocking();
-                        buffer.copy_from_page(data);
-                        payload.push((table_id, page_no, buffer, db_size));
-                    }
-                }
-            }
+            let pages_to_flush = self.shared.dirty_tracker.drain_for_table(table_id);
+            let _ = self.collect_pages_for_table(
+                table_id,
+                schema_name,
+                table_name,
+                file_manager,
+                &pages_to_flush,
+                &mut payload,
+            );
         }
 
         drop(lookup);
@@ -375,10 +371,7 @@ impl Database {
                 .as_mut()
                 .ok_or_else(|| eyre::eyre!("WAL not initialized but WAL mode is enabled"))?;
 
-            for (table_id, page_no, buffer, db_size) in payload {
-                wal.write_frame_with_file_id(page_no, db_size, buffer.as_slice(), table_id as u64)
-                    .wrap_err("failed to write WAL frame in direct commit")?;
-            }
+            Self::write_payload_to_wal(wal, &payload)?;
         }
 
         Ok(())
@@ -410,15 +403,6 @@ impl Database {
                 continue;
             }
 
-            let storage_arc = file_manager
-                .table_data(schema_name, table_name)
-                .wrap_err_with(|| {
-                    format!(
-                        "failed to get storage for table '{}.{}'",
-                        schema_name, table_name
-                    )
-                })?;
-
             for chunk in pages_to_flush.chunks(COMMIT_BATCH_SIZE) {
                 let _table_lock = self.shared.page_locks.table_intent_exclusive(table_id);
 
@@ -426,25 +410,17 @@ impl Database {
                     chunk.iter().map(|&p| (table_id, p)).collect();
                 let _page_locks = self.shared.page_locks.page_write_multi(&page_tuples);
 
-                let storage = storage_arc.read();
-                let db_size = storage.page_count();
-
                 let mut chunk_payload: CommitPayload = SmallVec::new();
+                self.collect_pages_for_table(
+                    table_id,
+                    schema_name,
+                    table_name,
+                    file_manager,
+                    chunk,
+                    &mut chunk_payload,
+                )?;
 
-                for &page_no in chunk {
-                    if let Ok(data) = storage.page(page_no) {
-                        let mut buffer = self.shared.page_buffer_pool.acquire_blocking();
-                        buffer.copy_from_page(data);
-                        chunk_payload.push((table_id, page_no, buffer, db_size));
-                    }
-                }
-
-                drop(storage);
-
-                for (tid, page_no, buffer, db_sz) in chunk_payload {
-                    wal.write_frame_with_file_id(page_no, db_sz, buffer.as_slice(), tid as u64)
-                        .wrap_err("failed to write WAL frame in chunked commit")?;
-                }
+                Self::write_payload_to_wal(wal, &chunk_payload)?;
             }
         }
 
@@ -461,12 +437,48 @@ impl Database {
             .ok_or_else(|| eyre::eyre!("WAL not initialized but WAL mode is enabled"))?;
 
         for commit in pending_commits {
-            for (table_id, page_no, buffer, db_size) in &commit.payload {
-                wal.write_frame_with_file_id(*page_no, *db_size, buffer.as_slice(), *table_id as u64)
-                    .wrap_err("failed to write WAL frame in group commit")?;
+            Self::write_payload_to_wal(wal, &commit.payload)?;
+        }
+
+        Ok(())
+    }
+
+    fn collect_pages_for_table(
+        &self,
+        table_id: u32,
+        schema_name: &str,
+        table_name: &str,
+        file_manager: &mut crate::storage::FileManager,
+        pages: &[u32],
+        payload: &mut CommitPayload,
+    ) -> Result<()> {
+        if pages.is_empty() {
+            return Ok(());
+        }
+
+        let storage_arc = file_manager.table_data(schema_name, table_name)?;
+        let storage = storage_arc.read();
+        let db_size = storage.page_count();
+
+        for &page_no in pages {
+            if let Ok(data) = storage.page(page_no) {
+                let mut buffer = self.shared.page_buffer_pool.acquire_blocking();
+                buffer.copy_from_page(data);
+                payload.push((table_id, page_no, buffer, db_size));
             }
         }
 
+        Ok(())
+    }
+
+    fn write_payload_to_wal(
+        wal: &mut crate::storage::Wal,
+        payload: &CommitPayload,
+    ) -> Result<()> {
+        for (table_id, page_no, buffer, db_size) in payload {
+            wal.write_frame_with_file_id(*page_no, *db_size, buffer.as_slice(), *table_id as u64)
+                .wrap_err("failed to write WAL frame")?;
+        }
         Ok(())
     }
 
