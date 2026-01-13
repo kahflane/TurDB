@@ -97,6 +97,7 @@
 use crate::types::OwnedValue;
 
 use parking_lot::RwLock;
+use smallvec::SmallVec;
 
 use crate::storage::MmapStorage;
 use std::cell::RefCell;
@@ -124,6 +125,8 @@ pub struct CachedIndexPlan {
     pub is_unique: bool,
     pub col_indices: Vec<usize>,
     pub storage: std::cell::RefCell<Option<std::sync::Weak<RwLock<MmapStorage>>>>,
+    pub key_buffer: std::cell::RefCell<Vec<u8>>,
+    pub root_page: std::cell::Cell<u32>,
 }
 
 #[derive(Debug, Clone)]
@@ -225,14 +228,14 @@ impl PreparedStatement {
 #[derive(Debug)]
 pub struct BoundStatement<'a> {
     prepared: &'a PreparedStatement,
-    pub(crate) params: Vec<OwnedValue>,
+    pub(crate) params: SmallVec<[OwnedValue; 8]>,
 }
 
 impl<'a> BoundStatement<'a> {
     fn new(prepared: &'a PreparedStatement) -> Self {
         Self {
             prepared,
-            params: Vec::with_capacity(prepared.param_count as usize),
+            params: SmallVec::new(),
         }
     }
 

@@ -322,22 +322,30 @@ impl Database {
 
             let mut index_storage_guard = index_storage_arc.write();
 
-            let (index_root, _) = {
-                use crate::storage::IndexFileHeader;
-                let page = index_storage_guard.page(0)?;
-                let header = IndexFileHeader::from_bytes(page)?;
-                (header.root_page(), ())
+            let index_root = {
+                let cached_root = index_plan.root_page.get();
+                if cached_root > 0 {
+                    cached_root
+                } else {
+                    use crate::storage::IndexFileHeader;
+                    let page = index_storage_guard.page(0)?;
+                    let header = IndexFileHeader::from_bytes(page)?;
+                    let root = header.root_page();
+                    index_plan.root_page.set(root);
+                    root
+                }
             };
 
-            let mut key_buf = Vec::new();
+            let mut key_buf_guard = index_plan.key_buffer.borrow_mut();
+            key_buf_guard.clear();
             for &col_idx in &index_plan.col_indices {
                 if let Some(val) = params.get(col_idx) {
-                    Self::encode_value_as_key(val, &mut key_buf);
+                    Self::encode_value_as_key(val, &mut *key_buf_guard);
                 }
             }
 
             let mut index_btree = BTree::new(&mut *index_storage_guard, index_root)?;
-            index_btree.insert(&key_buf, &row_id_bytes)?;
+            index_btree.insert(&key_buf_guard, &row_id_bytes)?;
 
             let new_root = index_btree.root_page();
             if new_root != index_root {
@@ -345,6 +353,7 @@ impl Database {
                 let page = index_storage_guard.page_mut(0)?;
                 let header = IndexFileHeader::from_bytes_mut(page)?;
                 header.set_root_page(new_root);
+                index_plan.root_page.set(new_root);
             }
         }
         #[cfg(feature = "timing")]

@@ -77,6 +77,7 @@ use std::sync::atomic::Ordering as AtomicOrdering;
 use std::collections::HashMap;
 use std::sync::Arc;
 
+#[cfg(feature = "timing")]
 use crate::database::timing::{INSERT_TIME_NS, PARSE_TIME_NS};
 
 /// Aggregate group state: group key hashes -> (accumulated group values, (count, sum) pairs for AVG)
@@ -3102,12 +3103,16 @@ impl Database {
     }
 
     pub fn execute(&self, sql: &str) -> Result<ExecuteResult> {
+        #[cfg(feature = "timing")]
         let parse_start = std::time::Instant::now();
+
         let arena = Bump::new();
         let mut parser = Parser::new(sql, &arena);
         let stmt = parser
             .parse_statement()
             .wrap_err("failed to parse SQL statement")?;
+
+        #[cfg(feature = "timing")]
         PARSE_TIME_NS.fetch_add(
             parse_start.elapsed().as_nanos() as u64,
             AtomicOrdering::Relaxed,
@@ -3117,12 +3122,16 @@ impl Database {
     }
 
     pub fn execute_with_params(&self, sql: &str, params: &[OwnedValue]) -> Result<ExecuteResult> {
+        #[cfg(feature = "timing")]
         let parse_start = std::time::Instant::now();
+
         let arena = Bump::new();
         let mut parser = Parser::new(sql, &arena);
         let stmt = parser
             .parse_statement()
             .wrap_err("failed to parse SQL statement")?;
+
+        #[cfg(feature = "timing")]
         PARSE_TIME_NS.fetch_add(
             parse_start.elapsed().as_nanos() as u64,
             AtomicOrdering::Relaxed,
@@ -3136,6 +3145,7 @@ impl Database {
         prepared: &super::PreparedStatement,
         params: &[OwnedValue],
     ) -> Result<ExecuteResult> {
+        #[cfg(feature = "timing")]
         if let Some(result) = prepared.with_cached_plan(|plan| {
             let insert_start = std::time::Instant::now();
             let result = self.execute_insert_cached(plan, params);
@@ -3148,18 +3158,29 @@ impl Database {
             return result;
         }
 
+        #[cfg(not(feature = "timing"))]
+        if let Some(result) =
+            prepared.with_cached_plan(|plan| self.execute_insert_cached(plan, params))
+        {
+            return result;
+        }
+
         if let Some(result) =
             prepared.with_cached_update_plan(|plan| self.execute_update_cached(plan, params))
         {
             return result;
         }
 
+        #[cfg(feature = "timing")]
         let parse_start = std::time::Instant::now();
+
         let arena = Bump::new();
         let mut parser = Parser::new(prepared.sql(), &arena);
         let stmt = parser
             .parse_statement()
             .wrap_err("failed to parse SQL statement")?;
+
+        #[cfg(feature = "timing")]
         PARSE_TIME_NS.fetch_add(
             parse_start.elapsed().as_nanos() as u64,
             AtomicOrdering::Relaxed,
@@ -3209,6 +3230,8 @@ impl Database {
                                     is_unique: true,
                                     col_indices: vec![idx],
                                     storage: std::cell::RefCell::new(None),
+                                    key_buffer: std::cell::RefCell::new(Vec::with_capacity(64)),
+                                    root_page: std::cell::Cell::new(0),
                                 });
                             }
                         }
@@ -3238,6 +3261,8 @@ impl Database {
                                 is_unique: idx_def.is_unique(),
                                 col_indices,
                                 storage: std::cell::RefCell::new(None),
+                                key_buffer: std::cell::RefCell::new(Vec::with_capacity(64)),
+                                root_page: std::cell::Cell::new(0),
                             });
                         }
                     }
