@@ -3299,6 +3299,7 @@ impl Database {
                             &storage_arc,
                         ))),
                         record_buffer: std::cell::RefCell::new(Vec::with_capacity(256)),
+                        mvcc_buffer: std::cell::RefCell::new(Vec::with_capacity(256)),
                         record_builder_state: std::cell::RefCell::new(Some(builder_state)),
                         indexes,
                     };

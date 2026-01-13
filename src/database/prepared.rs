@@ -115,6 +115,7 @@ pub struct CachedInsertPlan {
     pub row_count: std::cell::Cell<Option<u64>>,
     pub storage: std::cell::RefCell<Option<std::sync::Weak<RwLock<MmapStorage>>>>,
     pub record_buffer: std::cell::RefCell<Vec<u8>>,
+    pub mvcc_buffer: std::cell::RefCell<Vec<u8>>,
     pub record_builder_state: std::cell::RefCell<Option<crate::records::RecordBuilderState>>,
     pub indexes: Vec<CachedIndexPlan>,
 }

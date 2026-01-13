@@ -26,18 +26,19 @@
 //!    - Buffer -> WAL File.
 //!    - No Storage Locks required.
 
-use crate::memory::PooledPageBuffer;
+use crate::memory::FallbackBuffer;
 use parking_lot::{Condvar, Mutex};
 use smallvec::SmallVec;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-/// Payload type for dirty pages: (table_id, page_id, pooled_buffer, db_size)
+/// Payload type for dirty pages: (table_id, page_id, buffer, db_size)
 ///
-/// Uses `PooledPageBuffer` instead of `Vec<u8>` to avoid heap allocation on every
-/// commit. Buffers are returned to the pool when the payload is dropped.
-pub type CommitPayload = SmallVec<[(u32, u32, PooledPageBuffer, u32); 4]>;
+/// Uses `FallbackBuffer` which prefers pooled buffers but falls back to heap
+/// allocation when the pool is exhausted. This prevents commit failures under
+/// high concurrency while still benefiting from pooling in the common case.
+pub type CommitPayload = SmallVec<[(u32, u32, FallbackBuffer, u32); 4]>;
 
 /// Configuration for group commit behavior
 #[derive(Debug, Clone, Copy)]
@@ -414,8 +415,8 @@ mod tests {
 
     /// Helper to create a test payload with the given data byte
     fn test_payload(pool: &PageBufferPool, table_id: u32, page_no: u32, data_byte: u8, db_size: u32) -> CommitPayload {
-        let mut buffer = pool.acquire().expect("test pool should have buffers");
-        buffer[0] = data_byte;
+        let mut buffer = pool.acquire_or_alloc();
+        buffer.as_mut_slice()[0] = data_byte;
         smallvec![(table_id, page_no, buffer, db_size)]
     }
 

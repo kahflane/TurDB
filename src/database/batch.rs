@@ -172,7 +172,7 @@ impl Database {
         plan: &crate::database::prepared::CachedInsertPlan,
         params: &[OwnedValue],
     ) -> Result<usize> {
-        use crate::database::dml::mvcc_helpers::wrap_record_for_insert;
+        use crate::database::dml::mvcc_helpers::wrap_record_into_buffer;
 
         #[cfg(feature = "timing")]
         INSERT_COUNT.fetch_add(1, Ordering::Relaxed);
@@ -273,7 +273,8 @@ impl Database {
         #[cfg(feature = "timing")]
         let mvcc_start = std::time::Instant::now();
 
-        let mvcc_record = wrap_record_for_insert(txn_id, &buffer_guard, in_transaction);
+        let mut mvcc_buffer_guard = plan.mvcc_buffer.borrow_mut();
+        wrap_record_into_buffer(txn_id, &buffer_guard, in_transaction, &mut mvcc_buffer_guard);
 
         #[cfg(feature = "timing")]
         MVCC_WRAP_NS.fetch_add(mvcc_start.elapsed().as_nanos() as u64, Ordering::Relaxed);
@@ -292,13 +293,13 @@ impl Database {
             );
             let mut btree =
                 BTree::with_rightmost_hint(&mut wal_storage, root_page, rightmost_hint)?;
-            btree.insert_append(&row_key, &mvcc_record)?;
+            btree.insert_append(&row_key, &mvcc_buffer_guard)?;
             root_page = btree.root_page();
             rightmost_hint = btree.rightmost_hint();
         } else {
             let mut btree =
                 BTree::with_rightmost_hint(&mut storage_guard, root_page, rightmost_hint)?;
-            btree.insert_append(&row_key, &mvcc_record)?;
+            btree.insert_append(&row_key, &mvcc_buffer_guard)?;
             root_page = btree.root_page();
             rightmost_hint = btree.rightmost_hint();
         }

@@ -342,8 +342,7 @@ impl Database {
 
                 for page_no in pages_to_flush {
                     if let Ok(data) = storage.page(page_no) {
-                        let mut buffer = self.shared.page_buffer_pool.acquire()
-                            .ok_or_else(|| eyre::eyre!("page buffer pool exhausted"))?;
+                        let mut buffer = self.shared.page_buffer_pool.acquire_or_alloc();
                         buffer.copy_from_page(data);
                         payload.push((table_id, page_no, buffer, db_size));
                     }
@@ -444,8 +443,7 @@ impl Database {
 
                 for &page_no in chunk {
                     if let Ok(data) = storage.page(page_no) {
-                        let mut buffer = self.shared.page_buffer_pool.acquire()
-                            .ok_or_else(|| eyre::eyre!("page buffer pool exhausted during chunked commit"))?;
+                        let mut buffer = self.shared.page_buffer_pool.acquire_or_alloc();
                         buffer.copy_from_page(data);
                         chunk_payload.push((table_id, page_no, buffer, db_size));
                     }
@@ -486,14 +484,20 @@ impl Database {
         let commit_ts = self.shared.txn_manager.commit_txn(txn.slot_idx);
         let (write_entries, _undo_data) = txn.take_write_entries();
 
+        let mut value_buffer = Vec::with_capacity(256);
         for entry in write_entries.iter() {
-            self.finalize_write_entry_commit(entry, commit_ts)?;
+            self.finalize_write_entry_commit(entry, commit_ts, &mut value_buffer)?;
         }
 
         Ok(())
     }
 
-    fn finalize_write_entry_commit(&self, entry: &WriteEntry, commit_ts: TxnId) -> Result<()> {
+    fn finalize_write_entry_commit(
+        &self,
+        entry: &WriteEntry,
+        commit_ts: TxnId,
+        value_buffer: &mut Vec<u8>,
+    ) -> Result<()> {
         use crate::btree::BTree;
         use crate::mvcc::RecordHeader;
         use crate::storage::DEFAULT_SCHEMA;
@@ -527,11 +531,12 @@ impl Database {
                 header.set_locked(false);
                 header.txn_id = commit_ts;
 
-                let mut new_value = raw_value.to_vec();
-                header.write_to(&mut new_value[..RecordHeader::SIZE]);
+                value_buffer.clear();
+                value_buffer.extend_from_slice(raw_value);
+                header.write_to(&mut value_buffer[..RecordHeader::SIZE]);
 
                 let mut btree_mut = BTree::new(&mut *table_storage, 1)?;
-                btree_mut.update(&entry.key, &new_value)?;
+                btree_mut.update(&entry.key, value_buffer)?;
             }
         }
 

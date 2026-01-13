@@ -134,6 +134,21 @@ impl PageBufferPool {
         None
     }
 
+    /// Acquire a buffer from the pool, falling back to heap allocation if exhausted.
+    ///
+    /// This method should be used in commit paths where failing due to pool
+    /// exhaustion is unacceptable but allocation overhead is tolerable.
+    /// For hot CRUD paths, use `acquire()` which enforces zero-allocation.
+    ///
+    /// Returns a FallbackBuffer that may be either pooled or heap-allocated.
+    pub fn acquire_or_alloc(&self) -> FallbackBuffer {
+        if let Some(pooled) = self.acquire() {
+            FallbackBuffer::Pooled(pooled)
+        } else {
+            FallbackBuffer::Allocated(Box::new([0u8; PAGE_SIZE]))
+        }
+    }
+
     /// Returns the current number of available buffers in the pool (across all shards).
     ///
     /// **Performance note**: This method acquires all 16 shard locks sequentially.
@@ -233,6 +248,52 @@ unsafe impl Send for PooledPageBuffer {}
 // - PageBufferPoolInner contains only Mutex<Vec<...>> which is Sync
 // - No interior mutability is exposed through &PooledPageBuffer (Deref returns &[u8])
 unsafe impl Sync for PooledPageBuffer {}
+
+/// A buffer that may be pooled or heap-allocated.
+///
+/// Used by `acquire_or_alloc()` to provide fallback allocation in commit paths
+/// while still preferring pooled buffers when available.
+pub enum FallbackBuffer {
+    Pooled(PooledPageBuffer),
+    Allocated(Box<[u8; PAGE_SIZE]>),
+}
+
+impl FallbackBuffer {
+    /// Copy data into the buffer, truncating or zero-padding to PAGE_SIZE.
+    pub fn copy_from_page(&mut self, data: &[u8]) {
+        let buf = self.as_mut_slice();
+        let copy_len = data.len().min(PAGE_SIZE);
+        buf[..copy_len].copy_from_slice(&data[..copy_len]);
+        if copy_len < PAGE_SIZE {
+            buf[copy_len..].fill(0);
+        }
+    }
+
+    /// Returns the buffer contents as a slice.
+    pub fn as_slice(&self) -> &[u8] {
+        match self {
+            FallbackBuffer::Pooled(p) => p.as_slice(),
+            FallbackBuffer::Allocated(b) => b.as_slice(),
+        }
+    }
+
+    /// Returns the buffer contents as a mutable slice.
+    pub fn as_mut_slice(&mut self) -> &mut [u8] {
+        match self {
+            FallbackBuffer::Pooled(p) => p.deref_mut().as_mut_slice(),
+            FallbackBuffer::Allocated(b) => b.as_mut_slice(),
+        }
+    }
+}
+
+impl std::fmt::Debug for FallbackBuffer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            FallbackBuffer::Pooled(p) => f.debug_tuple("Pooled").field(p).finish(),
+            FallbackBuffer::Allocated(_) => f.debug_tuple("Allocated").finish(),
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {
