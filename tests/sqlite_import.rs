@@ -798,7 +798,9 @@ fn import_table_with_options(
 
                 // Commit every 10 batches to allow memory tracking to update
                 if batch_count.is_multiple_of(10) {
+                    let start_committing = Instant::now();
                     turdb.execute("COMMIT")?;
+                    eprintln!("Commit took {}s",start_committing.elapsed().as_secs());
 
                     // Update WAL frame count for memory watcher
                     if let Some(watcher) = options.memory_watcher {
@@ -876,7 +878,9 @@ fn import_table_with_options(
     }
 
     println!("[{}] Committing transaction...", table.name);
+    let start_committing = Instant::now();
     turdb.execute("COMMIT")?;
+    eprintln!("Commit took {}s",start_committing.elapsed().as_secs());
 
     let stats = TableImportStats {
         rows: total_inserted,
@@ -912,7 +916,7 @@ fn import_all_tables() {
     let sqlite_conn = Connection::open(SQLITE_DB_PATH).expect("Failed to open SQLite DB");
     let db = Database::create(TURDB_PATH).unwrap();
 
-    db.execute("PRAGMA WAL=OFF").expect("Failed to enable WAL");
+    db.execute("PRAGMA WAL=ON").expect("Failed to enable WAL");
     db.execute("PRAGMA synchronous=NORMAL")
         .expect("Failed to set synchronous mode");
     db.execute("SET foreign_keys = OFF")
@@ -1019,8 +1023,9 @@ fn import_small_tables() {
 
     let sqlite_conn = Connection::open(SQLITE_DB_PATH).expect("Failed to open SQLite DB");
     let db = Database::create(TURDB_PATH).unwrap();
-    db.execute("PRAGMA WAL=OFF").expect("Failed to enable WAL");
-    db.execute("PRAGMA synchronous=FULL")
+    db.execute("PRAGMA WAL=ON").expect("Failed to enable WAL");
+    db.execute("PRAGMA WAL_AUTOFLUSH=ON").expect("Failed to enable WAL");
+    db.execute("PRAGMA synchronous=NORMAL")
         .expect("Failed to set synchronous mode");
 
     print_memory_stats(&db, "Initial state");

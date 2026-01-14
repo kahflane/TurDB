@@ -434,18 +434,22 @@ impl Database {
         Ok(1)
     }
 
-    pub fn bulk_insert(&self, table_name: &str, rows: Vec<Vec<OwnedValue>>) -> Result<u64> {
+    pub fn bulk_insert(&self, table: &str, rows: Vec<Vec<OwnedValue>>) -> Result<u64> {
         use crate::database::dml::fast_load::FastLoader;
 
         self.ensure_catalog()?;
         self.ensure_file_manager()?;
 
-        let schema_name = DEFAULT_SCHEMA;
+        let (schema_name, table_name) = if let Some(dot_pos) = table.find('.') {
+            (&table[..dot_pos], &table[dot_pos + 1..])
+        } else {
+            (DEFAULT_SCHEMA, table)
+        };
 
         let record_schema = {
             let catalog_guard = self.shared.catalog.read();
             let catalog = catalog_guard.as_ref().unwrap();
-            let table_def = catalog.resolve_table(table_name)?;
+            let table_def = catalog.resolve_table_in_schema(Some(schema_name), table_name)?;
             create_record_schema(table_def.columns())
         };
 

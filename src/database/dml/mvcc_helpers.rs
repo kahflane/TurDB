@@ -18,7 +18,7 @@
 //! 1. Build user record from values
 //! 2. Wrap with RecordHeader (LOCK_BIT set for transactions, unset for auto-commit)
 //! 3. Insert into BTree
-//! 4. On commit: clear LOCK_BIT, set commit_ts
+//! 4. On commit: add entry to commit log (lock bit remains, visibility via commit log)
 //!
 //! ## Update Flow
 //!
@@ -26,7 +26,7 @@
 //! 2. Write old version to undo page
 //! 3. Build new record with prev_version pointer
 //! 4. Update BTree
-//! 5. On commit: clear LOCK_BIT, set commit_ts
+//! 5. On commit: add entry to commit log
 //!
 //! ## Delete Flow
 //!
@@ -34,14 +34,11 @@
 //! 2. Write old version to undo page
 //! 3. Set DELETE_BIT in header
 //! 4. Update BTree (tombstone remains)
-//! 5. On commit: clear LOCK_BIT, set commit_ts
+//! 5. On commit: add entry to commit log
 
 #![allow(dead_code)]
 
-use crate::mvcc::{
-    MvccTable, PageId, RecordHeader, TableId, TxnId, UndoRecord, WriteCheckResult, WriteEntry,
-};
-use crate::storage::Storage;
+use crate::mvcc::{MvccTable, PageId, RecordHeader, TableId, TxnId, UndoRecord, WriteCheckResult};
 use eyre::Result;
 
 pub fn wrap_record_for_insert(txn_id: TxnId, user_record: &[u8], in_transaction: bool) -> Vec<u8> {
@@ -139,54 +136,4 @@ pub fn has_mvcc_header(raw_value: &[u8]) -> bool {
 pub fn create_undo_record(table_id: TableId, key: &[u8], raw_value: &[u8]) -> Result<UndoRecord> {
     let mvcc_table = MvccTable::new(table_id);
     mvcc_table.create_undo_record(key, raw_value)
-}
-
-pub fn create_write_entry(
-    table_id: TableId,
-    key: Vec<u8>,
-    page_id: PageId,
-    offset: u16,
-    undo_page_id: Option<PageId>,
-    undo_offset: Option<u16>,
-    is_insert: bool,
-) -> WriteEntry {
-    WriteEntry {
-        table_id,
-        key,
-        page_id,
-        offset,
-        undo_page_id,
-        undo_offset,
-        is_insert,
-    }
-}
-
-pub fn finalize_commit<S: Storage>(
-    storage: &mut S,
-    entry: &WriteEntry,
-    commit_ts: TxnId,
-) -> Result<()> {
-    let page = storage.page_mut(entry.page_id as u32)?;
-    let offset = entry.offset as usize;
-
-    if offset + RecordHeader::SIZE <= page.len() {
-        MvccTable::finalize_commit_value(&mut page[offset..], commit_ts)?;
-    }
-
-    Ok(())
-}
-
-pub fn finalize_abort<S: Storage>(
-    storage: &mut S,
-    entry: &WriteEntry,
-    original_txn_id: TxnId,
-) -> Result<()> {
-    let page = storage.page_mut(entry.page_id as u32)?;
-    let offset = entry.offset as usize;
-
-    if offset + RecordHeader::SIZE <= page.len() {
-        MvccTable::finalize_abort_value(&mut page[offset..], original_txn_id)?;
-    }
-
-    Ok(())
 }

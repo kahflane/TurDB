@@ -33,8 +33,8 @@
 //! │       ▼                                     │                           │
 //! │   undo_write_entries() ◄──────────────────┘                             │
 //! │                                                                         │
-//! │   COMMIT ─────────► execute_commit() ──────► finalize_commit()          │
-//! │       │                                                                 │
+//! │   COMMIT ─────────► execute_commit() ──────► commit_txn()               │
+//! │       │                                     (commit log entry)         │
 //! │       └───────────► WAL flush (if enabled)                             │
 //! │                                                                         │
 //! └─────────────────────────────────────────────────────────────────────────┘
@@ -120,7 +120,7 @@ use smallvec::SmallVec;
 use super::group_commit::CommitPayload;
 use super::{Database, ExecuteResult};
 
-const COMMIT_BATCH_SIZE: usize = 12;
+const COMMIT_BATCH_SIZE: usize = 1000;
 
 /// Named checkpoint within a transaction for partial rollback.
 #[derive(Debug, Clone)]
@@ -403,26 +403,25 @@ impl Database {
                 continue;
             }
 
-            for chunk in pages_to_flush.chunks(COMMIT_BATCH_SIZE) {
-                let _table_lock = self.shared.page_locks.table_intent_exclusive(table_id);
+            let _table_lock = self.shared.page_locks.table_intent_exclusive(table_id);
 
-                let page_tuples: Vec<(u32, u32)> =
-                    chunk.iter().map(|&p| (table_id, p)).collect();
-                let _page_locks = self.shared.page_locks.page_write_multi(&page_tuples);
+            let storage_arc = file_manager.table_data(schema_name, table_name)?;
+            let storage = storage_arc.read();
+            let db_size = storage.page_count();
 
-                let mut chunk_payload: CommitPayload = SmallVec::new();
-                self.collect_pages_for_table(
-                    table_id,
-                    schema_name,
-                    table_name,
-                    file_manager,
-                    chunk,
-                    &mut chunk_payload,
-                )?;
+            let page_refs: Vec<(u32, &[u8])> = pages_to_flush
+                .iter()
+                .filter_map(|&page_no| storage.page(page_no).ok().map(|data| (page_no, data)))
+                .collect();
 
-                Self::write_payload_to_wal(wal, &chunk_payload)?;
-            }
+            let frames = page_refs
+                .iter()
+                .map(|(page_no, data)| (*page_no, db_size, *data, table_id as u64));
+
+            wal.write_frames_batch_no_sync(frames)?;
         }
+
+        wal.sync()?;
 
         Ok(())
     }
@@ -475,73 +474,18 @@ impl Database {
         wal: &mut crate::storage::Wal,
         payload: &CommitPayload,
     ) -> Result<()> {
-        for (table_id, page_no, buffer, db_size) in payload {
-            wal.write_frame_with_file_id(*page_no, *db_size, buffer.as_slice(), *table_id as u64)
-                .wrap_err("failed to write WAL frame")?;
-        }
-        Ok(())
+        let frames = payload
+            .iter()
+            .map(|(table_id, page_no, buffer, db_size)| {
+                (*page_no, *db_size, buffer.as_slice(), *table_id as u64)
+            });
+
+        wal.write_frames_batch(frames)
+            .wrap_err("failed to write WAL frames batch")
     }
 
-    fn finalize_transaction_commit(&self, mut txn: ActiveTransaction) -> Result<()> {
-        let commit_ts = self.shared.txn_manager.commit_txn(txn.slot_idx);
-        let (write_entries, _undo_data) = txn.take_write_entries();
-
-        let mut value_buffer = Vec::with_capacity(256);
-        for entry in write_entries.iter() {
-            self.finalize_write_entry_commit(entry, commit_ts, &mut value_buffer)?;
-        }
-
-        Ok(())
-    }
-
-    fn finalize_write_entry_commit(
-        &self,
-        entry: &WriteEntry,
-        commit_ts: TxnId,
-        value_buffer: &mut Vec<u8>,
-    ) -> Result<()> {
-        use crate::btree::BTree;
-        use crate::mvcc::RecordHeader;
-        use crate::storage::DEFAULT_SCHEMA;
-
-        self.ensure_file_manager()?;
-
-        let mut file_manager_guard = self.shared.file_manager.write();
-        let file_manager = file_manager_guard.as_mut().unwrap();
-
-        let catalog_guard = self.shared.catalog.read();
-        let catalog = catalog_guard.as_ref().unwrap();
-
-        let table_id = entry.table_id;
-        let table_def = catalog.table_by_id(table_id as u64);
-
-        if table_def.is_none() {
-            return Ok(());
-        }
-
-        let table_def = table_def.unwrap();
-        let schema_name = DEFAULT_SCHEMA;
-        let table_name = table_def.name();
-
-        let table_storage_arc = file_manager.table_data_mut(schema_name, table_name)?;
-        let mut table_storage = table_storage_arc.write();
-
-        let btree = BTree::new(&mut *table_storage, 1)?;
-        if let Some(raw_value) = btree.get(&entry.key)? {
-            if raw_value.len() >= RecordHeader::SIZE {
-                let mut header = RecordHeader::from_bytes(raw_value);
-                header.set_locked(false);
-                header.txn_id = commit_ts;
-
-                value_buffer.clear();
-                value_buffer.extend_from_slice(raw_value);
-                header.write_to(&mut value_buffer[..RecordHeader::SIZE]);
-
-                let mut btree_mut = BTree::new(&mut *table_storage, 1)?;
-                btree_mut.update(&entry.key, value_buffer)?;
-            }
-        }
-
+    fn finalize_transaction_commit(&self, txn: ActiveTransaction) -> Result<()> {
+        let _commit_ts = self.shared.txn_manager.commit_txn(txn.slot_idx);
         Ok(())
     }
 

@@ -101,6 +101,7 @@ pub struct TransactionManager {
     pub(crate) global_ts: AtomicU64,
     pub(crate) active_slots: [AtomicU64; MAX_CONCURRENT_TXNS],
     pub(crate) slot_lock: Mutex<()>,
+    pub(crate) commit_log: parking_lot::RwLock<hashbrown::HashMap<TxnId, TxnId>>,
 }
 
 impl TransactionManager {
@@ -112,6 +113,7 @@ impl TransactionManager {
             #[allow(clippy::borrow_interior_mutable_const)]
             active_slots: [INIT; MAX_CONCURRENT_TXNS],
             slot_lock: Mutex::new(()),
+            commit_log: parking_lot::RwLock::new(hashbrown::HashMap::new()),
         }
     }
 
@@ -131,9 +133,27 @@ impl TransactionManager {
     }
 
     pub fn commit_txn(&self, slot_idx: usize) -> TxnId {
+        let start_ts = self.active_slots[slot_idx].load(Ordering::SeqCst);
         let commit_ts = self.global_ts.fetch_add(1, Ordering::SeqCst);
         self.active_slots[slot_idx].store(0, Ordering::SeqCst);
+
+        if start_ts > 0 {
+            self.commit_log.write().insert(start_ts, commit_ts);
+        }
+
         commit_ts
+    }
+
+    pub fn get_commit_ts(&self, txn_id: TxnId) -> Option<TxnId> {
+        self.commit_log.read().get(&txn_id).copied()
+    }
+
+    pub fn is_committed(&self, txn_id: TxnId) -> bool {
+        self.commit_log.read().contains_key(&txn_id)
+    }
+
+    pub fn clear_commit_log_before(&self, watermark: TxnId) {
+        self.commit_log.write().retain(|&k, _| k >= watermark);
     }
 
     pub fn abort_txn(&self, slot_idx: usize) {

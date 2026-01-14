@@ -223,31 +223,6 @@ impl MvccTable {
         Ok(result)
     }
 
-    pub fn finalize_commit_value(raw_value: &mut [u8], commit_ts: TxnId) -> Result<()> {
-        if raw_value.len() < RecordHeader::SIZE {
-            bail!("value too small for commit finalization");
-        }
-
-        let mut header = RecordHeader::from_bytes(raw_value);
-        header.set_locked(false);
-        header.txn_id = commit_ts;
-        header.write_to(&mut raw_value[..RecordHeader::SIZE]);
-        Ok(())
-    }
-
-    pub fn finalize_abort_value(raw_value: &mut [u8], original_txn_id: TxnId) -> Result<()> {
-        if raw_value.len() < RecordHeader::SIZE {
-            bail!("value too small for abort finalization");
-        }
-
-        let mut header = RecordHeader::from_bytes(raw_value);
-        header.set_locked(false);
-        header.set_deleted(false);
-        header.txn_id = original_txn_id;
-        header.write_to(&mut raw_value[..RecordHeader::SIZE]);
-        Ok(())
-    }
-
     pub fn create_undo_record(&self, key: &[u8], raw_value: &[u8]) -> Result<UndoRecord> {
         let mvcc_value = Self::parse_value(raw_value)?;
         Ok(UndoRecord::new(

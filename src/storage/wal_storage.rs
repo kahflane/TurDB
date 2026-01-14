@@ -69,9 +69,9 @@
 //! 2. Truncate the WAL file
 //! 3. Free up disk space and improve read performance
 
-use super::{MmapStorage, Storage, Wal, PAGE_SIZE};
+use super::{MmapStorage, Storage, Wal};
 use crate::database::dirty_tracker::ShardedDirtyTracker;
-use eyre::{ensure, Result, WrapErr};
+use eyre::{Result, WrapErr};
 use hashbrown::{HashMap, HashSet};
 use parking_lot::Mutex;
 
@@ -102,26 +102,19 @@ impl<'a> WalStorage<'a> {
         };
 
         let db_size = storage.page_count();
-        let mut frames_written = 0;
+        let frames_count = dirty.len() as u32;
 
-        for page_no in dirty {
-            let page_data = storage.page(page_no)?;
+        let frames = dirty.iter().map(|&page_no| {
+            let page_data = storage
+                .page(page_no)
+                .expect("failed to read page for WAL flush");
+            (page_no, db_size, page_data, 0u64)
+        });
 
-            ensure!(
-                page_data.len() == PAGE_SIZE,
-                "page {} has unexpected size {} (expected {})",
-                page_no,
-                page_data.len(),
-                PAGE_SIZE
-            );
+        wal.write_frames_batch(frames)
+            .wrap_err("failed to write frames batch to WAL")?;
 
-            wal.write_frame(page_no, db_size, page_data)
-                .wrap_err_with(|| format!("failed to write page {} to WAL", page_no))?;
-
-            frames_written += 1;
-        }
-
-        Ok(frames_written)
+        Ok(frames_count)
     }
 
     pub fn dirty_page_count(&self) -> usize {
@@ -160,31 +153,19 @@ impl<'a> WalStorage<'a> {
         };
 
         let db_size = storage.page_count();
-        let mut frames_written = 0;
+        let frames_count = dirty.len() as u32;
 
-        for page_no in dirty {
-            let page_data = storage.page(page_no)?;
+        let frames = dirty.iter().map(|&page_no| {
+            let page_data = storage
+                .page(page_no)
+                .expect("failed to read page for WAL flush");
+            (page_no, db_size, page_data, file_id)
+        });
 
-            ensure!(
-                page_data.len() == PAGE_SIZE,
-                "page {} has unexpected size {} (expected {})",
-                page_no,
-                page_data.len(),
-                PAGE_SIZE
-            );
+        wal.write_frames_batch(frames)
+            .wrap_err_with(|| format!("failed to write frames batch for file_id={}", file_id))?;
 
-            wal.write_frame_with_file_id(page_no, db_size, page_data, file_id)
-                .wrap_err_with(|| {
-                    format!(
-                        "failed to write page {} (file_id={}) to WAL",
-                        page_no, file_id
-                    )
-                })?;
-
-            frames_written += 1;
-        }
-
-        Ok(frames_written)
+        Ok(frames_count)
     }
 }
 
@@ -312,31 +293,19 @@ impl<'a> WalStoragePerTable<'a> {
         }
 
         let db_size = storage.page_count();
-        let mut frames_written = 0;
+        let frames_count = dirty.len() as u32;
 
-        for page_no in dirty {
-            let page_data = storage.page(page_no)?;
+        let frames = dirty.iter().map(|&page_no| {
+            let page_data = storage
+                .page(page_no)
+                .expect("failed to read page for WAL flush");
+            (page_no, db_size, page_data, table_id as u64)
+        });
 
-            ensure!(
-                page_data.len() == PAGE_SIZE,
-                "page {} has unexpected size {} (expected {})",
-                page_no,
-                page_data.len(),
-                PAGE_SIZE
-            );
+        wal.write_frames_batch(frames)
+            .wrap_err_with(|| format!("failed to write frames batch for table_id={}", table_id))?;
 
-            wal.write_frame_with_file_id(page_no, db_size, page_data, table_id as u64)
-                .wrap_err_with(|| {
-                    format!(
-                        "failed to write page {} to WAL for table_id {}",
-                        page_no, table_id
-                    )
-                })?;
-
-            frames_written += 1;
-        }
-
-        Ok(frames_written)
+        Ok(frames_count)
     }
 }
 

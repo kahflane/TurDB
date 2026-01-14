@@ -243,7 +243,7 @@ fn test_pragma_wal_checkpoint_threshold() {
         turdb::ExecuteResult::Pragma { name, value } => {
             assert_eq!(name, "WAL_CHECKPOINT_THRESHOLD");
             let threshold: u32 = value.unwrap().parse().unwrap();
-            assert_eq!(threshold, 1000);
+            assert_eq!(threshold, 100_000);
         }
         _ => panic!("Expected Pragma result"),
     }

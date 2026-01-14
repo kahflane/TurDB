@@ -98,7 +98,7 @@ use zerocopy::{FromBytes, Immutable, IntoBytes};
 
 pub const WAL_FRAME_HEADER_SIZE: usize = 32;
 pub const MAX_SEGMENT_SIZE: u64 = 64 * 1024 * 1024;
-pub const DEFAULT_CHECKPOINT_THRESHOLD: u32 = 1000;
+pub const DEFAULT_CHECKPOINT_THRESHOLD: u32 = 100_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SyncMode {
@@ -182,7 +182,7 @@ use hashbrown::HashMap;
 use memmap2::Mmap;
 use parking_lot::{Mutex, RwLock};
 use std::fs::{create_dir_all, read_dir, remove_file, File, OpenOptions};
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 use super::PAGE_SIZE;
@@ -530,12 +530,13 @@ impl Wal {
         let mut segment = self.current_segment.lock();
 
         segment
-            .file
+            .writer
+            .get_mut()
             .set_len(0)
             .wrap_err("failed to truncate WAL segment file")?;
 
         segment
-            .file
+            .writer
             .flush()
             .wrap_err("failed to flush WAL segment after truncate")?;
 
@@ -705,6 +706,131 @@ impl Wal {
         Ok(())
     }
 
+    pub fn write_frames_batch<'a, I>(&self, frames: I) -> Result<()>
+    where
+        I: IntoIterator<Item = (u32, u32, &'a [u8], u64)>,
+    {
+        let should_sync = self.sync_mode().should_sync();
+        let mut frame_metadata: smallvec::SmallVec<[(u64, u32, u64, u64); 16]> = smallvec::SmallVec::new();
+
+        {
+            let mut segment = self.current_segment.lock();
+
+            for (page_no, db_size, page_data, file_id) in frames {
+                if page_data.len() != PAGE_SIZE {
+                    bail!(
+                        "page data must be exactly {} bytes, got {}",
+                        PAGE_SIZE,
+                        page_data.len()
+                    );
+                }
+
+                let current_offset = segment.offset();
+                let segment_num = segment.sequence;
+
+                let header = WalFrameHeader::new_with_file_id(
+                    page_no,
+                    db_size,
+                    self.salt1,
+                    self.salt2,
+                    0,
+                    file_id,
+                );
+                let checksum = compute_checksum(&header, page_data);
+                let mut header_with_checksum = header;
+                header_with_checksum.checksum = checksum;
+
+                segment.write_frame_with_sync(&header_with_checksum, page_data, false)?;
+
+                frame_metadata.push((file_id, page_no, segment_num, current_offset));
+            }
+
+            if should_sync && !frame_metadata.is_empty() {
+                segment.sync_to_disk()?;
+            }
+        }
+
+        if !frame_metadata.is_empty() {
+            let mut index = self.page_index.write();
+            for (file_id, page_no, segment_num, offset) in &frame_metadata {
+                index.insert((*file_id, *page_no), (*segment_num, *offset));
+            }
+            drop(index);
+
+            let mut mmap = self.read_mmap.write();
+            *mmap = None;
+
+            use std::sync::atomic::Ordering;
+            self.frame_count
+                .fetch_add(frame_metadata.len() as u32, Ordering::AcqRel);
+        }
+
+        Ok(())
+    }
+
+    pub fn write_frames_batch_no_sync<'a, I>(&self, frames: I) -> Result<()>
+    where
+        I: IntoIterator<Item = (u32, u32, &'a [u8], u64)>,
+    {
+        let mut frame_metadata: smallvec::SmallVec<[(u64, u32, u64, u64); 16]> =
+            smallvec::SmallVec::new();
+
+        {
+            let mut segment = self.current_segment.lock();
+
+            for (page_no, db_size, page_data, file_id) in frames {
+                if page_data.len() != PAGE_SIZE {
+                    bail!(
+                        "page data must be exactly {} bytes, got {}",
+                        PAGE_SIZE,
+                        page_data.len()
+                    );
+                }
+
+                let current_offset = segment.offset();
+                let segment_num = segment.sequence;
+
+                let header = WalFrameHeader::new_with_file_id(
+                    page_no,
+                    db_size,
+                    self.salt1,
+                    self.salt2,
+                    0,
+                    file_id,
+                );
+                let checksum = compute_checksum(&header, page_data);
+                let mut header_with_checksum = header;
+                header_with_checksum.checksum = checksum;
+
+                segment.write_frame_with_sync(&header_with_checksum, page_data, false)?;
+
+                frame_metadata.push((file_id, page_no, segment_num, current_offset));
+            }
+        }
+
+        if !frame_metadata.is_empty() {
+            let mut index = self.page_index.write();
+            for (file_id, page_no, segment_num, offset) in &frame_metadata {
+                index.insert((*file_id, *page_no), (*segment_num, *offset));
+            }
+            drop(index);
+
+            let mut mmap = self.read_mmap.write();
+            *mmap = None;
+
+            use std::sync::atomic::Ordering;
+            self.frame_count
+                .fetch_add(frame_metadata.len() as u32, Ordering::AcqRel);
+        }
+
+        Ok(())
+    }
+
+    pub fn sync(&self) -> Result<()> {
+        let mut segment = self.current_segment.lock();
+        segment.sync_to_disk()
+    }
+
     pub fn current_offset(&self) -> u64 {
         let segment = self.current_segment.lock();
         segment.offset()
@@ -738,8 +864,10 @@ impl Wal {
     }
 }
 
+const WAL_BUFFER_SIZE: usize = 8 * 1024 * 1024;
+
 pub struct WalSegment {
-    file: File,
+    writer: std::io::BufWriter<File>,
     sequence: u64,
     offset: u64,
     pub path: PathBuf,
@@ -756,7 +884,7 @@ impl WalSegment {
             .wrap_err_with(|| format!("failed to create WAL segment at {:?}", path))?;
 
         Ok(Self {
-            file,
+            writer: std::io::BufWriter::with_capacity(WAL_BUFFER_SIZE, file),
             sequence,
             offset: 0,
             path: path.to_path_buf(),
@@ -779,7 +907,7 @@ impl WalSegment {
             .len();
 
         Ok(Self {
-            file,
+            writer: std::io::BufWriter::with_capacity(WAL_BUFFER_SIZE, file),
             sequence,
             offset: len,
             path: path.to_path_buf(),
@@ -804,17 +932,24 @@ impl WalSegment {
         page_data: &[u8],
         sync: bool,
     ) -> Result<()> {
+        use std::io::Write;
+
         let header_bytes = header.as_bytes();
-        self.file
+
+        self.writer
             .write_all(header_bytes)
             .wrap_err("failed to write WAL frame header")?;
 
-        self.file
+        self.writer
             .write_all(page_data)
             .wrap_err("failed to write WAL frame page data")?;
 
         if sync {
-            self.file
+            self.writer
+                .flush()
+                .wrap_err("failed to flush WAL buffer")?;
+            self.writer
+                .get_mut()
                 .sync_data()
                 .wrap_err("failed to sync WAL frame to disk")?;
         }
@@ -824,9 +959,20 @@ impl WalSegment {
         Ok(())
     }
 
+    pub fn sync_to_disk(&mut self) -> Result<()> {
+        use std::io::Write;
+        self.writer
+            .flush()
+            .wrap_err("failed to flush WAL buffer")?;
+        self.writer
+            .get_mut()
+            .sync_data()
+            .wrap_err("failed to sync WAL segment to disk")
+    }
+
     pub fn read_frame(&mut self) -> Result<(WalFrameHeader, Vec<u8>)> {
         let mut header_bytes = vec![0u8; WAL_FRAME_HEADER_SIZE];
-        self.file
+        self.writer.get_mut()
             .read_exact(&mut header_bytes)
             .wrap_err("failed to read WAL frame header")?;
 
@@ -834,7 +980,7 @@ impl WalSegment {
             .map_err(|e| eyre::eyre!("invalid WAL frame header: {:?}", e))?;
 
         let mut page_data = vec![0u8; PAGE_SIZE];
-        self.file
+        self.writer.get_mut()
             .read_exact(&mut page_data)
             .wrap_err("failed to read WAL frame page data")?;
 
@@ -854,14 +1000,14 @@ impl WalSegment {
             WAL_FRAME_HEADER_SIZE + PAGE_SIZE
         );
 
-        self.file
+        self.writer.get_mut()
             .read_exact(&mut buf[..WAL_FRAME_HEADER_SIZE])
             .wrap_err("failed to read WAL frame header")?;
 
         let header = WalFrameHeader::read_from_bytes(&buf[..WAL_FRAME_HEADER_SIZE])
             .map_err(|e| eyre::eyre!("invalid WAL frame header: {:?}", e))?;
 
-        self.file
+        self.writer.get_mut()
             .read_exact(&mut buf[WAL_FRAME_HEADER_SIZE..WAL_FRAME_HEADER_SIZE + PAGE_SIZE])
             .wrap_err("failed to read WAL frame page data")?;
 
@@ -879,14 +1025,14 @@ impl WalSegment {
         use std::io::{Seek, SeekFrom};
 
         let mut header_bytes = [0u8; WAL_FRAME_HEADER_SIZE];
-        self.file
+        self.writer.get_mut()
             .read_exact(&mut header_bytes)
             .wrap_err("failed to read WAL frame header")?;
 
         let header = WalFrameHeader::read_from_bytes(&header_bytes)
             .map_err(|e| eyre::eyre!("invalid WAL frame header: {:?}", e))?;
 
-        self.file
+        self.writer.get_mut()
             .seek(SeekFrom::Current(PAGE_SIZE as i64))
             .wrap_err("failed to seek past WAL frame page data")?;
 
@@ -898,7 +1044,7 @@ impl WalSegment {
     pub fn reset_position(&mut self) -> Result<()> {
         use std::io::{Seek, SeekFrom};
 
-        self.file
+        self.writer.get_mut()
             .seek(SeekFrom::Start(0))
             .wrap_err("failed to reset WAL segment position")?;
         self.offset = 0;

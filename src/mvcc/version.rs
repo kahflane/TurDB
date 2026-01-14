@@ -78,6 +78,28 @@ impl RecordHeader {
         VisibilityResult::Visible
     }
 
+    pub fn is_visible_with_clog<F>(&self, read_ts: TxnId, get_commit_ts: F) -> VisibilityResult
+    where
+        F: Fn(TxnId) -> Option<TxnId>,
+    {
+        let effective_ts = if self.is_locked() {
+            match get_commit_ts(self.txn_id) {
+                Some(commit_ts) => commit_ts,
+                None => return VisibilityResult::Invisible,
+            }
+        } else {
+            self.txn_id
+        };
+
+        if effective_ts > read_ts {
+            return VisibilityResult::Invisible;
+        }
+        if self.is_deleted() {
+            return VisibilityResult::Deleted;
+        }
+        VisibilityResult::Visible
+    }
+
     pub fn can_write(&self, writer_txn_id: TxnId, writer_read_ts: TxnId) -> WriteCheckResult {
         if self.is_locked() {
             if self.txn_id == writer_txn_id {
@@ -246,19 +268,6 @@ impl VersionChainWriter {
         self.header.set_locked(true);
         self.header.set_deleted(true);
         self.header.txn_id = writer_txn_id;
-        &self.header
-    }
-
-    pub fn finalize_commit(&mut self, commit_ts: TxnId) -> &RecordHeader {
-        self.header.set_locked(false);
-        self.header.txn_id = commit_ts;
-        &self.header
-    }
-
-    pub fn finalize_abort(&mut self, original_txn_id: TxnId) -> &RecordHeader {
-        self.header.set_locked(false);
-        self.header.set_deleted(false);
-        self.header.txn_id = original_txn_id;
         &self.header
     }
 
