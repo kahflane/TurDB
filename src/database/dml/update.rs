@@ -1714,6 +1714,7 @@ impl Database {
         let stmt = parser
             .parse_statement()
             .wrap_err("failed to re-parse cached UPDATE statement")?;
+        parser.expect_end_of_statement()?;
 
         if let crate::sql::ast::Statement::Update(update) = stmt {
             self.execute_update(update, params, &arena)

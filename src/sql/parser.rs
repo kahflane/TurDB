@@ -190,6 +190,39 @@ impl<'a> Parser<'a> {
         }
     }
 
+    pub fn expect_end_of_statement(&mut self) -> Result<()> {
+        while self.consume_token(&Token::Semicolon) {}
+        if !self.is_at_end() {
+            bail!(
+                "near \"{}\": syntax error",
+                self.token_to_string(&self.current)
+            )
+        }
+        Ok(())
+    }
+
+    fn token_to_string(&self, token: &Token<'_>) -> String {
+        match token {
+            Token::Ident(s) => s.to_string(),
+            Token::String(s) => format!("'{}'", s),
+            Token::Integer(n) => n.to_string(),
+            Token::Float(f) => f.to_string(),
+            Token::Keyword(k) => format!("{:?}", k).to_uppercase(),
+            Token::Semicolon => ";".to_string(),
+            Token::Comma => ",".to_string(),
+            Token::Dot => ".".to_string(),
+            Token::LParen => "(".to_string(),
+            Token::RParen => ")".to_string(),
+            Token::Plus => "+".to_string(),
+            Token::Minus => "-".to_string(),
+            Token::Star => "*".to_string(),
+            Token::Slash => "/".to_string(),
+            Token::Eq => "=".to_string(),
+            Token::Eof => "EOF".to_string(),
+            _ => format!("{:?}", token),
+        }
+    }
+
     pub fn errors(&self) -> &[ParseError<'a>] {
         &self.errors
     }

@@ -715,6 +715,7 @@ impl Database {
         parser
             .parse_statement()
             .wrap_err_with(|| format!("failed to parse SQL for prepared statement: {}", sql))?;
+        parser.expect_end_of_statement()?;
 
         let param_count = count_parameters(sql);
         Ok(super::PreparedStatement::new(sql.to_string(), param_count))
@@ -737,6 +738,7 @@ impl Database {
         let stmt = parser
             .parse_statement()
             .wrap_err("failed to parse SQL statement")?;
+        parser.expect_end_of_statement()?;
 
         let is_distinct =
             matches!(&stmt, Statement::Select(select) if select.distinct == Distinct::Distinct);
@@ -3511,6 +3513,7 @@ impl Database {
         let stmt = parser
             .parse_statement()
             .wrap_err("failed to parse SQL statement")?;
+        parser.expect_end_of_statement()?;
 
         #[cfg(feature = "timing")]
         PARSE_TIME_NS.fetch_add(
@@ -3530,6 +3533,7 @@ impl Database {
         let stmt = parser
             .parse_statement()
             .wrap_err("failed to parse SQL statement")?;
+        parser.expect_end_of_statement()?;
 
         #[cfg(feature = "timing")]
         PARSE_TIME_NS.fetch_add(
@@ -3579,6 +3583,7 @@ impl Database {
         let stmt = parser
             .parse_statement()
             .wrap_err("failed to parse SQL statement")?;
+        parser.expect_end_of_statement()?;
 
         #[cfg(feature = "timing")]
         PARSE_TIME_NS.fetch_add(

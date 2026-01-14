@@ -271,7 +271,7 @@ impl Database {
         target_type: Option<&crate::records::types::DataType>,
     ) -> Result<OwnedValue> {
         use crate::records::types::DataType;
-        use crate::sql::ast::{Expr, Literal, UnaryOperator};
+        use crate::sql::ast::{Expr, FunctionArgs, Literal, UnaryOperator};
 
         match expr {
             Expr::Literal(lit) => match lit {
@@ -313,6 +313,32 @@ impl Database {
                     _ => bail!("unsupported unary operation"),
                 }
             }
+            Expr::Function(func) => {
+                let name = func.name.name.to_uppercase();
+                let is_nullary = match &func.args {
+                    FunctionArgs::None => true,
+                    FunctionArgs::Args(args) => args.is_empty(),
+                    FunctionArgs::Star => false,
+                };
+
+                if is_nullary {
+                    if let Some(result) = crate::sql::functions::eval_function(&name, &[]) {
+                        if let crate::types::Value::Text(s) = &result {
+                            return match target_type {
+                                Some(DataType::Timestamp) | Some(DataType::TimestampTz) => {
+                                    parse_timestamp(s)
+                                }
+                                Some(DataType::Date) => parse_date(s),
+                                Some(DataType::Time) => parse_time(s),
+                                _ => Ok(OwnedValue::from(&result)),
+                            };
+                        }
+                        return Ok(OwnedValue::from(&result));
+                    }
+                }
+
+                bail!("unsupported function in literal context: {}", name)
+            }
             _ => bail!("expected literal expression, got {:?}", expr),
         }
     }
@@ -345,7 +371,6 @@ impl Database {
                     }
                     ParameterRef::Positional(n) => (*n as usize).saturating_sub(1),
                     ParameterRef::Named(_) => {
-                        // For named params, use positional order (same as substitute_parameters)
                         let i = *param_idx;
                         *param_idx += 1;
                         i
