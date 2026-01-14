@@ -308,6 +308,16 @@ impl<'a> Planner<'a> {
         analyzer.extract_equi_join_keys(condition)
     }
 
+    pub fn extract_equi_join_keys_for_join(
+        &self,
+        condition: Option<&'a Expr<'a>>,
+        left: &'a LogicalOperator<'a>,
+        right: &'a LogicalOperator<'a>,
+    ) -> &'a [EquiJoinKey<'a>] {
+        let analyzer = JoinAnalyzer::new(self.arena);
+        analyzer.extract_equi_join_keys_for_join(condition, left, right)
+    }
+
     pub fn convert_equi_keys_to_join_keys(
         &self,
         equi_keys: &'a [EquiJoinKey<'a>],

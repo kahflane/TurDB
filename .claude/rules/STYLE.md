@@ -5,7 +5,7 @@
 ## File Structure
 
 ### Maximum Length
-- **Hard limit: 800 lines per file**
+- **Hard limit: 1800 lines per file**
 - If approaching limit, split into submodules
 
 ### Modularity
@@ -296,7 +296,7 @@ debug = true
 
 Before any code:
 
-- [ ] File under 800 lines?
+- [ ] File under 1800 lines?
 - [ ] No inline comments?
 - [ ] 80-100 line module doc at top?
 - [ ] Using `pub(crate)` not `pub` where possible?

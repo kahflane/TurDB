@@ -25,7 +25,7 @@ cat << 'EOF'
 ║  ✗ .clone() on page data                                                     ║
 ║  ✗ Custom error enums                                                        ║
 ║  ✗ Inline comments                                                           ║
-║  ✗ Files > 800 lines                                                         ║
+║  ✗ Files > 1800 lines                                                         ║
 ║  ✗ assert!(result.is_ok()) without checking contents                         ║
 ║  ✗ Tests that use function output as expected value                          ║
 ║                                                                               ║

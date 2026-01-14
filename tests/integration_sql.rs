@@ -1357,6 +1357,40 @@ mod aggregation_tests {
             other => panic!("Expected Int for MAX, got {:?}", other),
         }
     }
+
+    #[test]
+    fn having_without_group_by_filters_on_select_alias() {
+        let dir = tempdir().unwrap();
+        let db = Database::create(dir.path().join("test_db")).unwrap();
+        db.execute("CREATE TABLE nums (id INT)").unwrap();
+        db.execute("INSERT INTO nums VALUES (1)").unwrap();
+        db.execute("INSERT INTO nums VALUES (2)").unwrap();
+        db.execute("INSERT INTO nums VALUES (3)").unwrap();
+        db.execute("INSERT INTO nums VALUES (4)").unwrap();
+        db.execute("INSERT INTO nums VALUES (5)").unwrap();
+
+        let rows = db
+            .query("SELECT id * 2 AS doubled FROM nums HAVING doubled < 6")
+            .unwrap();
+
+        assert_eq!(
+            rows.len(),
+            2,
+            "HAVING doubled < 6 SHOULD return 2 rows (ids 1,2 with doubled values 2,4)"
+        );
+
+        let values: Vec<i64> = rows
+            .iter()
+            .filter_map(|row| {
+                if let OwnedValue::Int(v) = row.values[0] {
+                    Some(v)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert_eq!(values, vec![2, 4], "Doubled values SHOULD be [2, 4]");
+    }
 }
 
 mod edge_case_tests {

@@ -61,7 +61,10 @@
       "WebFetch(domain:github.com)",
       "WebFetch(domain:raw.githubusercontent.com)",
       "Bash(gh pr view:*)",
-      "Bash(gh api:*)"
+      "Bash(gh api:*)",
+      "WebFetch(domain:www.interdb.jp)",
+      "WebFetch(domain:wiki.postgresql.org)",
+      "WebFetch(domain:www.cybertec-postgresql.com)"
     ]
   },
   "hooks": {

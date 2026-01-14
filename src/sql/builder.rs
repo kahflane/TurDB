@@ -67,7 +67,7 @@ impl<'a> ExecutorBuilder<'a> {
                 {
                     self.build_aggregate_column_map(group_by, aggregates, column_map)
                 } else {
-                    column_map.to_vec()
+                    self.compute_input_column_map(filter.input)
                 };
                 let predicate = if !self.ctx.scalar_subquery_results.is_empty() {
                     CompiledPredicate::with_scalar_subqueries(

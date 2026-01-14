@@ -45,6 +45,7 @@ use crate::sql::optimizer::OptimizationRule;
 use crate::sql::planner::LogicalOperator;
 use bumpalo::Bump;
 use eyre::Result;
+use smallvec::SmallVec;
 
 pub struct PredicatePushdownRule;
 
@@ -198,6 +199,9 @@ impl PredicatePushdownRule {
     ) -> Result<Option<(&'a LogicalOperator<'a>, Option<&'a crate::sql::ast::Expr<'a>>)>> {
         match input {
             LogicalOperator::Project(proj) => {
+                if self.predicate_uses_alias(predicate, proj.aliases) {
+                    return Ok(None);
+                }
                 let new_filter = crate::sql::planner::LogicalFilter {
                     input: proj.input,
                     predicate,
@@ -244,7 +248,187 @@ impl PredicatePushdownRule {
                 )))
             }
 
+            LogicalOperator::Join(join) => {
+                let left_tables = self.collect_table_names(join.left);
+                let right_tables = self.collect_table_names(join.right);
+                let pred_tables = self.collect_predicate_tables(predicate);
+
+                let refs_left = pred_tables.iter().any(|t| left_tables.contains(*t));
+                let refs_right = pred_tables.iter().any(|t| right_tables.contains(*t));
+
+                if refs_left && !refs_right {
+                    let new_filter = crate::sql::planner::LogicalFilter {
+                        input: join.left,
+                        predicate,
+                    };
+                    let filtered = arena.alloc(LogicalOperator::Filter(new_filter));
+                    let new_join = crate::sql::planner::LogicalJoin {
+                        left: filtered,
+                        right: join.right,
+                        join_type: join.join_type,
+                        condition: join.condition,
+                    };
+                    Ok(Some((arena.alloc(LogicalOperator::Join(new_join)), None)))
+                } else if refs_right && !refs_left {
+                    let new_filter = crate::sql::planner::LogicalFilter {
+                        input: join.right,
+                        predicate,
+                    };
+                    let filtered = arena.alloc(LogicalOperator::Filter(new_filter));
+                    let new_join = crate::sql::planner::LogicalJoin {
+                        left: join.left,
+                        right: filtered,
+                        join_type: join.join_type,
+                        condition: join.condition,
+                    };
+                    Ok(Some((arena.alloc(LogicalOperator::Join(new_join)), None)))
+                } else {
+                    Ok(None)
+                }
+            }
+
             _ => Ok(None),
+        }
+    }
+
+    fn collect_table_names<'a>(&self, op: &'a LogicalOperator<'a>) -> std::collections::HashSet<&'a str> {
+        let mut tables = std::collections::HashSet::new();
+        self.collect_tables_recursive(op, &mut tables);
+        tables
+    }
+
+    fn collect_tables_recursive<'a>(&self, op: &'a LogicalOperator<'a>, tables: &mut std::collections::HashSet<&'a str>) {
+        match op {
+            LogicalOperator::Scan(scan) => {
+                if let Some(alias) = scan.alias {
+                    tables.insert(alias);
+                } else {
+                    tables.insert(scan.table);
+                }
+            }
+            LogicalOperator::Join(join) => {
+                self.collect_tables_recursive(join.left, tables);
+                self.collect_tables_recursive(join.right, tables);
+            }
+            LogicalOperator::Filter(filter) => {
+                self.collect_tables_recursive(filter.input, tables);
+            }
+            LogicalOperator::Project(project) => {
+                self.collect_tables_recursive(project.input, tables);
+            }
+            LogicalOperator::Aggregate(agg) => {
+                self.collect_tables_recursive(agg.input, tables);
+            }
+            LogicalOperator::Sort(sort) => {
+                self.collect_tables_recursive(sort.input, tables);
+            }
+            LogicalOperator::Limit(limit) => {
+                self.collect_tables_recursive(limit.input, tables);
+            }
+            LogicalOperator::Subquery(subq) => {
+                tables.insert(subq.alias);
+            }
+            _ => {}
+        }
+    }
+
+    fn collect_predicate_tables<'a>(&self, expr: &'a crate::sql::ast::Expr<'a>) -> SmallVec<[&'a str; 4]> {
+        let mut tables: SmallVec<[&'a str; 4]> = SmallVec::new();
+        self.collect_expr_tables(expr, &mut tables);
+        tables
+    }
+
+    fn collect_expr_tables<'a>(&self, expr: &'a crate::sql::ast::Expr<'a>, tables: &mut SmallVec<[&'a str; 4]>) {
+        use crate::sql::ast::Expr;
+        match expr {
+            Expr::Column(col) => {
+                if let Some(table) = col.table {
+                    tables.push(table);
+                }
+            }
+            Expr::BinaryOp { left, right, .. } => {
+                self.collect_expr_tables(left, tables);
+                self.collect_expr_tables(right, tables);
+            }
+            Expr::UnaryOp { expr, .. } => {
+                self.collect_expr_tables(expr, tables);
+            }
+            Expr::Function(func) => {
+                if let crate::sql::ast::FunctionArgs::Args(args) = &func.args {
+                    for arg in args.iter() {
+                        self.collect_expr_tables(arg.value, tables);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn predicate_uses_alias(&self, predicate: &crate::sql::ast::Expr<'_>, aliases: &[Option<&str>]) -> bool {
+        let alias_set: std::collections::HashSet<&str> = aliases
+            .iter()
+            .filter_map(|a| *a)
+            .collect();
+
+        if alias_set.is_empty() {
+            return false;
+        }
+
+        self.expr_uses_alias(predicate, &alias_set)
+    }
+
+    fn expr_uses_alias(&self, expr: &crate::sql::ast::Expr<'_>, aliases: &std::collections::HashSet<&str>) -> bool {
+        use crate::sql::ast::{Expr, FunctionArgs};
+
+        match expr {
+            Expr::Column(col) => {
+                aliases.contains(col.column)
+            }
+            Expr::BinaryOp { left, right, .. } => {
+                self.expr_uses_alias(left, aliases) || self.expr_uses_alias(right, aliases)
+            }
+            Expr::UnaryOp { expr, .. } => self.expr_uses_alias(expr, aliases),
+            Expr::Function(func) => {
+                match &func.args {
+                    FunctionArgs::Args(args) => args.iter().any(|arg| self.expr_uses_alias(arg.value, aliases)),
+                    _ => false,
+                }
+            }
+            Expr::Between { expr, low, high, .. } => {
+                self.expr_uses_alias(expr, aliases)
+                    || self.expr_uses_alias(low, aliases)
+                    || self.expr_uses_alias(high, aliases)
+            }
+            Expr::InList { expr, list, .. } => {
+                self.expr_uses_alias(expr, aliases)
+                    || list.iter().any(|e| self.expr_uses_alias(e, aliases))
+            }
+            Expr::Like { expr, pattern, .. } => {
+                self.expr_uses_alias(expr, aliases) || self.expr_uses_alias(pattern, aliases)
+            }
+            Expr::IsNull { expr, .. } => self.expr_uses_alias(expr, aliases),
+            Expr::Case { operand, conditions, else_result } => {
+                if let Some(op) = operand {
+                    if self.expr_uses_alias(op, aliases) {
+                        return true;
+                    }
+                }
+                for clause in conditions.iter() {
+                    if self.expr_uses_alias(clause.condition, aliases) || self.expr_uses_alias(clause.result, aliases) {
+                        return true;
+                    }
+                }
+                if let Some(else_expr) = else_result {
+                    if self.expr_uses_alias(else_expr, aliases) {
+                        return true;
+                    }
+                }
+                false
+            }
+            Expr::Cast { expr, .. } => self.expr_uses_alias(expr, aliases),
+            Expr::Subquery(_) => false,
+            Expr::Exists { .. } => false,
+            _ => false,
         }
     }
 }

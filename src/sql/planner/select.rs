@@ -158,6 +158,16 @@ impl<'a> Planner<'a> {
         }));
         current = project;
 
+        if select.having.is_some() && select.group_by.is_empty() && !has_aggregates {
+            if let Some(having) = select.having {
+                let having_filter = self.arena.alloc(LogicalOperator::Filter(LogicalFilter {
+                    input: current,
+                    predicate: having,
+                }));
+                current = having_filter;
+            }
+        }
+
         if let Some(set_op) = select.set_op {
             let right_select = set_op.right;
             let right_order_by = right_select.order_by;
@@ -292,6 +302,16 @@ impl<'a> Planner<'a> {
             aliases,
         }));
         current = project;
+
+        if select.having.is_some() && select.group_by.is_empty() && !has_aggregates {
+            if let Some(having) = select.having {
+                let having_filter = self.arena.alloc(LogicalOperator::Filter(LogicalFilter {
+                    input: current,
+                    predicate: having,
+                }));
+                current = having_filter;
+            }
+        }
 
         if let Some(set_op) = select.set_op {
             let right_plan = self.plan_select_core(set_op.right, cte_context)?;

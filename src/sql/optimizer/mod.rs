@@ -90,6 +90,7 @@ impl Optimizer {
         Self {
             rules: vec![
                 Box::new(rules::ConstantFoldingRule),
+                Box::new(rules::JoinConditionExtractionRule),
                 Box::new(rules::PredicatePushdownRule),
                 Box::new(rules::ProjectionPruningRule),
                 Box::new(rules::SubqueryDecorrelationRule),
@@ -187,6 +188,6 @@ mod tests {
     fn test_optimizer_default() {
         let optimizer = Optimizer::default();
         assert_eq!(optimizer.max_iterations, 10);
-        assert_eq!(optimizer.rules.len(), 4);
+        assert_eq!(optimizer.rules.len(), 5);
     }
 }

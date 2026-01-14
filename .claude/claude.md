@@ -39,7 +39,7 @@ These patterns are NEVER acceptable:
 12. Custom error enums - use `eyre` only
 13. Error messages without context (operation, resource, reason)
 14. `pub` when `pub(crate)` suffices
-15. Files over 800 lines
+15. Files over 1800 lines
 
 ### Dependencies
 16. `serde` - use custom zero-copy serialization

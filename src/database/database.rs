@@ -1113,6 +1113,73 @@ impl Database {
                 } else {
                     Ok(join_rows)
                 }
+            } else if let Some(inner_hash_join) = find_hash_join_in_subquery(subq.child_plan) {
+                let (mut join_rows, join_column_map) =
+                    execute_hash_join_in_subquery(inner_hash_join, subq.child_plan, &subq.output_schema, catalog, file_manager)?;
+
+                fn get_limit_from_plan_hash<'a>(
+                    op: &'a crate::sql::planner::PhysicalOperator<'a>,
+                ) -> (Option<usize>, usize) {
+                    use crate::sql::planner::PhysicalOperator;
+                    match op {
+                        PhysicalOperator::LimitExec(l) => (l.limit.map(|v| v as usize), l.offset.unwrap_or(0) as usize),
+                        PhysicalOperator::FilterExec(f) => get_limit_from_plan_hash(f.input),
+                        PhysicalOperator::ProjectExec(p) => get_limit_from_plan_hash(p.input),
+                        PhysicalOperator::SortExec(s) => get_limit_from_plan_hash(s.input),
+                        PhysicalOperator::TopKExec(t) => (Some(t.limit as usize), t.offset.unwrap_or(0) as usize),
+                        _ => (None, 0),
+                    }
+                }
+
+                let (limit, offset) = get_limit_from_plan_hash(subq.child_plan);
+
+                if offset > 0 {
+                    join_rows = join_rows.into_iter().skip(offset).collect();
+                }
+
+                if let Some(lim) = limit {
+                    join_rows.truncate(lim);
+                }
+
+                fn get_project_from_plan_hash<'a>(
+                    op: &'a crate::sql::planner::PhysicalOperator<'a>,
+                ) -> Option<&'a [&'a crate::sql::ast::Expr<'a>]> {
+                    use crate::sql::planner::PhysicalOperator;
+                    match op {
+                        PhysicalOperator::ProjectExec(p) => Some(p.expressions),
+                        PhysicalOperator::LimitExec(l) => get_project_from_plan_hash(l.input),
+                        PhysicalOperator::SortExec(s) => get_project_from_plan_hash(s.input),
+                        PhysicalOperator::TopKExec(t) => get_project_from_plan_hash(t.input),
+                        _ => None,
+                    }
+                }
+
+                if let Some(projections) = get_project_from_plan_hash(subq.child_plan) {
+                    let compiled_projections: Vec<crate::sql::predicate::CompiledPredicate> = projections
+                        .iter()
+                        .map(|expr| crate::sql::predicate::CompiledPredicate::with_column_map_ref(expr, &join_column_map))
+                        .collect();
+
+                    let mut projected_rows: Vec<Vec<OwnedValue>> = Vec::with_capacity(join_rows.len());
+                    for row_owned in &join_rows {
+                        let values: smallvec::SmallVec<[Value<'_>; 16]> =
+                            row_owned.iter().map(|v| v.to_value()).collect();
+                        let row_ref = ExecutorRow::new(&values);
+
+                        let projected: Vec<OwnedValue> = compiled_projections
+                            .iter()
+                            .map(|pred| {
+                                pred.evaluate_to_value(&row_ref)
+                                    .map(|v| OwnedValue::from(&v))
+                                    .unwrap_or(OwnedValue::Null)
+                            })
+                            .collect();
+                        projected_rows.push(projected);
+                    }
+                    Ok(projected_rows)
+                } else {
+                    Ok(join_rows)
+                }
             } else {
                 bail!("subquery inner plan must have a table scan")
             }
@@ -1130,6 +1197,22 @@ impl Database {
                 PhysicalOperator::SortExec(s) => find_join_in_subquery(s.input),
                 PhysicalOperator::TopKExec(t) => find_join_in_subquery(t.input),
                 PhysicalOperator::HashAggregate(a) => find_join_in_subquery(a.input),
+                _ => None,
+            }
+        }
+
+        fn find_hash_join_in_subquery<'a>(
+            op: &'a crate::sql::planner::PhysicalOperator<'a>,
+        ) -> Option<&'a crate::sql::planner::PhysicalGraceHashJoin<'a>> {
+            use crate::sql::planner::PhysicalOperator;
+            match op {
+                PhysicalOperator::GraceHashJoin(join) => Some(join),
+                PhysicalOperator::FilterExec(f) => find_hash_join_in_subquery(f.input),
+                PhysicalOperator::ProjectExec(p) => find_hash_join_in_subquery(p.input),
+                PhysicalOperator::LimitExec(l) => find_hash_join_in_subquery(l.input),
+                PhysicalOperator::SortExec(s) => find_hash_join_in_subquery(s.input),
+                PhysicalOperator::TopKExec(t) => find_hash_join_in_subquery(t.input),
+                PhysicalOperator::HashAggregate(a) => find_hash_join_in_subquery(a.input),
                 _ => None,
             }
         }
@@ -1264,6 +1347,205 @@ impl Database {
 
                     if passes {
                         result_rows.push(combined_buf.to_vec());
+                    }
+                }
+            }
+
+            Ok((result_rows, column_map))
+        }
+
+        fn execute_hash_join_in_subquery<'a>(
+            join: &'a crate::sql::planner::PhysicalGraceHashJoin<'a>,
+            _full_plan: &'a crate::sql::planner::PhysicalOperator<'a>,
+            _output_schema: &crate::sql::planner::OutputSchema<'a>,
+            catalog: &crate::schema::catalog::Catalog,
+            file_manager: &mut FileManager,
+        ) -> Result<MaterializedSubqueryResult> {
+            fn get_table_scan<'a>(
+                op: &'a crate::sql::planner::PhysicalOperator<'a>,
+            ) -> Option<&'a crate::sql::planner::PhysicalTableScan<'a>> {
+                use crate::sql::planner::PhysicalOperator;
+                match op {
+                    PhysicalOperator::TableScan(scan) => Some(scan),
+                    PhysicalOperator::FilterExec(f) => get_table_scan(f.input),
+                    PhysicalOperator::ProjectExec(p) => get_table_scan(p.input),
+                    PhysicalOperator::LimitExec(l) => get_table_scan(l.input),
+                    _ => None,
+                }
+            }
+
+            let left_scan = get_table_scan(join.left);
+            let right_scan = get_table_scan(join.right);
+
+            let left_table_def = left_scan
+                .map(|scan| catalog.resolve_table_in_schema(scan.schema, scan.table))
+                .transpose()?;
+            let right_table_def = right_scan
+                .map(|scan| catalog.resolve_table_in_schema(scan.schema, scan.table))
+                .transpose()?;
+
+            let left_col_count = left_table_def.as_ref().map_or(0, |t| t.columns().len());
+            let right_col_count = right_table_def.as_ref().map_or(0, |t| t.columns().len());
+            let column_map_capacity = (left_col_count + right_col_count) * 3;
+
+            let mut column_map: Vec<(String, usize)> = Vec::with_capacity(column_map_capacity);
+            let mut idx = 0usize;
+
+            let left_rows: Vec<Vec<OwnedValue>> = if let (Some(scan), Some(table_def)) = (left_scan, &left_table_def) {
+                let schema_name = scan.schema.unwrap_or(DEFAULT_SCHEMA);
+                let table_name = scan.table;
+                let alias = scan.alias.unwrap_or(table_name);
+                let column_types: Vec<_> =
+                    table_def.columns().iter().map(|c| c.data_type()).collect();
+                let storage_arc = file_manager.table_data(schema_name, table_name)?;
+                let storage = storage_arc.read();
+                let header = TableFileHeader::from_bytes(storage.page(0)?)?;
+                let row_count_estimate = header.row_count() as usize;
+                let root_page = header.root_page();
+                let mut source = StreamingBTreeSource::from_btree_scan_with_projections(
+                    &storage,
+                    root_page,
+                    column_types,
+                    None,
+                )?;
+                let mut rows = Vec::with_capacity(row_count_estimate);
+                while let Some(row) = source.next_row()? {
+                    rows.push(row.iter().map(OwnedValue::from).collect());
+                }
+                let extra_table_name = if scan.alias.is_some() && alias != table_name {
+                    Some(table_name)
+                } else {
+                    None
+                };
+                build_column_map_with_alias(table_def, alias, extra_table_name, idx, &mut column_map);
+                idx += table_def.columns().len();
+                rows
+            } else {
+                Vec::new()
+            };
+
+            let right_rows: Vec<Vec<OwnedValue>> = if let (Some(scan), Some(table_def)) = (right_scan, &right_table_def) {
+                let schema_name = scan.schema.unwrap_or(DEFAULT_SCHEMA);
+                let table_name = scan.table;
+                let alias = scan.alias.unwrap_or(table_name);
+                let column_types: Vec<_> =
+                    table_def.columns().iter().map(|c| c.data_type()).collect();
+                let storage_arc = file_manager.table_data(schema_name, table_name)?;
+                let storage = storage_arc.read();
+                let header = TableFileHeader::from_bytes(storage.page(0)?)?;
+                let row_count_estimate = header.row_count() as usize;
+                let root_page = header.root_page();
+                let mut source = StreamingBTreeSource::from_btree_scan_with_projections(
+                    &storage,
+                    root_page,
+                    column_types,
+                    None,
+                )?;
+                let mut rows = Vec::with_capacity(row_count_estimate);
+                while let Some(row) = source.next_row()? {
+                    rows.push(row.iter().map(OwnedValue::from).collect());
+                }
+                let extra_table_name = if scan.alias.is_some() && alias != table_name {
+                    Some(table_name)
+                } else {
+                    None
+                };
+                build_column_map_with_alias(table_def, alias, extra_table_name, idx, &mut column_map);
+                rows
+            } else {
+                Vec::new()
+            };
+
+            let left_key_indices: smallvec::SmallVec<[usize; 4]> = join.join_keys
+                .iter()
+                .filter_map(|(left_expr, _)| {
+                    if let crate::sql::ast::Expr::Column(col) = left_expr {
+                        let col_name = if let Some(tbl) = col.table {
+                            format!("{}.{}", tbl, col.column).to_lowercase()
+                        } else {
+                            col.column.to_lowercase()
+                        };
+                        column_map.iter().find(|(name, _)| name == &col_name).map(|(_, i)| *i)
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+
+            let right_key_indices: smallvec::SmallVec<[usize; 4]> = join.join_keys
+                .iter()
+                .filter_map(|(_, right_expr)| {
+                    if let crate::sql::ast::Expr::Column(col) = right_expr {
+                        let col_name = if let Some(tbl) = col.table {
+                            format!("{}.{}", tbl, col.column).to_lowercase()
+                        } else {
+                            col.column.to_lowercase()
+                        };
+                        column_map.iter().find(|(name, _)| name == &col_name).map(|(_, i)| *i)
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+
+            fn hash_owned_value(val: &OwnedValue, hasher: &mut std::collections::hash_map::DefaultHasher) {
+                use std::hash::Hash;
+                match val {
+                    OwnedValue::Null => 0u8.hash(hasher),
+                    OwnedValue::Bool(b) => b.hash(hasher),
+                    OwnedValue::Int(i) => i.hash(hasher),
+                    OwnedValue::Float(f) => f.to_bits().hash(hasher),
+                    OwnedValue::Text(s) => s.hash(hasher),
+                    OwnedValue::Blob(b) => b.hash(hasher),
+                    _ => format!("{:?}", val).hash(hasher),
+                }
+            }
+
+            let mut hash_map: hashbrown::HashMap<u64, Vec<usize>> = hashbrown::HashMap::new();
+            for (row_idx, row) in left_rows.iter().enumerate() {
+                use std::hash::Hasher;
+                let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                for &key_idx in &left_key_indices {
+                    if let Some(val) = row.get(key_idx) {
+                        hash_owned_value(val, &mut hasher);
+                    }
+                }
+                let hash = hasher.finish();
+                hash_map.entry(hash).or_insert_with(Vec::new).push(row_idx);
+            }
+
+            let mut result_rows: Vec<Vec<OwnedValue>> = Vec::new();
+            let mut combined_buf: smallvec::SmallVec<[OwnedValue; 16]> = smallvec::SmallVec::new();
+
+            for right_row in &right_rows {
+                use std::hash::Hasher;
+                let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                for &key_idx in &right_key_indices {
+                    let actual_idx = key_idx.saturating_sub(left_col_count);
+                    if let Some(val) = right_row.get(actual_idx) {
+                        hash_owned_value(val, &mut hasher);
+                    }
+                }
+                let hash = hasher.finish();
+
+                if let Some(left_indices) = hash_map.get(&hash) {
+                    for &left_idx in left_indices {
+                        let left_row = &left_rows[left_idx];
+                        let matches = left_key_indices.iter().zip(right_key_indices.iter()).all(|(&li, &ri)| {
+                            let right_actual_idx = ri.saturating_sub(left_col_count);
+                            if let (Some(lv), Some(rv)) = (left_row.get(li), right_row.get(right_actual_idx)) {
+                                lv == rv
+                            } else {
+                                false
+                            }
+                        });
+
+                        if matches {
+                            combined_buf.clear();
+                            combined_buf.extend(left_row.iter().cloned());
+                            combined_buf.extend(right_row.iter().cloned());
+                            result_rows.push(combined_buf.to_vec());
+                        }
                     }
                 }
             }
@@ -1844,6 +2126,21 @@ impl Database {
                     }
                 }
 
+                fn find_hash_join<'a>(
+                    op: &'a crate::sql::planner::PhysicalOperator<'a>,
+                ) -> Option<&'a crate::sql::planner::PhysicalGraceHashJoin<'a>> {
+                    use crate::sql::planner::PhysicalOperator;
+                    match op {
+                        PhysicalOperator::GraceHashJoin(join) => Some(join),
+                        PhysicalOperator::FilterExec(f) => find_hash_join(f.input),
+                        PhysicalOperator::ProjectExec(p) => find_hash_join(p.input),
+                        PhysicalOperator::LimitExec(l) => find_hash_join(l.input),
+                        PhysicalOperator::SortExec(s) => find_hash_join(s.input),
+                        PhysicalOperator::TopKExec(t) => find_hash_join(t.input),
+                        _ => None,
+                    }
+                }
+
                 fn execute_nested_join_recursive<'a>(
                     nested_join: &'a crate::sql::planner::PhysicalNestedLoopJoin<'a>,
                     catalog: &crate::schema::catalog::Catalog,
@@ -1970,6 +2267,155 @@ impl Database {
                     Ok((result_rows, column_map))
                 }
 
+                fn execute_hash_join_recursive<'a>(
+                    hash_join: &'a crate::sql::planner::PhysicalGraceHashJoin<'a>,
+                    catalog: &crate::schema::catalog::Catalog,
+                    file_manager: &mut FileManager,
+                ) -> Result<MaterializedSubqueryResult> {
+                    let mut left_rows: Vec<Vec<OwnedValue>> = Vec::new();
+                    let mut right_rows: Vec<Vec<OwnedValue>> = Vec::new();
+                    let mut column_map: Vec<(String, usize)> = Vec::new();
+                    let mut idx = 0usize;
+
+                    fn get_scan_from_op<'a>(
+                        op: &'a crate::sql::planner::PhysicalOperator<'a>,
+                    ) -> Option<&'a crate::sql::planner::PhysicalTableScan<'a>> {
+                        use crate::sql::planner::PhysicalOperator;
+                        match op {
+                            PhysicalOperator::TableScan(scan) => Some(scan),
+                            PhysicalOperator::FilterExec(f) => get_scan_from_op(f.input),
+                            PhysicalOperator::ProjectExec(p) => get_scan_from_op(p.input),
+                            PhysicalOperator::LimitExec(l) => get_scan_from_op(l.input),
+                            _ => None,
+                        }
+                    }
+
+                    let left_scan = get_scan_from_op(hash_join.left);
+                    let right_scan = get_scan_from_op(hash_join.right);
+
+                    if let Some(scan) = left_scan {
+                        let table_def = catalog.resolve_table_in_schema(scan.schema, scan.table)?;
+                        let (rows, _) = materialize_table_rows(catalog, file_manager, scan.schema, scan.table)?;
+                        left_rows = rows;
+                        let alias = scan.alias.unwrap_or(scan.table);
+                        for col in table_def.columns() {
+                            column_map.push((col.name().to_lowercase(), idx));
+                            column_map.push((format!("{}.{}", scan.table, col.name()).to_lowercase(), idx));
+                            column_map.push((format!("{}.{}", alias, col.name()).to_lowercase(), idx));
+                            idx += 1;
+                        }
+                    }
+
+                    let left_col_count = idx;
+
+                    if let Some(scan) = right_scan {
+                        let table_def = catalog.resolve_table_in_schema(scan.schema, scan.table)?;
+                        let (rows, _) = materialize_table_rows(catalog, file_manager, scan.schema, scan.table)?;
+                        right_rows = rows;
+                        let alias = scan.alias.unwrap_or(scan.table);
+                        for col in table_def.columns() {
+                            column_map.push((col.name().to_lowercase(), idx));
+                            column_map.push((format!("{}.{}", scan.table, col.name()).to_lowercase(), idx));
+                            column_map.push((format!("{}.{}", alias, col.name()).to_lowercase(), idx));
+                            idx += 1;
+                        }
+                    }
+
+                    let left_key_indices: smallvec::SmallVec<[usize; 4]> = hash_join.join_keys
+                        .iter()
+                        .filter_map(|(left_expr, _)| {
+                            if let crate::sql::ast::Expr::Column(col) = left_expr {
+                                let col_name = if let Some(tbl) = col.table {
+                                    format!("{}.{}", tbl, col.column).to_lowercase()
+                                } else {
+                                    col.column.to_lowercase()
+                                };
+                                column_map.iter().find(|(name, _)| name == &col_name).map(|(_, i)| *i)
+                            } else {
+                                None
+                            }
+                        })
+                        .collect();
+
+                    let right_key_indices: smallvec::SmallVec<[usize; 4]> = hash_join.join_keys
+                        .iter()
+                        .filter_map(|(_, right_expr)| {
+                            if let crate::sql::ast::Expr::Column(col) = right_expr {
+                                let col_name = if let Some(tbl) = col.table {
+                                    format!("{}.{}", tbl, col.column).to_lowercase()
+                                } else {
+                                    col.column.to_lowercase()
+                                };
+                                column_map.iter().find(|(name, _)| name == &col_name).map(|(_, i)| *i)
+                            } else {
+                                None
+                            }
+                        })
+                        .collect();
+
+                    fn hash_owned_val(val: &OwnedValue, hasher: &mut std::collections::hash_map::DefaultHasher) {
+                        use std::hash::Hash;
+                        match val {
+                            OwnedValue::Null => 0u8.hash(hasher),
+                            OwnedValue::Bool(b) => b.hash(hasher),
+                            OwnedValue::Int(i) => i.hash(hasher),
+                            OwnedValue::Float(f) => f.to_bits().hash(hasher),
+                            OwnedValue::Text(s) => s.hash(hasher),
+                            OwnedValue::Blob(b) => b.hash(hasher),
+                            _ => format!("{:?}", val).hash(hasher),
+                        }
+                    }
+
+                    let mut hash_table: hashbrown::HashMap<u64, Vec<usize>> = hashbrown::HashMap::new();
+                    for (row_idx, row) in left_rows.iter().enumerate() {
+                        use std::hash::Hasher;
+                        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                        for &key_idx in &left_key_indices {
+                            if let Some(val) = row.get(key_idx) {
+                                hash_owned_val(val, &mut hasher);
+                            }
+                        }
+                        let hash = hasher.finish();
+                        hash_table.entry(hash).or_insert_with(Vec::new).push(row_idx);
+                    }
+
+                    let mut result_rows: Vec<Vec<OwnedValue>> = Vec::new();
+                    for right_row in &right_rows {
+                        use std::hash::Hasher;
+                        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                        for &key_idx in &right_key_indices {
+                            let actual_idx = key_idx.saturating_sub(left_col_count);
+                            if let Some(val) = right_row.get(actual_idx) {
+                                hash_owned_val(val, &mut hasher);
+                            }
+                        }
+                        let hash = hasher.finish();
+
+                        if let Some(left_indices) = hash_table.get(&hash) {
+                            for &left_idx in left_indices {
+                                let left_row = &left_rows[left_idx];
+                                let matches = left_key_indices.iter().zip(right_key_indices.iter()).all(|(&li, &ri)| {
+                                    let right_actual_idx = ri.saturating_sub(left_col_count);
+                                    if let (Some(lv), Some(rv)) = (left_row.get(li), right_row.get(right_actual_idx)) {
+                                        lv == rv
+                                    } else {
+                                        false
+                                    }
+                                });
+
+                                if matches {
+                                    let mut combined: Vec<OwnedValue> = Vec::with_capacity(left_row.len() + right_row.len());
+                                    combined.extend(left_row.iter().cloned());
+                                    combined.extend(right_row.iter().cloned());
+                                    result_rows.push(combined);
+                                }
+                            }
+                        }
+                    }
+
+                    Ok((result_rows, column_map))
+                }
+
                 let (left_op, right_op, join_type, condition, join_keys) = match plan_source {
                     Some(PlanSource::NestedLoopJoin(j)) => {
                         (j.left, j.right, j.join_type, j.condition, &[][..])
@@ -1992,6 +2438,8 @@ impl Database {
                 let right_scan = find_scan_in_join(right_op);
                 let left_nested_join = find_nested_join(left_op);
                 let right_nested_join = find_nested_join(right_op);
+                let left_hash_join = find_hash_join(left_op);
+                let right_hash_join = find_hash_join(right_op);
 
                 let mut left_rows: Vec<Vec<OwnedValue>> = Vec::new();
                 let mut right_rows: Vec<Vec<OwnedValue>> = Vec::new();
@@ -2023,6 +2471,9 @@ impl Database {
                 } else if let Some(nested_join) = left_nested_join {
                     (left_rows, left_nested_join_column_map) =
                         execute_nested_join_recursive(nested_join, catalog, file_manager)?;
+                } else if let Some(hash_join) = left_hash_join {
+                    (left_rows, left_nested_join_column_map) =
+                        execute_hash_join_recursive(hash_join, catalog, file_manager)?;
                 }
 
                 if let Some(subq) = right_subq {
@@ -2043,6 +2494,10 @@ impl Database {
                 } else if let Some(nested_join) = right_nested_join {
                     (right_rows, right_nested_join_column_map) =
                         execute_nested_join_recursive(nested_join, catalog, file_manager)?;
+                    right_col_count = right_rows.first().map(|r| r.len()).unwrap_or(0);
+                } else if let Some(hash_join) = right_hash_join {
+                    (right_rows, right_nested_join_column_map) =
+                        execute_hash_join_recursive(hash_join, catalog, file_manager)?;
                     right_col_count = right_rows.first().map(|r| r.len()).unwrap_or(0);
                 }
 

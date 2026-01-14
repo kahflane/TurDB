@@ -104,7 +104,11 @@ impl<'a> Planner<'a> {
                 match join.join_type {
                     JoinType::Semi => {
                         if self.has_equi_join_keys(join.condition) {
-                            let equi_keys = self.extract_equi_join_keys(join.condition);
+                            let equi_keys = self.extract_equi_join_keys_for_join(
+                                join.condition,
+                                join.left,
+                                join.right,
+                            );
                             let join_keys = self.convert_equi_keys_to_join_keys(equi_keys);
                             let physical = self.arena.alloc(PhysicalOperator::HashSemiJoin(
                                 PhysicalHashSemiJoin {
@@ -128,7 +132,11 @@ impl<'a> Planner<'a> {
                     }
                     JoinType::Anti => {
                         if self.has_equi_join_keys(join.condition) {
-                            let equi_keys = self.extract_equi_join_keys(join.condition);
+                            let equi_keys = self.extract_equi_join_keys_for_join(
+                                join.condition,
+                                join.left,
+                                join.right,
+                            );
                             let join_keys = self.convert_equi_keys_to_join_keys(equi_keys);
                             let physical = self.arena.alloc(PhysicalOperator::HashAntiJoin(
                                 PhysicalHashAntiJoin {
@@ -152,7 +160,11 @@ impl<'a> Planner<'a> {
                     }
                     _ => {
                         if self.has_equi_join_keys(join.condition) {
-                            let equi_keys = self.extract_equi_join_keys(join.condition);
+                            let equi_keys = self.extract_equi_join_keys_for_join(
+                                join.condition,
+                                join.left,
+                                join.right,
+                            );
                             let join_keys = self.convert_equi_keys_to_join_keys(equi_keys);
                             let physical = self.arena.alloc(PhysicalOperator::GraceHashJoin(
                                 PhysicalGraceHashJoin {
