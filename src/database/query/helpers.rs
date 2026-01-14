@@ -379,6 +379,93 @@ pub fn build_simple_column_map(table_def: &TableDef) -> Vec<(String, usize)> {
         .collect()
 }
 
+/// Compares two OwnedValues for equality with type coercion.
+///
+/// This function handles the case where Int and Float types need to be
+/// compared as equal when they represent the same numeric value.
+/// This is essential for hash joins where one side may have BIGINT
+/// and the other DOUBLE PRECISION for the join column.
+pub fn owned_values_equal_with_coercion(a: &OwnedValue, b: &OwnedValue) -> bool {
+    match (a, b) {
+        (OwnedValue::Null, _) | (_, OwnedValue::Null) => false,
+        (OwnedValue::Int(a), OwnedValue::Int(b)) => a == b,
+        (OwnedValue::Float(a), OwnedValue::Float(b)) => a == b,
+        (OwnedValue::Int(a), OwnedValue::Float(b)) => (*a as f64) == *b,
+        (OwnedValue::Float(a), OwnedValue::Int(b)) => *a == (*b as f64),
+        (OwnedValue::Text(a), OwnedValue::Text(b)) => a == b,
+        (OwnedValue::Bool(a), OwnedValue::Bool(b)) => a == b,
+        (OwnedValue::Blob(a), OwnedValue::Blob(b)) => a == b,
+        (OwnedValue::Date(a), OwnedValue::Date(b)) => a == b,
+        (OwnedValue::Time(a), OwnedValue::Time(b)) => a == b,
+        (OwnedValue::Timestamp(a), OwnedValue::Timestamp(b)) => a == b,
+        (OwnedValue::Uuid(a), OwnedValue::Uuid(b)) => a == b,
+        _ => a == b,
+    }
+}
+
+/// Hashes an OwnedValue with type normalization for hash joins.
+///
+/// This function normalizes Int to Float before hashing so that
+/// Int(18) and Float(18.0) produce the same hash value. This is
+/// essential for hash joins between columns of different numeric types.
+pub fn hash_owned_value_normalized(val: &OwnedValue, hasher: &mut impl std::hash::Hasher) {
+    use std::hash::Hash;
+    match val {
+        OwnedValue::Null => 0u8.hash(hasher),
+        OwnedValue::Int(i) => (*i as f64).to_bits().hash(hasher),
+        OwnedValue::Float(f) => f.to_bits().hash(hasher),
+        OwnedValue::Text(s) => s.hash(hasher),
+        OwnedValue::Bool(b) => b.hash(hasher),
+        OwnedValue::Blob(b) => b.hash(hasher),
+        OwnedValue::Date(d) => d.hash(hasher),
+        OwnedValue::Time(t) => t.hash(hasher),
+        OwnedValue::Timestamp(ts) => ts.hash(hasher),
+        OwnedValue::Uuid(u) => u.hash(hasher),
+        OwnedValue::Vector(v) => {
+            for f in v {
+                f.to_bits().hash(hasher);
+            }
+        }
+        OwnedValue::TimestampTz(ts, tz) => {
+            ts.hash(hasher);
+            tz.hash(hasher);
+        }
+        OwnedValue::Interval(a, b, c) => {
+            a.hash(hasher);
+            b.hash(hasher);
+            c.hash(hasher);
+        }
+        OwnedValue::Inet4(addr) => addr.hash(hasher),
+        OwnedValue::Inet6(addr) => addr.hash(hasher),
+        OwnedValue::MacAddr(m) => m.hash(hasher),
+        OwnedValue::Jsonb(j) => j.hash(hasher),
+        OwnedValue::Decimal(d, scale) => {
+            d.hash(hasher);
+            scale.hash(hasher);
+        }
+        OwnedValue::Point(x, y) => {
+            x.to_bits().hash(hasher);
+            y.to_bits().hash(hasher);
+        }
+        OwnedValue::Box(p1, p2) => {
+            p1.0.to_bits().hash(hasher);
+            p1.1.to_bits().hash(hasher);
+            p2.0.to_bits().hash(hasher);
+            p2.1.to_bits().hash(hasher);
+        }
+        OwnedValue::Circle(center, radius) => {
+            center.0.to_bits().hash(hasher);
+            center.1.to_bits().hash(hasher);
+            radius.to_bits().hash(hasher);
+        }
+        OwnedValue::Enum(a, b) => {
+            a.hash(hasher);
+            b.hash(hasher);
+        }
+        OwnedValue::ToastPointer(p) => p.hash(hasher),
+    }
+}
+
 /// Builds a column map with alias/table name qualified entries.
 /// More efficient than allocating per-column - reuses a format buffer.
 pub fn build_column_map_with_alias(

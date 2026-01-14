@@ -148,8 +148,8 @@ impl<'a> JoinAnalyzer<'a> {
         left_tables: &HashSet<&str>,
         right_tables: &HashSet<&str>,
     ) -> EquiJoinKey<'a> {
-        let left_in_right = key.left_table.map_or(false, |t| right_tables.contains(t));
-        let right_in_left = key.right_table.map_or(false, |t| left_tables.contains(t));
+        let left_in_right = key.left_table.is_some_and(|t| right_tables.contains(t));
+        let right_in_left = key.right_table.is_some_and(|t| left_tables.contains(t));
 
         if left_in_right && right_in_left {
             EquiJoinKey {

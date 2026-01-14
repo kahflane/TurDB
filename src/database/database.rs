@@ -1488,42 +1488,31 @@ impl Database {
                 })
                 .collect();
 
-            fn hash_owned_value(val: &OwnedValue, hasher: &mut std::collections::hash_map::DefaultHasher) {
-                use std::hash::Hash;
-                match val {
-                    OwnedValue::Null => 0u8.hash(hasher),
-                    OwnedValue::Bool(b) => b.hash(hasher),
-                    OwnedValue::Int(i) => i.hash(hasher),
-                    OwnedValue::Float(f) => f.to_bits().hash(hasher),
-                    OwnedValue::Text(s) => s.hash(hasher),
-                    OwnedValue::Blob(b) => b.hash(hasher),
-                    _ => format!("{:?}", val).hash(hasher),
-                }
-            }
-
             let mut hash_map: hashbrown::HashMap<u64, Vec<usize>> = hashbrown::HashMap::new();
             for (row_idx, row) in left_rows.iter().enumerate() {
+                use crate::database::query::hash_owned_value_normalized;
                 use std::hash::Hasher;
                 let mut hasher = std::collections::hash_map::DefaultHasher::new();
                 for &key_idx in &left_key_indices {
                     if let Some(val) = row.get(key_idx) {
-                        hash_owned_value(val, &mut hasher);
+                        hash_owned_value_normalized(val, &mut hasher);
                     }
                 }
                 let hash = hasher.finish();
-                hash_map.entry(hash).or_insert_with(Vec::new).push(row_idx);
+                hash_map.entry(hash).or_default().push(row_idx);
             }
 
             let mut result_rows: Vec<Vec<OwnedValue>> = Vec::new();
             let mut combined_buf: smallvec::SmallVec<[OwnedValue; 16]> = smallvec::SmallVec::new();
 
             for right_row in &right_rows {
+                use crate::database::query::hash_owned_value_normalized;
                 use std::hash::Hasher;
                 let mut hasher = std::collections::hash_map::DefaultHasher::new();
                 for &key_idx in &right_key_indices {
                     let actual_idx = key_idx.saturating_sub(left_col_count);
                     if let Some(val) = right_row.get(actual_idx) {
-                        hash_owned_value(val, &mut hasher);
+                        hash_owned_value_normalized(val, &mut hasher);
                     }
                 }
                 let hash = hasher.finish();
@@ -1532,9 +1521,10 @@ impl Database {
                     for &left_idx in left_indices {
                         let left_row = &left_rows[left_idx];
                         let matches = left_key_indices.iter().zip(right_key_indices.iter()).all(|(&li, &ri)| {
+                            use crate::database::query::owned_values_equal_with_coercion;
                             let right_actual_idx = ri.saturating_sub(left_col_count);
                             if let (Some(lv), Some(rv)) = (left_row.get(li), right_row.get(right_actual_idx)) {
-                                lv == rv
+                                owned_values_equal_with_coercion(lv, rv)
                             } else {
                                 false
                             }
@@ -2353,40 +2343,29 @@ impl Database {
                         })
                         .collect();
 
-                    fn hash_owned_val(val: &OwnedValue, hasher: &mut std::collections::hash_map::DefaultHasher) {
-                        use std::hash::Hash;
-                        match val {
-                            OwnedValue::Null => 0u8.hash(hasher),
-                            OwnedValue::Bool(b) => b.hash(hasher),
-                            OwnedValue::Int(i) => i.hash(hasher),
-                            OwnedValue::Float(f) => f.to_bits().hash(hasher),
-                            OwnedValue::Text(s) => s.hash(hasher),
-                            OwnedValue::Blob(b) => b.hash(hasher),
-                            _ => format!("{:?}", val).hash(hasher),
-                        }
-                    }
-
                     let mut hash_table: hashbrown::HashMap<u64, Vec<usize>> = hashbrown::HashMap::new();
                     for (row_idx, row) in left_rows.iter().enumerate() {
+                        use crate::database::query::hash_owned_value_normalized;
                         use std::hash::Hasher;
                         let mut hasher = std::collections::hash_map::DefaultHasher::new();
                         for &key_idx in &left_key_indices {
                             if let Some(val) = row.get(key_idx) {
-                                hash_owned_val(val, &mut hasher);
+                                hash_owned_value_normalized(val, &mut hasher);
                             }
                         }
                         let hash = hasher.finish();
-                        hash_table.entry(hash).or_insert_with(Vec::new).push(row_idx);
+                        hash_table.entry(hash).or_default().push(row_idx);
                     }
 
                     let mut result_rows: Vec<Vec<OwnedValue>> = Vec::new();
                     for right_row in &right_rows {
+                        use crate::database::query::hash_owned_value_normalized;
                         use std::hash::Hasher;
                         let mut hasher = std::collections::hash_map::DefaultHasher::new();
                         for &key_idx in &right_key_indices {
                             let actual_idx = key_idx.saturating_sub(left_col_count);
                             if let Some(val) = right_row.get(actual_idx) {
-                                hash_owned_val(val, &mut hasher);
+                                hash_owned_value_normalized(val, &mut hasher);
                             }
                         }
                         let hash = hasher.finish();
@@ -2395,9 +2374,10 @@ impl Database {
                             for &left_idx in left_indices {
                                 let left_row = &left_rows[left_idx];
                                 let matches = left_key_indices.iter().zip(right_key_indices.iter()).all(|(&li, &ri)| {
+                                    use crate::database::query::owned_values_equal_with_coercion;
                                     let right_actual_idx = ri.saturating_sub(left_col_count);
                                     if let (Some(lv), Some(rv)) = (left_row.get(li), right_row.get(right_actual_idx)) {
-                                        lv == rv
+                                        owned_values_equal_with_coercion(lv, rv)
                                     } else {
                                         false
                                     }
@@ -2668,64 +2648,12 @@ impl Database {
                 };
 
                 fn hash_join_key(row: &[OwnedValue], key_indices: &[usize]) -> u64 {
-                    use std::hash::{Hash, Hasher};
+                    use crate::database::query::hash_owned_value_normalized;
+                    use std::hash::Hasher;
                     let mut hasher = std::collections::hash_map::DefaultHasher::new();
                     for &idx in key_indices {
                         if let Some(val) = row.get(idx) {
-                            match val {
-                                OwnedValue::Null => 0u8.hash(&mut hasher),
-                                OwnedValue::Bool(b) => b.hash(&mut hasher),
-                                OwnedValue::Int(i) => i.hash(&mut hasher),
-                                OwnedValue::Float(f) => f.to_bits().hash(&mut hasher),
-                                OwnedValue::Text(s) => s.hash(&mut hasher),
-                                OwnedValue::Blob(b) => b.hash(&mut hasher),
-                                OwnedValue::Vector(v) => {
-                                    for f in v {
-                                        f.to_bits().hash(&mut hasher);
-                                    }
-                                }
-                                OwnedValue::Date(d) => d.hash(&mut hasher),
-                                OwnedValue::Time(t) => t.hash(&mut hasher),
-                                OwnedValue::Timestamp(ts) => ts.hash(&mut hasher),
-                                OwnedValue::TimestampTz(ts, tz) => {
-                                    ts.hash(&mut hasher);
-                                    tz.hash(&mut hasher);
-                                }
-                                OwnedValue::Interval(a, b, c) => {
-                                    a.hash(&mut hasher);
-                                    b.hash(&mut hasher);
-                                    c.hash(&mut hasher);
-                                }
-                                OwnedValue::Uuid(u) => u.hash(&mut hasher),
-                                OwnedValue::Inet4(addr) => addr.hash(&mut hasher),
-                                OwnedValue::Inet6(addr) => addr.hash(&mut hasher),
-                                OwnedValue::MacAddr(m) => m.hash(&mut hasher),
-                                OwnedValue::Jsonb(j) => j.hash(&mut hasher),
-                                OwnedValue::Decimal(d, scale) => {
-                                    d.hash(&mut hasher);
-                                    scale.hash(&mut hasher);
-                                }
-                                OwnedValue::Point(x, y) => {
-                                    x.to_bits().hash(&mut hasher);
-                                    y.to_bits().hash(&mut hasher);
-                                }
-                                OwnedValue::Box(p1, p2) => {
-                                    p1.0.to_bits().hash(&mut hasher);
-                                    p1.1.to_bits().hash(&mut hasher);
-                                    p2.0.to_bits().hash(&mut hasher);
-                                    p2.1.to_bits().hash(&mut hasher);
-                                }
-                                OwnedValue::Circle(center, radius) => {
-                                    center.0.to_bits().hash(&mut hasher);
-                                    center.1.to_bits().hash(&mut hasher);
-                                    radius.to_bits().hash(&mut hasher);
-                                }
-                                OwnedValue::Enum(a, b) => {
-                                    a.hash(&mut hasher);
-                                    b.hash(&mut hasher);
-                                }
-                                OwnedValue::ToastPointer(p) => p.hash(&mut hasher),
-                            }
+                            hash_owned_value_normalized(val, &mut hasher);
                         }
                     }
                     hasher.finish()
@@ -2777,7 +2705,11 @@ impl Database {
                                         .iter()
                                         .zip(right_key_indices.iter())
                                         .all(|(&li, &ri)| {
-                                            left_row.get(li) == right_row.get(ri)
+                                            use crate::database::query::owned_values_equal_with_coercion;
+                                            match (left_row.get(li), right_row.get(ri)) {
+                                                (Some(l), Some(r)) => owned_values_equal_with_coercion(l, r),
+                                                _ => false,
+                                            }
                                         });
 
                                     if !keys_match {
