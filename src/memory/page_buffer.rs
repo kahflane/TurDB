@@ -36,15 +36,13 @@
 //! during CRUD operations. Size the pool appropriately at startup based on
 //! expected concurrent commit load.
 
+use crate::config::BUFFER_POOL_SHARD_COUNT;
 use crate::storage::PAGE_SIZE;
 use parking_lot::{Condvar, Mutex};
 use std::mem::ManuallyDrop;
 use std::ops::{Deref, DerefMut};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-
-/// Number of shards for the buffer pool to reduce lock contention.
-const BUFFER_POOL_SHARD_COUNT: usize = 16;
 
 /// A pool of reusable page-sized buffers.
 ///

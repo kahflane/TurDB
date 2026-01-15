@@ -93,12 +93,17 @@
 //!
 //! For safety, we sync after each frame write by default.
 
+use crate::config::{
+    DEFAULT_CHECKPOINT_THRESHOLD as CONFIG_CHECKPOINT_THRESHOLD,
+    MAX_WAL_SEGMENT_SIZE, WAL_BUFFER_SIZE as CONFIG_WAL_BUFFER_SIZE,
+    WAL_FRAME_HEADER_SIZE as CONFIG_WAL_FRAME_HEADER_SIZE,
+};
 use crc::{Crc, CRC_64_ECMA_182};
 use zerocopy::{FromBytes, Immutable, IntoBytes};
 
-pub const WAL_FRAME_HEADER_SIZE: usize = 32;
-pub const MAX_SEGMENT_SIZE: u64 = 64 * 1024 * 1024;
-pub const DEFAULT_CHECKPOINT_THRESHOLD: u32 = 100_000;
+pub const WAL_FRAME_HEADER_SIZE: usize = CONFIG_WAL_FRAME_HEADER_SIZE;
+pub const MAX_SEGMENT_SIZE: u64 = MAX_WAL_SEGMENT_SIZE;
+pub const DEFAULT_CHECKPOINT_THRESHOLD: u32 = CONFIG_CHECKPOINT_THRESHOLD;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SyncMode {
@@ -864,7 +869,7 @@ impl Wal {
     }
 }
 
-const WAL_BUFFER_SIZE: usize = 8 * 1024 * 1024;
+const WAL_BUFFER_SIZE: usize = CONFIG_WAL_BUFFER_SIZE;
 
 pub struct WalSegment {
     writer: std::io::BufWriter<File>,

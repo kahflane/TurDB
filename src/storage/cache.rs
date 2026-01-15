@@ -97,9 +97,8 @@ use eyre::{ensure, Result};
 use parking_lot::RwLock;
 
 use super::PAGE_SIZE;
+use crate::config::CACHE_SHARD_COUNT as SHARD_COUNT;
 use crate::memory::{MemoryBudget, Pool};
-
-const SHARD_COUNT: usize = 64;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct PageKey {

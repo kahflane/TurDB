@@ -37,6 +37,7 @@
 //! db.execute("INSERT INTO foo VALUES (1)").unwrap();
 //! ```
 
+use crate::config::DEFAULT_BUFFER_POOL_SIZE;
 use crate::database::convert::convert_value_with_type;
 use crate::database::dirty_tracker::ShardedDirtyTracker;
 use crate::database::query::{
@@ -85,10 +86,6 @@ type AggregateGroups = HashMap<Vec<u64>, (Vec<OwnedValue>, Vec<(i64, f64)>)>;
 
 /// Result type for subquery materialization: (rows, column_map)
 type MaterializedSubqueryResult = (Vec<Vec<OwnedValue>>, Vec<(String, usize)>);
-
-/// Default number of pre-allocated page buffers in the buffer pool.
-/// Sized to handle typical concurrent commit workloads without allocation.
-const DEFAULT_BUFFER_POOL_SIZE: usize = 16;
 
 pub(crate) struct SharedDatabase {
     pub(crate) path: PathBuf,

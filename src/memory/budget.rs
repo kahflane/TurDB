@@ -35,15 +35,12 @@ use std::sync::OnceLock;
 use eyre::{bail, Result};
 use sysinfo::System;
 
-static SYSTEM_TOTAL_MEMORY: OnceLock<usize> = OnceLock::new();
+pub use crate::config::{
+    CACHE_RESERVED, DEFAULT_BUDGET_PERCENT, MIN_BUDGET_FLOOR, QUERY_RESERVED, RECOVERY_RESERVED,
+    SCHEMA_RESERVED, TOTAL_RESERVED,
+};
 
-pub const DEFAULT_BUDGET_PERCENT: usize = 25;
-pub const MIN_BUDGET_FLOOR: usize = 4 * 1024 * 1024;
-pub const CACHE_RESERVED: usize = 512 * 1024;
-pub const QUERY_RESERVED: usize = 256 * 1024;
-pub const RECOVERY_RESERVED: usize = 256 * 1024;
-pub const SCHEMA_RESERVED: usize = 128 * 1024;
-pub const TOTAL_RESERVED: usize = CACHE_RESERVED + QUERY_RESERVED + RECOVERY_RESERVED + SCHEMA_RESERVED;
+static SYSTEM_TOTAL_MEMORY: OnceLock<usize> = OnceLock::new();
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Pool {

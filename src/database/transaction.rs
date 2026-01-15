@@ -110,6 +110,7 @@
 //! - WAL flush acquires file_manager and WAL locks atomically
 //! - Page locks use 256-shard design to minimize contention
 
+use crate::config::COMMIT_BATCH_SIZE;
 use crate::mvcc::{TxnId, TxnState, UndoRegistry, WriteEntry};
 use crate::schema::table::{Constraint, IndexType};
 use crate::sql::ast::IsolationLevel;
@@ -119,8 +120,6 @@ use smallvec::SmallVec;
 
 use super::group_commit::CommitPayload;
 use super::{Database, ExecuteResult};
-
-const COMMIT_BATCH_SIZE: usize = 1000;
 
 /// Named checkpoint within a transaction for partial rollback.
 #[derive(Debug, Clone)]

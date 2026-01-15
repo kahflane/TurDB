@@ -79,6 +79,7 @@
 pub mod btree;
 #[cfg(feature = "cli")]
 pub mod cli;
+pub mod config;
 pub mod constraints;
 pub mod database;
 pub mod encoding;

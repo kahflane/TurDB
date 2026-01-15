@@ -50,11 +50,10 @@
 //! deterministic based on table_id, ensuring all operations for a given table
 //! go to the same shard.
 
+use crate::config::DIRTY_SHARD_COUNT;
 use hashbrown::HashMap;
 use parking_lot::Mutex;
 use roaring::RoaringBitmap;
-
-const DIRTY_SHARD_COUNT: usize = 16;
 
 /// Sharded dirty page tracker for high-performance dirty page management.
 ///

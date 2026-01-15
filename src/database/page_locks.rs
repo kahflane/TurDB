@@ -71,13 +71,11 @@
 //! intent_exclusive, and exclusive all false/zero), the table entry is removed
 //! from the map to prevent unbounded memory growth.
 
+use crate::config::{PAGE_SHARD_COUNT, TABLE_SHARD_COUNT};
 use parking_lot::{Mutex, RwLock};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-
-const TABLE_SHARD_COUNT: usize = 64;
-const PAGE_SHARD_COUNT: usize = 256;
 
 #[derive(Debug, Default)]
 pub struct LockStats {

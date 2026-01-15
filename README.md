@@ -5,12 +5,32 @@
 </p>
 
 <p align="center">
-  <strong>Embedded database with row storage and native vector search</strong>
+  <strong>High-performance embedded database with row storage and native vector search</strong>
 </p>
 
 ---
 
-TurDB is an embedded database written in Rust that combines row storage with HNSW vector search. It uses memory-mapped I/O, zero-copy data access, and a file-per-table architecture.
+TurDB is an embedded database written in Rust combining SQLite-inspired row storage with HNSW vector search. Built for performance with zero-copy data access, memory-mapped I/O, and MVCC transactions.
+
+## Architecture
+
+```
+┌─────────────────────────────────────┐
+│         Public API (Database)       │
+├─────────────────────────────────────┤
+│     SQL Layer (Parser/Executor)     │
+├─────────────────────────────────────┤
+│  Schema & Catalog │ MVCC Transaction│
+├───────────────────┼─────────────────┤
+│   B-Tree Index    │   HNSW Index    │
+├─────────────────────────────────────┤
+│     Record Serialization Layer      │
+├─────────────────────────────────────┤
+│      Storage Layer (Pager/Cache)    │
+├─────────────────────────────────────┤
+│    Memory-Mapped File I/O + WAL     │
+└─────────────────────────────────────┘
+```
 
 ## SQL Dialect
 
@@ -47,6 +67,8 @@ CREATE TABLE IF NOT EXISTS products (
 | `NOT NULL`       | Disallow NULL values                     |
 | `UNIQUE`         | Enforce uniqueness                       |
 | `DEFAULT value`  | Default value when not specified         |
+| `CHECK (expr)`   | Validate with expression                 |
+| `FOREIGN KEY`    | Cross-table reference constraint         |
 
 #### CREATE INDEX
 
@@ -74,6 +96,14 @@ DROP SCHEMA analytics;
 
 Qualified table names: `schema_name.table_name`
 
+#### ALTER TABLE
+
+```sql
+ALTER TABLE users ADD COLUMN phone VARCHAR(20);
+ALTER TABLE users DROP COLUMN phone;
+ALTER TABLE users RENAME COLUMN email TO email_address;
+```
+
 ### Data Types
 
 | Type             | Description                         | Storage   |
@@ -97,8 +127,18 @@ Qualified table names: `schema_name.table_name`
 | `UUID`           | 128-bit unique identifier           | 16 bytes  |
 | `JSONB`          | Binary JSON                         | Variable  |
 | `VECTOR(dim)`    | Float array for similarity search   | dim*4 bytes |
-| `INET`           | IPv4 or IPv6 address                | Variable  |
+| `INET`           | IPv4 or IPv6 address                | 4-16 bytes |
 | `MACADDR`        | MAC address                         | 6 bytes   |
+| `POINT`          | 2D point (x, y)                     | 16 bytes  |
+| `BOX`            | 2D bounding box                     | 32 bytes  |
+| `CIRCLE`         | Circle (center, radius)             | 24 bytes  |
+| `INT4RANGE`      | Integer range                       | 9 bytes   |
+| `INT8RANGE`      | Bigint range                        | 17 bytes  |
+| `DATERANGE`      | Date range                          | 9 bytes   |
+| `TSRANGE`        | Timestamp range                     | 17 bytes  |
+| `ENUM`           | Enumerated type                     | 4 bytes   |
+| `ARRAY`          | Array type                          | Variable  |
+| `COMPOSITE`      | User-defined composite type         | Variable  |
 
 #### Type Aliases
 
@@ -108,25 +148,26 @@ Qualified table names: `schema_name.table_name`
 | `FLOAT`            | `REAL`         |
 | `DOUBLE PRECISION` | `DOUBLE`       |
 | `BOOL`             | `BOOLEAN`      |
+| `INT2`             | `SMALLINT`     |
+| `INT4`             | `INT`          |
+| `INT8`             | `BIGINT`       |
+| `FLOAT4`           | `REAL`         |
+| `FLOAT8`           | `DOUBLE`       |
 
 ### Data Manipulation Language
 
 #### INSERT
 
 ```sql
--- Named columns
 INSERT INTO users (name, email, age) VALUES ('Alice', 'alice@example.com', 30);
 
--- All columns
 INSERT INTO users VALUES (1, 'Bob', 'bob@example.com', 25, NULL, CURRENT_TIMESTAMP);
 
--- Multiple rows
 INSERT INTO users (name, email) VALUES
     ('Carol', 'carol@example.com'),
     ('Dave', 'dave@example.com'),
     ('Eve', 'eve@example.com');
 
--- With RETURNING clause
 INSERT INTO users (name, email) VALUES ('Frank', 'frank@example.com') RETURNING id;
 ```
 
@@ -161,7 +202,6 @@ TRUNCATE TABLE logs;
 #### SELECT
 
 ```sql
--- Basic query
 SELECT * FROM users;
 SELECT id, name, email FROM users;
 
@@ -198,6 +238,7 @@ SELECT DISTINCT status FROM orders;
 | Range       | `BETWEEN`, `NOT BETWEEN`                       |
 | List        | `IN`, `NOT IN`                                 |
 | Null        | `IS NULL`, `IS NOT NULL`                       |
+| Vector      | `<->` (L2 distance), `<=>` (cosine distance)   |
 
 #### JOINs
 
@@ -213,13 +254,20 @@ FROM users u
 LEFT JOIN orders o ON u.id = o.customer_id
 GROUP BY u.id, u.name;
 
--- Multiple joins
+-- Cross join
+SELECT * FROM colors CROSS JOIN sizes;
+
+-- Multiple joins (3-way and beyond)
 SELECT u.name, p.name AS product, oi.quantity
 FROM users u
 JOIN orders o ON u.id = o.customer_id
 JOIN order_items oi ON o.id = oi.order_id
 JOIN products p ON oi.product_id = p.id;
 ```
+
+Supported join types: `INNER JOIN`, `LEFT JOIN`, `RIGHT JOIN`, `FULL OUTER JOIN`, `CROSS JOIN`
+
+Join algorithms: Hash joins (default for equi-joins), nested loop joins
 
 #### Aggregate Functions
 
@@ -246,14 +294,53 @@ HAVING COUNT(*) > 10;
 #### Subqueries
 
 ```sql
+-- IN subquery
 SELECT * FROM users WHERE id IN (
     SELECT customer_id FROM orders WHERE total > 1000
 );
 
+-- Scalar subquery
 SELECT u.*, (
     SELECT COUNT(*) FROM orders WHERE customer_id = u.id
 ) AS order_count
 FROM users u;
+
+-- EXISTS subquery
+SELECT * FROM users u WHERE EXISTS (
+    SELECT 1 FROM orders WHERE customer_id = u.id
+);
+```
+
+#### Set Operations
+
+```sql
+SELECT id, name FROM employees
+UNION
+SELECT id, name FROM contractors;
+
+SELECT id FROM active_users
+INTERSECT
+SELECT id FROM premium_users;
+
+SELECT id FROM all_users
+EXCEPT
+SELECT id FROM banned_users;
+
+-- With ALL (preserve duplicates)
+SELECT name FROM table1 UNION ALL SELECT name FROM table2;
+```
+
+#### Window Functions
+
+```sql
+SELECT
+    name,
+    department,
+    salary,
+    ROW_NUMBER() OVER (PARTITION BY department ORDER BY salary DESC) as rank,
+    SUM(salary) OVER (PARTITION BY department) as dept_total,
+    AVG(salary) OVER () as company_avg
+FROM employees;
 ```
 
 ### Transactions
@@ -281,29 +368,145 @@ RELEASE sp1;
 COMMIT;
 ```
 
+### EXPLAIN
+
+```sql
+EXPLAIN SELECT * FROM users WHERE id = 1;
+```
+
+### SQL Functions
+
+#### String Functions
+
+| Function | Description |
+|----------|-------------|
+| `UPPER(str)`, `UCASE(str)` | Convert to uppercase |
+| `LOWER(str)`, `LCASE(str)` | Convert to lowercase |
+| `LENGTH(str)`, `LEN(str)` | Byte length |
+| `CHAR_LENGTH(str)` | Character count |
+| `SUBSTR(str, pos, len)` | Substring extraction |
+| `LEFT(str, len)` | Left substring |
+| `RIGHT(str, len)` | Right substring |
+| `CONCAT(s1, s2, ...)` | Concatenate strings |
+| `CONCAT_WS(sep, s1, s2, ...)` | Concatenate with separator |
+| `TRIM(str)` | Trim whitespace |
+| `LTRIM(str)`, `RTRIM(str)` | Trim left/right |
+| `LPAD(str, len, pad)` | Left pad |
+| `RPAD(str, len, pad)` | Right pad |
+| `REPLACE(str, from, to)` | Replace occurrences |
+| `REVERSE(str)` | Reverse string |
+| `REPEAT(str, n)` | Repeat n times |
+| `INSTR(str, substr)` | Find position |
+| `LOCATE(substr, str)` | Find position |
+| `ASCII(str)` | ASCII code of first char |
+| `STRCMP(s1, s2)` | Compare strings |
+
+#### Numeric Functions
+
+| Function | Description |
+|----------|-------------|
+| `ABS(n)` | Absolute value |
+| `ROUND(n, d)` | Round to d decimals |
+| `CEIL(n)`, `CEILING(n)` | Round up |
+| `FLOOR(n)` | Round down |
+| `TRUNCATE(n, d)` | Truncate to d decimals |
+| `MOD(n, m)` | Modulo |
+| `SQRT(n)` | Square root |
+| `POW(x, y)`, `POWER(x, y)` | x raised to y |
+| `EXP(n)` | e raised to n |
+| `LOG(n)`, `LN(n)` | Natural log |
+| `LOG10(n)` | Log base 10 |
+| `LOG2(n)` | Log base 2 |
+| `SIN(n)`, `COS(n)`, `TAN(n)` | Trig functions |
+| `ASIN(n)`, `ACOS(n)`, `ATAN(n)` | Inverse trig |
+| `DEGREES(n)` | Radians to degrees |
+| `RADIANS(n)` | Degrees to radians |
+| `PI()` | Value of pi |
+| `RAND()` | Random number [0, 1) |
+| `SIGN(n)` | Sign (-1, 0, 1) |
+| `GREATEST(a, b, ...)` | Maximum value |
+| `LEAST(a, b, ...)` | Minimum value |
+
+#### Date/Time Functions
+
+| Function | Description |
+|----------|-------------|
+| `NOW()`, `CURRENT_TIMESTAMP` | Current datetime |
+| `CURDATE()`, `CURRENT_DATE` | Current date |
+| `CURTIME()`, `CURRENT_TIME` | Current time |
+| `DATE(datetime)` | Extract date |
+| `TIME(datetime)` | Extract time |
+| `YEAR(date)` | Extract year |
+| `MONTH(date)` | Extract month |
+| `DAY(date)` | Extract day |
+| `HOUR(time)` | Extract hour |
+| `MINUTE(time)` | Extract minute |
+| `SECOND(time)` | Extract second |
+| `DAYNAME(date)` | Day name |
+| `MONTHNAME(date)` | Month name |
+| `DAYOFWEEK(date)` | Day of week (1-7) |
+| `DAYOFYEAR(date)` | Day of year |
+| `QUARTER(date)` | Quarter (1-4) |
+| `WEEK(date)` | Week number |
+| `DATE_ADD(date, days)` | Add days |
+| `DATE_SUB(date, days)` | Subtract days |
+| `DATEDIFF(d1, d2)` | Days between dates |
+| `LAST_DAY(date)` | Last day of month |
+| `DATE_FORMAT(date, fmt)` | Format date |
+
+#### Control Flow Functions
+
+| Function | Description |
+|----------|-------------|
+| `IF(cond, then, else)` | Conditional |
+| `IFNULL(expr, alt)` | NULL replacement |
+| `NULLIF(a, b)` | Return NULL if equal |
+| `COALESCE(a, b, ...)` | First non-NULL |
+| `CASE WHEN ... THEN ... END` | Case expression |
+
+#### System Functions
+
+| Function | Description |
+|----------|-------------|
+| `VERSION()` | Database version |
+| `DATABASE()` | Current database |
+| `TYPEOF(expr)` | Type of expression |
+| `CAST(expr AS type)` | Type conversion |
+
 ### Pragmas and Configuration
 
 #### Write-Ahead Logging
 
 ```sql
-PRAGMA WAL=ON;
-PRAGMA WAL=OFF;
+PRAGMA wal = ON;              -- Enable WAL
+PRAGMA wal = OFF;             -- Disable WAL
+PRAGMA wal_autoflush = OFF;   -- Defer WAL writes for batches
+PRAGMA wal_checkpoint;        -- Force checkpoint
+PRAGMA wal_frame_count;       -- Current frame count
+PRAGMA wal_size;              -- WAL size in bytes
 ```
 
 #### Synchronous Mode
 
 ```sql
-PRAGMA synchronous=OFF;     -- No fsync, fastest, risk of corruption
-PRAGMA synchronous=NORMAL;  -- fsync at critical moments
-PRAGMA synchronous=FULL;    -- fsync after every transaction
+PRAGMA synchronous = OFF;     -- No fsync, fastest, risk of corruption
+PRAGMA synchronous = NORMAL;  -- fsync at critical moments
+PRAGMA synchronous = FULL;    -- fsync after every transaction
 ```
 
-#### Session Variables
+#### Memory Configuration
 
 ```sql
-SET cache_size = 1024;
-SET foreign_keys = OFF;
-SET foreign_keys = ON;
+PRAGMA memory_budget;              -- Query total memory budget
+PRAGMA memory_stats;               -- Per-pool memory usage
+PRAGMA join_memory_budget = 65536; -- Set join memory limit
+```
+
+#### Database State
+
+```sql
+PRAGMA database_mode;   -- Query mode (read_write or read_only_degraded)
+PRAGMA recover_wal;     -- Trigger streaming WAL recovery
 ```
 
 ### Vector Operations
@@ -322,10 +525,16 @@ CREATE TABLE documents (
 INSERT INTO documents (content, embedding)
 VALUES ('Hello world', '[0.1, 0.2, 0.3, ...]');
 
--- Similarity search (nearest neighbors)
+-- Similarity search (L2 distance)
 SELECT id, content
 FROM documents
 ORDER BY embedding <-> '[0.15, 0.25, 0.35, ...]'
+LIMIT 10;
+
+-- Cosine similarity
+SELECT id, content
+FROM documents
+ORDER BY embedding <=> '[0.15, 0.25, 0.35, ...]'
 LIMIT 10;
 ```
 
@@ -334,17 +543,16 @@ LIMIT 10;
 The TurDB CLI provides an interactive shell for database operations.
 
 ```
-turdb ./mydb           # Open existing database
-turdb --create ./newdb # Create new database
-turdb --version        # Show version
+turdb ./mydb              # Open or create database
+turdb --create ./newdb    # Create new database
+turdb --version           # Show version
+turdb --help              # Show help
 ```
 
 ### Interactive Mode
 
 ```
-TurDB version 0.1.0
-Enter ".help" for usage hints.
-Connected to: ./mydb
+TurDB - High-performance embedded database
 
 turdb> SELECT * FROM users;
 +----+-------+-----+
@@ -353,20 +561,20 @@ turdb> SELECT * FROM users;
 |  1 | Alice |  30 |
 |  2 | Bob   |  25 |
 +----+-------+-----+
-2 rows in set (0.001 sec)
+2 rows in set
 ```
 
 ### Dot Commands
 
 | Command            | Description                              |
 |--------------------|------------------------------------------|
-| `.quit`, `.exit`   | Exit the CLI                             |
+| `.quit`, `.exit`, `.q` | Exit the CLI                         |
 | `.tables`          | List all tables                          |
 | `.schema [TABLE]`  | Show CREATE statement for table(s)       |
 | `.indexes [TABLE]` | List indexes                             |
-| `.help`            | Show available commands                  |
+| `.help`, `.h`, `.?` | Show available commands                 |
 
-Multi-line statements are supported. The prompt changes from `turdb>` to `    ->` when a statement continues across lines. Terminate statements with `;`.
+Multi-line statements are supported. Press Enter to continue on the next line. Terminate statements with `;`. Use Ctrl+C to cancel or Ctrl+D to exit.
 
 ## Storage Architecture
 
@@ -379,6 +587,8 @@ database_dir/
 │   ├── table.tbd        # Table data (B+tree)
 │   ├── table.idx        # Secondary indexes
 │   └── table.hnsw       # Vector indexes
+├── custom_schema/       # User-created schemas
+│   └── ...
 └── wal/
     └── wal.000001       # Write-ahead log
 ```
@@ -388,15 +598,50 @@ database_dir/
 All files use 16KB pages with the following structure:
 
 ```
-+------------------+
++------------------+ 0
 | Page Header (16B)|
-+------------------+
++------------------+ 16
 | Cell Pointers    |
+| (2 bytes each)   |
 +------------------+
 | Free Space       |
 +------------------+
 | Cell Content     |
-+------------------+
+| (grows upward)   |
++------------------+ 16384
+```
+
+### B-Tree Features
+
+- B+tree indexes with slot arrays for fast prefix filtering
+- 4-byte prefix hints for optimized binary search
+- Overflow pages for large values (TOAST)
+- Leaf page linking for sequential scans
+
+### HNSW Vector Index
+
+- Hierarchical Navigable Small World graph
+- O(log N) approximate nearest neighbor search
+- Configurable M (connections) and efConstruction
+- Distance metrics: L2 (Euclidean), Cosine, Inner Product
+- SQ8 quantization for 4x memory reduction
+- SIMD acceleration (AVX2)
+
+## MVCC Transactions
+
+TurDB uses Multi-Version Concurrency Control with Snapshot Isolation:
+
+- Readers never block writers
+- Writers never block readers
+- Row-level versioning with undo pages
+- Lock-free timestamp allocation
+- Automatic rollback on transaction drop
+
+```rust
+// Transactions are automatically managed
+db.execute("BEGIN")?;
+db.execute("UPDATE accounts SET balance = balance - 100 WHERE id = 1")?;
+db.execute("COMMIT")?;
 ```
 
 ## Programmatic API
@@ -411,14 +656,25 @@ let db = Database::create("./mydb")?;
 
 // Open existing database
 let db = Database::open("./mydb")?;
+
+// Open with recovery info
+let (db, recovery) = Database::open_with_recovery("./mydb")?;
 ```
 
 ### Executing SQL
 
 ```rust
+use turdb::{Database, ExecuteResult, OwnedValue};
+
 // Execute DDL/DML
 db.execute("CREATE TABLE users (id INT, name TEXT)")?;
 db.execute("INSERT INTO users VALUES (1, 'Alice')")?;
+
+// Execute with parameters
+db.execute_with_params(
+    "INSERT INTO users VALUES (?, ?)",
+    &[OwnedValue::Int(2), OwnedValue::Text("Bob".into())]
+)?;
 
 // Query with results
 match db.execute("SELECT * FROM users")? {
@@ -429,19 +685,70 @@ match db.execute("SELECT * FROM users")? {
     }
     _ => {}
 }
+
+// Simple query
+let rows = db.query("SELECT * FROM users")?;
 ```
 
-### Batch Operations
+### Prepared Statements
 
 ```rust
-use turdb::{Database, OwnedValue};
+let stmt = db.prepare("SELECT * FROM users WHERE id = ?")?;
+let result = stmt.bind(&[OwnedValue::Int(1)]).execute(&db)?;
+```
 
-let rows: Vec<Vec<OwnedValue>> = vec![
-    vec![OwnedValue::Int(1), OwnedValue::Text("Alice".into())],
-    vec![OwnedValue::Int(2), OwnedValue::Text("Bob".into())],
+### Value Types
+
+```rust
+use turdb::OwnedValue;
+
+let values = vec![
+    OwnedValue::Int(42),
+    OwnedValue::Float(3.14),
+    OwnedValue::Text("hello".into()),
+    OwnedValue::Blob(vec![0x01, 0x02, 0x03]),
+    OwnedValue::Null,
 ];
+```
 
-db.insert_batch("users", &rows)?;
+## Performance
+
+### Design Principles
+
+- **Zero-copy**: Direct mmap slices, no intermediate buffers
+- **Zero-allocation**: Pre-allocated buffers in CRUD paths
+- **Memory-mapped I/O**: Kernel-managed page caching
+- **SIEVE eviction**: Better than LRU for database scans
+- **Lock sharding**: 64+ shards for concurrent access
+
+### Targets
+
+| Operation | Target |
+|-----------|--------|
+| Point read (cached) | < 1 microsecond |
+| Point read (disk) | < 50 microseconds |
+| Sequential scan | > 1M rows/sec |
+| Insert | > 100K rows/sec |
+| k-NN search (1M vectors, k=10) | < 10ms |
+
+### Memory Budget
+
+- Hard limit: 25% of system RAM (4MB minimum)
+- Pool allocation: Cache, Query, Recovery, Schema
+- Query via `PRAGMA memory_stats`
+
+## Dependencies
+
+```toml
+eyre = "0.6"           # Error handling
+parking_lot = "0.12"   # Synchronization primitives
+memmap2 = "0.9"        # Memory-mapped I/O
+zerocopy = "0.8"       # Zero-copy serialization
+bumpalo = "3.14"       # Arena allocator
+smallvec = "1.11"      # Small vector optimization
+hashbrown = "0.14"     # Fast hash maps
+roaring = "0.10"       # Bitmap indexes
+crc = "3.0"            # Page checksums
 ```
 
 ## License
