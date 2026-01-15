@@ -353,6 +353,7 @@ pub struct TableDef {
     primary_key: Option<Vec<String>>,
     indexes: Vec<IndexDef>,
     toast_id: Option<u64>,
+    row_count: u64,
 }
 
 impl TableDef {
@@ -364,6 +365,7 @@ impl TableDef {
             primary_key: None,
             indexes: Vec::new(),
             toast_id: None,
+            row_count: 0,
         }
     }
 
@@ -461,5 +463,13 @@ impl TableDef {
         } else {
             false
         }
+    }
+
+    pub fn row_count(&self) -> u64 {
+        self.row_count
+    }
+
+    pub fn set_row_count(&mut self, count: u64) {
+        self.row_count = count;
     }
 }

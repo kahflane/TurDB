@@ -66,6 +66,7 @@ pub use index_selection::{
 };
 pub use join_analysis::{EquiJoinKey, JoinAnalyzer};
 
+use crate::schema::Catalog;
 use crate::sql::planner::LogicalOperator;
 use bumpalo::Bump;
 use eyre::Result;
@@ -80,12 +81,12 @@ pub trait OptimizationRule {
     ) -> Result<Option<&'a LogicalOperator<'a>>>;
 }
 
-pub struct Optimizer {
-    rules: Vec<Box<dyn OptimizationRule + Send + Sync>>,
+pub struct Optimizer<'c> {
+    rules: Vec<Box<dyn OptimizationRule + Send + Sync + 'c>>,
     max_iterations: usize,
 }
 
-impl Optimizer {
+impl Optimizer<'static> {
     pub fn new() -> Self {
         Self {
             rules: vec![
@@ -98,8 +99,24 @@ impl Optimizer {
             max_iterations: 10,
         }
     }
+}
 
-    pub fn with_rules(rules: Vec<Box<dyn OptimizationRule + Send + Sync>>) -> Self {
+impl<'c> Optimizer<'c> {
+    pub fn with_catalog(catalog: &'c Catalog) -> Self {
+        Self {
+            rules: vec![
+                Box::new(rules::ConstantFoldingRule),
+                Box::new(rules::JoinConditionExtractionRule),
+                Box::new(rules::JoinReorderingRule::new(catalog)),
+                Box::new(rules::PredicatePushdownRule),
+                Box::new(rules::ProjectionPruningRule),
+                Box::new(rules::SubqueryDecorrelationRule),
+            ],
+            max_iterations: 10,
+        }
+    }
+
+    pub fn with_rules(rules: Vec<Box<dyn OptimizationRule + Send + Sync + 'c>>) -> Self {
         Self {
             rules,
             max_iterations: 10,
@@ -143,12 +160,12 @@ impl Optimizer {
         Ok(current)
     }
 
-    pub fn add_rule(&mut self, rule: Box<dyn OptimizationRule + Send + Sync>) {
+    pub fn add_rule(&mut self, rule: Box<dyn OptimizationRule + Send + Sync + 'c>) {
         self.rules.push(rule);
     }
 }
 
-impl Default for Optimizer {
+impl Default for Optimizer<'static> {
     fn default() -> Self {
         Self::new()
     }

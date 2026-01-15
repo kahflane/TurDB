@@ -209,7 +209,7 @@ SELECT a.id, b.id FROM (SELECT id FROM organizations ORDER BY id ASC LIMIT 4) AS
 -- EXPECT_ROWS: >= 1
 
 -- Q42: Three-way join
-SELECT ct.id, c.title, t.name FROM competition_tags ct, competitions c, tags t WHERE ct.competition_id = c.id AND ct.tag_id = t.id LIMIT 10;
+SELECT ct.id, c.title, t.name, e.type FROM competition_tags ct, competitions c, tags t, episodes e WHERE ct.competition_id = c.id AND ct.tag_id = t.id AND e.competition_id = ct.competition_id LIMIT 10;
 -- EXPECT_ROWS: >= 1
 
 -- =============================================================================

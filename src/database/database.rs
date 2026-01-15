@@ -586,6 +586,9 @@ impl Database {
 
     fn load_catalog(path: &Path) -> Result<Catalog> {
         use crate::schema::persistence::CatalogPersistence;
+        use crate::storage::TableFileHeader;
+        use std::fs::File;
+        use std::io::Read;
 
         let catalog_path = path.join(CATALOG_FILE_NAME);
         let mut catalog = Catalog::new();
@@ -593,6 +596,26 @@ impl Database {
             CatalogPersistence::load(&catalog_path, &mut catalog)
                 .wrap_err_with(|| format!("failed to load catalog from {:?}", catalog_path))?;
         }
+
+        for (schema_name, schema) in catalog.schemas_mut() {
+            let schema_dir = path.join(schema_name);
+            for table in schema.tables_mut().values_mut() {
+                let table_path = schema_dir.join(format!("{}.tbd", table.name()));
+                if table_path.exists() {
+                    let mut file = match File::open(&table_path) {
+                        Ok(f) => f,
+                        Err(_) => continue,
+                    };
+                    let mut header_bytes = [0u8; 128];
+                    if file.read_exact(&mut header_bytes).is_ok() {
+                        if let Ok(header) = TableFileHeader::from_bytes(&header_bytes) {
+                            table.set_row_count(header.row_count());
+                        }
+                    }
+                }
+            }
+        }
+
         Ok(catalog)
     }
 

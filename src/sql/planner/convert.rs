@@ -32,7 +32,7 @@ use eyre::{bail, Result};
 
 impl<'a> Planner<'a> {
     pub(crate) fn optimize_to_physical(&self, logical: &LogicalPlan<'a>) -> Result<PhysicalPlan<'a>> {
-        let optimizer = Optimizer::new();
+        let optimizer = Optimizer::with_catalog(self.catalog);
         let optimized_root = optimizer.optimize(logical.root, self.arena)?;
 
         let physical_root = self.logical_to_physical(optimized_root)?;

@@ -141,6 +141,10 @@ impl Catalog {
         &self.schemas
     }
 
+    pub fn schemas_mut(&mut self) -> &mut HashMap<String, Schema> {
+        &mut self.schemas
+    }
+
     pub fn create_table(
         &mut self,
         schema_name: &str,

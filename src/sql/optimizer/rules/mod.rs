@@ -8,9 +8,10 @@
 //! |------|---------|----------|
 //! | ConstantFolding | Evaluate constants at plan time | 1 (first) |
 //! | JoinConditionExtraction | Extract join conditions from WHERE | 2 |
-//! | PredicatePushdown | Move filters to data sources | 3 |
-//! | ProjectionPruning | Remove unused columns | 4 |
-//! | SubqueryDecorrelation | Convert correlated subqueries to joins | 5 (last) |
+//! | JoinReordering | Reorder joins by cardinality | 3 |
+//! | PredicatePushdown | Move filters to data sources | 4 |
+//! | ProjectionPruning | Remove unused columns | 5 |
+//! | SubqueryDecorrelation | Convert correlated subqueries to joins | 6 (last) |
 //!
 //! ## Rule Implementation Guidelines
 //!
@@ -22,11 +23,13 @@
 mod constant_folding;
 mod decorrelate;
 mod join_condition_extraction;
+mod join_reordering;
 mod predicate_pushdown;
 mod projection_pruning;
 
 pub use constant_folding::ConstantFoldingRule;
 pub use decorrelate::SubqueryDecorrelationRule;
 pub use join_condition_extraction::JoinConditionExtractionRule;
+pub use join_reordering::JoinReorderingRule;
 pub use predicate_pushdown::PredicatePushdownRule;
 pub use projection_pruning::ProjectionPruningRule;
