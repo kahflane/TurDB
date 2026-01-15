@@ -2075,6 +2075,7 @@ impl Database {
             }
             Some(PlanSource::NestedLoopJoin(_))
             | Some(PlanSource::GraceHashJoin(_))
+            | Some(PlanSource::StreamingHashJoin(_))
             | Some(PlanSource::HashSemiJoin(_))
             | Some(PlanSource::HashAntiJoin(_)) => {
                 fn find_subquery_in_join<'a>(
@@ -2119,6 +2120,20 @@ impl Database {
                         PhysicalOperator::TopKExec(t) => find_scan_in_join(t.input),
                         PhysicalOperator::LimitExec(l) => find_scan_in_join(l.input),
                         PhysicalOperator::WindowExec(w) => find_scan_in_join(w.input),
+                        _ => None,
+                    }
+                }
+
+                fn find_filter_in_input<'a>(
+                    op: &'a crate::sql::planner::PhysicalOperator<'a>,
+                ) -> Option<&'a crate::sql::ast::Expr<'a>> {
+                    use crate::sql::planner::PhysicalOperator;
+                    match op {
+                        PhysicalOperator::FilterExec(f) => Some(f.predicate),
+                        PhysicalOperator::ProjectExec(p) => find_filter_in_input(p.input),
+                        PhysicalOperator::SortExec(s) => find_filter_in_input(s.input),
+                        PhysicalOperator::TopKExec(t) => find_filter_in_input(t.input),
+                        PhysicalOperator::LimitExec(l) => find_filter_in_input(l.input),
                         _ => None,
                     }
                 }
@@ -2425,6 +2440,14 @@ impl Database {
                     Some(PlanSource::GraceHashJoin(j)) => {
                         (j.left, j.right, j.join_type, None, j.join_keys)
                     }
+                    Some(PlanSource::StreamingHashJoin(j)) => {
+                        let (left, right) = if j.swapped {
+                            (j.probe, j.build)
+                        } else {
+                            (j.build, j.probe)
+                        };
+                        (left, right, j.join_type, None, j.join_keys)
+                    }
                     Some(PlanSource::HashSemiJoin(j)) => {
                         (j.left, j.right, crate::sql::ast::JoinType::Semi, None, j.join_keys)
                     }
@@ -2442,6 +2465,8 @@ impl Database {
                 let right_nested_join = find_nested_join(right_op);
                 let left_hash_join = find_hash_join(left_op);
                 let right_hash_join = find_hash_join(right_op);
+                let left_input_filter = find_filter_in_input(left_op);
+                let right_input_filter = find_filter_in_input(right_op);
 
                 let mut left_rows: Vec<Vec<OwnedValue>> = Vec::new();
                 let mut right_rows: Vec<Vec<OwnedValue>> = Vec::new();
@@ -2470,6 +2495,24 @@ impl Database {
                     left_schema = schema_opt;
                     let (rows, _) = materialize_table_rows(catalog, file_manager, schema_opt, table_name)?;
                     left_rows = rows;
+
+                    if let Some(filter_pred) = left_input_filter {
+                        let table_def = catalog.resolve_table_in_schema(schema_opt, table_name)?;
+                        let mut local_col_map: Vec<(String, usize)> = Vec::new();
+                        for (col_idx, col) in table_def.columns().iter().enumerate() {
+                            local_col_map.push((col.name().to_lowercase(), col_idx));
+                            local_col_map.push((format!("{}.{}", table_name, col.name()).to_lowercase(), col_idx));
+                            if let Some(a) = alias {
+                                local_col_map.push((format!("{}.{}", a, col.name()).to_lowercase(), col_idx));
+                            }
+                        }
+                        let compiled = crate::sql::predicate::CompiledPredicate::with_column_map_ref(filter_pred, &local_col_map);
+                        left_rows.retain(|row| {
+                            let values: smallvec::SmallVec<[Value<'_>; 16]> = row.iter().map(|v| v.to_value()).collect();
+                            let row_ref = ExecutorRow::new(&values);
+                            compiled.evaluate(&row_ref)
+                        });
+                    }
                 } else if let Some(nested_join) = left_nested_join {
                     (left_rows, left_nested_join_column_map) =
                         execute_nested_join_recursive(nested_join, catalog, file_manager)?;
@@ -2493,6 +2536,24 @@ impl Database {
                     let (rows, column_types) = materialize_table_rows(catalog, file_manager, schema_opt, table_name)?;
                     right_rows = rows;
                     right_col_count = column_types.len();
+
+                    if let Some(filter_pred) = right_input_filter {
+                        let table_def = catalog.resolve_table_in_schema(schema_opt, table_name)?;
+                        let mut local_col_map: Vec<(String, usize)> = Vec::new();
+                        for (col_idx, col) in table_def.columns().iter().enumerate() {
+                            local_col_map.push((col.name().to_lowercase(), col_idx));
+                            local_col_map.push((format!("{}.{}", table_name, col.name()).to_lowercase(), col_idx));
+                            if let Some(a) = alias {
+                                local_col_map.push((format!("{}.{}", a, col.name()).to_lowercase(), col_idx));
+                            }
+                        }
+                        let compiled = crate::sql::predicate::CompiledPredicate::with_column_map_ref(filter_pred, &local_col_map);
+                        right_rows.retain(|row| {
+                            let values: smallvec::SmallVec<[Value<'_>; 16]> = row.iter().map(|v| v.to_value()).collect();
+                            let row_ref = ExecutorRow::new(&values);
+                            compiled.evaluate(&row_ref)
+                        });
+                    }
                 } else if let Some(nested_join) = right_nested_join {
                     (right_rows, right_nested_join_column_map) =
                         execute_nested_join_recursive(nested_join, catalog, file_manager)?;
@@ -2571,6 +2632,7 @@ impl Database {
                         PhysicalOperator::LimitExec(l) => find_filter_for_join(l.input),
                         PhysicalOperator::SortExec(s) => find_filter_for_join(s.input),
                         PhysicalOperator::HashAggregate(a) => find_filter_for_join(a.input),
+                        PhysicalOperator::TopKExec(t) => find_filter_for_join(t.input),
                         _ => None,
                     }
                 }
@@ -2649,24 +2711,75 @@ impl Database {
                 let mut right_matched: Vec<bool> = vec![false; right_rows.len()];
 
                 let output_columns = physical_plan.output_schema.columns;
-                let output_source_indices: Vec<(usize, crate::types::DataType)> = {
-                    let mut name_occurrence_count: hashbrown::HashMap<String, usize> =
-                        hashbrown::HashMap::new();
-                    output_columns
-                        .iter()
-                        .map(|col| {
-                            let col_name = col.name.to_lowercase();
-                            let occurrence = *name_occurrence_count.get(&col_name).unwrap_or(&0);
-                            *name_occurrence_count.entry(col_name.clone()).or_insert(0) += 1;
-                            let source_idx = join_column_map
+
+                fn find_project_exprs<'a>(
+                    op: &'a crate::sql::planner::PhysicalOperator<'a>,
+                ) -> Option<&'a [&'a crate::sql::ast::Expr<'a>]> {
+                    use crate::sql::planner::PhysicalOperator;
+                    match op {
+                        PhysicalOperator::ProjectExec(p) => Some(p.expressions),
+                        PhysicalOperator::LimitExec(l) => find_project_exprs(l.input),
+                        PhysicalOperator::SortExec(s) => find_project_exprs(s.input),
+                        PhysicalOperator::TopKExec(t) => find_project_exprs(t.input),
+                        PhysicalOperator::FilterExec(f) => find_project_exprs(f.input),
+                        _ => None,
+                    }
+                }
+
+                fn resolve_expr_to_idx(
+                    expr: &crate::sql::ast::Expr,
+                    column_map: &[(String, usize)],
+                ) -> Option<usize> {
+                    use crate::sql::ast::Expr;
+                    if let Expr::Column(col) = expr {
+                        if let Some(table) = col.table {
+                            let qualified = format!("{}.{}", table, col.column).to_lowercase();
+                            if let Some((_, idx)) = column_map
                                 .iter()
-                                .filter(|(name, _)| name == &col_name)
-                                .nth(occurrence)
-                                .map(|(_, idx)| *idx)
-                                .unwrap_or(0);
-                            (source_idx, col.data_type)
-                        })
-                        .collect()
+                                .find(|(name, _)| name.eq_ignore_ascii_case(&qualified))
+                            {
+                                return Some(*idx);
+                            }
+                        }
+                        column_map
+                            .iter()
+                            .find(|(name, _)| name.eq_ignore_ascii_case(col.column))
+                            .map(|(_, idx)| *idx)
+                    } else {
+                        None
+                    }
+                }
+
+                let output_source_indices: Vec<(usize, crate::types::DataType)> = {
+                    if let Some(project_exprs) = find_project_exprs(physical_plan.root) {
+                        project_exprs
+                            .iter()
+                            .zip(output_columns.iter())
+                            .map(|(expr, col)| {
+                                let source_idx = resolve_expr_to_idx(expr, &join_column_map)
+                                    .unwrap_or(0);
+                                (source_idx, col.data_type)
+                            })
+                            .collect()
+                    } else {
+                        let mut name_occurrence_count: hashbrown::HashMap<String, usize> =
+                            hashbrown::HashMap::new();
+                        output_columns
+                            .iter()
+                            .map(|col| {
+                                let col_name = col.name.to_lowercase();
+                                let occurrence = *name_occurrence_count.get(&col_name).unwrap_or(&0);
+                                *name_occurrence_count.entry(col_name.clone()).or_insert(0) += 1;
+                                let source_idx = join_column_map
+                                    .iter()
+                                    .filter(|(name, _)| name == &col_name)
+                                    .nth(occurrence)
+                                    .map(|(_, idx)| *idx)
+                                    .unwrap_or(0);
+                                (source_idx, col.data_type)
+                            })
+                            .collect()
+                    }
                 };
 
                 fn hash_join_key(row: &[OwnedValue], key_indices: &[usize]) -> u64 {

@@ -60,7 +60,8 @@ pub use physical::{
     PhysicalIndexScan, PhysicalInListSubqueryExec, PhysicalLimitExec, PhysicalNestedLoopJoin,
     PhysicalOperator, PhysicalPlan, PhysicalProjectExec, PhysicalScalarSubqueryExec,
     PhysicalSecondaryIndexScan, PhysicalSetOpExec, PhysicalSortExec, PhysicalSortedAggregate,
-    PhysicalSubqueryExec, PhysicalTableScan, PhysicalTopKExec, PhysicalWindowExec,
+    PhysicalStreamingHashJoin, PhysicalSubqueryExec, PhysicalTableScan, PhysicalTopKExec,
+    PhysicalWindowExec,
 };
 pub use schema::{CteContext, OutputColumn, OutputSchema, PlannedCte, TableSource};
 pub use types::{PlanNode, ScanRange};

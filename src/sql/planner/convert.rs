@@ -24,7 +24,7 @@ use super::physical::{
     AggregateExpr, AggregateFunction, PhysicalFilterExec, PhysicalGraceHashJoin,
     PhysicalHashAggregate, PhysicalHashAntiJoin, PhysicalHashSemiJoin, PhysicalLimitExec,
     PhysicalNestedLoopJoin, PhysicalOperator, PhysicalPlan, PhysicalProjectExec,
-    PhysicalSetOpExec, PhysicalSortExec, PhysicalSubqueryExec,
+    PhysicalSetOpExec, PhysicalSortExec, PhysicalStreamingHashJoin, PhysicalSubqueryExec,
     PhysicalTableScan, PhysicalTopKExec, PhysicalWindowExec,
 };
 use super::Planner;
@@ -166,16 +166,47 @@ impl<'a> Planner<'a> {
                                 join.right,
                             );
                             let join_keys = self.convert_equi_keys_to_join_keys(equi_keys);
-                            let physical = self.arena.alloc(PhysicalOperator::GraceHashJoin(
-                                PhysicalGraceHashJoin {
-                                    left,
-                                    right,
-                                    join_type: join.join_type,
-                                    join_keys,
-                                    num_partitions: 16,
-                                },
-                            ));
-                            Ok(physical)
+
+                            let left_card = self.estimate_cardinality(join.left);
+                            let right_card = self.estimate_cardinality(join.right);
+
+                            let use_streaming = matches!(
+                                join.join_type,
+                                JoinType::Inner | JoinType::Cross
+                            );
+
+                            if use_streaming {
+                                let (build, probe, final_keys, swapped) = if left_card <= right_card {
+                                    (left, right, join_keys, false)
+                                } else {
+                                    let swapped_keys: &[(&Expr<'a>, &Expr<'a>)] = self
+                                        .arena
+                                        .alloc_slice_fill_iter(join_keys.iter().map(|(l, r)| (*r, *l)));
+                                    (right, left, swapped_keys, true)
+                                };
+
+                                let physical = self.arena.alloc(PhysicalOperator::StreamingHashJoin(
+                                    PhysicalStreamingHashJoin {
+                                        build,
+                                        probe,
+                                        join_type: join.join_type,
+                                        join_keys: final_keys,
+                                        swapped,
+                                    },
+                                ));
+                                Ok(physical)
+                            } else {
+                                let physical = self.arena.alloc(PhysicalOperator::GraceHashJoin(
+                                    PhysicalGraceHashJoin {
+                                        left,
+                                        right,
+                                        join_type: join.join_type,
+                                        join_keys,
+                                        num_partitions: 16,
+                                    },
+                                ));
+                                Ok(physical)
+                            }
                         } else {
                             let physical = self.arena.alloc(PhysicalOperator::NestedLoopJoin(
                                 PhysicalNestedLoopJoin {
@@ -307,6 +338,59 @@ impl<'a> Planner<'a> {
                     }));
                 Ok(physical)
             }
+        }
+    }
+
+    fn estimate_cardinality(&self, op: &LogicalOperator<'a>) -> u64 {
+        const DEFAULT_CARDINALITY: u64 = 1000;
+        const FILTER_SELECTIVITY: f64 = 0.1;
+        const JOIN_SELECTIVITY: f64 = 0.1;
+
+        match op {
+            LogicalOperator::Scan(scan) => {
+                if let Ok(table_def) =
+                    self.catalog.resolve_table_in_schema(scan.schema, scan.table)
+                {
+                    let row_count = table_def.row_count();
+                    if row_count > 0 {
+                        return row_count;
+                    }
+                }
+                DEFAULT_CARDINALITY
+            }
+            LogicalOperator::DualScan => 1,
+            LogicalOperator::Filter(filter) => {
+                let input_card = self.estimate_cardinality(filter.input);
+                ((input_card as f64) * FILTER_SELECTIVITY).max(1.0) as u64
+            }
+            LogicalOperator::Project(project) => self.estimate_cardinality(project.input),
+            LogicalOperator::Aggregate(agg) => {
+                let input_card = self.estimate_cardinality(agg.input);
+                if agg.group_by.is_empty() {
+                    1
+                } else {
+                    (input_card / 10).max(1)
+                }
+            }
+            LogicalOperator::Join(join) => {
+                let left_card = self.estimate_cardinality(join.left);
+                let right_card = self.estimate_cardinality(join.right);
+                if join.condition.is_some() {
+                    ((left_card as f64 * right_card as f64 * JOIN_SELECTIVITY) as u64).max(1)
+                } else {
+                    left_card * right_card
+                }
+            }
+            LogicalOperator::Sort(sort) => self.estimate_cardinality(sort.input),
+            LogicalOperator::Limit(limit) => {
+                let input_card = self.estimate_cardinality(limit.input);
+                match limit.limit {
+                    Some(l) => input_card.min(l),
+                    None => input_card,
+                }
+            }
+            LogicalOperator::Subquery(subq) => self.estimate_cardinality(subq.plan),
+            _ => DEFAULT_CARDINALITY,
         }
     }
 

@@ -18,7 +18,8 @@ use crate::sql::executor::{RowSource, StreamingBTreeSource};
 use crate::sql::planner::{
     AggregateFunction, PhysicalGraceHashJoin, PhysicalHashAntiJoin, PhysicalHashSemiJoin,
     PhysicalIndexScan, PhysicalNestedLoopJoin, PhysicalOperator, PhysicalSecondaryIndexScan,
-    PhysicalSetOpExec, PhysicalSortExec, PhysicalSubqueryExec, PhysicalTableScan,
+    PhysicalSetOpExec, PhysicalSortExec, PhysicalStreamingHashJoin, PhysicalSubqueryExec,
+    PhysicalTableScan,
 };
 use crate::storage::{FileManager, TableFileHeader, DEFAULT_SCHEMA};
 use crate::types::{DataType, OwnedValue};
@@ -36,6 +37,7 @@ pub enum PlanSource<'a> {
     Subquery(&'a PhysicalSubqueryExec<'a>),
     NestedLoopJoin(&'a PhysicalNestedLoopJoin<'a>),
     GraceHashJoin(&'a PhysicalGraceHashJoin<'a>),
+    StreamingHashJoin(&'a PhysicalStreamingHashJoin<'a>),
     HashSemiJoin(&'a PhysicalHashSemiJoin<'a>),
     HashAntiJoin(&'a PhysicalHashAntiJoin<'a>),
     SetOp(&'a PhysicalSetOpExec<'a>),
@@ -55,6 +57,7 @@ pub fn find_plan_source<'a>(op: &'a PhysicalOperator<'a>) -> Option<PlanSource<'
         PhysicalOperator::SubqueryExec(subq) => Some(PlanSource::Subquery(subq)),
         PhysicalOperator::NestedLoopJoin(join) => Some(PlanSource::NestedLoopJoin(join)),
         PhysicalOperator::GraceHashJoin(join) => Some(PlanSource::GraceHashJoin(join)),
+        PhysicalOperator::StreamingHashJoin(join) => Some(PlanSource::StreamingHashJoin(join)),
         PhysicalOperator::SetOpExec(set_op) => Some(PlanSource::SetOp(set_op)),
         PhysicalOperator::FilterExec(filter) => find_plan_source(filter.input),
         PhysicalOperator::ProjectExec(project) => find_plan_source(project.input),

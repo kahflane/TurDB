@@ -225,6 +225,28 @@ pub struct GraceHashJoinState<'a, S: RowSource> {
     pub build_row_buf: SmallVec<[Value<'static>; 16]>,
 }
 
+pub struct StreamingHashJoinState<'a, S: RowSource> {
+    pub build: Box<DynamicExecutor<'a, S>>,
+    pub probe: Box<DynamicExecutor<'a, S>>,
+    pub build_key_indices: SmallVec<[usize; 4]>,
+    pub probe_key_indices: SmallVec<[usize; 4]>,
+    pub arena: &'a Bump,
+    pub hash_table: hashbrown::HashMap<u64, SmallVec<[usize; 8]>>,
+    pub build_rows: Vec<Vec<Value<'static>>>,
+    pub current_probe_row: Option<SmallVec<[Value<'static>; 16]>>,
+    pub current_matches: SmallVec<[usize; 8]>,
+    pub current_match_idx: usize,
+    pub join_type: JoinType,
+    pub probe_row_matched: bool,
+    pub build_matched: Vec<bool>,
+    pub emitting_unmatched_build: bool,
+    pub unmatched_build_idx: usize,
+    pub build_col_count: usize,
+    pub probe_col_count: usize,
+    pub built: bool,
+    pub swapped: bool,
+}
+
 pub struct HashSemiJoinState<'a, S: RowSource> {
     pub left: Box<DynamicExecutor<'a, S>>,
     pub right: Box<DynamicExecutor<'a, S>>,

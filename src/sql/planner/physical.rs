@@ -9,7 +9,7 @@
 //! - **Scans**: TableScan, IndexScan, SecondaryIndexScan
 //! - **Filtering**: FilterExec
 //! - **Projection**: ProjectExec
-//! - **Joins**: NestedLoopJoin, GraceHashJoin, HashSemiJoin, HashAntiJoin
+//! - **Joins**: NestedLoopJoin, GraceHashJoin, StreamingHashJoin, HashSemiJoin, HashAntiJoin
 //! - **Aggregation**: HashAggregate, SortedAggregate
 //! - **Ordering**: SortExec, TopKExec
 //! - **Limiting**: LimitExec
@@ -38,6 +38,7 @@ pub enum PhysicalOperator<'a> {
     ProjectExec(PhysicalProjectExec<'a>),
     NestedLoopJoin(PhysicalNestedLoopJoin<'a>),
     GraceHashJoin(PhysicalGraceHashJoin<'a>),
+    StreamingHashJoin(PhysicalStreamingHashJoin<'a>),
     HashSemiJoin(PhysicalHashSemiJoin<'a>),
     HashAntiJoin(PhysicalHashAntiJoin<'a>),
     HashAggregate(PhysicalHashAggregate<'a>),
@@ -121,6 +122,15 @@ pub struct PhysicalGraceHashJoin<'a> {
     pub join_type: JoinType,
     pub join_keys: &'a [(&'a Expr<'a>, &'a Expr<'a>)],
     pub num_partitions: u8,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct PhysicalStreamingHashJoin<'a> {
+    pub build: &'a PhysicalOperator<'a>,
+    pub probe: &'a PhysicalOperator<'a>,
+    pub join_type: JoinType,
+    pub join_keys: &'a [(&'a Expr<'a>, &'a Expr<'a>)],
+    pub swapped: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -281,6 +291,13 @@ impl<'a> PhysicalPlan<'a> {
                 let _ = writeln!(output, "{}-> GraceHashJoin ({:?})", prefix, join.join_type);
                 self.format_operator(join.left, indent + 1, output);
                 self.format_operator(join.right, indent + 1, output);
+            }
+            PhysicalOperator::StreamingHashJoin(join) => {
+                let _ = writeln!(output, "{}-> StreamingHashJoin ({:?})", prefix, join.join_type);
+                let _ = writeln!(output, "{}  Build:", prefix);
+                self.format_operator(join.build, indent + 2, output);
+                let _ = writeln!(output, "{}  Probe (streaming):", prefix);
+                self.format_operator(join.probe, indent + 2, output);
             }
             PhysicalOperator::HashAggregate(agg) => {
                 let _ = writeln!(output, "{}-> HashAggregate", prefix);

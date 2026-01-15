@@ -463,3 +463,63 @@ fn multiple_join_conditions() {
 
     assert_eq!(rows.len(), 3, "Should have 3 inventory records for electronics");
 }
+
+#[test]
+fn qualified_column_names_resolve_correctly_in_join() {
+    let (db, _temp) = create_test_db();
+
+    db.execute("CREATE TABLE competitions (id BIGINT PRIMARY KEY, name TEXT)")
+        .expect("Failed to create competitions table");
+    db.execute("CREATE TABLE episodes (id BIGINT PRIMARY KEY, competition_id BIGINT, title TEXT)")
+        .expect("Failed to create episodes table");
+
+    db.execute("BEGIN").unwrap();
+    db.execute("INSERT INTO competitions VALUES (1, 'Competition A')")
+        .unwrap();
+    db.execute("INSERT INTO competitions VALUES (2, 'Competition B')")
+        .unwrap();
+    db.execute("INSERT INTO competitions VALUES (3, 'Competition C')")
+        .unwrap();
+    db.execute("INSERT INTO episodes VALUES (100, 1, 'Episode 1')")
+        .unwrap();
+    db.execute("INSERT INTO episodes VALUES (101, 1, 'Episode 2')")
+        .unwrap();
+    db.execute("COMMIT").unwrap();
+
+    let rows = db
+        .query(
+            "SELECT c.id AS comp_id, e.id AS epis_id
+             FROM competitions c
+             LEFT JOIN episodes e ON e.competition_id = c.id
+             ORDER BY c.id, e.id",
+        )
+        .expect("Failed to execute LEFT JOIN with qualified columns");
+
+    assert_eq!(rows.len(), 4, "Should have 2 matched + 2 unmatched = 4 rows");
+
+    let comp_id_0 = rows[0].values.get(0).and_then(|v| v.as_int()).unwrap();
+    let epis_id_0 = rows[0].values.get(1).and_then(|v| v.as_int());
+    assert_eq!(comp_id_0, 1, "First row comp_id should be 1");
+    assert_eq!(epis_id_0, Some(100), "First row epis_id should be 100");
+
+    let comp_id_1 = rows[1].values.get(0).and_then(|v| v.as_int()).unwrap();
+    let epis_id_1 = rows[1].values.get(1).and_then(|v| v.as_int());
+    assert_eq!(comp_id_1, 1, "Second row comp_id should be 1");
+    assert_eq!(epis_id_1, Some(101), "Second row epis_id should be 101");
+
+    let comp_id_2 = rows[2].values.get(0).and_then(|v| v.as_int()).unwrap();
+    let epis_id_2 = rows[2].values.get(1);
+    assert_eq!(comp_id_2, 2, "Third row comp_id should be 2");
+    assert!(
+        epis_id_2.map(|v| v.is_null()).unwrap_or(false),
+        "Third row epis_id should be NULL (no matching episode)"
+    );
+
+    let comp_id_3 = rows[3].values.get(0).and_then(|v| v.as_int()).unwrap();
+    let epis_id_3 = rows[3].values.get(1);
+    assert_eq!(comp_id_3, 3, "Fourth row comp_id should be 3");
+    assert!(
+        epis_id_3.map(|v| v.is_null()).unwrap_or(false),
+        "Fourth row epis_id should be NULL (no matching episode)"
+    );
+}

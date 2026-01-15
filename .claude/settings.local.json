@@ -64,7 +64,8 @@
       "Bash(gh api:*)",
       "WebFetch(domain:www.interdb.jp)",
       "WebFetch(domain:wiki.postgresql.org)",
-      "WebFetch(domain:www.cybertec-postgresql.com)"
+      "WebFetch(domain:www.cybertec-postgresql.com)",
+      "Bash(time printf:*)"
     ]
   },
   "hooks": {

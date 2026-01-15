@@ -1,6 +1,23 @@
 use crate::sql::adapter::BTreeCursorAdapter;
-use crate::sql::ast::JoinType;
+use crate::sql::ast::{ColumnRef, JoinType};
 use crate::sql::context::ExecutionContext;
+
+fn resolve_column_index(col: &ColumnRef, column_map: &[(String, usize)]) -> Option<usize> {
+    if let Some(table) = col.table {
+        let qualified = format!("{}.{}", table, col.column).to_lowercase();
+        if let Some((_, idx)) = column_map
+            .iter()
+            .find(|(n, _)| n.eq_ignore_ascii_case(&qualified))
+        {
+            return Some(*idx);
+        }
+    }
+
+    column_map
+        .iter()
+        .find(|(n, _)| n.eq_ignore_ascii_case(col.column))
+        .map(|(_, idx)| *idx)
+}
 use crate::sql::executor::{
     AggregateFunction, DynamicExecutor, RowSource, SortKey, TableScanExecutor,
 };
@@ -118,11 +135,12 @@ impl<'a> ExecutorBuilder<'a> {
                         self.ctx.arena,
                     ))
                 } else {
+                    let input_column_map = self.compute_input_column_map(project.input);
                     let projections: Vec<usize> = if project.expressions.is_empty() {
                         let output_len = if let Some((group_by, aggregates)) = &agg_info {
                             group_by.len() + aggregates.len()
                         } else {
-                            column_map.len()
+                            input_column_map.iter().map(|(_, idx)| *idx).max().map(|m| m + 1).unwrap_or(0)
                         };
                         (0..output_len).collect()
                     } else {
@@ -189,10 +207,7 @@ impl<'a> ExecutorBuilder<'a> {
                                     }
                                     default_idx
                                 } else if let Expr::Column(col_ref) = expr {
-                                    column_map
-                                        .iter()
-                                        .find(|(name, _)| name.eq_ignore_ascii_case(col_ref.column))
-                                        .map(|(_, idx)| *idx)
+                                    resolve_column_index(col_ref, &input_column_map)
                                         .unwrap_or(default_idx)
                                 } else if let Expr::Function(FunctionCall {
                                     over: Some(_), ..
@@ -245,11 +260,9 @@ impl<'a> ExecutorBuilder<'a> {
                             .iter()
                             .map(|key| {
                                 if let crate::sql::ast::Expr::Column(col) = key.expr {
-                                    if let Some((_, idx)) = full_column_map
-                                        .iter()
-                                        .find(|(n, _)| n.eq_ignore_ascii_case(col.column))
+                                    if let Some(idx) = resolve_column_index(&col, &full_column_map)
                                     {
-                                        return SortKey::column(*idx, key.ascending);
+                                        return SortKey::column(idx, key.ascending);
                                     }
                                 }
                                 SortKey::expression(key.expr, full_column_map.clone(), key.ascending)
@@ -270,10 +283,7 @@ impl<'a> ExecutorBuilder<'a> {
                             .iter()
                             .filter_map(|expr| {
                                 if let crate::sql::ast::Expr::Column(col) = expr {
-                                    full_column_map
-                                        .iter()
-                                        .find(|(n, _)| n.eq_ignore_ascii_case(col.column))
-                                        .map(|(_, idx)| *idx)
+                                    resolve_column_index(col, &full_column_map)
                                 } else {
                                     None
                                 }
@@ -295,11 +305,8 @@ impl<'a> ExecutorBuilder<'a> {
                     .iter()
                     .map(|key| {
                         if let crate::sql::ast::Expr::Column(col) = key.expr {
-                            if let Some((_, idx)) = input_column_map
-                                .iter()
-                                .find(|(n, _)| n.eq_ignore_ascii_case(col.column))
-                            {
-                                return SortKey::column(*idx, key.ascending);
+                            if let Some(idx) = resolve_column_index(&col, &input_column_map) {
+                                return SortKey::column(idx, key.ascending);
                             }
                         }
                         SortKey::expression(key.expr, input_column_map.clone(), key.ascending)
@@ -322,11 +329,8 @@ impl<'a> ExecutorBuilder<'a> {
                     .iter()
                     .map(|key| {
                         if let crate::sql::ast::Expr::Column(col) = key.expr {
-                            if let Some((_, idx)) = input_column_map
-                                .iter()
-                                .find(|(n, _)| n.eq_ignore_ascii_case(col.column))
-                            {
-                                return SortKey::column(*idx, key.ascending);
+                            if let Some(idx) = resolve_column_index(&col, &input_column_map) {
+                                return SortKey::column(idx, key.ascending);
                             }
                         }
                         SortKey::expression(key.expr, input_column_map.clone(), key.ascending)
@@ -371,10 +375,7 @@ impl<'a> ExecutorBuilder<'a> {
                         .iter()
                         .filter_map(|expr| {
                             if let crate::sql::ast::Expr::Column(col) = expr {
-                                column_map
-                                    .iter()
-                                    .find(|(n, _)| n.eq_ignore_ascii_case(col.column))
-                                    .map(|(_, i)| *i)
+                                resolve_column_index(col, column_map)
                             } else {
                                 None
                             }
@@ -391,10 +392,7 @@ impl<'a> ExecutorBuilder<'a> {
                             .argument
                             .and_then(|arg| {
                                 if let crate::sql::ast::Expr::Column(col) = arg {
-                                    column_map
-                                        .iter()
-                                        .find(|(n, _)| n.eq_ignore_ascii_case(col.column))
-                                        .map(|(_, i)| *i)
+                                    resolve_column_index(&col, column_map)
                                 } else {
                                     None
                                 }
@@ -453,10 +451,7 @@ impl<'a> ExecutorBuilder<'a> {
                         .iter()
                         .filter_map(|expr| {
                             if let crate::sql::ast::Expr::Column(col) = expr {
-                                column_map
-                                    .iter()
-                                    .find(|(n, _)| n.eq_ignore_ascii_case(col.column))
-                                    .map(|(_, i)| *i)
+                                resolve_column_index(col, column_map)
                             } else {
                                 None
                             }
@@ -473,10 +468,7 @@ impl<'a> ExecutorBuilder<'a> {
                             .argument
                             .and_then(|arg| {
                                 if let crate::sql::ast::Expr::Column(col) = arg {
-                                    column_map
-                                        .iter()
-                                        .find(|(n, _)| n.eq_ignore_ascii_case(col.column))
-                                        .map(|(_, i)| *i)
+                                    resolve_column_index(&col, column_map)
                                 } else {
                                     None
                                 }
@@ -522,6 +514,11 @@ impl<'a> ExecutorBuilder<'a> {
             PhysicalOperator::GraceHashJoin(_) => {
                 eyre::bail!(
                     "GraceHashJoin requires two sources - use build_grace_hash_join instead"
+                )
+            }
+            PhysicalOperator::StreamingHashJoin(_) => {
+                eyre::bail!(
+                    "StreamingHashJoin requires two sources - use build_streaming_hash_join instead"
                 )
             }
             PhysicalOperator::HashSemiJoin(_) => {
@@ -861,12 +858,16 @@ impl<'a> ExecutorBuilder<'a> {
         match op {
             PhysicalOperator::TableScan(scan) => {
                 if let Some(table_def) = scan.table_def {
-                    table_def
-                        .columns()
-                        .iter()
-                        .enumerate()
-                        .map(|(idx, col)| (col.name().to_lowercase(), idx))
-                        .collect()
+                    let mut result: Vec<(String, usize)> = Vec::new();
+                    for (idx, col) in table_def.columns().iter().enumerate() {
+                        let col_name = col.name().to_lowercase();
+                        result.push((col_name.clone(), idx));
+                        if let Some(alias) = scan.alias {
+                            result.push((format!("{}.{}", alias.to_lowercase(), col_name), idx));
+                        }
+                        result.push((format!("{}.{}", scan.table.to_lowercase(), col_name), idx));
+                    }
+                    result
                 } else {
                     Vec::new()
                 }
@@ -909,7 +910,7 @@ impl<'a> ExecutorBuilder<'a> {
             PhysicalOperator::NestedLoopJoin(join) => {
                 let mut result = self.compute_input_column_map(join.left);
                 let right_cols = self.compute_input_column_map(join.right);
-                let offset = result.len();
+                let offset = result.iter().map(|(_, idx)| *idx).max().map(|m| m + 1).unwrap_or(0);
                 for (name, idx) in right_cols {
                     result.push((name, idx + offset));
                 }
@@ -918,8 +919,22 @@ impl<'a> ExecutorBuilder<'a> {
             PhysicalOperator::GraceHashJoin(join) => {
                 let mut result = self.compute_input_column_map(join.left);
                 let right_cols = self.compute_input_column_map(join.right);
-                let offset = result.len();
+                let offset = result.iter().map(|(_, idx)| *idx).max().map(|m| m + 1).unwrap_or(0);
                 for (name, idx) in right_cols {
+                    result.push((name, idx + offset));
+                }
+                result
+            }
+            PhysicalOperator::StreamingHashJoin(join) => {
+                let (first, second) = if join.swapped {
+                    (join.probe, join.build)
+                } else {
+                    (join.build, join.probe)
+                };
+                let mut result = self.compute_input_column_map(first);
+                let second_cols = self.compute_input_column_map(second);
+                let offset = result.iter().map(|(_, idx)| *idx).max().map(|m| m + 1).unwrap_or(0);
+                for (name, idx) in second_cols {
                     result.push((name, idx + offset));
                 }
                 result

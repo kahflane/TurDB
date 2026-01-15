@@ -78,7 +78,8 @@ use crate::sql::predicate::CompiledPredicate;
 use crate::sql::partition_spiller::PartitionSpiller;
 use crate::sql::state::{
     AggregateState, GraceHashJoinState, HashAggregateState, HashAntiJoinState, HashSemiJoinState,
-    IndexScanState, LimitState, NestedLoopJoinState, SortState, TopKState, WindowState,
+    IndexScanState, LimitState, NestedLoopJoinState, SortState, StreamingHashJoinState, TopKState,
+    WindowState,
 };
 use crate::sql::util::{
     allocate_value_to_arena, clone_value_owned, clone_value_ref_to_arena, compare_values_for_sort,
@@ -1829,6 +1830,7 @@ pub enum DynamicExecutor<'a, S: RowSource> {
     NestedLoopJoin(NestedLoopJoinState<'a, S>),
     /// Boxed to reduce enum size - GraceHashJoinState contains large partition buffers
     GraceHashJoin(Box<GraceHashJoinState<'a, S>>),
+    StreamingHashJoin(StreamingHashJoinState<'a, S>),
     HashSemiJoin(HashSemiJoinState<'a, S>),
     HashAntiJoin(HashAntiJoinState<'a, S>),
     HashAggregate(HashAggregateState<'a, S>),
@@ -1997,6 +1999,39 @@ impl<'a, S: RowSource> Executor<'a> for DynamicExecutor<'a, S> {
                 state.unmatched_build_partition = 0;
                 state.unmatched_build_idx = 0;
                 Ok(())
+            }
+            DynamicExecutor::StreamingHashJoin(state) => {
+                if !state.built {
+                    state.hash_table.clear();
+                    state.build_rows.clear();
+
+                    state.build.open()?;
+                    while let Some(row) = state.build.next()? {
+                        let hash = hash_keys(&row, &state.build_key_indices);
+                        let owned: Vec<Value<'static>> =
+                            row.values.iter().map(clone_value_owned).collect();
+                        let idx = state.build_rows.len();
+                        state
+                            .hash_table
+                            .entry(hash)
+                            .or_insert_with(SmallVec::new)
+                            .push(idx);
+                        state.build_rows.push(owned);
+                    }
+                    state.build.close()?;
+
+                    state.build_matched = vec![false; state.build_rows.len()];
+                    state.built = true;
+                }
+
+                state.current_probe_row = None;
+                state.current_matches.clear();
+                state.current_match_idx = 0;
+                state.probe_row_matched = false;
+                state.emitting_unmatched_build = false;
+                state.unmatched_build_idx = 0;
+
+                state.probe.open()
             }
             DynamicExecutor::HashSemiJoin(state) => {
                 if !state.built {
@@ -2608,6 +2643,125 @@ impl<'a, S: RowSource> Executor<'a> for DynamicExecutor<'a, S> {
                 state.current_matches.clear();
                 state.probe_row_matched = false;
             },
+            DynamicExecutor::StreamingHashJoin(state) => loop {
+                if state.emitting_unmatched_build {
+                    while state.unmatched_build_idx < state.build_rows.len() {
+                        let idx = state.unmatched_build_idx;
+                        state.unmatched_build_idx += 1;
+                        if !state.build_matched[idx] {
+                            let build_row = &state.build_rows[idx];
+                            let combined: Vec<Value<'a>> = if state.swapped {
+                                let mut v: Vec<Value<'a>> =
+                                    (0..state.probe_col_count).map(|_| Value::Null).collect();
+                                v.extend(
+                                    build_row
+                                        .iter()
+                                        .map(|val| clone_value_ref_to_arena(val, state.arena)),
+                                );
+                                v
+                            } else {
+                                let mut v: Vec<Value<'a>> = build_row
+                                    .iter()
+                                    .map(|val| clone_value_ref_to_arena(val, state.arena))
+                                    .collect();
+                                v.extend((0..state.probe_col_count).map(|_| Value::Null));
+                                v
+                            };
+                            let allocated = state.arena.alloc_slice_fill_iter(combined);
+                            return Ok(Some(ExecutorRow::new(allocated)));
+                        }
+                    }
+                    return Ok(None);
+                }
+
+                if state.current_match_idx < state.current_matches.len() {
+                    let build_idx = state.current_matches[state.current_match_idx];
+                    state.current_match_idx += 1;
+                    state.probe_row_matched = true;
+
+                    if matches!(state.join_type, JoinType::Left | JoinType::Full) {
+                        state.build_matched[build_idx] = true;
+                    }
+
+                    let build_row = &state.build_rows[build_idx];
+                    let probe_row = state.current_probe_row.as_ref().unwrap();
+
+                    let combined: Vec<Value<'a>> = if state.swapped {
+                        probe_row
+                            .iter()
+                            .chain(build_row.iter())
+                            .map(|v| clone_value_ref_to_arena(v, state.arena))
+                            .collect()
+                    } else {
+                        build_row
+                            .iter()
+                            .chain(probe_row.iter())
+                            .map(|v| clone_value_ref_to_arena(v, state.arena))
+                            .collect()
+                    };
+                    let allocated = state.arena.alloc_slice_fill_iter(combined);
+                    return Ok(Some(ExecutorRow::new(allocated)));
+                }
+
+                if state.current_probe_row.is_some()
+                    && !state.probe_row_matched
+                    && matches!(state.join_type, JoinType::Right | JoinType::Full)
+                {
+                    let probe_row = state.current_probe_row.as_ref().unwrap();
+                    let combined: Vec<Value<'a>> = if state.swapped {
+                        let mut v: Vec<Value<'a>> = probe_row
+                            .iter()
+                            .map(|val| clone_value_ref_to_arena(val, state.arena))
+                            .collect();
+                        v.extend((0..state.build_col_count).map(|_| Value::Null));
+                        v
+                    } else {
+                        let mut v: Vec<Value<'a>> =
+                            (0..state.build_col_count).map(|_| Value::Null).collect();
+                        v.extend(
+                            probe_row
+                                .iter()
+                                .map(|val| clone_value_ref_to_arena(val, state.arena)),
+                        );
+                        v
+                    };
+                    let allocated = state.arena.alloc_slice_fill_iter(combined);
+                    state.current_probe_row = None;
+                    return Ok(Some(ExecutorRow::new(allocated)));
+                }
+
+                match state.probe.next()? {
+                    Some(row) => {
+                        let owned: SmallVec<[Value<'static>; 16]> =
+                            row.values.iter().map(clone_value_owned).collect();
+                        let hash = hash_keys_static(&owned, &state.probe_key_indices);
+
+                        state.current_matches.clear();
+                        if let Some(matches) = state.hash_table.get(&hash) {
+                            for &idx in matches.iter() {
+                                if keys_match_static(
+                                    &state.build_rows[idx],
+                                    &owned,
+                                    &state.build_key_indices,
+                                    &state.probe_key_indices,
+                                ) {
+                                    state.current_matches.push(idx);
+                                }
+                            }
+                        }
+                        state.current_probe_row = Some(owned);
+                        state.current_match_idx = 0;
+                        state.probe_row_matched = false;
+                    }
+                    None => {
+                        if matches!(state.join_type, JoinType::Left | JoinType::Full) {
+                            state.emitting_unmatched_build = true;
+                            continue;
+                        }
+                        return Ok(None);
+                    }
+                }
+            },
             DynamicExecutor::HashSemiJoin(state) => loop {
                 match state.left.next()? {
                     Some(row) => {
@@ -2776,6 +2930,7 @@ impl<'a, S: RowSource> Executor<'a> for DynamicExecutor<'a, S> {
                 }
                 Ok(())
             }
+            DynamicExecutor::StreamingHashJoin(state) => state.probe.close(),
             DynamicExecutor::HashSemiJoin(state) => state.left.close(),
             DynamicExecutor::HashAntiJoin(state) => state.left.close(),
             DynamicExecutor::HashAggregate(state) => state.child.close(),

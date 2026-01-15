@@ -169,6 +169,27 @@ impl<'a> Planner<'a> {
                     columns: columns.into_bump_slice(),
                 })
             }
+            PhysicalOperator::StreamingHashJoin(join) => {
+                let (first, second) = if join.swapped {
+                    (join.probe, join.build)
+                } else {
+                    (join.build, join.probe)
+                };
+                let first_schema = self.compute_output_schema(first)?;
+                let second_schema = self.compute_output_schema(second)?;
+                let mut columns = bumpalo::collections::Vec::new_in(self.arena);
+
+                for col in first_schema.columns {
+                    columns.push(*col);
+                }
+                for col in second_schema.columns {
+                    columns.push(*col);
+                }
+
+                Ok(OutputSchema {
+                    columns: columns.into_bump_slice(),
+                })
+            }
             PhysicalOperator::HashAggregate(agg) => {
                 let mut columns = bumpalo::collections::Vec::new_in(self.arena);
                 let input_schema = self.compute_output_schema(agg.input)?;
