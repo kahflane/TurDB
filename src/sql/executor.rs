@@ -1877,6 +1877,15 @@ impl<'a, S: RowSource> Executor<'a> for DynamicExecutor<'a, S> {
                         let owned: Vec<Value<'static>> =
                             row.values.iter().map(clone_value_owned).collect();
                         state.right_rows.push(owned);
+
+                        if let Some(budget) = state.memory_budget {
+                            let estimated_size = state.right_rows.len() * 128;
+                            if estimated_size > state.last_reported_bytes + 64 * 1024 {
+                                let delta = estimated_size - state.last_reported_bytes;
+                                budget.allocate(crate::memory::Pool::Query, delta)?;
+                                state.last_reported_bytes = estimated_size;
+                            }
+                        }
                     }
                     state.right.close()?;
                     state.materialized = true;
@@ -1937,6 +1946,7 @@ impl<'a, S: RowSource> Executor<'a> for DynamicExecutor<'a, S> {
                         }
                         state.right.close()?;
                     } else {
+                        let mut total_rows = 0usize;
                         state.left.open()?;
                         while let Some(row) = state.left.next()? {
                             let hash = hash_keys(&row, &state.left_key_indices);
@@ -1944,6 +1954,16 @@ impl<'a, S: RowSource> Executor<'a> for DynamicExecutor<'a, S> {
                             let owned: Vec<Value<'static>> =
                                 row.values.iter().map(clone_value_owned).collect();
                             state.left_partitions[partition].push(owned);
+                            total_rows += 1;
+
+                            if let Some(budget) = state.memory_budget_ref {
+                                let estimated_size = total_rows * 128;
+                                if estimated_size > state.last_reported_bytes + 64 * 1024 {
+                                    let delta = estimated_size - state.last_reported_bytes;
+                                    budget.allocate(crate::memory::Pool::Query, delta)?;
+                                    state.last_reported_bytes = estimated_size;
+                                }
+                            }
                         }
                         state.left.close()?;
 
@@ -1954,6 +1974,16 @@ impl<'a, S: RowSource> Executor<'a> for DynamicExecutor<'a, S> {
                             let owned: Vec<Value<'static>> =
                                 row.values.iter().map(clone_value_owned).collect();
                             state.right_partitions[partition].push(owned);
+                            total_rows += 1;
+
+                            if let Some(budget) = state.memory_budget_ref {
+                                let estimated_size = total_rows * 128;
+                                if estimated_size > state.last_reported_bytes + 64 * 1024 {
+                                    let delta = estimated_size - state.last_reported_bytes;
+                                    budget.allocate(crate::memory::Pool::Query, delta)?;
+                                    state.last_reported_bytes = estimated_size;
+                                }
+                            }
                         }
                         state.right.close()?;
 
@@ -2018,6 +2048,15 @@ impl<'a, S: RowSource> Executor<'a> for DynamicExecutor<'a, S> {
                             .or_insert_with(SmallVec::new)
                             .push(idx);
                         state.build_rows.push(owned);
+
+                        if let Some(budget) = state.memory_budget_ref {
+                            let estimated_size = state.build_rows.len() * 128;
+                            if estimated_size > state.last_reported_bytes + 64 * 1024 {
+                                let delta = estimated_size - state.last_reported_bytes;
+                                budget.allocate(crate::memory::Pool::Query, delta)?;
+                                state.last_reported_bytes = estimated_size;
+                            }
+                        }
                     }
                     state.build.close()?;
 
@@ -2212,6 +2251,16 @@ impl<'a, S: RowSource> Executor<'a> for DynamicExecutor<'a, S> {
 
                         if state.heap.len() < heap_size {
                             state.heap.push(owned);
+
+                            if let Some(budget) = state.memory_budget {
+                                let estimated_size = state.heap.len() * 128;
+                                if estimated_size > state.last_reported_bytes + 64 * 1024 {
+                                    let delta = estimated_size - state.last_reported_bytes;
+                                    budget.allocate(crate::memory::Pool::Query, delta)?;
+                                    state.last_reported_bytes = estimated_size;
+                                }
+                            }
+
                             if state.heap.len() == heap_size {
                                 state.heap.sort_by(|a, b| {
                                     for key in sort_keys.iter() {
@@ -2884,6 +2933,15 @@ impl<'a, S: RowSource> Executor<'a> for DynamicExecutor<'a, S> {
                         let owned: Vec<Value<'static>> =
                             row.values.iter().map(clone_value_owned).collect();
                         state.rows.push(owned);
+
+                        if let Some(budget) = state.memory_budget {
+                            let estimated_size = state.rows.len() * 128;
+                            if estimated_size > state.last_reported_bytes + 64 * 1024 {
+                                let delta = estimated_size - state.last_reported_bytes;
+                                budget.allocate(crate::memory::Pool::Query, delta)?;
+                                state.last_reported_bytes = estimated_size;
+                            }
+                        }
                     }
                     state.compute_window_functions();
                     state.computed = true;

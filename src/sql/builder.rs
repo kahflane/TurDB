@@ -372,6 +372,8 @@ impl<'a> ExecutorBuilder<'a> {
                     result: Vec::new(),
                     iter_idx: 0,
                     computed: false,
+                    memory_budget: self.ctx.memory_budget,
+                    last_reported_bytes: 0,
                 }))
             }
             PhysicalOperator::IndexScan(_) => Ok(DynamicExecutor::TableScan(
@@ -580,6 +582,7 @@ impl<'a> ExecutorBuilder<'a> {
                     window.window_functions,
                     self.ctx.arena,
                     column_map.to_vec(),
+                    self.ctx.memory_budget,
                 )))
             }
             PhysicalOperator::SetOpExec(_) => {
@@ -637,6 +640,8 @@ impl<'a> ExecutorBuilder<'a> {
             unmatched_right_idx: 0,
             left_col_count,
             right_col_count,
+            memory_budget: self.ctx.memory_budget,
+            last_reported_bytes: 0,
         }
     }
 
@@ -687,6 +692,8 @@ impl<'a> ExecutorBuilder<'a> {
             query_id,
             probe_row_buf: smallvec::SmallVec::new(),
             build_row_buf: smallvec::SmallVec::new(),
+            memory_budget_ref: self.ctx.memory_budget,
+            last_reported_bytes: 0,
         }
     }
 

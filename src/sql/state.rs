@@ -39,6 +39,8 @@ pub struct TopKState<'a, S: RowSource> {
     pub result: Vec<Vec<Value<'static>>>,
     pub iter_idx: usize,
     pub computed: bool,
+    pub memory_budget: Option<&'a Arc<MemoryBudget>>,
+    pub last_reported_bytes: usize,
 }
 
 pub struct HashAggregateState<'a, S: RowSource> {
@@ -195,6 +197,8 @@ pub struct NestedLoopJoinState<'a, S: RowSource> {
     pub unmatched_right_idx: usize,
     pub left_col_count: usize,
     pub right_col_count: usize,
+    pub memory_budget: Option<&'a Arc<MemoryBudget>>,
+    pub last_reported_bytes: usize,
 }
 
 pub struct GraceHashJoinState<'a, S: RowSource> {
@@ -229,6 +233,8 @@ pub struct GraceHashJoinState<'a, S: RowSource> {
     pub query_id: u64,
     pub probe_row_buf: SmallVec<[Value<'static>; 16]>,
     pub build_row_buf: SmallVec<[Value<'static>; 16]>,
+    pub memory_budget_ref: Option<&'a Arc<MemoryBudget>>,
+    pub last_reported_bytes: usize,
 }
 
 pub struct StreamingHashJoinState<'a, S: RowSource> {
@@ -251,6 +257,8 @@ pub struct StreamingHashJoinState<'a, S: RowSource> {
     pub probe_col_count: usize,
     pub built: bool,
     pub swapped: bool,
+    pub memory_budget_ref: Option<&'a Arc<MemoryBudget>>,
+    pub last_reported_bytes: usize,
 }
 
 pub struct HashSemiJoinState<'a, S: RowSource> {
@@ -310,6 +318,8 @@ pub struct WindowState<'a, S: RowSource> {
     pub iter_idx: usize,
     pub computed: bool,
     pub column_map: Vec<(String, usize)>,
+    pub memory_budget: Option<&'a Arc<MemoryBudget>>,
+    pub last_reported_bytes: usize,
 }
 
 impl<'a, S: RowSource> WindowState<'a, S> {
@@ -317,6 +327,7 @@ impl<'a, S: RowSource> WindowState<'a, S> {
         child: Box<DynamicExecutor<'a, S>>,
         window_functions: &'a [WindowFunctionDef<'a>],
         arena: &'a Bump,
+        memory_budget: Option<&'a Arc<MemoryBudget>>,
     ) -> Self {
         Self {
             child,
@@ -327,6 +338,8 @@ impl<'a, S: RowSource> WindowState<'a, S> {
             iter_idx: 0,
             computed: false,
             column_map: Vec::new(),
+            memory_budget,
+            last_reported_bytes: 0,
         }
     }
 
@@ -335,6 +348,7 @@ impl<'a, S: RowSource> WindowState<'a, S> {
         window_functions: &'a [WindowFunctionDef<'a>],
         arena: &'a Bump,
         column_map: Vec<(String, usize)>,
+        memory_budget: Option<&'a Arc<MemoryBudget>>,
     ) -> Self {
         Self {
             child,
@@ -345,6 +359,8 @@ impl<'a, S: RowSource> WindowState<'a, S> {
             iter_idx: 0,
             computed: false,
             column_map,
+            memory_budget,
+            last_reported_bytes: 0,
         }
     }
 
