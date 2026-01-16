@@ -9,7 +9,7 @@
 //! - **Scans**: TableScan, IndexScan, SecondaryIndexScan
 //! - **Filtering**: FilterExec
 //! - **Projection**: ProjectExec
-//! - **Joins**: NestedLoopJoin, GraceHashJoin, StreamingHashJoin, HashSemiJoin, HashAntiJoin
+//! - **Joins**: NestedLoopJoin, IndexNestedLoopJoin, GraceHashJoin, StreamingHashJoin, HashSemiJoin, HashAntiJoin
 //! - **Aggregation**: HashAggregate, SortedAggregate
 //! - **Ordering**: SortExec, TopKExec
 //! - **Limiting**: LimitExec
@@ -37,6 +37,7 @@ pub enum PhysicalOperator<'a> {
     FilterExec(PhysicalFilterExec<'a>),
     ProjectExec(PhysicalProjectExec<'a>),
     NestedLoopJoin(PhysicalNestedLoopJoin<'a>),
+    IndexNestedLoopJoin(PhysicalIndexNestedLoopJoin<'a>),
     GraceHashJoin(PhysicalGraceHashJoin<'a>),
     StreamingHashJoin(PhysicalStreamingHashJoin<'a>),
     HashSemiJoin(PhysicalHashSemiJoin<'a>),
@@ -113,6 +114,19 @@ pub struct PhysicalNestedLoopJoin<'a> {
     pub right: &'a PhysicalOperator<'a>,
     pub join_type: JoinType,
     pub condition: Option<&'a Expr<'a>>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct PhysicalIndexNestedLoopJoin<'a> {
+    pub outer: &'a PhysicalOperator<'a>,
+    pub inner_table: &'a str,
+    pub inner_schema: Option<&'a str>,
+    pub inner_alias: Option<&'a str>,
+    pub inner_index_name: &'a str,
+    pub inner_table_def: Option<&'a TableDef>,
+    pub join_type: JoinType,
+    pub outer_key: &'a Expr<'a>,
+    pub inner_key_column: &'a str,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -286,6 +300,20 @@ impl<'a> PhysicalPlan<'a> {
                 let _ = writeln!(output, "{}-> NestedLoopJoin ({:?})", prefix, join.join_type);
                 self.format_operator(join.left, indent + 1, output);
                 self.format_operator(join.right, indent + 1, output);
+            }
+            PhysicalOperator::IndexNestedLoopJoin(join) => {
+                let _ = writeln!(
+                    output,
+                    "{}-> IndexNestedLoopJoin ({:?}) on {}.{} using index {}",
+                    prefix,
+                    join.join_type,
+                    join.inner_schema.unwrap_or("root"),
+                    join.inner_table,
+                    join.inner_index_name
+                );
+                let _ = writeln!(output, "{}  Outer:", prefix);
+                self.format_operator(join.outer, indent + 2, output);
+                let _ = writeln!(output, "{}  Inner: Index lookup on {}", prefix, join.inner_key_column);
             }
             PhysicalOperator::GraceHashJoin(join) => {
                 let _ = writeln!(output, "{}-> GraceHashJoin ({:?})", prefix, join.join_type);

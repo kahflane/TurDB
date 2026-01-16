@@ -25,7 +25,7 @@
 //! }
 //! ```
 
-use crate::schema::{Catalog, Constraint, IndexDef, IndexType, TableDef};
+use crate::schema::{Catalog, IndexDef, IndexType, TableDef};
 use crate::sql::ast::{BinaryOperator, Expr};
 use crate::sql::planner::{
     LogicalFilter, LogicalOperator, LogicalProject, LogicalScan, LogicalSort,
@@ -138,14 +138,6 @@ impl<'a> IndexSelector<'a> {
         let table_def = self.catalog.resolve_table(scan.table).ok()?;
 
         let (col_name, literal_expr) = extract_equality_predicate(filter.predicate)?;
-
-        let is_pk_column = table_def
-            .columns()
-            .iter()
-            .any(|c| c.name().eq_ignore_ascii_case(col_name) && c.has_constraint(&Constraint::PrimaryKey));
-        if is_pk_column {
-            return None;
-        }
 
         let matching_index = table_def.indexes().iter().find(|idx| {
             if idx.has_expressions() || idx.is_partial() {

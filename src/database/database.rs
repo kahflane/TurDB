@@ -3406,6 +3406,314 @@ impl Database {
 
                 result_rows
             }
+            Some(PlanSource::IndexNestedLoopJoin(join)) => {
+                use crate::btree::BTreeReader;
+                use crate::records::RecordView;
+                use crate::sql::ast::Expr;
+
+                let limit_info = find_limit(physical_plan.root);
+                let _offset = limit_info.and_then(|(_, o)| o).unwrap_or(0) as usize;
+                let limit = limit_info.and_then(|(l, _)| l).map(|l| l as usize);
+
+                let output_columns = physical_plan.output_schema.columns;
+
+                fn find_project_exprs<'a>(
+                    op: &'a crate::sql::planner::PhysicalOperator<'a>,
+                ) -> Option<&'a [&'a crate::sql::ast::Expr<'a>]> {
+                    use crate::sql::planner::PhysicalOperator;
+                    match op {
+                        PhysicalOperator::ProjectExec(p) => Some(p.expressions),
+                        PhysicalOperator::LimitExec(l) => find_project_exprs(l.input),
+                        PhysicalOperator::SortExec(s) => find_project_exprs(s.input),
+                        PhysicalOperator::TopKExec(t) => find_project_exprs(t.input),
+                        PhysicalOperator::FilterExec(f) => find_project_exprs(f.input),
+                        _ => None,
+                    }
+                }
+
+                let outer_rows: Vec<Vec<OwnedValue>> = {
+                    fn find_scan_in_outer<'a>(
+                        op: &'a crate::sql::planner::PhysicalOperator<'a>,
+                    ) -> Option<(&'a str, Option<&'a str>, Option<&'a str>)> {
+                        use crate::sql::planner::PhysicalOperator;
+                        match op {
+                            PhysicalOperator::TableScan(s) => Some((s.table, s.schema, s.alias)),
+                            PhysicalOperator::IndexScan(s) => Some((s.table, s.schema, None)),
+                            PhysicalOperator::SecondaryIndexScan(s) => Some((s.table, s.schema, None)),
+                            PhysicalOperator::FilterExec(f) => find_scan_in_outer(f.input),
+                            PhysicalOperator::ProjectExec(p) => find_scan_in_outer(p.input),
+                            PhysicalOperator::LimitExec(l) => find_scan_in_outer(l.input),
+                            _ => None,
+                        }
+                    }
+
+                    if let Some((table, schema_opt, _alias)) = find_scan_in_outer(join.outer) {
+                        let (rows, _) = materialize_table_rows(catalog, file_manager, schema_opt, table)?;
+                        rows
+                    } else {
+                        Vec::new()
+                    }
+                };
+
+                let outer_scan_info = {
+                    fn find_scan_info<'a>(
+                        op: &'a crate::sql::planner::PhysicalOperator<'a>,
+                    ) -> Option<(&'a str, Option<&'a str>, Option<&'a str>)> {
+                        use crate::sql::planner::PhysicalOperator;
+                        match op {
+                            PhysicalOperator::TableScan(s) => Some((s.table, s.schema, s.alias)),
+                            PhysicalOperator::IndexScan(s) => Some((s.table, s.schema, None)),
+                            PhysicalOperator::SecondaryIndexScan(s) => Some((s.table, s.schema, None)),
+                            PhysicalOperator::FilterExec(f) => find_scan_info(f.input),
+                            PhysicalOperator::ProjectExec(p) => find_scan_info(p.input),
+                            PhysicalOperator::LimitExec(l) => find_scan_info(l.input),
+                            _ => None,
+                        }
+                    }
+                    find_scan_info(join.outer)
+                };
+
+                let (outer_table, outer_schema, outer_alias) = outer_scan_info
+                    .ok_or_else(|| eyre::eyre!("IndexNestedLoopJoin: cannot find outer table scan"))?;
+
+                let outer_table_def = catalog.resolve_table_in_schema(outer_schema, outer_table)?;
+
+                let outer_key_idx: Option<usize> = match join.outer_key {
+                    Expr::Column(col_ref) => {
+                        outer_table_def
+                            .columns()
+                            .iter()
+                            .position(|c| c.name().eq_ignore_ascii_case(col_ref.column))
+                    }
+                    _ => None,
+                };
+
+                let outer_key_idx = outer_key_idx
+                    .ok_or_else(|| eyre::eyre!("IndexNestedLoopJoin: cannot resolve outer key column"))?;
+
+                let inner_schema_name = join.inner_schema.unwrap_or(DEFAULT_SCHEMA);
+                let inner_table_def = join
+                    .inner_table_def
+                    .ok_or_else(|| eyre::eyre!("IndexNestedLoopJoin: missing inner table def"))?;
+
+                let inner_columns = inner_table_def.columns();
+                let inner_schema = create_record_schema(inner_columns);
+                let inner_col_count = inner_columns.len();
+
+                toast_table_info = Some((inner_schema_name.to_string(), join.inner_table.to_string()));
+
+                let index_storage_arc = file_manager
+                    .index_data(inner_schema_name, join.inner_table, join.inner_index_name)
+                    .wrap_err_with(|| {
+                        format!(
+                            "IndexNestedLoopJoin: failed to open index {}.{}.{}",
+                            inner_schema_name, join.inner_table, join.inner_index_name
+                        )
+                    })?;
+
+                let table_storage_arc = file_manager
+                    .table_data(inner_schema_name, join.inner_table)
+                    .wrap_err_with(|| {
+                        format!(
+                            "IndexNestedLoopJoin: failed to open table {}.{}",
+                            inner_schema_name, join.inner_table
+                        )
+                    })?;
+
+                let mut join_column_map: Vec<(String, usize)> = Vec::new();
+                let mut idx = 0usize;
+
+                for col in outer_table_def.columns() {
+                    join_column_map.push((col.name().to_lowercase(), idx));
+                    join_column_map.push((format!("{}.{}", outer_table, col.name()).to_lowercase(), idx));
+                    if let Some(alias) = outer_alias {
+                        join_column_map.push((format!("{}.{}", alias, col.name()).to_lowercase(), idx));
+                    }
+                    idx += 1;
+                }
+
+                for col in inner_columns {
+                    join_column_map.push((col.name().to_lowercase(), idx));
+                    join_column_map.push((format!("{}.{}", join.inner_table, col.name()).to_lowercase(), idx));
+                    if let Some(alias) = join.inner_alias {
+                        join_column_map.push((format!("{}.{}", alias, col.name()).to_lowercase(), idx));
+                    }
+                    idx += 1;
+                }
+
+                fn resolve_expr_to_idx(
+                    expr: &crate::sql::ast::Expr,
+                    column_map: &[(String, usize)],
+                ) -> Option<usize> {
+                    if let Expr::Column(col) = expr {
+                        if let Some(table) = col.table {
+                            let qualified = format!("{}.{}", table, col.column).to_lowercase();
+                            if let Some((_, idx)) = column_map
+                                .iter()
+                                .find(|(name, _)| name.eq_ignore_ascii_case(&qualified))
+                            {
+                                return Some(*idx);
+                            }
+                        }
+                        column_map
+                            .iter()
+                            .find(|(name, _)| name.eq_ignore_ascii_case(col.column))
+                            .map(|(_, idx)| *idx)
+                    } else {
+                        None
+                    }
+                }
+
+                let output_source_indices: Vec<(usize, crate::types::DataType)> = {
+                    if let Some(project_exprs) = find_project_exprs(physical_plan.root) {
+                        project_exprs
+                            .iter()
+                            .zip(output_columns.iter())
+                            .map(|(expr, col)| {
+                                let source_idx = resolve_expr_to_idx(expr, &join_column_map).unwrap_or(0);
+                                (source_idx, col.data_type)
+                            })
+                            .collect()
+                    } else {
+                        output_columns
+                            .iter()
+                            .map(|col| {
+                                let col_name = col.name.to_lowercase();
+                                let source_idx = join_column_map
+                                    .iter()
+                                    .find(|(name, _)| name == &col_name)
+                                    .map(|(_, idx)| *idx)
+                                    .unwrap_or(0);
+                                (source_idx, col.data_type)
+                            })
+                            .collect()
+                    }
+                };
+
+                let mut result_rows: Vec<Row> = Vec::new();
+                let mut combined_buf: smallvec::SmallVec<[OwnedValue; 16]> = smallvec::SmallVec::new();
+                let null_inner_row: Vec<OwnedValue> = vec![OwnedValue::Null; inner_col_count];
+
+                let index_storage = index_storage_arc.read();
+                let table_storage = table_storage_arc.read();
+
+                let index_root_page = read_index_root_page(&index_storage)?;
+                let index_reader = BTreeReader::new(&index_storage, index_root_page)?;
+
+                let table_root_page = read_root_page(&table_storage)?;
+                let table_reader = BTreeReader::new(&table_storage, table_root_page)?;
+
+                let is_unique_index = inner_table_def
+                    .indexes()
+                    .iter()
+                    .find(|idx| idx.name() == join.inner_index_name)
+                    .map(|idx| idx.is_unique())
+                    .unwrap_or(false);
+                let row_id_suffix_len = if is_unique_index { 0 } else { 8 };
+
+                for outer_row in &outer_rows {
+                    let key_value = outer_row.get(outer_key_idx).cloned().unwrap_or(OwnedValue::Null);
+
+                    if key_value.is_null() {
+                        if matches!(join.join_type, crate::sql::ast::JoinType::Left) {
+                            combined_buf.clear();
+                            combined_buf.extend(outer_row.iter().cloned());
+                            combined_buf.extend(null_inner_row.iter().cloned());
+
+                            let owned: Vec<OwnedValue> = output_source_indices
+                                .iter()
+                                .map(|(source_idx, data_type)| {
+                                    let val = combined_buf.get(*source_idx).cloned().unwrap_or(OwnedValue::Null);
+                                    convert_value_with_type(&val.to_value(), *data_type)
+                                })
+                                .collect();
+                            result_rows.push(Row::new(owned));
+                        }
+                        continue;
+                    }
+
+                    let mut key_buf: Vec<u8> = Vec::with_capacity(32);
+                    key_value.to_value().encode_to_key(&mut key_buf);
+
+                    let mut inner_matches: Vec<Vec<OwnedValue>> = Vec::new();
+
+                    let mut cursor = index_reader.cursor_seek(&key_buf)?;
+                    if cursor.valid() {
+                        loop {
+                            let index_key = cursor.key()?;
+                            if !index_key.starts_with(&key_buf) {
+                                break;
+                            }
+
+                            let row_id_bytes = if is_unique_index {
+                                cursor.value()?
+                            } else {
+                                &index_key[index_key.len().saturating_sub(row_id_suffix_len)..]
+                            };
+
+                            if row_id_bytes.len() == 8 {
+                                let row_key: [u8; 8] = row_id_bytes.try_into().unwrap();
+                                if let Some(row_data) = table_reader.get(&row_key)? {
+                                    let user_data = crate::database::dml::mvcc_helpers::get_user_data(row_data);
+                                    let record = RecordView::new(user_data, &inner_schema)?;
+                                    let row_values = OwnedValue::extract_row_from_record(&record, inner_columns)?;
+                                    inner_matches.push(row_values);
+                                }
+                            }
+
+                            if !cursor.advance()? {
+                                break;
+                            }
+                        }
+                    }
+
+                    if inner_matches.is_empty() {
+                        if matches!(join.join_type, crate::sql::ast::JoinType::Left) {
+                            combined_buf.clear();
+                            combined_buf.extend(outer_row.iter().cloned());
+                            combined_buf.extend(null_inner_row.iter().cloned());
+
+                            let owned: Vec<OwnedValue> = output_source_indices
+                                .iter()
+                                .map(|(source_idx, data_type)| {
+                                    let val = combined_buf.get(*source_idx).cloned().unwrap_or(OwnedValue::Null);
+                                    convert_value_with_type(&val.to_value(), *data_type)
+                                })
+                                .collect();
+                            result_rows.push(Row::new(owned));
+                        }
+                    } else {
+                        for inner_row in inner_matches {
+                            combined_buf.clear();
+                            combined_buf.extend(outer_row.iter().cloned());
+                            combined_buf.extend(inner_row.iter().cloned());
+
+                            let owned: Vec<OwnedValue> = output_source_indices
+                                .iter()
+                                .map(|(source_idx, data_type)| {
+                                    let val = combined_buf.get(*source_idx).cloned().unwrap_or(OwnedValue::Null);
+                                    convert_value_with_type(&val.to_value(), *data_type)
+                                })
+                                .collect();
+                            result_rows.push(Row::new(owned));
+
+                            if let Some(lim) = limit {
+                                if result_rows.len() >= lim {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+
+                    if let Some(lim) = limit {
+                        if result_rows.len() >= lim {
+                            break;
+                        }
+                    }
+                }
+
+                result_rows
+            }
             Some(PlanSource::SetOp(_set_op)) => {
                 drop(file_manager_guard);
                 let rows = self.execute_physical_plan_recursive(physical_plan.root, &arena)?;

@@ -555,6 +555,9 @@ impl<'a> ExecutorBuilder<'a> {
             PhysicalOperator::SetOpExec(_) => {
                 eyre::bail!("SetOpExec requires special handling - use Database::query instead")
             }
+            PhysicalOperator::IndexNestedLoopJoin(_) => {
+                eyre::bail!("IndexNestedLoopJoin requires special handling in Database::query")
+            }
         }
     }
 
@@ -966,6 +969,17 @@ impl<'a> ExecutorBuilder<'a> {
                 } else {
                     Vec::new()
                 }
+            }
+            PhysicalOperator::IndexNestedLoopJoin(join) => {
+                let mut result = self.compute_input_column_map(join.outer);
+                let offset = result.iter().map(|(_, idx)| *idx).max().map(|m| m + 1).unwrap_or(0);
+                if let Some(table_def) = join.inner_table_def {
+                    for (idx, col) in table_def.columns().iter().enumerate() {
+                        result.push((col.name().to_lowercase(), idx + offset));
+                        result.push((format!("{}.{}", join.inner_table.to_lowercase(), col.name().to_lowercase()), idx + offset));
+                    }
+                }
+                result
             }
         }
     }

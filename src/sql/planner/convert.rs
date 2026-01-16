@@ -22,10 +22,11 @@ use super::encoding::encode_literal_to_bytes;
 use super::logical::{LogicalOperator, LogicalPlan};
 use super::physical::{
     AggregateExpr, AggregateFunction, PhysicalFilterExec, PhysicalGraceHashJoin,
-    PhysicalHashAggregate, PhysicalHashAntiJoin, PhysicalHashSemiJoin, PhysicalLimitExec,
-    PhysicalNestedLoopJoin, PhysicalOperator, PhysicalPlan, PhysicalProjectExec,
-    PhysicalSetOpExec, PhysicalSortExec, PhysicalStreamingHashJoin, PhysicalSubqueryExec,
-    PhysicalTableScan, PhysicalTopKExec, PhysicalWindowExec,
+    PhysicalHashAggregate, PhysicalHashAntiJoin, PhysicalHashSemiJoin,
+    PhysicalIndexNestedLoopJoin, PhysicalLimitExec, PhysicalNestedLoopJoin, PhysicalOperator,
+    PhysicalPlan, PhysicalProjectExec, PhysicalSetOpExec, PhysicalSortExec,
+    PhysicalStreamingHashJoin, PhysicalSubqueryExec, PhysicalTableScan, PhysicalTopKExec,
+    PhysicalWindowExec,
 };
 use super::Planner;
 use eyre::{bail, Result};
@@ -98,6 +99,10 @@ impl<'a> Planner<'a> {
                 Ok(physical)
             }
             LogicalOperator::Join(join) => {
+                if let Some(index_join) = self.try_index_nested_loop_join(join)? {
+                    return Ok(index_join);
+                }
+
                 let left = self.logical_to_physical(join.left)?;
                 let right = self.logical_to_physical(join.right)?;
 
@@ -441,5 +446,170 @@ impl<'a> Planner<'a> {
         }
 
         result.into_bump_slice()
+    }
+
+    fn try_index_nested_loop_join(
+        &self,
+        join: &super::logical::LogicalJoin<'a>,
+    ) -> Result<Option<&'a PhysicalOperator<'a>>> {
+        use crate::sql::ast::{BinaryOperator, ColumnRef};
+
+        if !matches!(
+            join.join_type,
+            JoinType::Inner | JoinType::Left | JoinType::Right
+        ) {
+            return Ok(None);
+        }
+
+        let condition = match join.condition {
+            Some(c) => c,
+            None => return Ok(None),
+        };
+
+        let (left_col, right_col) = match condition {
+            Expr::BinaryOp {
+                left,
+                op: BinaryOperator::Eq,
+                right,
+            } => {
+                let left_col = match left {
+                    Expr::Column(col) => col,
+                    _ => return Ok(None),
+                };
+                let right_col = match right {
+                    Expr::Column(col) => col,
+                    _ => return Ok(None),
+                };
+                (left_col, right_col)
+            }
+            _ => return Ok(None),
+        };
+
+        let (outer_key, inner_col, inner_op, outer_op) =
+            if let LogicalOperator::Scan(right_scan) = join.right {
+                let table_name = if let Some(schema) = right_scan.schema {
+                    format!("{}.{}", schema, right_scan.table)
+                } else {
+                    right_scan.table.to_string()
+                };
+
+                let table_def = match self.catalog.resolve_table(&table_name) {
+                    Ok(t) => t,
+                    Err(_) => return Ok(None),
+                };
+
+                let right_col_name = if let Some(table_ref) = right_col.table {
+                    if table_ref.eq_ignore_ascii_case(right_scan.table)
+                        || right_scan
+                            .alias
+                            .map(|a| a.eq_ignore_ascii_case(table_ref))
+                            .unwrap_or(false)
+                    {
+                        right_col.column
+                    } else {
+                        left_col.column
+                    }
+                } else {
+                    let col_exists_in_right = table_def
+                        .columns()
+                        .iter()
+                        .any(|c| c.name().eq_ignore_ascii_case(right_col.column));
+                    if col_exists_in_right {
+                        right_col.column
+                    } else {
+                        left_col.column
+                    }
+                };
+
+                let matching_index = table_def.indexes().iter().find(|idx| {
+                    idx.columns()
+                        .next()
+                        .map(|first_col| first_col.eq_ignore_ascii_case(right_col_name))
+                        .unwrap_or(false)
+                });
+
+                if matching_index.is_none() {
+                    return Ok(None);
+                }
+
+                let outer_key_expr = if right_col_name == right_col.column {
+                    self.arena.alloc(Expr::Column(ColumnRef {
+                        schema: None,
+                        table: left_col.table,
+                        column: left_col.column,
+                    }))
+                } else {
+                    self.arena.alloc(Expr::Column(ColumnRef {
+                        schema: None,
+                        table: right_col.table,
+                        column: right_col.column,
+                    }))
+                };
+
+                (
+                    outer_key_expr,
+                    right_col_name,
+                    join.right,
+                    join.left,
+                )
+            } else {
+                return Ok(None);
+            };
+
+        let outer_card = self.estimate_cardinality(outer_op);
+        let inner_card = self.estimate_cardinality(inner_op);
+
+        let use_index_join = outer_card < inner_card / 5 || outer_card < 10000;
+
+        if !use_index_join {
+            return Ok(None);
+        }
+
+        let outer_physical = self.logical_to_physical(outer_op)?;
+
+        let LogicalOperator::Scan(inner_scan) = inner_op else {
+            return Ok(None);
+        };
+
+        let inner_table_name = if let Some(schema) = inner_scan.schema {
+            format!("{}.{}", schema, inner_scan.table)
+        } else {
+            inner_scan.table.to_string()
+        };
+        let inner_table_def = self.catalog.resolve_table(&inner_table_name).ok();
+        let inner_table_def_alloc = inner_table_def.map(|t| &*self.arena.alloc(t.clone()));
+
+        let matching_index = inner_table_def
+            .as_ref()
+            .and_then(|td| {
+                td.indexes().iter().find(|idx| {
+                    idx.columns()
+                        .next()
+                        .map(|first_col| first_col.eq_ignore_ascii_case(inner_col))
+                        .unwrap_or(false)
+                })
+            })
+            .map(|idx| self.arena.alloc_str(idx.name()));
+
+        let index_name = match matching_index {
+            Some(name) => name,
+            None => return Ok(None),
+        };
+
+        let physical = self.arena.alloc(PhysicalOperator::IndexNestedLoopJoin(
+            PhysicalIndexNestedLoopJoin {
+                outer: outer_physical,
+                inner_table: inner_scan.table,
+                inner_schema: inner_scan.schema,
+                inner_alias: inner_scan.alias,
+                inner_index_name: index_name,
+                inner_table_def: inner_table_def_alloc,
+                join_type: join.join_type,
+                outer_key,
+                inner_key_column: self.arena.alloc_str(inner_col),
+            },
+        ));
+
+        Ok(Some(physical))
     }
 }

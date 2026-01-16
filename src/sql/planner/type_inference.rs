@@ -303,6 +303,32 @@ impl<'a> Planner<'a> {
                     columns: columns.into_bump_slice(),
                 })
             }
+            PhysicalOperator::IndexNestedLoopJoin(join) => {
+                let outer_schema = self.compute_output_schema(join.outer)?;
+                let mut columns = bumpalo::collections::Vec::new_in(self.arena);
+
+                for col in outer_schema.columns {
+                    columns.push(OutputColumn {
+                        name: col.name,
+                        data_type: col.data_type,
+                        nullable: col.nullable,
+                    });
+                }
+
+                if let Some(table_def) = join.inner_table_def {
+                    for col in table_def.columns() {
+                        columns.push(OutputColumn {
+                            name: self.arena.alloc_str(col.name()),
+                            data_type: col.data_type(),
+                            nullable: true,
+                        });
+                    }
+                }
+
+                Ok(OutputSchema {
+                    columns: columns.into_bump_slice(),
+                })
+            }
         }
     }
 

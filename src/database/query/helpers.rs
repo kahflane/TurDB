@@ -17,9 +17,9 @@ use crate::sql::ast::Expr;
 use crate::sql::executor::{RowSource, StreamingBTreeSource};
 use crate::sql::planner::{
     AggregateFunction, PhysicalGraceHashJoin, PhysicalHashAntiJoin, PhysicalHashSemiJoin,
-    PhysicalIndexScan, PhysicalNestedLoopJoin, PhysicalOperator, PhysicalSecondaryIndexScan,
-    PhysicalSetOpExec, PhysicalSortExec, PhysicalStreamingHashJoin, PhysicalSubqueryExec,
-    PhysicalTableScan,
+    PhysicalIndexNestedLoopJoin, PhysicalIndexScan, PhysicalNestedLoopJoin, PhysicalOperator,
+    PhysicalSecondaryIndexScan, PhysicalSetOpExec, PhysicalSortExec, PhysicalStreamingHashJoin,
+    PhysicalSubqueryExec, PhysicalTableScan,
 };
 use crate::storage::{FileManager, TableFileHeader, DEFAULT_SCHEMA};
 use crate::types::{DataType, OwnedValue};
@@ -36,6 +36,7 @@ pub enum PlanSource<'a> {
     SecondaryIndexScan(&'a PhysicalSecondaryIndexScan<'a>),
     Subquery(&'a PhysicalSubqueryExec<'a>),
     NestedLoopJoin(&'a PhysicalNestedLoopJoin<'a>),
+    IndexNestedLoopJoin(&'a PhysicalIndexNestedLoopJoin<'a>),
     GraceHashJoin(&'a PhysicalGraceHashJoin<'a>),
     StreamingHashJoin(&'a PhysicalStreamingHashJoin<'a>),
     HashSemiJoin(&'a PhysicalHashSemiJoin<'a>),
@@ -56,6 +57,7 @@ pub fn find_plan_source<'a>(op: &'a PhysicalOperator<'a>) -> Option<PlanSource<'
         PhysicalOperator::SecondaryIndexScan(scan) => Some(PlanSource::SecondaryIndexScan(scan)),
         PhysicalOperator::SubqueryExec(subq) => Some(PlanSource::Subquery(subq)),
         PhysicalOperator::NestedLoopJoin(join) => Some(PlanSource::NestedLoopJoin(join)),
+        PhysicalOperator::IndexNestedLoopJoin(join) => Some(PlanSource::IndexNestedLoopJoin(join)),
         PhysicalOperator::GraceHashJoin(join) => Some(PlanSource::GraceHashJoin(join)),
         PhysicalOperator::StreamingHashJoin(join) => Some(PlanSource::StreamingHashJoin(join)),
         PhysicalOperator::SetOpExec(set_op) => Some(PlanSource::SetOp(set_op)),

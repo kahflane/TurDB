@@ -57,11 +57,11 @@ pub use logical::{
 pub use physical::{
     AggregateExpr, AggregateFunction, PhysicalExistsSubqueryExec, PhysicalFilterExec,
     PhysicalGraceHashJoin, PhysicalHashAggregate, PhysicalHashAntiJoin, PhysicalHashSemiJoin,
-    PhysicalIndexScan, PhysicalInListSubqueryExec, PhysicalLimitExec, PhysicalNestedLoopJoin,
-    PhysicalOperator, PhysicalPlan, PhysicalProjectExec, PhysicalScalarSubqueryExec,
-    PhysicalSecondaryIndexScan, PhysicalSetOpExec, PhysicalSortExec, PhysicalSortedAggregate,
-    PhysicalStreamingHashJoin, PhysicalSubqueryExec, PhysicalTableScan, PhysicalTopKExec,
-    PhysicalWindowExec,
+    PhysicalIndexNestedLoopJoin, PhysicalIndexScan, PhysicalInListSubqueryExec, PhysicalLimitExec,
+    PhysicalNestedLoopJoin, PhysicalOperator, PhysicalPlan, PhysicalProjectExec,
+    PhysicalScalarSubqueryExec, PhysicalSecondaryIndexScan, PhysicalSetOpExec, PhysicalSortExec,
+    PhysicalSortedAggregate, PhysicalStreamingHashJoin, PhysicalSubqueryExec, PhysicalTableScan,
+    PhysicalTopKExec, PhysicalWindowExec,
 };
 pub use schema::{CteContext, OutputColumn, OutputSchema, PlannedCte, TableSource};
 pub use types::{PlanNode, ScanRange};

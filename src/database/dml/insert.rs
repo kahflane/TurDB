@@ -434,10 +434,7 @@ impl Database {
         }
 
         let mut unique_column_keys: Vec<(usize, FileKey, bool, bool)> = Vec::new();
-        for (col_idx, index_name, is_pk, is_auto_increment) in &unique_columns {
-            if *is_auto_increment {
-                continue;
-            }
+        for (col_idx, index_name, is_pk, _is_auto_increment) in &unique_columns {
             if file_manager.index_exists(schema_name, table_name, index_name) {
                 let storage = file_manager.index_data_mut(schema_name, table_name, index_name)?;
                 let key = crate::storage::FileManager::make_index_key(
