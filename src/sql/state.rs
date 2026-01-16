@@ -1,3 +1,4 @@
+use crate::memory::MemoryBudget;
 use crate::sql::adapter::BTreeCursorAdapter;
 use crate::sql::ast::JoinType;
 use crate::sql::executor::{AggregateFunction, DynamicExecutor, ExecutorRow, RowSource, SortKey};
@@ -7,6 +8,7 @@ use crate::types::Value;
 use bumpalo::Bump;
 use smallvec::SmallVec;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 pub struct LimitState<'a, S: RowSource> {
     pub child: Box<DynamicExecutor<'a, S>>,
@@ -23,6 +25,8 @@ pub struct SortState<'a, S: RowSource> {
     pub rows: Vec<Vec<Value<'static>>>,
     pub iter_idx: usize,
     pub sorted: bool,
+    pub memory_budget: Option<&'a Arc<MemoryBudget>>,
+    pub last_reported_bytes: usize,
 }
 
 pub struct TopKState<'a, S: RowSource> {
@@ -46,6 +50,8 @@ pub struct HashAggregateState<'a, S: RowSource> {
     pub groups: hashbrown::HashMap<Vec<u8>, (Vec<Value<'static>>, Vec<AggregateState>)>,
     pub result_iter: Option<std::vec::IntoIter<(Vec<Value<'static>>, Vec<AggregateState>)>>,
     pub computed: bool,
+    pub memory_budget: Option<&'a Arc<MemoryBudget>>,
+    pub last_reported_bytes: usize,
 }
 
 #[derive(Debug, Clone)]

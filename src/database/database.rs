@@ -1648,10 +1648,11 @@ impl Database {
                     )
                 };
 
+                let memory_budget = &self.shared.memory_budget;
                 let ctx = if scalar_subquery_results.is_empty() {
-                    ExecutionContext::new(&arena)
+                    ExecutionContext::with_memory_budget(&arena, memory_budget)
                 } else {
-                    ExecutionContext::with_scalar_subqueries(&arena, scalar_subquery_results.clone())
+                    ExecutionContext::with_scalar_subqueries_and_budget(&arena, scalar_subquery_results.clone(), memory_budget)
                 };
                 let builder = ExecutorBuilder::new(&ctx);
 
@@ -1752,10 +1753,11 @@ impl Database {
                 )
                 .wrap_err("failed to create range scan for index scan")?;
 
+                let memory_budget = &self.shared.memory_budget;
                 let ctx = if scalar_subquery_results.is_empty() {
-                    ExecutionContext::new(&arena)
+                    ExecutionContext::with_memory_budget(&arena, memory_budget)
                 } else {
-                    ExecutionContext::with_scalar_subqueries(&arena, scalar_subquery_results.clone())
+                    ExecutionContext::with_scalar_subqueries_and_budget(&arena, scalar_subquery_results.clone(), memory_budget)
                 };
                 let builder = ExecutorBuilder::new(&ctx);
 
@@ -1980,10 +1982,11 @@ impl Database {
 
                 let materialized_source = MaterializedRowSource::new(materialized_rows);
 
+                let memory_budget = &self.shared.memory_budget;
                 let ctx = if scalar_subquery_results.is_empty() {
-                    ExecutionContext::new(&arena)
+                    ExecutionContext::with_memory_budget(&arena, memory_budget)
                 } else {
-                    ExecutionContext::with_scalar_subqueries(&arena, scalar_subquery_results.clone())
+                    ExecutionContext::with_scalar_subqueries_and_budget(&arena, scalar_subquery_results.clone(), memory_budget)
                 };
                 let builder = ExecutorBuilder::new(&ctx);
 
@@ -2037,10 +2040,11 @@ impl Database {
                     .map(|(idx, col)| (col.name.to_lowercase(), idx))
                     .collect();
 
+                let memory_budget = &self.shared.memory_budget;
                 let ctx = if scalar_subquery_results.is_empty() {
-                    ExecutionContext::new(&arena)
+                    ExecutionContext::with_memory_budget(&arena, memory_budget)
                 } else {
-                    ExecutionContext::with_scalar_subqueries(&arena, scalar_subquery_results.clone())
+                    ExecutionContext::with_scalar_subqueries_and_budget(&arena, scalar_subquery_results.clone(), memory_budget)
                 };
                 let builder = ExecutorBuilder::new(&ctx);
                 let mut executor = builder
@@ -3720,7 +3724,8 @@ impl Database {
                 return Ok((column_names, rows));
             }
             Some(PlanSource::DualScan) => {
-                let ctx = ExecutionContext::new(&arena);
+                let memory_budget = &self.shared.memory_budget;
+                let ctx = ExecutionContext::with_memory_budget(&arena, memory_budget);
                 let builder = ExecutorBuilder::new(&ctx);
 
                 let source = crate::sql::executor::DualSource::default();
@@ -3892,7 +3897,8 @@ impl Database {
                 .map(|(idx, col)| (col.name().to_lowercase(), idx))
                 .collect();
 
-            let ctx = ExecutionContext::new(&arena);
+            let memory_budget = &self.shared.memory_budget;
+            let ctx = ExecutionContext::with_memory_budget(&arena, memory_budget);
             let builder = ExecutorBuilder::new(&ctx);
             let mut executor = builder
                 .build_with_source_and_column_map(&physical_plan, source, &source_column_map)

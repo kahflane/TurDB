@@ -292,6 +292,8 @@ impl<'a> ExecutorBuilder<'a> {
                             rows: Vec::new(),
                             iter_idx: 0,
                             sorted: false,
+                            memory_budget: self.ctx.memory_budget,
+                            last_reported_bytes: 0,
                         });
 
                         let projections: Vec<usize> = project
@@ -338,6 +340,8 @@ impl<'a> ExecutorBuilder<'a> {
                     rows: Vec::new(),
                     iter_idx: 0,
                     sorted: false,
+                    memory_budget: self.ctx.memory_budget,
+                    last_reported_bytes: 0,
                 }))
             }
             PhysicalOperator::TopKExec(topk) => {
@@ -450,6 +454,8 @@ impl<'a> ExecutorBuilder<'a> {
                     groups: hashbrown::HashMap::new(),
                     result_iter: None,
                     computed: false,
+                    memory_budget: self.ctx.memory_budget,
+                    last_reported_bytes: 0,
                 }))
             }
             PhysicalOperator::SortedAggregate(agg) => {
@@ -526,6 +532,8 @@ impl<'a> ExecutorBuilder<'a> {
                     groups: hashbrown::HashMap::new(),
                     result_iter: None,
                     computed: false,
+                    memory_budget: self.ctx.memory_budget,
+                    last_reported_bytes: 0,
                 }))
             }
             PhysicalOperator::NestedLoopJoin(_) => {
@@ -737,6 +745,8 @@ impl<'a> ExecutorBuilder<'a> {
             groups: hashbrown::HashMap::new(),
             result_iter: None,
             computed: false,
+            memory_budget: self.ctx.memory_budget,
+            last_reported_bytes: 0,
         }
     }
 

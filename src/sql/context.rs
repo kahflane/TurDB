@@ -1,6 +1,8 @@
 use bumpalo::Bump;
+use crate::memory::MemoryBudget;
 use crate::types::OwnedValue;
 use smallvec::SmallVec;
+use std::sync::Arc;
 
 pub type ScalarSubqueryResults = SmallVec<[(usize, OwnedValue); 4]>;
 
@@ -9,6 +11,7 @@ pub struct ExecutionContext<'a> {
     pub file_manager: Option<&'a mut crate::storage::FileManager>,
     pub catalog: Option<&'a crate::schema::Catalog>,
     pub scalar_subquery_results: ScalarSubqueryResults,
+    pub memory_budget: Option<&'a Arc<MemoryBudget>>,
 }
 
 impl<'a> ExecutionContext<'a> {
@@ -18,6 +21,17 @@ impl<'a> ExecutionContext<'a> {
             file_manager: None,
             catalog: None,
             scalar_subquery_results: SmallVec::new(),
+            memory_budget: None,
+        }
+    }
+
+    pub fn with_memory_budget(arena: &'a Bump, memory_budget: &'a Arc<MemoryBudget>) -> Self {
+        Self {
+            arena,
+            file_manager: None,
+            catalog: None,
+            scalar_subquery_results: SmallVec::new(),
+            memory_budget: Some(memory_budget),
         }
     }
 
@@ -27,6 +41,21 @@ impl<'a> ExecutionContext<'a> {
             file_manager: None,
             catalog: None,
             scalar_subquery_results: results,
+            memory_budget: None,
+        }
+    }
+
+    pub fn with_scalar_subqueries_and_budget(
+        arena: &'a Bump,
+        results: ScalarSubqueryResults,
+        memory_budget: &'a Arc<MemoryBudget>,
+    ) -> Self {
+        Self {
+            arena,
+            file_manager: None,
+            catalog: None,
+            scalar_subquery_results: results,
+            memory_budget: Some(memory_budget),
         }
     }
 
@@ -40,6 +69,7 @@ impl<'a> ExecutionContext<'a> {
             file_manager: Some(file_manager),
             catalog: Some(catalog),
             scalar_subquery_results: SmallVec::new(),
+            memory_budget: None,
         }
     }
 

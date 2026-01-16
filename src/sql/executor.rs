@@ -2162,6 +2162,15 @@ impl<'a, S: RowSource> Executor<'a> for DynamicExecutor<'a, S> {
                         let owned: Vec<Value<'static>> =
                             row.values.iter().map(clone_value_owned).collect();
                         state.rows.push(owned);
+
+                        if let Some(budget) = state.memory_budget {
+                            let estimated_size = state.rows.len() * 128;
+                            if estimated_size > state.last_reported_bytes + 64 * 1024 {
+                                let delta = estimated_size - state.last_reported_bytes;
+                                budget.allocate(crate::memory::Pool::Query, delta)?;
+                                state.last_reported_bytes = estimated_size;
+                            }
+                        }
                     }
 
                     let sort_keys = &state.sort_keys;
@@ -2801,6 +2810,7 @@ impl<'a, S: RowSource> Executor<'a> for DynamicExecutor<'a, S> {
             },
             DynamicExecutor::HashAggregate(state) => {
                 if !state.computed {
+                    let mut row_count = 0usize;
                     while let Some(row) = state.child.next()? {
                         let (group_key, group_values) =
                             if let Some(ref group_by_exprs) = state.group_by_exprs {
@@ -2831,7 +2841,18 @@ impl<'a, S: RowSource> Executor<'a> for DynamicExecutor<'a, S> {
                         for (idx, agg_fn) in state.aggregates.iter().enumerate() {
                             entry.1[idx].update(agg_fn, &row);
                         }
+
+                        row_count += 1;
+                        if let Some(budget) = state.memory_budget {
+                            let estimated_size = state.groups.len() * 256;
+                            if estimated_size > state.last_reported_bytes + 64 * 1024 {
+                                let delta = estimated_size - state.last_reported_bytes;
+                                budget.allocate(crate::memory::Pool::Query, delta)?;
+                                state.last_reported_bytes = estimated_size;
+                            }
+                        }
                     }
+                    let _ = row_count;
 
                     let results: Vec<(Vec<Value<'static>>, Vec<AggregateState>)> =
                         state.groups.drain().map(|(_, v)| v).collect();
