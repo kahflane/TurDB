@@ -100,6 +100,9 @@ impl Database {
         let mut storages: HashMap<u64, (PathBuf, MmapStorage)> = HashMap::new();
         let mut modified_file_ids: hashbrown::HashSet<u64> = hashbrown::HashSet::new();
 
+        let mut undo_frames: HashMap<(u64, u32), Vec<u8>> = HashMap::new();
+        let mut redo_pages: hashbrown::HashSet<(u64, u32)> = hashbrown::HashSet::new();
+
         for entry in fs::read_dir(db_path).wrap_err("failed to read database directory")? {
             let entry = entry.wrap_err("failed to read directory entry")?;
             let path = entry.path();
@@ -138,31 +141,60 @@ impl Database {
                 .wrap_err_with(|| format!("failed to open WAL segment {:?}", segment_path))?;
 
             while let Ok((header, page_data)) = segment.read_frame() {
-                let file_id = header.file_id;
+                if header.is_undo_frame() {
+                    let table_id = header.undo_table_id() as u64;
+                    let key = (table_id, header.page_no);
+                    undo_frames.entry(key).or_insert_with(|| page_data.clone());
+                } else {
+                    let file_id = header.actual_file_id();
+                    redo_pages.insert((file_id, header.page_no));
 
-                if let Some((_path, storage)) = storages.get_mut(&file_id) {
-                    if header.page_no >= storage.page_count() {
-                        let required_pages = header.db_size.max(header.page_no + 1);
-                        storage.grow(required_pages).wrap_err_with(|| {
+                    if let Some((_path, storage)) = storages.get_mut(&file_id) {
+                        if header.page_no >= storage.page_count() {
+                            let required_pages = header.db_size.max(header.page_no + 1);
+                            storage.grow(required_pages).wrap_err_with(|| {
+                                format!(
+                                    "failed to grow storage for file_id={} to {} pages",
+                                    file_id, required_pages
+                                )
+                            })?;
+                        }
+
+                        let page_mut = storage.page_mut(header.page_no).wrap_err_with(|| {
                             format!(
-                                "failed to grow storage for file_id={} to {} pages",
-                                file_id, required_pages
+                                "failed to get page {} for file_id={} during recovery",
+                                header.page_no, file_id
                             )
                         })?;
+
+                        page_mut.copy_from_slice(&page_data);
+                        modified_file_ids.insert(file_id);
+                        total_frames += 1;
                     }
-
-                    let page_mut = storage.page_mut(header.page_no).wrap_err_with(|| {
-                        format!(
-                            "failed to get page {} for file_id={} during recovery",
-                            header.page_no, file_id
-                        )
-                    })?;
-
-                    page_mut.copy_from_slice(&page_data);
-                    modified_file_ids.insert(file_id);
-                    total_frames += 1;
                 }
             }
+        }
+
+        let mut undo_applied = 0u32;
+        for ((table_id, page_no), before_image) in &undo_frames {
+            if !redo_pages.contains(&(*table_id, *page_no)) {
+                if let Some((_path, storage)) = storages.get_mut(table_id) {
+                    if *page_no < storage.page_count() {
+                        if let Ok(page_mut) = storage.page_mut(*page_no) {
+                            page_mut.copy_from_slice(before_image);
+                            modified_file_ids.insert(*table_id);
+                            undo_applied += 1;
+                        }
+                    }
+                }
+            }
+        }
+
+        if undo_applied > 0 {
+            eprintln!(
+                "[recovery] Applied {} undo frames for uncommitted transactions",
+                undo_applied
+            );
         }
 
         for file_id in &modified_file_ids {
@@ -173,11 +205,12 @@ impl Database {
             }
         }
 
-        if total_frames > 0 {
+        if total_frames > 0 || undo_applied > 0 {
             if max_segment > 1 {
                 eprintln!(
-                    "[recovery] Applied {} frames, syncing {} modified tables...",
+                    "[recovery] Applied {} redo frames, {} undo frames, syncing {} modified tables...",
                     total_frames,
+                    undo_applied,
                     modified_file_ids.len()
                 );
             }
@@ -192,7 +225,7 @@ impl Database {
             }
         }
 
-        Ok(total_frames)
+        Ok(total_frames + undo_applied)
     }
 
     fn collect_table_storages(

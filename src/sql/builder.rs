@@ -260,7 +260,7 @@ impl<'a> ExecutorBuilder<'a> {
                             .iter()
                             .map(|key| {
                                 if let crate::sql::ast::Expr::Column(col) = key.expr {
-                                    if let Some(idx) = resolve_column_index(&col, &full_column_map)
+                                    if let Some(idx) = resolve_column_index(col, &full_column_map)
                                     {
                                         return SortKey::column(idx, key.ascending);
                                     }
@@ -305,7 +305,7 @@ impl<'a> ExecutorBuilder<'a> {
                     .iter()
                     .map(|key| {
                         if let crate::sql::ast::Expr::Column(col) = key.expr {
-                            if let Some(idx) = resolve_column_index(&col, &input_column_map) {
+                            if let Some(idx) = resolve_column_index(col, &input_column_map) {
                                 return SortKey::column(idx, key.ascending);
                             }
                         }
@@ -329,7 +329,7 @@ impl<'a> ExecutorBuilder<'a> {
                     .iter()
                     .map(|key| {
                         if let crate::sql::ast::Expr::Column(col) = key.expr {
-                            if let Some(idx) = resolve_column_index(&col, &input_column_map) {
+                            if let Some(idx) = resolve_column_index(col, &input_column_map) {
                                 return SortKey::column(idx, key.ascending);
                             }
                         }
@@ -392,7 +392,7 @@ impl<'a> ExecutorBuilder<'a> {
                             .argument
                             .and_then(|arg| {
                                 if let crate::sql::ast::Expr::Column(col) = arg {
-                                    resolve_column_index(&col, column_map)
+                                    resolve_column_index(col, column_map)
                                 } else {
                                     None
                                 }
@@ -468,7 +468,7 @@ impl<'a> ExecutorBuilder<'a> {
                             .argument
                             .and_then(|arg| {
                                 if let crate::sql::ast::Expr::Column(col) = arg {
-                                    resolve_column_index(&col, column_map)
+                                    resolve_column_index(col, column_map)
                                 } else {
                                     None
                                 }

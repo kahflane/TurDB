@@ -114,7 +114,7 @@ use crate::config::COMMIT_BATCH_SIZE;
 use crate::mvcc::{TxnId, TxnState, UndoRegistry, WriteEntry};
 use crate::schema::table::{Constraint, IndexType};
 use crate::sql::ast::IsolationLevel;
-use crate::storage::IndexFileHeader;
+use crate::storage::{IndexFileHeader, SyncMode};
 use eyre::{bail, Result, WrapErr};
 use smallvec::SmallVec;
 
@@ -143,6 +143,7 @@ pub struct ActiveTransaction {
     pub write_entries: SmallVec<[WriteEntry; 16]>,
     pub undo_data: SmallVec<[Option<Vec<u8>>; 16]>,
     pub undo_registry: UndoRegistry,
+    pub wal_undo_pages: hashbrown::HashSet<(u32, u32)>,
 }
 
 impl std::fmt::Debug for ActiveTransaction {
@@ -182,7 +183,16 @@ impl ActiveTransaction {
             write_entries: SmallVec::new(),
             undo_data: SmallVec::new(),
             undo_registry: UndoRegistry::new(),
+            wal_undo_pages: hashbrown::HashSet::new(),
         }
+    }
+
+    pub fn needs_wal_undo_frame(&self, table_id: u32, page_no: u32) -> bool {
+        !self.wal_undo_pages.contains(&(table_id, page_no))
+    }
+
+    pub fn mark_wal_undo_frame_written(&mut self, table_id: u32, page_no: u32) {
+        self.wal_undo_pages.insert((table_id, page_no));
     }
 
     pub fn create_savepoint(&mut self, name: String) {
@@ -358,6 +368,7 @@ impl Database {
                                 .fail_batch(&pending_commits, &e.to_string()),
                         }
                         result?;
+                        self.sync_dirty_storages(dirty_table_ids)?;
                     }
                 }
                 Err(e) => {
@@ -371,56 +382,63 @@ impl Database {
                 .ok_or_else(|| eyre::eyre!("WAL not initialized but WAL mode is enabled"))?;
 
             Self::write_payload_to_wal(wal, &payload)?;
+            drop(wal_guard);
+            self.sync_dirty_storages(dirty_table_ids)?;
         }
 
         Ok(())
     }
 
     fn execute_chunked_wal_commit(&self, dirty_table_ids: &[u32]) -> Result<()> {
-        let mut wal_guard = self.shared.wal.lock();
-        let wal = wal_guard
-            .as_mut()
-            .ok_or_else(|| eyre::eyre!("WAL not initialized but WAL mode is enabled"))?;
+        {
+            let mut wal_guard = self.shared.wal.lock();
+            let wal = wal_guard
+                .as_mut()
+                .ok_or_else(|| eyre::eyre!("WAL not initialized but WAL mode is enabled"))?;
 
-        let mut file_manager_guard = self.shared.file_manager.write();
-        let file_manager = file_manager_guard
-            .as_mut()
-            .ok_or_else(|| eyre::eyre!("file manager not available for commit"))?;
+            let mut file_manager_guard = self.shared.file_manager.write();
+            let file_manager = file_manager_guard
+                .as_mut()
+                .ok_or_else(|| eyre::eyre!("file manager not available for commit"))?;
 
-        let lookup = self.shared.table_id_lookup.read();
-        let mut sorted_table_ids: SmallVec<[u32; 16]> = dirty_table_ids.iter().copied().collect();
-        sorted_table_ids.sort_unstable();
+            let lookup = self.shared.table_id_lookup.read();
+            let mut sorted_table_ids: SmallVec<[u32; 16]> =
+                dirty_table_ids.iter().copied().collect();
+            sorted_table_ids.sort_unstable();
 
-        for &table_id in &sorted_table_ids {
-            let Some((schema_name, table_name)) = lookup.get(&table_id) else {
-                continue;
-            };
+            for &table_id in &sorted_table_ids {
+                let Some((schema_name, table_name)) = lookup.get(&table_id) else {
+                    continue;
+                };
 
-            let pages_to_flush = self.shared.dirty_tracker.drain_for_table(table_id);
+                let pages_to_flush = self.shared.dirty_tracker.drain_for_table(table_id);
 
-            if pages_to_flush.is_empty() {
-                continue;
+                if pages_to_flush.is_empty() {
+                    continue;
+                }
+
+                let _table_lock = self.shared.page_locks.table_intent_exclusive(table_id);
+
+                let storage_arc = file_manager.table_data(schema_name, table_name)?;
+                let storage = storage_arc.read();
+                let db_size = storage.page_count();
+
+                let page_refs: Vec<(u32, &[u8])> = pages_to_flush
+                    .iter()
+                    .filter_map(|&page_no| storage.page(page_no).ok().map(|data| (page_no, data)))
+                    .collect();
+
+                let frames = page_refs
+                    .iter()
+                    .map(|(page_no, data)| (*page_no, db_size, *data, table_id as u64));
+
+                wal.write_frames_batch_no_sync(frames)?;
             }
 
-            let _table_lock = self.shared.page_locks.table_intent_exclusive(table_id);
-
-            let storage_arc = file_manager.table_data(schema_name, table_name)?;
-            let storage = storage_arc.read();
-            let db_size = storage.page_count();
-
-            let page_refs: Vec<(u32, &[u8])> = pages_to_flush
-                .iter()
-                .filter_map(|&page_no| storage.page(page_no).ok().map(|data| (page_no, data)))
-                .collect();
-
-            let frames = page_refs
-                .iter()
-                .map(|(page_no, data)| (*page_no, db_size, *data, table_id as u64));
-
-            wal.write_frames_batch_no_sync(frames)?;
+            wal.sync()?;
         }
 
-        wal.sync()?;
+        self.sync_dirty_storages(dirty_table_ids)?;
 
         Ok(())
     }
@@ -481,6 +499,39 @@ impl Database {
 
         wal.write_frames_batch(frames)
             .wrap_err("failed to write WAL frames batch")
+    }
+
+    fn sync_dirty_storages(&self, dirty_table_ids: &[u32]) -> Result<()> {
+        let sync_mode = {
+            let wal_guard = self.shared.wal.lock();
+            wal_guard
+                .as_ref()
+                .map(|w| w.sync_mode())
+                .unwrap_or(SyncMode::Full)
+        };
+
+        if sync_mode != SyncMode::Full {
+            return Ok(());
+        }
+
+        let mut file_manager_guard = self.shared.file_manager.write();
+        let file_manager = match file_manager_guard.as_mut() {
+            Some(fm) => fm,
+            None => return Ok(()),
+        };
+
+        let lookup = self.shared.table_id_lookup.read();
+        for &table_id in dirty_table_ids {
+            let Some((schema_name, table_name)) = lookup.get(&table_id) else {
+                continue;
+            };
+            if let Ok(storage_arc) = file_manager.table_data(schema_name, table_name) {
+                let storage = storage_arc.write();
+                let _ = storage.sync();
+            }
+        }
+
+        Ok(())
     }
 
     fn finalize_transaction_commit(&self, txn: ActiveTransaction) -> Result<()> {
@@ -853,5 +904,39 @@ impl Database {
 
             let _ = self.undo_write_entries(&write_entries, &undo_data);
         }
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn write_wal_undo_frame_if_needed(
+        &self,
+        table_id: u32,
+        page_no: u32,
+        page_data: &[u8],
+    ) -> Result<()> {
+        let txn_guard = self.active_txn.lock();
+        let txn = match txn_guard.as_ref() {
+            Some(t) => t,
+            None => return Ok(()),
+        };
+
+        if !txn.needs_wal_undo_frame(table_id, page_no) {
+            return Ok(());
+        }
+
+        let txn_id = txn.txn_id;
+        drop(txn_guard);
+
+        let wal_guard = self.shared.wal.lock();
+        if let Some(ref wal) = *wal_guard {
+            wal.write_undo_frame(table_id, txn_id as u32, page_no, 0, page_data)?;
+        }
+        drop(wal_guard);
+
+        let mut txn_guard = self.active_txn.lock();
+        if let Some(ref mut txn) = *txn_guard {
+            txn.mark_wal_undo_frame_written(table_id, page_no);
+        }
+
+        Ok(())
     }
 }

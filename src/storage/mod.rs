@@ -107,7 +107,7 @@ pub use headers::{
 };
 pub use mmap::MmapStorage;
 pub use page::{validate_page, PageHeader, PageType};
-pub use wal::{SyncMode, Wal, WalFrameHeader, WalSegment, WAL_FRAME_HEADER_SIZE, DEFAULT_CHECKPOINT_THRESHOLD};
+pub use wal::{SyncMode, Wal, WalFrameHeader, WalFrameType, WalSegment, WAL_FRAME_HEADER_SIZE, DEFAULT_CHECKPOINT_THRESHOLD};
 pub use wal_storage::{WalStorage, WalStoragePerTable};
 
 use eyre::{ensure, Result};

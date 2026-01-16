@@ -1814,6 +1814,7 @@ where
 ///
 /// These are **one-time allocations per operator** during query planning, not per-row
 /// allocations during execution, so they comply with the zero-allocation-per-row goal.
+#[allow(clippy::large_enum_variant)]
 pub enum DynamicExecutor<'a, S: RowSource> {
     TableScan(TableScanExecutor<'a, S>),
     IndexScan(IndexScanState<'a>),

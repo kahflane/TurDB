@@ -118,6 +118,7 @@ impl Database {
                     val
                 ),
             };
+            self.ensure_wal()?;
             let wal_guard = self.shared.wal.lock();
             if let Some(ref wal) = *wal_guard {
                 wal.set_sync_mode(mode);

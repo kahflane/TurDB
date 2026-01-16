@@ -104,7 +104,7 @@ impl<'c> JoinReorderingRule<'c> {
                         let mut tables_with_card: SmallVec<[(&'a LogicalOperator<'a>, u64); 8]> =
                             SmallVec::new();
                         for table in tables.iter() {
-                            let card = self.estimate_table_cardinality(*table, &cost_estimator);
+                            let card = self.estimate_table_cardinality(table, &cost_estimator);
                             tables_with_card.push((*table, card));
                         }
 
@@ -264,15 +264,12 @@ impl<'c> JoinReorderingRule<'c> {
         plan: &'a LogicalOperator<'a>,
         conditions: &mut SmallVec<[&'a Expr<'a>; 8]>,
     ) {
-        match plan {
-            LogicalOperator::Join(join) => {
-                if let Some(cond) = join.condition {
-                    self.flatten_and(cond, conditions);
-                }
-                self.collect_conditions_recursive(join.left, conditions);
-                self.collect_conditions_recursive(join.right, conditions);
+        if let LogicalOperator::Join(join) = plan {
+            if let Some(cond) = join.condition {
+                self.flatten_and(cond, conditions);
             }
-            _ => {}
+            self.collect_conditions_recursive(join.left, conditions);
+            self.collect_conditions_recursive(join.right, conditions);
         }
     }
 
@@ -327,8 +324,7 @@ impl<'c> JoinReorderingRule<'c> {
         let mut result = ordered_tables[0];
         self.add_table_names(result, &mut accumulated_tables);
 
-        for i in 1..ordered_tables.len() {
-            let right_table = ordered_tables[i];
+        for right_table in ordered_tables.iter().skip(1).copied() {
             let mut right_tables: HashSet<&str> = HashSet::new();
             self.add_table_names(right_table, &mut right_tables);
 

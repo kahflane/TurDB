@@ -497,17 +497,17 @@ fn qualified_column_names_resolve_correctly_in_join() {
 
     assert_eq!(rows.len(), 4, "Should have 2 matched + 2 unmatched = 4 rows");
 
-    let comp_id_0 = rows[0].values.get(0).and_then(|v| v.as_int()).unwrap();
+    let comp_id_0 = rows[0].values.first().and_then(|v| v.as_int()).unwrap();
     let epis_id_0 = rows[0].values.get(1).and_then(|v| v.as_int());
     assert_eq!(comp_id_0, 1, "First row comp_id should be 1");
     assert_eq!(epis_id_0, Some(100), "First row epis_id should be 100");
 
-    let comp_id_1 = rows[1].values.get(0).and_then(|v| v.as_int()).unwrap();
+    let comp_id_1 = rows[1].values.first().and_then(|v| v.as_int()).unwrap();
     let epis_id_1 = rows[1].values.get(1).and_then(|v| v.as_int());
     assert_eq!(comp_id_1, 1, "Second row comp_id should be 1");
     assert_eq!(epis_id_1, Some(101), "Second row epis_id should be 101");
 
-    let comp_id_2 = rows[2].values.get(0).and_then(|v| v.as_int()).unwrap();
+    let comp_id_2 = rows[2].values.first().and_then(|v| v.as_int()).unwrap();
     let epis_id_2 = rows[2].values.get(1);
     assert_eq!(comp_id_2, 2, "Third row comp_id should be 2");
     assert!(
@@ -515,7 +515,7 @@ fn qualified_column_names_resolve_correctly_in_join() {
         "Third row epis_id should be NULL (no matching episode)"
     );
 
-    let comp_id_3 = rows[3].values.get(0).and_then(|v| v.as_int()).unwrap();
+    let comp_id_3 = rows[3].values.first().and_then(|v| v.as_int()).unwrap();
     let epis_id_3 = rows[3].values.get(1);
     assert_eq!(comp_id_3, 3, "Fourth row comp_id should be 3");
     assert!(

@@ -119,6 +119,32 @@ impl SyncMode {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum WalFrameType {
+    #[default]
+    Redo = 0x00,
+    Undo = 0x02,
+}
+
+impl WalFrameType {
+    pub fn from_u8(value: u8) -> Self {
+        match value {
+            0x02 => WalFrameType::Undo,
+            _ => WalFrameType::Redo,
+        }
+    }
+
+    pub fn as_u8(self) -> u8 {
+        self as u8
+    }
+}
+
+const FRAME_TYPE_SHIFT: u32 = 56;
+const FILE_ID_MASK: u64 = 0x00FF_FFFF_FFFF_FFFF;
+const TABLE_ID_SHIFT: u32 = 32;
+const TABLE_ID_MASK: u64 = 0x00FF_FFFF_0000_0000;
+const TXN_ID_MASK: u64 = 0x0000_0000_FFFF_FFFF;
+
 const CRC64: Crc<u64> = Crc::<u64>::new(&CRC_64_ECMA_182);
 
 #[repr(C)]
@@ -160,6 +186,53 @@ impl WalFrameHeader {
             salt2,
             checksum,
         }
+    }
+
+    pub fn new_undo_frame(
+        page_no: u32,
+        db_size: u32,
+        salt1: u32,
+        salt2: u32,
+        checksum: u64,
+        table_id: u32,
+        txn_id: u32,
+    ) -> Self {
+        let file_id = ((WalFrameType::Undo.as_u8() as u64) << FRAME_TYPE_SHIFT)
+            | (((table_id & 0x00FF_FFFF) as u64) << TABLE_ID_SHIFT)
+            | (txn_id as u64);
+        Self {
+            file_id,
+            page_no,
+            db_size,
+            salt1,
+            salt2,
+            checksum,
+        }
+    }
+
+    pub fn frame_type(&self) -> WalFrameType {
+        let type_byte = ((self.file_id >> FRAME_TYPE_SHIFT) & 0xFF) as u8;
+        WalFrameType::from_u8(type_byte)
+    }
+
+    pub fn actual_file_id(&self) -> u64 {
+        self.file_id & FILE_ID_MASK
+    }
+
+    pub fn undo_table_id(&self) -> u32 {
+        ((self.file_id & TABLE_ID_MASK) >> TABLE_ID_SHIFT) as u32
+    }
+
+    pub fn undo_txn_id(&self) -> u32 {
+        (self.file_id & TXN_ID_MASK) as u32
+    }
+
+    pub fn is_undo_frame(&self) -> bool {
+        self.frame_type() == WalFrameType::Undo
+    }
+
+    pub fn is_redo_frame(&self) -> bool {
+        self.frame_type() == WalFrameType::Redo
     }
 }
 
@@ -702,6 +775,53 @@ impl Wal {
         let mut index = self.page_index.write();
         index.insert((file_id, page_no), (segment_num, current_offset));
         drop(index);
+
+        let mut mmap = self.read_mmap.write();
+        *mmap = None;
+
+        self.increment_frame_count();
+
+        Ok(())
+    }
+
+    pub fn write_undo_frame(
+        &self,
+        table_id: u32,
+        txn_id: u32,
+        page_no: u32,
+        db_size: u32,
+        before_image: &[u8],
+    ) -> Result<()> {
+        ensure!(
+            before_image.len() == PAGE_SIZE,
+            "before_image must be exactly {} bytes, got {}",
+            PAGE_SIZE,
+            before_image.len()
+        );
+
+        if self.needs_rotation() {
+            self.rotate_segment()
+                .wrap_err("failed to rotate WAL segment during write_undo_frame")?;
+        }
+
+        let header = WalFrameHeader::new_undo_frame(
+            page_no,
+            db_size,
+            self.salt1,
+            self.salt2,
+            0,
+            table_id,
+            txn_id,
+        );
+        let checksum = compute_checksum(&header, before_image);
+        let mut header_with_checksum = header;
+        header_with_checksum.checksum = checksum;
+
+        let should_sync = self.sync_mode().should_sync();
+        {
+            let mut segment = self.current_segment.lock();
+            segment.write_frame_with_sync(&header_with_checksum, before_image, should_sync)?;
+        }
 
         let mut mmap = self.read_mmap.write();
         *mmap = None;
@@ -2003,5 +2123,90 @@ mod tests {
         );
 
         temp_dir.close().ok();
+    }
+
+    #[test]
+    fn undo_frame_header_sets_frame_type_correctly() {
+        let header = WalFrameHeader::new_undo_frame(42, 100, 0x1234, 0x5678, 0, 7, 999);
+
+        assert_eq!(header.frame_type(), WalFrameType::Undo);
+        assert!(header.is_undo_frame());
+        assert!(!header.is_redo_frame());
+        assert_eq!(header.undo_table_id(), 7);
+        assert_eq!(header.undo_txn_id(), 999);
+        assert_eq!(header.page_no, 42);
+        assert_eq!(header.db_size, 100);
+    }
+
+    #[test]
+    fn redo_frame_header_has_redo_frame_type() {
+        let header = WalFrameHeader::new(42, 100, 0x1234, 0x5678, 0);
+
+        assert_eq!(header.frame_type(), WalFrameType::Redo);
+        assert!(header.is_redo_frame());
+        assert!(!header.is_undo_frame());
+    }
+
+    #[test]
+    fn undo_frame_header_roundtrip() {
+        let table_id: u32 = 0x00AB_CDEF;
+        let txn_id: u32 = 0x1234_5678;
+        let original = WalFrameHeader::new_undo_frame(123, 456, 789, 101112, 0, table_id, txn_id);
+
+        let bytes = original.as_bytes();
+        let parsed = WalFrameHeader::read_from_bytes(bytes).expect("should parse");
+
+        assert_eq!(parsed.frame_type(), WalFrameType::Undo);
+        assert_eq!(parsed.undo_table_id(), table_id & 0x00FF_FFFF);
+        assert_eq!(parsed.undo_txn_id(), txn_id);
+        assert_eq!(parsed.page_no, original.page_no);
+        assert_eq!(parsed.db_size, original.db_size);
+    }
+
+    #[test]
+    fn write_undo_frame_appends_to_wal() {
+        use super::super::PAGE_SIZE;
+
+        let temp_dir = std::env::temp_dir().join("turdb_test_write_undo_frame");
+        let wal_dir = temp_dir.join("wal");
+
+        if wal_dir.exists() {
+            std::fs::remove_dir_all(&wal_dir).ok();
+        }
+
+        let wal = Wal::create(&wal_dir).expect("should create WAL");
+        let before_image = vec![42u8; PAGE_SIZE];
+
+        wal.write_undo_frame(7, 1001, 5, 10, &before_image)
+            .expect("should write undo frame");
+
+        assert_eq!(wal.frame_count(), 1);
+
+        std::fs::remove_dir_all(&temp_dir).ok();
+    }
+
+    #[test]
+    fn undo_and_redo_frames_can_be_written_sequentially() {
+        use super::super::PAGE_SIZE;
+
+        let temp_dir = std::env::temp_dir().join("turdb_test_mixed_frames");
+        let wal_dir = temp_dir.join("wal");
+
+        if wal_dir.exists() {
+            std::fs::remove_dir_all(&wal_dir).ok();
+        }
+
+        let wal = Wal::create(&wal_dir).expect("should create WAL");
+        let page_data = vec![1u8; PAGE_SIZE];
+        let before_image = vec![0u8; PAGE_SIZE];
+
+        wal.write_undo_frame(7, 1001, 5, 10, &before_image)
+            .expect("should write undo frame");
+        wal.write_frame(5, 10, &page_data)
+            .expect("should write redo frame");
+
+        assert_eq!(wal.frame_count(), 2);
+
+        std::fs::remove_dir_all(&temp_dir).ok();
     }
 }
