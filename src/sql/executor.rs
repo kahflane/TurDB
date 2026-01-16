@@ -2256,9 +2256,9 @@ impl<'a, S: RowSource> Executor<'a> for DynamicExecutor<'a, S> {
                                                 let c = compare_values_for_sort(&l_val, &lg_val);
                                                 if c != std::cmp::Ordering::Equal {
                                                     result = if key.ascending {
-                                                        c.reverse()
-                                                    } else {
                                                         c
+                                                    } else {
+                                                        c.reverse()
                                                     };
                                                     break;
                                                 }
@@ -2281,9 +2281,9 @@ impl<'a, S: RowSource> Executor<'a> for DynamicExecutor<'a, S> {
                                                 let c = compare_values_for_sort(&r_val, &lg_val);
                                                 if c != std::cmp::Ordering::Equal {
                                                     result = if key.ascending {
-                                                        c.reverse()
-                                                    } else {
                                                         c
+                                                    } else {
+                                                        c.reverse()
                                                     };
                                                     break;
                                                 }

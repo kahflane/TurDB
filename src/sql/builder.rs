@@ -18,6 +18,22 @@ fn resolve_column_index(col: &ColumnRef, column_map: &[(String, usize)]) -> Opti
         .find(|(n, _)| n.eq_ignore_ascii_case(col.column))
         .map(|(_, idx)| *idx)
 }
+
+fn find_matching_projection_index<'a>(
+    input: &'a crate::sql::planner::PhysicalOperator<'a>,
+    expr: &crate::sql::ast::Expr<'a>,
+) -> Option<usize> {
+    use crate::sql::planner::PhysicalOperator;
+
+    if let PhysicalOperator::ProjectExec(project) = input {
+        for (idx, proj_expr) in project.expressions.iter().enumerate() {
+            if *proj_expr == expr {
+                return Some(idx);
+            }
+        }
+    }
+    None
+}
 use crate::sql::executor::{
     AggregateFunction, DynamicExecutor, RowSource, SortKey, TableScanExecutor,
 };
@@ -309,6 +325,9 @@ impl<'a> ExecutorBuilder<'a> {
                                 return SortKey::column(idx, key.ascending);
                             }
                         }
+                        if let Some(idx) = find_matching_projection_index(sort.input, key.expr) {
+                            return SortKey::column(idx, key.ascending);
+                        }
                         SortKey::expression(key.expr, input_column_map.clone(), key.ascending)
                     })
                     .collect();
@@ -332,6 +351,9 @@ impl<'a> ExecutorBuilder<'a> {
                             if let Some(idx) = resolve_column_index(col, &input_column_map) {
                                 return SortKey::column(idx, key.ascending);
                             }
+                        }
+                        if let Some(idx) = find_matching_projection_index(topk.input, key.expr) {
+                            return SortKey::column(idx, key.ascending);
                         }
                         SortKey::expression(key.expr, input_column_map.clone(), key.ascending)
                     })
