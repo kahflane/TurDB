@@ -28,8 +28,114 @@ use super::physical::{
     PhysicalStreamingHashJoin, PhysicalSubqueryExec, PhysicalTableScan, PhysicalTopKExec,
     PhysicalWindowExec,
 };
+use super::logical::{LogicalProject, SortKey};
 use super::Planner;
+use crate::sql::ast::FunctionArgs;
 use eyre::{bail, Result};
+
+fn collect_column_refs<'a>(expr: &'a Expr<'a>, cols: &mut Vec<&'a str>) {
+    match expr {
+        Expr::Column(col_ref) => cols.push(col_ref.column),
+        Expr::BinaryOp { left, right, .. } => {
+            collect_column_refs(left, cols);
+            collect_column_refs(right, cols);
+        }
+        Expr::UnaryOp { expr: e, .. } => collect_column_refs(e, cols),
+        Expr::Function(func) => {
+            if let FunctionArgs::Args(args) = func.args {
+                for arg in args.iter() {
+                    collect_column_refs(arg.value, cols);
+                }
+            }
+        }
+        Expr::Array(elems) => {
+            for elem in elems.iter() {
+                collect_column_refs(elem, cols);
+            }
+        }
+        Expr::Case { operand, conditions, else_result } => {
+            if let Some(op) = operand {
+                collect_column_refs(op, cols);
+            }
+            for clause in conditions.iter() {
+                collect_column_refs(clause.condition, cols);
+                collect_column_refs(clause.result, cols);
+            }
+            if let Some(e) = else_result {
+                collect_column_refs(e, cols);
+            }
+        }
+        Expr::InList { expr: e, list, .. } => {
+            collect_column_refs(e, cols);
+            for item in list.iter() {
+                collect_column_refs(item, cols);
+            }
+        }
+        Expr::Between { expr: e, low, high, .. } => {
+            collect_column_refs(e, cols);
+            collect_column_refs(low, cols);
+            collect_column_refs(high, cols);
+        }
+        Expr::Subquery(_) | Expr::Exists { .. } | Expr::InSubquery { .. } => {}
+        Expr::IsNull { expr: e, .. } | Expr::Cast { expr: e, .. } => {
+            collect_column_refs(e, cols);
+        }
+        Expr::Like { expr: e, pattern, .. } => {
+            collect_column_refs(e, cols);
+            collect_column_refs(pattern, cols);
+        }
+        Expr::IsDistinctFrom { left, right, .. } => {
+            collect_column_refs(left, cols);
+            collect_column_refs(right, cols);
+        }
+        Expr::ArraySubscript { array, index } => {
+            collect_column_refs(array, cols);
+            collect_column_refs(index, cols);
+        }
+        Expr::ArraySlice { array, lower, upper } => {
+            collect_column_refs(array, cols);
+            if let Some(l) = lower { collect_column_refs(l, cols); }
+            if let Some(u) = upper { collect_column_refs(u, cols); }
+        }
+        Expr::Row(elems) => {
+            for elem in elems.iter() {
+                collect_column_refs(elem, cols);
+            }
+        }
+        Expr::Literal(_) | Expr::Parameter(_) => {}
+    }
+}
+
+fn order_by_uses_only_projected_columns<'a>(
+    order_by: &[SortKey<'a>],
+    project: &LogicalProject<'a>,
+) -> bool {
+    for key in order_by {
+        if project.expressions.contains(&key.expr) {
+            continue;
+        }
+
+        let mut cols_needed: Vec<&str> = Vec::new();
+        collect_column_refs(key.expr, &mut cols_needed);
+
+        for col_name in cols_needed {
+            let found = project.expressions.iter().any(|e| {
+                if let Expr::Column(col_ref) = e {
+                    col_ref.column.eq_ignore_ascii_case(col_name)
+                } else {
+                    false
+                }
+            }) || project.aliases.iter().any(|a| {
+                a.map(|alias| alias.eq_ignore_ascii_case(col_name)).unwrap_or(false)
+            });
+
+            if !found {
+                return false;
+            }
+        }
+    }
+    true
+}
 
 impl<'a> Planner<'a> {
     pub(crate) fn optimize_to_physical(&self, logical: &LogicalPlan<'a>) -> Result<PhysicalPlan<'a>> {
@@ -254,6 +360,28 @@ impl<'a> Planner<'a> {
                                     offset: limit.offset,
                                 }));
                             return Ok(physical);
+                        }
+
+                        if let LogicalOperator::Project(project) = sort.input {
+                            if !order_by_uses_only_projected_columns(sort.order_by, project) {
+                                let inner_input = self.logical_to_physical(project.input)?;
+                                let topk = self
+                                    .arena
+                                    .alloc(PhysicalOperator::TopKExec(PhysicalTopKExec {
+                                        input: inner_input,
+                                        order_by: sort.order_by,
+                                        limit: limit_val,
+                                        offset: limit.offset,
+                                    }));
+                                let physical = self
+                                    .arena
+                                    .alloc(PhysicalOperator::ProjectExec(PhysicalProjectExec {
+                                        input: topk,
+                                        expressions: project.expressions,
+                                        aliases: project.aliases,
+                                    }));
+                                return Ok(physical);
+                            }
                         }
 
                         let sort_input = self.logical_to_physical(sort.input)?;
