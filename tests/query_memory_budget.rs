@@ -378,13 +378,7 @@ fn topk_operator_reports_allocations() {
 }
 
 /// Test that a join query fails gracefully when memory budget is exhausted.
-///
-/// NOTE: This test is ignored because join queries in database.rs use a custom
-/// execution path that materializes rows directly without going through the
-/// executor framework where memory budget tracking is implemented.
-/// Full join budget enforcement requires changes to database.rs join handling.
 #[test]
-#[ignore = "requires database.rs join path integration"]
 fn join_exceeding_budget_returns_error() {
     let dir = tempdir().unwrap();
     let db_path = dir.path().join("test_db");

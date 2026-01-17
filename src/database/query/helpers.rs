@@ -12,6 +12,7 @@
 //! - Optimization: `is_simple_count_star`
 //! - Value comparison: `compare_owned_values`
 
+use crate::memory::{MemoryBudget, Pool};
 use crate::schema::{Catalog, TableDef};
 use crate::sql::ast::Expr;
 use crate::sql::executor::{RowSource, StreamingBTreeSource};
@@ -25,6 +26,7 @@ use crate::storage::{FileManager, TableFileHeader, DEFAULT_SCHEMA};
 use crate::types::{DataType, OwnedValue};
 use eyre::Result;
 use std::cmp::Ordering;
+use std::sync::Arc;
 
 /// Represents the source of data in a physical query plan.
 ///
@@ -329,7 +331,19 @@ pub fn materialize_table_rows(
     schema: Option<&str>,
     table_name: &str,
 ) -> Result<(Vec<Vec<OwnedValue>>, Vec<DataType>)> {
-    let (rows, column_types, _) = materialize_table_rows_with_def(catalog, file_manager, schema, table_name)?;
+    let (rows, column_types, _) = materialize_table_rows_with_def(catalog, file_manager, schema, table_name, None)?;
+    Ok((rows, column_types))
+}
+
+/// Materializes all rows from a table with memory budget tracking.
+pub fn materialize_table_rows_with_budget(
+    catalog: &Catalog,
+    file_manager: &mut FileManager,
+    schema: Option<&str>,
+    table_name: &str,
+    memory_budget: &Arc<MemoryBudget>,
+) -> Result<(Vec<Vec<OwnedValue>>, Vec<DataType>)> {
+    let (rows, column_types, _) = materialize_table_rows_with_def(catalog, file_manager, schema, table_name, Some(memory_budget))?;
     Ok((rows, column_types))
 }
 
@@ -337,12 +351,16 @@ pub fn materialize_table_rows(
 ///
 /// Use this variant when you need access to the TableDef for building column maps
 /// or other metadata operations after materializing rows.
+///
+/// When `memory_budget` is provided, tracks row allocations and fails with an
+/// OOM error if the Query pool budget is exceeded.
 #[allow(clippy::type_complexity)]
 pub fn materialize_table_rows_with_def<'a>(
     catalog: &'a Catalog,
     file_manager: &mut FileManager,
     schema: Option<&str>,
     table_name: &str,
+    memory_budget: Option<&Arc<MemoryBudget>>,
 ) -> Result<(Vec<Vec<OwnedValue>>, Vec<DataType>, &'a TableDef)> {
     let schema_name = schema.unwrap_or(DEFAULT_SCHEMA);
     let table_def = catalog.resolve_table_in_schema(schema, table_name)?;
@@ -362,9 +380,31 @@ pub fn materialize_table_rows_with_def<'a>(
         None,
     )?;
 
+    const ROW_SIZE_ESTIMATE: usize = 128;
+    const SYNC_INTERVAL: usize = 64 * 1024;
+
     let mut rows = Vec::new();
+    let mut total_bytes = 0usize;
+    let mut last_reported_bytes = 0usize;
+
     while let Some(row) = source.next_row()? {
         rows.push(row.iter().map(OwnedValue::from).collect());
+        total_bytes += ROW_SIZE_ESTIMATE;
+
+        if let Some(budget) = memory_budget {
+            if total_bytes > last_reported_bytes + SYNC_INTERVAL {
+                let delta = total_bytes - last_reported_bytes;
+                budget.allocate(Pool::Query, delta)?;
+                last_reported_bytes = total_bytes;
+            }
+        }
+    }
+
+    if let Some(budget) = memory_budget {
+        let remaining = total_bytes - last_reported_bytes;
+        if remaining > 0 {
+            budget.allocate(Pool::Query, remaining)?;
+        }
     }
 
     Ok((rows, column_types, table_def))

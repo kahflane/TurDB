@@ -44,7 +44,8 @@ use crate::database::query::{
     build_column_map_with_alias, build_simple_column_map, compare_owned_values, find_limit,
     find_nested_subquery, find_plan_source, find_projections, find_sort_exec, find_table_scan,
     has_aggregate, has_filter, has_order_by_expression, has_window, is_simple_count_star,
-    materialize_table_rows, materialize_table_rows_with_def, PlanSource,
+    materialize_table_rows, materialize_table_rows_with_budget, materialize_table_rows_with_def,
+    PlanSource,
 };
 use crate::database::row::Row;
 use crate::database::transaction::ActiveTransaction;
@@ -2176,6 +2177,7 @@ impl Database {
                     nested_join: &'a crate::sql::planner::PhysicalNestedLoopJoin<'a>,
                     catalog: &crate::schema::catalog::Catalog,
                     file_manager: &mut FileManager,
+                    memory_budget: &Arc<MemoryBudget>,
                 ) -> Result<MaterializedSubqueryResult> {
                     let mut left_rows: Vec<Vec<OwnedValue>> = Vec::new();
                     let mut right_rows: Vec<Vec<OwnedValue>> = Vec::new();
@@ -2216,7 +2218,7 @@ impl Database {
                     if let Some(scan) = left_scan {
                         let table_name = scan.table;
                         let alias = scan.alias.unwrap_or(table_name);
-                        let (rows, _, table_def) = materialize_table_rows_with_def(catalog, file_manager, scan.schema, table_name)?;
+                        let (rows, _, table_def) = materialize_table_rows_with_def(catalog, file_manager, scan.schema, table_name, Some(memory_budget))?;
                         left_rows = rows;
                         for col in table_def.columns() {
                             column_map.push((col.name().to_lowercase(), idx));
@@ -2227,7 +2229,7 @@ impl Database {
                             idx += 1;
                         }
                     } else if let Some(nested) = left_nested {
-                        let (rows, nested_col_map) = execute_nested_join_recursive(nested, catalog, file_manager)?;
+                        let (rows, nested_col_map) = execute_nested_join_recursive(nested, catalog, file_manager, memory_budget)?;
                         left_rows = rows;
                         let row_width = left_rows.first().map(|r| r.len()).unwrap_or(0);
                         for (name, nested_idx) in nested_col_map {
@@ -2245,7 +2247,7 @@ impl Database {
                     if let Some(scan) = right_scan {
                         let table_name = scan.table;
                         let alias = scan.alias.unwrap_or(table_name);
-                        let (rows, _, table_def) = materialize_table_rows_with_def(catalog, file_manager, scan.schema, table_name)?;
+                        let (rows, _, table_def) = materialize_table_rows_with_def(catalog, file_manager, scan.schema, table_name, Some(memory_budget))?;
                         right_rows = rows;
                         for col in table_def.columns() {
                             column_map.push((col.name().to_lowercase(), idx));
@@ -2256,7 +2258,7 @@ impl Database {
                             idx += 1;
                         }
                     } else if let Some(nested) = right_nested {
-                        let (rows, nested_col_map) = execute_nested_join_recursive(nested, catalog, file_manager)?;
+                        let (rows, nested_col_map) = execute_nested_join_recursive(nested, catalog, file_manager, memory_budget)?;
                         right_rows = rows;
                         let row_width = right_rows.first().map(|r| r.len()).unwrap_or(0);
                         for (name, nested_idx) in nested_col_map {
@@ -2273,6 +2275,11 @@ impl Database {
                     let condition_predicate = nested_join.condition.map(|c| {
                         crate::sql::predicate::CompiledPredicate::with_column_map_ref(c, &column_map)
                     });
+
+                    const ROW_SIZE_ESTIMATE: usize = 128;
+                    const SYNC_INTERVAL: usize = 64 * 1024;
+                    let mut total_bytes = 0usize;
+                    let mut last_reported_bytes = 0usize;
 
                     let mut result_rows: Vec<Vec<OwnedValue>> = Vec::new();
                     for left_row in &left_rows {
@@ -2291,8 +2298,20 @@ impl Database {
 
                             if passes {
                                 result_rows.push(combined);
+                                total_bytes += ROW_SIZE_ESTIMATE;
+
+                                if total_bytes > last_reported_bytes + SYNC_INTERVAL {
+                                    let delta = total_bytes - last_reported_bytes;
+                                    memory_budget.allocate(Pool::Query, delta)?;
+                                    last_reported_bytes = total_bytes;
+                                }
                             }
                         }
+                    }
+
+                    let remaining = total_bytes - last_reported_bytes;
+                    if remaining > 0 {
+                        memory_budget.allocate(Pool::Query, remaining)?;
                     }
 
                     Ok((result_rows, column_map))
@@ -2302,6 +2321,7 @@ impl Database {
                     hash_join: &'a crate::sql::planner::PhysicalGraceHashJoin<'a>,
                     catalog: &crate::schema::catalog::Catalog,
                     file_manager: &mut FileManager,
+                    memory_budget: &Arc<MemoryBudget>,
                 ) -> Result<MaterializedSubqueryResult> {
                     let mut left_rows: Vec<Vec<OwnedValue>> = Vec::new();
                     let mut right_rows: Vec<Vec<OwnedValue>> = Vec::new();
@@ -2326,7 +2346,7 @@ impl Database {
 
                     if let Some(scan) = left_scan {
                         let table_def = catalog.resolve_table_in_schema(scan.schema, scan.table)?;
-                        let (rows, _) = materialize_table_rows(catalog, file_manager, scan.schema, scan.table)?;
+                        let (rows, _) = materialize_table_rows_with_budget(catalog, file_manager, scan.schema, scan.table, memory_budget)?;
                         left_rows = rows;
                         let alias = scan.alias.unwrap_or(scan.table);
                         for col in table_def.columns() {
@@ -2341,7 +2361,7 @@ impl Database {
 
                     if let Some(scan) = right_scan {
                         let table_def = catalog.resolve_table_in_schema(scan.schema, scan.table)?;
-                        let (rows, _) = materialize_table_rows(catalog, file_manager, scan.schema, scan.table)?;
+                        let (rows, _) = materialize_table_rows_with_budget(catalog, file_manager, scan.schema, scan.table, memory_budget)?;
                         right_rows = rows;
                         let alias = scan.alias.unwrap_or(scan.table);
                         for col in table_def.columns() {
@@ -2384,6 +2404,10 @@ impl Database {
                         })
                         .collect();
 
+                    const HASH_ENTRY_SIZE: usize = 24;
+                    let hash_table_bytes = left_rows.len() * HASH_ENTRY_SIZE;
+                    memory_budget.allocate(Pool::Query, hash_table_bytes)?;
+
                     let mut hash_table: hashbrown::HashMap<u64, Vec<usize>> = hashbrown::HashMap::new();
                     for (row_idx, row) in left_rows.iter().enumerate() {
                         use crate::database::query::hash_owned_value_normalized;
@@ -2397,6 +2421,11 @@ impl Database {
                         let hash = hasher.finish();
                         hash_table.entry(hash).or_default().push(row_idx);
                     }
+
+                    const ROW_SIZE_ESTIMATE: usize = 128;
+                    const SYNC_INTERVAL: usize = 64 * 1024;
+                    let mut total_bytes = 0usize;
+                    let mut last_reported_bytes = 0usize;
 
                     let mut result_rows: Vec<Vec<OwnedValue>> = Vec::new();
                     for right_row in &right_rows {
@@ -2429,9 +2458,21 @@ impl Database {
                                     combined.extend(left_row.iter().cloned());
                                     combined.extend(right_row.iter().cloned());
                                     result_rows.push(combined);
+
+                                    total_bytes += ROW_SIZE_ESTIMATE;
+                                    if total_bytes > last_reported_bytes + SYNC_INTERVAL {
+                                        let delta = total_bytes - last_reported_bytes;
+                                        memory_budget.allocate(Pool::Query, delta)?;
+                                        last_reported_bytes = total_bytes;
+                                    }
                                 }
                             }
                         }
+                    }
+
+                    let remaining = total_bytes - last_reported_bytes;
+                    if remaining > 0 {
+                        memory_budget.allocate(Pool::Query, remaining)?;
                     }
 
                     Ok((result_rows, column_map))
@@ -2472,6 +2513,8 @@ impl Database {
                 let left_input_filter = find_filter_in_input(left_op);
                 let right_input_filter = find_filter_in_input(right_op);
 
+                let memory_budget = &self.shared.memory_budget;
+
                 let mut left_rows: Vec<Vec<OwnedValue>> = Vec::new();
                 let mut right_rows: Vec<Vec<OwnedValue>> = Vec::new();
                 let mut right_col_count = 0usize;
@@ -2497,7 +2540,7 @@ impl Database {
                     left_table_name = Some(table_name);
                     left_alias = alias;
                     left_schema = schema_opt;
-                    let (rows, _) = materialize_table_rows(catalog, file_manager, schema_opt, table_name)?;
+                    let (rows, _) = materialize_table_rows_with_budget(catalog, file_manager, schema_opt, table_name, memory_budget)?;
                     left_rows = rows;
 
                     if let Some(filter_pred) = left_input_filter {
@@ -2519,10 +2562,10 @@ impl Database {
                     }
                 } else if let Some(nested_join) = left_nested_join {
                     (left_rows, left_nested_join_column_map) =
-                        execute_nested_join_recursive(nested_join, catalog, file_manager)?;
+                        execute_nested_join_recursive(nested_join, catalog, file_manager, memory_budget)?;
                 } else if let Some(hash_join) = left_hash_join {
                     (left_rows, left_nested_join_column_map) =
-                        execute_hash_join_recursive(hash_join, catalog, file_manager)?;
+                        execute_hash_join_recursive(hash_join, catalog, file_manager, memory_budget)?;
                 }
 
                 if let Some(subq) = right_subq {
@@ -2537,7 +2580,7 @@ impl Database {
                     right_table_name = Some(table_name);
                     right_alias = alias;
                     right_schema = schema_opt;
-                    let (rows, column_types) = materialize_table_rows(catalog, file_manager, schema_opt, table_name)?;
+                    let (rows, column_types): (Vec<Vec<OwnedValue>>, Vec<DataType>) = materialize_table_rows_with_budget(catalog, file_manager, schema_opt, table_name, memory_budget)?;
                     right_rows = rows;
                     right_col_count = column_types.len();
 
@@ -2560,11 +2603,11 @@ impl Database {
                     }
                 } else if let Some(nested_join) = right_nested_join {
                     (right_rows, right_nested_join_column_map) =
-                        execute_nested_join_recursive(nested_join, catalog, file_manager)?;
+                        execute_nested_join_recursive(nested_join, catalog, file_manager, memory_budget)?;
                     right_col_count = right_rows.first().map(|r| r.len()).unwrap_or(0);
                 } else if let Some(hash_join) = right_hash_join {
                     (right_rows, right_nested_join_column_map) =
-                        execute_hash_join_recursive(hash_join, catalog, file_manager)?;
+                        execute_hash_join_recursive(hash_join, catalog, file_manager, memory_budget)?;
                     right_col_count = right_rows.first().map(|r| r.len()).unwrap_or(0);
                 }
 
@@ -2816,6 +2859,10 @@ impl Database {
                     hashbrown::HashMap::with_capacity(left_rows.len());
 
                 if use_hash_join {
+                    const HASH_ENTRY_SIZE: usize = 24;
+                    let hash_table_bytes = left_rows.len() * HASH_ENTRY_SIZE;
+                    memory_budget.allocate(Pool::Query, hash_table_bytes)?;
+
                     for (left_idx, left_row) in left_rows.iter().enumerate() {
                         if has_null_key(left_row, &left_key_indices) {
                             continue;
@@ -2827,6 +2874,11 @@ impl Database {
 
                 let mut combined_buf: smallvec::SmallVec<[OwnedValue; 16]> =
                     smallvec::SmallVec::new();
+
+                const ROW_SIZE_ESTIMATE: usize = 128;
+                const SYNC_INTERVAL: usize = 64 * 1024;
+                let mut join_total_bytes = 0usize;
+                let mut join_last_reported = 0usize;
 
                 'outer: {
                     if use_hash_join {
@@ -2919,6 +2971,12 @@ impl Database {
                                     }
 
                                     result_rows.push(Row::new(owned));
+                                    join_total_bytes += ROW_SIZE_ESTIMATE;
+                                    if join_total_bytes > join_last_reported + SYNC_INTERVAL {
+                                        let delta = join_total_bytes - join_last_reported;
+                                        memory_budget.allocate(Pool::Query, delta)?;
+                                        join_last_reported = join_total_bytes;
+                                    }
 
                                     if let Some(lim) = limit {
                                         if result_rows.len() >= lim {
@@ -3008,6 +3066,12 @@ impl Database {
                                 }
 
                                 result_rows.push(Row::new(owned));
+                                join_total_bytes += ROW_SIZE_ESTIMATE;
+                                if join_total_bytes > join_last_reported + SYNC_INTERVAL {
+                                    let delta = join_total_bytes - join_last_reported;
+                                    memory_budget.allocate(Pool::Query, delta)?;
+                                    join_last_reported = join_total_bytes;
+                                }
 
                                 if let Some(lim) = limit {
                                     if result_rows.len() >= lim {
@@ -3064,6 +3128,12 @@ impl Database {
                             }
 
                             result_rows.push(Row::new(owned));
+                            join_total_bytes += ROW_SIZE_ESTIMATE;
+                            if join_total_bytes > join_last_reported + SYNC_INTERVAL {
+                                let delta = join_total_bytes - join_last_reported;
+                                memory_budget.allocate(Pool::Query, delta)?;
+                                join_last_reported = join_total_bytes;
+                            }
 
                             if let Some(lim) = limit {
                                 if result_rows.len() >= lim {
@@ -3133,6 +3203,12 @@ impl Database {
                         }
 
                         result_rows.push(Row::new(owned));
+                        join_total_bytes += ROW_SIZE_ESTIMATE;
+                        if join_total_bytes > join_last_reported + SYNC_INTERVAL {
+                            let delta = join_total_bytes - join_last_reported;
+                            memory_budget.allocate(Pool::Query, delta)?;
+                            join_last_reported = join_total_bytes;
+                        }
 
                         if let Some(lim) = limit {
                             if result_rows.len() >= lim {
@@ -3185,6 +3261,12 @@ impl Database {
                         }
 
                         result_rows.push(Row::new(owned));
+                        join_total_bytes += ROW_SIZE_ESTIMATE;
+                        if join_total_bytes > join_last_reported + SYNC_INTERVAL {
+                            let delta = join_total_bytes - join_last_reported;
+                            memory_budget.allocate(Pool::Query, delta)?;
+                            join_last_reported = join_total_bytes;
+                        }
 
                         if let Some(lim) = limit {
                             if result_rows.len() >= lim {
@@ -3192,6 +3274,11 @@ impl Database {
                             }
                         }
                     }
+                }
+
+                let join_remaining = join_total_bytes - join_last_reported;
+                if join_remaining > 0 {
+                    memory_budget.allocate(Pool::Query, join_remaining)?;
                 }
 
                 fn find_hash_aggregate<'a>(
