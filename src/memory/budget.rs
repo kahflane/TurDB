@@ -28,6 +28,25 @@
 //! - Stack allocations
 //! - Small temporary buffers (< 1KB)
 //! - Static data structures
+//!
+//! ## Query Memory Estimates
+//!
+//! Query operators use conservative estimates for memory tracking since exact
+//! allocation sizes would require traversing all stored values. The estimates
+//! are designed to slightly over-count rather than under-count to prevent OOM:
+//!
+//! | Context | Estimate | Rationale |
+//! |---------|----------|-----------|
+//! | Row materialization | 128 bytes/row | Covers typical row with 8-10 columns |
+//! | Hash aggregate entry | 256 bytes/entry | Includes key, group values, and aggregate states |
+//! | Hash table bucket | 24 bytes/entry | Hash key (8) + indices vec overhead (16) |
+//!
+//! These estimates may significantly over-count for tables with few small columns
+//! or under-count for tables with many large text/blob columns. The periodic sync
+//! pattern (every 64KB) amortizes the overhead of atomic operations.
+//!
+//! Actual memory usage may differ from tracked amounts. The goal is preventing
+//! runaway queries from exhausting system memory, not precise accounting.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::OnceLock;

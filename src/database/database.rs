@@ -1653,7 +1653,7 @@ impl Database {
                 let ctx = if scalar_subquery_results.is_empty() {
                     ExecutionContext::with_memory_budget(&arena, memory_budget)
                 } else {
-                    ExecutionContext::with_scalar_subqueries_and_budget(&arena, scalar_subquery_results.clone(), memory_budget)
+                    ExecutionContext::with_scalar_subqueries_and_budget(&arena, &scalar_subquery_results, memory_budget)
                 };
                 let builder = ExecutorBuilder::new(&ctx);
 
@@ -1758,7 +1758,7 @@ impl Database {
                 let ctx = if scalar_subquery_results.is_empty() {
                     ExecutionContext::with_memory_budget(&arena, memory_budget)
                 } else {
-                    ExecutionContext::with_scalar_subqueries_and_budget(&arena, scalar_subquery_results.clone(), memory_budget)
+                    ExecutionContext::with_scalar_subqueries_and_budget(&arena, &scalar_subquery_results, memory_budget)
                 };
                 let builder = ExecutorBuilder::new(&ctx);
 
@@ -1987,7 +1987,7 @@ impl Database {
                 let ctx = if scalar_subquery_results.is_empty() {
                     ExecutionContext::with_memory_budget(&arena, memory_budget)
                 } else {
-                    ExecutionContext::with_scalar_subqueries_and_budget(&arena, scalar_subquery_results.clone(), memory_budget)
+                    ExecutionContext::with_scalar_subqueries_and_budget(&arena, &scalar_subquery_results, memory_budget)
                 };
                 let builder = ExecutorBuilder::new(&ctx);
 
@@ -2045,7 +2045,7 @@ impl Database {
                 let ctx = if scalar_subquery_results.is_empty() {
                     ExecutionContext::with_memory_budget(&arena, memory_budget)
                 } else {
-                    ExecutionContext::with_scalar_subqueries_and_budget(&arena, scalar_subquery_results.clone(), memory_budget)
+                    ExecutionContext::with_scalar_subqueries_and_budget(&arena, &scalar_subquery_results, memory_budget)
                 };
                 let builder = ExecutorBuilder::new(&ctx);
                 let mut executor = builder

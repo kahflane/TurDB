@@ -2859,7 +2859,6 @@ impl<'a, S: RowSource> Executor<'a> for DynamicExecutor<'a, S> {
             },
             DynamicExecutor::HashAggregate(state) => {
                 if !state.computed {
-                    let mut row_count = 0usize;
                     while let Some(row) = state.child.next()? {
                         let (group_key, group_values) =
                             if let Some(ref group_by_exprs) = state.group_by_exprs {
@@ -2891,7 +2890,6 @@ impl<'a, S: RowSource> Executor<'a> for DynamicExecutor<'a, S> {
                             entry.1[idx].update(agg_fn, &row);
                         }
 
-                        row_count += 1;
                         if let Some(budget) = state.memory_budget {
                             let estimated_size = state.groups.len() * 256;
                             if estimated_size > state.last_reported_bytes + 64 * 1024 {
@@ -2901,7 +2899,6 @@ impl<'a, S: RowSource> Executor<'a> for DynamicExecutor<'a, S> {
                             }
                         }
                     }
-                    let _ = row_count;
 
                     let results: Vec<(Vec<Value<'static>>, Vec<AggregateState>)> =
                         state.groups.drain().map(|(_, v)| v).collect();

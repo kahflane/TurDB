@@ -10,7 +10,7 @@ pub struct ExecutionContext<'a> {
     pub arena: &'a Bump,
     pub file_manager: Option<&'a mut crate::storage::FileManager>,
     pub catalog: Option<&'a crate::schema::Catalog>,
-    pub scalar_subquery_results: ScalarSubqueryResults,
+    pub scalar_subquery_results: Option<&'a ScalarSubqueryResults>,
     pub memory_budget: Option<&'a Arc<MemoryBudget>>,
 }
 
@@ -20,7 +20,7 @@ impl<'a> ExecutionContext<'a> {
             arena,
             file_manager: None,
             catalog: None,
-            scalar_subquery_results: SmallVec::new(),
+            scalar_subquery_results: None,
             memory_budget: None,
         }
     }
@@ -30,31 +30,31 @@ impl<'a> ExecutionContext<'a> {
             arena,
             file_manager: None,
             catalog: None,
-            scalar_subquery_results: SmallVec::new(),
+            scalar_subquery_results: None,
             memory_budget: Some(memory_budget),
         }
     }
 
-    pub fn with_scalar_subqueries(arena: &'a Bump, results: ScalarSubqueryResults) -> Self {
+    pub fn with_scalar_subqueries(arena: &'a Bump, results: &'a ScalarSubqueryResults) -> Self {
         Self {
             arena,
             file_manager: None,
             catalog: None,
-            scalar_subquery_results: results,
+            scalar_subquery_results: Some(results),
             memory_budget: None,
         }
     }
 
     pub fn with_scalar_subqueries_and_budget(
         arena: &'a Bump,
-        results: ScalarSubqueryResults,
+        results: &'a ScalarSubqueryResults,
         memory_budget: &'a Arc<MemoryBudget>,
     ) -> Self {
         Self {
             arena,
             file_manager: None,
             catalog: None,
-            scalar_subquery_results: results,
+            scalar_subquery_results: Some(results),
             memory_budget: Some(memory_budget),
         }
     }
@@ -68,7 +68,7 @@ impl<'a> ExecutionContext<'a> {
             arena,
             file_manager: Some(file_manager),
             catalog: Some(catalog),
-            scalar_subquery_results: SmallVec::new(),
+            scalar_subquery_results: None,
             memory_budget: None,
         }
     }

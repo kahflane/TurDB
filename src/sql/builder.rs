@@ -102,14 +102,15 @@ impl<'a> ExecutorBuilder<'a> {
                 } else {
                     self.compute_input_column_map(filter.input)
                 };
-                let predicate = if !self.ctx.scalar_subquery_results.is_empty() {
-                    CompiledPredicate::with_scalar_subqueries(
-                        filter.predicate,
-                        effective_column_map,
-                        self.ctx.scalar_subquery_results.clone(),
-                    )
-                } else {
-                    CompiledPredicate::new(filter.predicate, effective_column_map)
+                let predicate = match self.ctx.scalar_subquery_results {
+                    Some(results) if !results.is_empty() => {
+                        CompiledPredicate::with_scalar_subqueries(
+                            filter.predicate,
+                            effective_column_map,
+                            results.clone(),
+                        )
+                    }
+                    _ => CompiledPredicate::new(filter.predicate, effective_column_map),
                 };
                 Ok(DynamicExecutor::Filter(Box::new(child), predicate))
             }

@@ -1,4 +1,4 @@
-use crate::memory::MemoryBudget;
+use crate::memory::{MemoryBudget, Pool};
 use crate::sql::adapter::BTreeCursorAdapter;
 use crate::sql::ast::JoinType;
 use crate::sql::executor::{AggregateFunction, DynamicExecutor, ExecutorRow, RowSource, SortKey};
@@ -651,5 +651,75 @@ impl<'a, S: RowSource> WindowState<'a, S> {
             .iter()
             .find(|(name, _)| name.eq_ignore_ascii_case(col_name))
             .map(|(_, idx)| *idx)
+    }
+}
+
+impl<'a, S: RowSource> Drop for SortState<'a, S> {
+    fn drop(&mut self) {
+        if let Some(budget) = self.memory_budget {
+            if self.last_reported_bytes > 0 {
+                budget.release(Pool::Query, self.last_reported_bytes);
+            }
+        }
+    }
+}
+
+impl<'a, S: RowSource> Drop for TopKState<'a, S> {
+    fn drop(&mut self) {
+        if let Some(budget) = self.memory_budget {
+            if self.last_reported_bytes > 0 {
+                budget.release(Pool::Query, self.last_reported_bytes);
+            }
+        }
+    }
+}
+
+impl<'a, S: RowSource> Drop for HashAggregateState<'a, S> {
+    fn drop(&mut self) {
+        if let Some(budget) = self.memory_budget {
+            if self.last_reported_bytes > 0 {
+                budget.release(Pool::Query, self.last_reported_bytes);
+            }
+        }
+    }
+}
+
+impl<'a, S: RowSource> Drop for NestedLoopJoinState<'a, S> {
+    fn drop(&mut self) {
+        if let Some(budget) = self.memory_budget {
+            if self.last_reported_bytes > 0 {
+                budget.release(Pool::Query, self.last_reported_bytes);
+            }
+        }
+    }
+}
+
+impl<'a, S: RowSource> Drop for GraceHashJoinState<'a, S> {
+    fn drop(&mut self) {
+        if let Some(budget) = self.memory_budget_ref {
+            if self.last_reported_bytes > 0 {
+                budget.release(Pool::Query, self.last_reported_bytes);
+            }
+        }
+    }
+}
+
+impl<'a, S: RowSource> Drop for StreamingHashJoinState<'a, S> {
+    fn drop(&mut self) {
+        if let Some(budget) = self.memory_budget_ref {
+            if self.last_reported_bytes > 0 {
+                budget.release(Pool::Query, self.last_reported_bytes);
+            }
+        }
+    }
+}
+
+impl<'a, S: RowSource> Drop for WindowState<'a, S> {
+    fn drop(&mut self) {
+        if let Some(budget) = self.memory_budget {
+            if self.last_reported_bytes > 0 {
+                budget.release(Pool::Query, self.last_reported_bytes);
+            }
+        }
     }
 }
