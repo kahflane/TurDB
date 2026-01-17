@@ -70,6 +70,7 @@
 //! - Point lookup: < 1µs (cached)
 //! - Join performance: Depends on algorithm selection
 
+use crate::memory::{Pool, ROW_SIZE_ESTIMATE, SYNC_INTERVAL};
 use crate::mvcc::RecordHeader;
 use crate::sql::adapter::BTreeCursorAdapter;
 use crate::sql::ast::JoinType;
@@ -1879,10 +1880,10 @@ impl<'a, S: RowSource> Executor<'a> for DynamicExecutor<'a, S> {
                         state.right_rows.push(owned);
 
                         if let Some(budget) = state.memory_budget {
-                            let estimated_size = state.right_rows.len() * 128;
-                            if estimated_size > state.last_reported_bytes + 64 * 1024 {
+                            let estimated_size = state.right_rows.len() * ROW_SIZE_ESTIMATE;
+                            if estimated_size > state.last_reported_bytes + SYNC_INTERVAL {
                                 let delta = estimated_size - state.last_reported_bytes;
-                                budget.allocate(crate::memory::Pool::Query, delta)?;
+                                budget.allocate(Pool::Query, delta)?;
                                 state.last_reported_bytes = estimated_size;
                             }
                         }
@@ -1957,10 +1958,10 @@ impl<'a, S: RowSource> Executor<'a> for DynamicExecutor<'a, S> {
                             total_rows += 1;
 
                             if let Some(budget) = state.memory_budget_ref {
-                                let estimated_size = total_rows * 128;
-                                if estimated_size > state.last_reported_bytes + 64 * 1024 {
+                                let estimated_size = total_rows * ROW_SIZE_ESTIMATE;
+                                if estimated_size > state.last_reported_bytes + SYNC_INTERVAL {
                                     let delta = estimated_size - state.last_reported_bytes;
-                                    budget.allocate(crate::memory::Pool::Query, delta)?;
+                                    budget.allocate(Pool::Query, delta)?;
                                     state.last_reported_bytes = estimated_size;
                                 }
                             }
@@ -1977,10 +1978,10 @@ impl<'a, S: RowSource> Executor<'a> for DynamicExecutor<'a, S> {
                             total_rows += 1;
 
                             if let Some(budget) = state.memory_budget_ref {
-                                let estimated_size = total_rows * 128;
-                                if estimated_size > state.last_reported_bytes + 64 * 1024 {
+                                let estimated_size = total_rows * ROW_SIZE_ESTIMATE;
+                                if estimated_size > state.last_reported_bytes + SYNC_INTERVAL {
                                     let delta = estimated_size - state.last_reported_bytes;
-                                    budget.allocate(crate::memory::Pool::Query, delta)?;
+                                    budget.allocate(Pool::Query, delta)?;
                                     state.last_reported_bytes = estimated_size;
                                 }
                             }
@@ -2050,10 +2051,10 @@ impl<'a, S: RowSource> Executor<'a> for DynamicExecutor<'a, S> {
                         state.build_rows.push(owned);
 
                         if let Some(budget) = state.memory_budget_ref {
-                            let estimated_size = state.build_rows.len() * 128;
-                            if estimated_size > state.last_reported_bytes + 64 * 1024 {
+                            let estimated_size = state.build_rows.len() * ROW_SIZE_ESTIMATE;
+                            if estimated_size > state.last_reported_bytes + SYNC_INTERVAL {
                                 let delta = estimated_size - state.last_reported_bytes;
-                                budget.allocate(crate::memory::Pool::Query, delta)?;
+                                budget.allocate(Pool::Query, delta)?;
                                 state.last_reported_bytes = estimated_size;
                             }
                         }
@@ -2203,10 +2204,10 @@ impl<'a, S: RowSource> Executor<'a> for DynamicExecutor<'a, S> {
                         state.rows.push(owned);
 
                         if let Some(budget) = state.memory_budget {
-                            let estimated_size = state.rows.len() * 128;
-                            if estimated_size > state.last_reported_bytes + 64 * 1024 {
+                            let estimated_size = state.rows.len() * ROW_SIZE_ESTIMATE;
+                            if estimated_size > state.last_reported_bytes + SYNC_INTERVAL {
                                 let delta = estimated_size - state.last_reported_bytes;
-                                budget.allocate(crate::memory::Pool::Query, delta)?;
+                                budget.allocate(Pool::Query, delta)?;
                                 state.last_reported_bytes = estimated_size;
                             }
                         }
@@ -2253,10 +2254,10 @@ impl<'a, S: RowSource> Executor<'a> for DynamicExecutor<'a, S> {
                             state.heap.push(owned);
 
                             if let Some(budget) = state.memory_budget {
-                                let estimated_size = state.heap.len() * 128;
-                                if estimated_size > state.last_reported_bytes + 64 * 1024 {
+                                let estimated_size = state.heap.len() * ROW_SIZE_ESTIMATE;
+                                if estimated_size > state.last_reported_bytes + SYNC_INTERVAL {
                                     let delta = estimated_size - state.last_reported_bytes;
-                                    budget.allocate(crate::memory::Pool::Query, delta)?;
+                                    budget.allocate(Pool::Query, delta)?;
                                     state.last_reported_bytes = estimated_size;
                                 }
                             }
@@ -2892,9 +2893,9 @@ impl<'a, S: RowSource> Executor<'a> for DynamicExecutor<'a, S> {
 
                         if let Some(budget) = state.memory_budget {
                             let estimated_size = state.groups.len() * 256;
-                            if estimated_size > state.last_reported_bytes + 64 * 1024 {
+                            if estimated_size > state.last_reported_bytes + SYNC_INTERVAL {
                                 let delta = estimated_size - state.last_reported_bytes;
-                                budget.allocate(crate::memory::Pool::Query, delta)?;
+                                budget.allocate(Pool::Query, delta)?;
                                 state.last_reported_bytes = estimated_size;
                             }
                         }
@@ -2932,10 +2933,10 @@ impl<'a, S: RowSource> Executor<'a> for DynamicExecutor<'a, S> {
                         state.rows.push(owned);
 
                         if let Some(budget) = state.memory_budget {
-                            let estimated_size = state.rows.len() * 128;
-                            if estimated_size > state.last_reported_bytes + 64 * 1024 {
+                            let estimated_size = state.rows.len() * ROW_SIZE_ESTIMATE;
+                            if estimated_size > state.last_reported_bytes + SYNC_INTERVAL {
                                 let delta = estimated_size - state.last_reported_bytes;
-                                budget.allocate(crate::memory::Pool::Query, delta)?;
+                                budget.allocate(Pool::Query, delta)?;
                                 state.last_reported_bytes = estimated_size;
                             }
                         }

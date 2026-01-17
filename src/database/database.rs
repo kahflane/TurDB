@@ -2282,7 +2282,8 @@ impl Database {
                     let mut result_rows: Vec<Vec<OwnedValue>> = Vec::new();
                     for left_row in &left_rows {
                         for right_row in &right_rows {
-                            let mut combined: Vec<OwnedValue> = left_row.clone();
+                            let mut combined = Vec::with_capacity(left_row.len() + right_row.len());
+                            combined.extend(left_row.iter().cloned());
                             combined.extend(right_row.iter().cloned());
 
                             let passes = if let Some(ref pred) = condition_predicate {
@@ -3101,9 +3102,9 @@ impl Database {
                             continue;
                         }
 
-                        let mut combined: Vec<OwnedValue> =
-                            std::iter::repeat_n(OwnedValue::Null, left_col_count).collect();
-                        combined.extend(right_row.clone());
+                        let mut combined = Vec::with_capacity(left_col_count + right_row.len());
+                        combined.extend(std::iter::repeat_n(OwnedValue::Null, left_col_count));
+                        combined.extend(right_row.iter().cloned());
 
                         let output_columns = physical_plan.output_schema.columns;
                         let mut name_occurrence_count: std::collections::HashMap<String, usize> =
