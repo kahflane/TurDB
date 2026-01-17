@@ -12,7 +12,7 @@
 //! - Optimization: `is_simple_count_star`
 //! - Value comparison: `compare_owned_values`
 
-use crate::memory::{MemoryBudget, Pool};
+use crate::memory::{MemoryBudget, PeriodicBudgetTracker, Pool, ROW_SIZE_ESTIMATE};
 use crate::schema::{Catalog, TableDef};
 use crate::sql::ast::Expr;
 use crate::sql::executor::{RowSource, StreamingBTreeSource};
@@ -335,15 +335,40 @@ pub fn materialize_table_rows(
     Ok((rows, column_types))
 }
 
-/// Materializes all rows from a table with memory budget tracking.
-pub fn materialize_table_rows_with_budget(
+/// Materializes all rows from a table using a shared budget tracker.
+///
+/// The tracker handles both allocation and automatic release on drop.
+pub fn materialize_table_rows_with_tracker(
     catalog: &Catalog,
     file_manager: &mut FileManager,
     schema: Option<&str>,
     table_name: &str,
-    memory_budget: &Arc<MemoryBudget>,
+    tracker: &mut PeriodicBudgetTracker<'_>,
 ) -> Result<(Vec<Vec<OwnedValue>>, Vec<DataType>)> {
-    let (rows, column_types, _) = materialize_table_rows_with_def(catalog, file_manager, schema, table_name, Some(memory_budget))?;
+    let schema_name = schema.unwrap_or(crate::storage::DEFAULT_SCHEMA);
+    let table_def = catalog.resolve_table_in_schema(schema, table_name)?;
+    let column_types: Vec<DataType> = table_def.columns().iter().map(|c| c.data_type()).collect();
+
+    let storage_arc = file_manager.table_data(schema_name, table_name)?;
+    let storage = storage_arc.read();
+    let root_page = {
+        let page = storage.page(0)?;
+        TableFileHeader::from_bytes(page)?.root_page()
+    };
+
+    let mut source = StreamingBTreeSource::from_btree_scan_with_projections(
+        &storage,
+        root_page,
+        column_types.clone(),
+        None,
+    )?;
+
+    let mut rows = Vec::new();
+    while let Some(row) = source.next_row()? {
+        rows.push(row.iter().map(OwnedValue::from).collect());
+        tracker.track(ROW_SIZE_ESTIMATE)?;
+    }
+
     Ok((rows, column_types))
 }
 

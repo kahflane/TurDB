@@ -74,5 +74,8 @@
 mod budget;
 mod page_buffer;
 
-pub use budget::{BudgetStats, MemoryBudget, MemoryError, Pool};
+pub use budget::{
+    BudgetStats, MemoryBudget, MemoryError, PeriodicBudgetTracker, Pool, HASH_AGGREGATE_ENTRY_SIZE,
+    HASH_ENTRY_SIZE, ROW_SIZE_ESTIMATE, SYNC_INTERVAL,
+};
 pub use page_buffer::{PageBufferPool, PooledPageBuffer};

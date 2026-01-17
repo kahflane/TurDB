@@ -26,6 +26,6 @@ pub use helpers::{
     build_column_map_with_alias, build_simple_column_map, compare_owned_values, find_limit,
     find_nested_subquery, find_plan_source, find_projections, find_sort_exec, find_table_scan,
     has_aggregate, has_filter, has_order_by_expression, has_window, hash_owned_value_normalized,
-    is_simple_count_star, materialize_table_rows, materialize_table_rows_with_budget,
-    materialize_table_rows_with_def, owned_values_equal_with_coercion, PlanSource,
+    is_simple_count_star, materialize_table_rows, materialize_table_rows_with_tracker,
+    owned_values_equal_with_coercion, PlanSource,
 };

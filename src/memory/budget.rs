@@ -368,6 +368,51 @@ impl Default for MemoryBudget {
     }
 }
 
+pub const ROW_SIZE_ESTIMATE: usize = 128;
+pub const HASH_ENTRY_SIZE: usize = 24;
+pub const HASH_AGGREGATE_ENTRY_SIZE: usize = 256;
+pub const SYNC_INTERVAL: usize = 64 * 1024;
+
+pub struct PeriodicBudgetTracker<'a> {
+    budget: &'a MemoryBudget,
+    pool: Pool,
+    total_bytes: usize,
+    last_reported_bytes: usize,
+}
+
+impl<'a> PeriodicBudgetTracker<'a> {
+    pub fn new(budget: &'a MemoryBudget, pool: Pool) -> Self {
+        Self {
+            budget,
+            pool,
+            total_bytes: 0,
+            last_reported_bytes: 0,
+        }
+    }
+
+    pub fn track(&mut self, bytes: usize) -> Result<()> {
+        self.total_bytes += bytes;
+        if self.total_bytes > self.last_reported_bytes + SYNC_INTERVAL {
+            let delta = self.total_bytes - self.last_reported_bytes;
+            self.budget.allocate(self.pool, delta)?;
+            self.last_reported_bytes = self.total_bytes;
+        }
+        Ok(())
+    }
+
+    pub fn tracked_bytes(&self) -> usize {
+        self.last_reported_bytes
+    }
+}
+
+impl Drop for PeriodicBudgetTracker<'_> {
+    fn drop(&mut self) {
+        if self.last_reported_bytes > 0 {
+            self.budget.release(self.pool, self.last_reported_bytes);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
