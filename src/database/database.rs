@@ -2296,8 +2296,8 @@ impl Database {
                             };
 
                             if passes {
-                                result_rows.push(combined);
                                 tracker.track(ROW_SIZE_ESTIMATE)?;
+                                result_rows.push(combined);
                             }
                         }
                     }
@@ -2435,11 +2435,11 @@ impl Database {
                                 });
 
                                 if matches {
+                                    tracker.track(ROW_SIZE_ESTIMATE)?;
                                     let mut combined: Vec<OwnedValue> = Vec::with_capacity(left_row.len() + right_row.len());
                                     combined.extend(left_row.iter().cloned());
                                     combined.extend(right_row.iter().cloned());
                                     result_rows.push(combined);
-                                    tracker.track(ROW_SIZE_ESTIMATE)?;
                                 }
                             }
                         }
@@ -2934,8 +2934,8 @@ impl Database {
                                         continue;
                                     }
 
-                                    result_rows.push(Row::new(owned));
                                     tracker.track(ROW_SIZE_ESTIMATE)?;
+                                    result_rows.push(Row::new(owned));
 
                                     if let Some(lim) = limit {
                                         if result_rows.len() >= lim {
@@ -3024,8 +3024,8 @@ impl Database {
                                     continue;
                                 }
 
-                                result_rows.push(Row::new(owned));
                                 tracker.track(ROW_SIZE_ESTIMATE)?;
+                                result_rows.push(Row::new(owned));
 
                                 if let Some(lim) = limit {
                                     if result_rows.len() >= lim {
@@ -3081,8 +3081,8 @@ impl Database {
                                 continue;
                             }
 
-                            result_rows.push(Row::new(owned));
                             tracker.track(ROW_SIZE_ESTIMATE)?;
+                            result_rows.push(Row::new(owned));
 
                             if let Some(lim) = limit {
                                 if result_rows.len() >= lim {
@@ -3151,8 +3151,8 @@ impl Database {
                             continue;
                         }
 
-                        result_rows.push(Row::new(owned));
                         tracker.track(ROW_SIZE_ESTIMATE)?;
+                        result_rows.push(Row::new(owned));
 
                         if let Some(lim) = limit {
                             if result_rows.len() >= lim {
@@ -3204,8 +3204,8 @@ impl Database {
                             continue;
                         }
 
-                        result_rows.push(Row::new(owned));
                         tracker.track(ROW_SIZE_ESTIMATE)?;
+                        result_rows.push(Row::new(owned));
 
                         if let Some(lim) = limit {
                             if result_rows.len() >= lim {

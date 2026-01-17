@@ -400,6 +400,13 @@ impl<'a> PeriodicBudgetTracker<'a> {
         Ok(())
     }
 
+    pub fn pre_allocate(&mut self, bytes: usize) -> Result<()> {
+        self.budget.allocate(self.pool, bytes)?;
+        self.total_bytes += bytes;
+        self.last_reported_bytes = self.total_bytes;
+        Ok(())
+    }
+
     pub fn tracked_bytes(&self) -> usize {
         self.last_reported_bytes
     }

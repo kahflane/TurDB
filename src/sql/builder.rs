@@ -689,11 +689,11 @@ impl<'a> ExecutorBuilder<'a> {
             left_spiller: None,
             right_spiller: None,
             spill_dir,
-            memory_budget,
+            spill_memory_limit: memory_budget,
             query_id,
             probe_row_buf: smallvec::SmallVec::new(),
             build_row_buf: smallvec::SmallVec::new(),
-            memory_budget_ref: self.ctx.memory_budget,
+            memory_budget: self.ctx.memory_budget,
             last_reported_bytes: 0,
         }
     }

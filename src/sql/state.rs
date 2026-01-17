@@ -229,11 +229,11 @@ pub struct GraceHashJoinState<'a, S: RowSource> {
     pub left_spiller: Option<PartitionSpiller>,
     pub right_spiller: Option<PartitionSpiller>,
     pub spill_dir: Option<PathBuf>,
-    pub memory_budget: usize,
+    pub spill_memory_limit: usize,
     pub query_id: u64,
     pub probe_row_buf: SmallVec<[Value<'static>; 16]>,
     pub build_row_buf: SmallVec<[Value<'static>; 16]>,
-    pub memory_budget_ref: Option<&'a Arc<MemoryBudget>>,
+    pub memory_budget: Option<&'a Arc<MemoryBudget>>,
     pub last_reported_bytes: usize,
 }
 
@@ -257,7 +257,7 @@ pub struct StreamingHashJoinState<'a, S: RowSource> {
     pub probe_col_count: usize,
     pub built: bool,
     pub swapped: bool,
-    pub memory_budget_ref: Option<&'a Arc<MemoryBudget>>,
+    pub memory_budget: Option<&'a Arc<MemoryBudget>>,
     pub last_reported_bytes: usize,
 }
 
@@ -696,7 +696,7 @@ impl<'a, S: RowSource> Drop for NestedLoopJoinState<'a, S> {
 
 impl<'a, S: RowSource> Drop for GraceHashJoinState<'a, S> {
     fn drop(&mut self) {
-        if let Some(budget) = self.memory_budget_ref {
+        if let Some(budget) = self.memory_budget {
             if self.last_reported_bytes > 0 {
                 budget.release(Pool::Query, self.last_reported_bytes);
             }
@@ -706,7 +706,7 @@ impl<'a, S: RowSource> Drop for GraceHashJoinState<'a, S> {
 
 impl<'a, S: RowSource> Drop for StreamingHashJoinState<'a, S> {
     fn drop(&mut self) {
-        if let Some(budget) = self.memory_budget_ref {
+        if let Some(budget) = self.memory_budget {
             if self.last_reported_bytes > 0 {
                 budget.release(Pool::Query, self.last_reported_bytes);
             }
