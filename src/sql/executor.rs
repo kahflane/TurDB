@@ -70,6 +70,7 @@
 //! - Point lookup: < 1µs (cached)
 //! - Join performance: Depends on algorithm selection
 
+use crate::memory::{Pool, ROW_SIZE_ESTIMATE, SYNC_INTERVAL};
 use crate::mvcc::RecordHeader;
 use crate::sql::adapter::BTreeCursorAdapter;
 use crate::sql::ast::JoinType;
@@ -1874,6 +1875,14 @@ impl<'a, S: RowSource> Executor<'a> for DynamicExecutor<'a, S> {
                     state.right.open()?;
                     state.right_rows.clear();
                     while let Some(row) = state.right.next()? {
+                        if let Some(budget) = state.memory_budget {
+                            let next_size = (state.right_rows.len() + 1) * ROW_SIZE_ESTIMATE;
+                            if next_size > state.last_reported_bytes + SYNC_INTERVAL {
+                                let delta = next_size - state.last_reported_bytes;
+                                budget.allocate(Pool::Query, delta)?;
+                                state.last_reported_bytes = next_size;
+                            }
+                        }
                         let owned: Vec<Value<'static>> =
                             row.values.iter().map(clone_value_owned).collect();
                         state.right_rows.push(owned);
@@ -1897,14 +1906,14 @@ impl<'a, S: RowSource> Executor<'a> for DynamicExecutor<'a, S> {
                         state.left_spiller = Some(PartitionSpiller::new(
                             spill_dir.clone(),
                             state.num_partitions,
-                            state.memory_budget,
+                            state.spill_memory_limit,
                             state.query_id,
                             'L',
                         )?);
                         state.right_spiller = Some(PartitionSpiller::new(
                             spill_dir,
                             state.num_partitions,
-                            state.memory_budget,
+                            state.spill_memory_limit,
                             state.query_id,
                             'R',
                         )?);
@@ -1937,23 +1946,42 @@ impl<'a, S: RowSource> Executor<'a> for DynamicExecutor<'a, S> {
                         }
                         state.right.close()?;
                     } else {
+                        let mut total_rows = 0usize;
                         state.left.open()?;
                         while let Some(row) = state.left.next()? {
+                            if let Some(budget) = state.memory_budget {
+                                let next_size = (total_rows + 1) * ROW_SIZE_ESTIMATE;
+                                if next_size > state.last_reported_bytes + SYNC_INTERVAL {
+                                    let delta = next_size - state.last_reported_bytes;
+                                    budget.allocate(Pool::Query, delta)?;
+                                    state.last_reported_bytes = next_size;
+                                }
+                            }
                             let hash = hash_keys(&row, &state.left_key_indices);
                             let partition = (hash as usize) % state.num_partitions;
                             let owned: Vec<Value<'static>> =
                                 row.values.iter().map(clone_value_owned).collect();
                             state.left_partitions[partition].push(owned);
+                            total_rows += 1;
                         }
                         state.left.close()?;
 
                         state.right.open()?;
                         while let Some(row) = state.right.next()? {
+                            if let Some(budget) = state.memory_budget {
+                                let next_size = (total_rows + 1) * ROW_SIZE_ESTIMATE;
+                                if next_size > state.last_reported_bytes + SYNC_INTERVAL {
+                                    let delta = next_size - state.last_reported_bytes;
+                                    budget.allocate(Pool::Query, delta)?;
+                                    state.last_reported_bytes = next_size;
+                                }
+                            }
                             let hash = hash_keys(&row, &state.right_key_indices);
                             let partition = (hash as usize) % state.num_partitions;
                             let owned: Vec<Value<'static>> =
                                 row.values.iter().map(clone_value_owned).collect();
                             state.right_partitions[partition].push(owned);
+                            total_rows += 1;
                         }
                         state.right.close()?;
 
@@ -2008,6 +2036,14 @@ impl<'a, S: RowSource> Executor<'a> for DynamicExecutor<'a, S> {
 
                     state.build.open()?;
                     while let Some(row) = state.build.next()? {
+                        if let Some(budget) = state.memory_budget {
+                            let next_size = (state.build_rows.len() + 1) * ROW_SIZE_ESTIMATE;
+                            if next_size > state.last_reported_bytes + SYNC_INTERVAL {
+                                let delta = next_size - state.last_reported_bytes;
+                                budget.allocate(Pool::Query, delta)?;
+                                state.last_reported_bytes = next_size;
+                            }
+                        }
                         let hash = hash_keys(&row, &state.build_key_indices);
                         let owned: Vec<Value<'static>> =
                             row.values.iter().map(clone_value_owned).collect();
@@ -2159,6 +2195,14 @@ impl<'a, S: RowSource> Executor<'a> for DynamicExecutor<'a, S> {
             DynamicExecutor::Sort(state) => {
                 if !state.sorted {
                     while let Some(row) = state.child.next()? {
+                        if let Some(budget) = state.memory_budget {
+                            let next_size = (state.rows.len() + 1) * ROW_SIZE_ESTIMATE;
+                            if next_size > state.last_reported_bytes + SYNC_INTERVAL {
+                                let delta = next_size - state.last_reported_bytes;
+                                budget.allocate(Pool::Query, delta)?;
+                                state.last_reported_bytes = next_size;
+                            }
+                        }
                         let owned: Vec<Value<'static>> =
                             row.values.iter().map(clone_value_owned).collect();
                         state.rows.push(owned);
@@ -2202,7 +2246,16 @@ impl<'a, S: RowSource> Executor<'a> for DynamicExecutor<'a, S> {
                             row.values.iter().map(clone_value_owned).collect();
 
                         if state.heap.len() < heap_size {
+                            if let Some(budget) = state.memory_budget {
+                                let next_size = (state.heap.len() + 1) * ROW_SIZE_ESTIMATE;
+                                if next_size > state.last_reported_bytes + SYNC_INTERVAL {
+                                    let delta = next_size - state.last_reported_bytes;
+                                    budget.allocate(Pool::Query, delta)?;
+                                    state.last_reported_bytes = next_size;
+                                }
+                            }
                             state.heap.push(owned);
+
                             if state.heap.len() == heap_size {
                                 state.heap.sort_by(|a, b| {
                                     for key in sort_keys.iter() {
@@ -2819,6 +2872,18 @@ impl<'a, S: RowSource> Executor<'a> for DynamicExecutor<'a, S> {
                                 (key, values)
                             };
 
+                        let is_new_group = !state.groups.contains_key(&group_key);
+                        if is_new_group {
+                            if let Some(budget) = state.memory_budget {
+                                let next_size = (state.groups.len() + 1) * 256;
+                                if next_size > state.last_reported_bytes + SYNC_INTERVAL {
+                                    let delta = next_size - state.last_reported_bytes;
+                                    budget.allocate(Pool::Query, delta)?;
+                                    state.last_reported_bytes = next_size;
+                                }
+                            }
+                        }
+
                         let entry = state.groups.entry(group_key).or_insert_with(|| {
                             let initial_states: Vec<AggregateState> = state
                                 .aggregates
@@ -2860,6 +2925,14 @@ impl<'a, S: RowSource> Executor<'a> for DynamicExecutor<'a, S> {
             DynamicExecutor::Window(state) => {
                 if !state.computed {
                     while let Some(row) = state.child.next()? {
+                        if let Some(budget) = state.memory_budget {
+                            let next_size = (state.rows.len() + 1) * ROW_SIZE_ESTIMATE;
+                            if next_size > state.last_reported_bytes + SYNC_INTERVAL {
+                                let delta = next_size - state.last_reported_bytes;
+                                budget.allocate(Pool::Query, delta)?;
+                                state.last_reported_bytes = next_size;
+                            }
+                        }
                         let owned: Vec<Value<'static>> =
                             row.values.iter().map(clone_value_owned).collect();
                         state.rows.push(owned);

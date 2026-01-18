@@ -1,3 +1,4 @@
+use crate::memory::{MemoryBudget, Pool};
 use crate::sql::adapter::BTreeCursorAdapter;
 use crate::sql::ast::JoinType;
 use crate::sql::executor::{AggregateFunction, DynamicExecutor, ExecutorRow, RowSource, SortKey};
@@ -7,6 +8,7 @@ use crate::types::Value;
 use bumpalo::Bump;
 use smallvec::SmallVec;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 pub struct LimitState<'a, S: RowSource> {
     pub child: Box<DynamicExecutor<'a, S>>,
@@ -23,6 +25,8 @@ pub struct SortState<'a, S: RowSource> {
     pub rows: Vec<Vec<Value<'static>>>,
     pub iter_idx: usize,
     pub sorted: bool,
+    pub memory_budget: Option<&'a Arc<MemoryBudget>>,
+    pub last_reported_bytes: usize,
 }
 
 pub struct TopKState<'a, S: RowSource> {
@@ -35,6 +39,8 @@ pub struct TopKState<'a, S: RowSource> {
     pub result: Vec<Vec<Value<'static>>>,
     pub iter_idx: usize,
     pub computed: bool,
+    pub memory_budget: Option<&'a Arc<MemoryBudget>>,
+    pub last_reported_bytes: usize,
 }
 
 pub struct HashAggregateState<'a, S: RowSource> {
@@ -46,6 +52,8 @@ pub struct HashAggregateState<'a, S: RowSource> {
     pub groups: hashbrown::HashMap<Vec<u8>, (Vec<Value<'static>>, Vec<AggregateState>)>,
     pub result_iter: Option<std::vec::IntoIter<(Vec<Value<'static>>, Vec<AggregateState>)>>,
     pub computed: bool,
+    pub memory_budget: Option<&'a Arc<MemoryBudget>>,
+    pub last_reported_bytes: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -189,6 +197,8 @@ pub struct NestedLoopJoinState<'a, S: RowSource> {
     pub unmatched_right_idx: usize,
     pub left_col_count: usize,
     pub right_col_count: usize,
+    pub memory_budget: Option<&'a Arc<MemoryBudget>>,
+    pub last_reported_bytes: usize,
 }
 
 pub struct GraceHashJoinState<'a, S: RowSource> {
@@ -219,10 +229,12 @@ pub struct GraceHashJoinState<'a, S: RowSource> {
     pub left_spiller: Option<PartitionSpiller>,
     pub right_spiller: Option<PartitionSpiller>,
     pub spill_dir: Option<PathBuf>,
-    pub memory_budget: usize,
+    pub spill_memory_limit: usize,
     pub query_id: u64,
     pub probe_row_buf: SmallVec<[Value<'static>; 16]>,
     pub build_row_buf: SmallVec<[Value<'static>; 16]>,
+    pub memory_budget: Option<&'a Arc<MemoryBudget>>,
+    pub last_reported_bytes: usize,
 }
 
 pub struct StreamingHashJoinState<'a, S: RowSource> {
@@ -245,6 +257,8 @@ pub struct StreamingHashJoinState<'a, S: RowSource> {
     pub probe_col_count: usize,
     pub built: bool,
     pub swapped: bool,
+    pub memory_budget: Option<&'a Arc<MemoryBudget>>,
+    pub last_reported_bytes: usize,
 }
 
 pub struct HashSemiJoinState<'a, S: RowSource> {
@@ -304,6 +318,8 @@ pub struct WindowState<'a, S: RowSource> {
     pub iter_idx: usize,
     pub computed: bool,
     pub column_map: Vec<(String, usize)>,
+    pub memory_budget: Option<&'a Arc<MemoryBudget>>,
+    pub last_reported_bytes: usize,
 }
 
 impl<'a, S: RowSource> WindowState<'a, S> {
@@ -311,6 +327,7 @@ impl<'a, S: RowSource> WindowState<'a, S> {
         child: Box<DynamicExecutor<'a, S>>,
         window_functions: &'a [WindowFunctionDef<'a>],
         arena: &'a Bump,
+        memory_budget: Option<&'a Arc<MemoryBudget>>,
     ) -> Self {
         Self {
             child,
@@ -321,6 +338,8 @@ impl<'a, S: RowSource> WindowState<'a, S> {
             iter_idx: 0,
             computed: false,
             column_map: Vec::new(),
+            memory_budget,
+            last_reported_bytes: 0,
         }
     }
 
@@ -329,6 +348,7 @@ impl<'a, S: RowSource> WindowState<'a, S> {
         window_functions: &'a [WindowFunctionDef<'a>],
         arena: &'a Bump,
         column_map: Vec<(String, usize)>,
+        memory_budget: Option<&'a Arc<MemoryBudget>>,
     ) -> Self {
         Self {
             child,
@@ -339,6 +359,8 @@ impl<'a, S: RowSource> WindowState<'a, S> {
             iter_idx: 0,
             computed: false,
             column_map,
+            memory_budget,
+            last_reported_bytes: 0,
         }
     }
 
@@ -629,5 +651,75 @@ impl<'a, S: RowSource> WindowState<'a, S> {
             .iter()
             .find(|(name, _)| name.eq_ignore_ascii_case(col_name))
             .map(|(_, idx)| *idx)
+    }
+}
+
+impl<'a, S: RowSource> Drop for SortState<'a, S> {
+    fn drop(&mut self) {
+        if let Some(budget) = self.memory_budget {
+            if self.last_reported_bytes > 0 {
+                budget.release(Pool::Query, self.last_reported_bytes);
+            }
+        }
+    }
+}
+
+impl<'a, S: RowSource> Drop for TopKState<'a, S> {
+    fn drop(&mut self) {
+        if let Some(budget) = self.memory_budget {
+            if self.last_reported_bytes > 0 {
+                budget.release(Pool::Query, self.last_reported_bytes);
+            }
+        }
+    }
+}
+
+impl<'a, S: RowSource> Drop for HashAggregateState<'a, S> {
+    fn drop(&mut self) {
+        if let Some(budget) = self.memory_budget {
+            if self.last_reported_bytes > 0 {
+                budget.release(Pool::Query, self.last_reported_bytes);
+            }
+        }
+    }
+}
+
+impl<'a, S: RowSource> Drop for NestedLoopJoinState<'a, S> {
+    fn drop(&mut self) {
+        if let Some(budget) = self.memory_budget {
+            if self.last_reported_bytes > 0 {
+                budget.release(Pool::Query, self.last_reported_bytes);
+            }
+        }
+    }
+}
+
+impl<'a, S: RowSource> Drop for GraceHashJoinState<'a, S> {
+    fn drop(&mut self) {
+        if let Some(budget) = self.memory_budget {
+            if self.last_reported_bytes > 0 {
+                budget.release(Pool::Query, self.last_reported_bytes);
+            }
+        }
+    }
+}
+
+impl<'a, S: RowSource> Drop for StreamingHashJoinState<'a, S> {
+    fn drop(&mut self) {
+        if let Some(budget) = self.memory_budget {
+            if self.last_reported_bytes > 0 {
+                budget.release(Pool::Query, self.last_reported_bytes);
+            }
+        }
+    }
+}
+
+impl<'a, S: RowSource> Drop for WindowState<'a, S> {
+    fn drop(&mut self) {
+        if let Some(budget) = self.memory_budget {
+            if self.last_reported_bytes > 0 {
+                budget.release(Pool::Query, self.last_reported_bytes);
+            }
+        }
     }
 }

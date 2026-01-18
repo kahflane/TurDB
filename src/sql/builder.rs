@@ -102,14 +102,15 @@ impl<'a> ExecutorBuilder<'a> {
                 } else {
                     self.compute_input_column_map(filter.input)
                 };
-                let predicate = if !self.ctx.scalar_subquery_results.is_empty() {
-                    CompiledPredicate::with_scalar_subqueries(
-                        filter.predicate,
-                        effective_column_map,
-                        self.ctx.scalar_subquery_results.clone(),
-                    )
-                } else {
-                    CompiledPredicate::new(filter.predicate, effective_column_map)
+                let predicate = match self.ctx.scalar_subquery_results {
+                    Some(results) if !results.is_empty() => {
+                        CompiledPredicate::with_scalar_subqueries(
+                            filter.predicate,
+                            effective_column_map,
+                            results.clone(),
+                        )
+                    }
+                    _ => CompiledPredicate::new(filter.predicate, effective_column_map),
                 };
                 Ok(DynamicExecutor::Filter(Box::new(child), predicate))
             }
@@ -292,6 +293,8 @@ impl<'a> ExecutorBuilder<'a> {
                             rows: Vec::new(),
                             iter_idx: 0,
                             sorted: false,
+                            memory_budget: self.ctx.memory_budget,
+                            last_reported_bytes: 0,
                         });
 
                         let projections: Vec<usize> = project
@@ -338,6 +341,8 @@ impl<'a> ExecutorBuilder<'a> {
                     rows: Vec::new(),
                     iter_idx: 0,
                     sorted: false,
+                    memory_budget: self.ctx.memory_budget,
+                    last_reported_bytes: 0,
                 }))
             }
             PhysicalOperator::TopKExec(topk) => {
@@ -368,6 +373,8 @@ impl<'a> ExecutorBuilder<'a> {
                     result: Vec::new(),
                     iter_idx: 0,
                     computed: false,
+                    memory_budget: self.ctx.memory_budget,
+                    last_reported_bytes: 0,
                 }))
             }
             PhysicalOperator::IndexScan(_) => Ok(DynamicExecutor::TableScan(
@@ -450,6 +457,8 @@ impl<'a> ExecutorBuilder<'a> {
                     groups: hashbrown::HashMap::new(),
                     result_iter: None,
                     computed: false,
+                    memory_budget: self.ctx.memory_budget,
+                    last_reported_bytes: 0,
                 }))
             }
             PhysicalOperator::SortedAggregate(agg) => {
@@ -526,6 +535,8 @@ impl<'a> ExecutorBuilder<'a> {
                     groups: hashbrown::HashMap::new(),
                     result_iter: None,
                     computed: false,
+                    memory_budget: self.ctx.memory_budget,
+                    last_reported_bytes: 0,
                 }))
             }
             PhysicalOperator::NestedLoopJoin(_) => {
@@ -572,6 +583,7 @@ impl<'a> ExecutorBuilder<'a> {
                     window.window_functions,
                     self.ctx.arena,
                     column_map.to_vec(),
+                    self.ctx.memory_budget,
                 )))
             }
             PhysicalOperator::SetOpExec(_) => {
@@ -629,6 +641,8 @@ impl<'a> ExecutorBuilder<'a> {
             unmatched_right_idx: 0,
             left_col_count,
             right_col_count,
+            memory_budget: self.ctx.memory_budget,
+            last_reported_bytes: 0,
         }
     }
 
@@ -675,10 +689,12 @@ impl<'a> ExecutorBuilder<'a> {
             left_spiller: None,
             right_spiller: None,
             spill_dir,
-            memory_budget,
+            spill_memory_limit: memory_budget,
             query_id,
             probe_row_buf: smallvec::SmallVec::new(),
             build_row_buf: smallvec::SmallVec::new(),
+            memory_budget: self.ctx.memory_budget,
+            last_reported_bytes: 0,
         }
     }
 
@@ -737,6 +753,8 @@ impl<'a> ExecutorBuilder<'a> {
             groups: hashbrown::HashMap::new(),
             result_iter: None,
             computed: false,
+            memory_budget: self.ctx.memory_budget,
+            last_reported_bytes: 0,
         }
     }
 

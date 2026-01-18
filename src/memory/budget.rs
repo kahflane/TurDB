@@ -28,6 +28,25 @@
 //! - Stack allocations
 //! - Small temporary buffers (< 1KB)
 //! - Static data structures
+//!
+//! ## Query Memory Estimates
+//!
+//! Query operators use conservative estimates for memory tracking since exact
+//! allocation sizes would require traversing all stored values. The estimates
+//! are designed to slightly over-count rather than under-count to prevent OOM:
+//!
+//! | Context | Estimate | Rationale |
+//! |---------|----------|-----------|
+//! | Row materialization | 128 bytes/row | Covers typical row with 8-10 columns |
+//! | Hash aggregate entry | 256 bytes/entry | Includes key, group values, and aggregate states |
+//! | Hash table bucket | 24 bytes/entry | Hash key (8) + indices vec overhead (16) |
+//!
+//! These estimates may significantly over-count for tables with few small columns
+//! or under-count for tables with many large text/blob columns. The periodic sync
+//! pattern (every 64KB) amortizes the overhead of atomic operations.
+//!
+//! Actual memory usage may differ from tracked amounts. The goal is preventing
+//! runaway queries from exhausting system memory, not precise accounting.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::OnceLock;
@@ -346,6 +365,58 @@ impl MemoryBudget {
 impl Default for MemoryBudget {
     fn default() -> Self {
         Self::auto_detect()
+    }
+}
+
+pub const ROW_SIZE_ESTIMATE: usize = 128;
+pub const HASH_ENTRY_SIZE: usize = 24;
+pub const HASH_AGGREGATE_ENTRY_SIZE: usize = 256;
+pub const SYNC_INTERVAL: usize = 64 * 1024;
+
+pub struct PeriodicBudgetTracker<'a> {
+    budget: &'a MemoryBudget,
+    pool: Pool,
+    total_bytes: usize,
+    last_reported_bytes: usize,
+}
+
+impl<'a> PeriodicBudgetTracker<'a> {
+    pub fn new(budget: &'a MemoryBudget, pool: Pool) -> Self {
+        Self {
+            budget,
+            pool,
+            total_bytes: 0,
+            last_reported_bytes: 0,
+        }
+    }
+
+    pub fn track(&mut self, bytes: usize) -> Result<()> {
+        self.total_bytes += bytes;
+        if self.total_bytes > self.last_reported_bytes + SYNC_INTERVAL {
+            let delta = self.total_bytes - self.last_reported_bytes;
+            self.budget.allocate(self.pool, delta)?;
+            self.last_reported_bytes = self.total_bytes;
+        }
+        Ok(())
+    }
+
+    pub fn pre_allocate(&mut self, bytes: usize) -> Result<()> {
+        self.budget.allocate(self.pool, bytes)?;
+        self.total_bytes += bytes;
+        self.last_reported_bytes = self.total_bytes;
+        Ok(())
+    }
+
+    pub fn tracked_bytes(&self) -> usize {
+        self.last_reported_bytes
+    }
+}
+
+impl Drop for PeriodicBudgetTracker<'_> {
+    fn drop(&mut self) {
+        if self.last_reported_bytes > 0 {
+            self.budget.release(self.pool, self.last_reported_bytes);
+        }
     }
 }
 
