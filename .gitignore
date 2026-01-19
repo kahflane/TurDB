@@ -30,3 +30,6 @@ scripts/prepare_qdrant_comparison.py
 
 docs/ignore/
 docs/plans/
+
+# Local test files (not tracked, not run by cargo test)
+tests_local/

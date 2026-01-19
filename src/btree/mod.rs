@@ -105,5 +105,5 @@ pub use leaf::{
 pub use simd_scan::{find_key_simd, prefetch_slots, BatchSlotIterator, SlotBatch};
 pub use tree::{
     get_fastpath_fail_stats, get_fastpath_stats, get_slowpath_stats, reset_fastpath_stats, BTree,
-    BTreeReader, Cursor, InsertResult, SearchHandle, MAX_TREE_DEPTH,
+    BTreeReader, Cursor, InsertResult, InsertUniqueResult, SearchHandle, MAX_TREE_DEPTH,
 };

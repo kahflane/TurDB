@@ -199,6 +199,12 @@ pub enum InsertResult {
     Split { separator: Vec<u8>, new_page: u32 },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InsertUniqueResult {
+    Inserted,
+    Duplicate(SearchHandle),
+}
+
 pub struct Cursor<'a, S: Storage + ?Sized> {
     storage: &'a S,
     root_page: u32,
@@ -705,6 +711,95 @@ impl<'a, S: Storage> BTree<'a, S> {
         }
 
         Ok(())
+    }
+
+    /// Inserts a key-value pair only if the key does not already exist.
+    /// Returns `InsertUniqueResult::Inserted` if the insert succeeded,
+    /// or `InsertUniqueResult::Duplicate(handle)` if the key already exists.
+    ///
+    /// This method combines search and insert into a single tree traversal,
+    /// eliminating the need for a separate search() call before insert().
+    /// This is critical for unique constraint checking in INSERT operations.
+    pub fn insert_if_not_exists(
+        &mut self,
+        key: &[u8],
+        value: &[u8],
+    ) -> Result<InsertUniqueResult> {
+        let mut path: PathStack = SmallVec::new();
+        let mut current_page = self.root_page;
+
+        loop {
+            let page_data = self.storage.page(current_page)?;
+            let header = PageHeader::from_bytes(page_data)?;
+
+            match header.page_type() {
+                PageType::BTreeLeaf => break,
+                PageType::BTreeInterior => {
+                    let interior = InteriorNode::from_page(page_data)?;
+                    let (child_page, _) = interior.find_child(key)?;
+                    path.push(current_page);
+                    current_page = child_page;
+                }
+                _ => bail!(
+                    "unexpected page type {:?} during insert_if_not_exists at page {}",
+                    header.page_type(),
+                    current_page
+                ),
+            }
+        }
+
+        let leaf_page_no = current_page;
+        let page_data = self.storage.page(leaf_page_no)?;
+        let leaf = LeafNode::from_page(page_data)?;
+
+        match leaf.find_key(key) {
+            SearchResult::Found(cell_index) => {
+                Ok(InsertUniqueResult::Duplicate(SearchHandle {
+                    page_no: leaf_page_no,
+                    cell_index,
+                }))
+            }
+            SearchResult::NotFound(insert_pos) => {
+                let result =
+                    self.insert_into_leaf_at_position(leaf_page_no, key, value, insert_pos)?;
+                self.update_rightmost_hint(leaf_page_no);
+
+                if let InsertResult::Split {
+                    separator,
+                    new_page,
+                } = result
+                {
+                    self.propagate_split(path, &separator, leaf_page_no, new_page)?;
+                    self.update_rightmost_hint(new_page);
+                }
+
+                Ok(InsertUniqueResult::Inserted)
+            }
+        }
+    }
+
+    /// Insert into leaf at a known position (from find_key NotFound result).
+    /// This avoids the second find_key call that insert_cell() would do.
+    fn insert_into_leaf_at_position(
+        &mut self,
+        page_no: u32,
+        key: &[u8],
+        value: &[u8],
+        insert_pos: usize,
+    ) -> Result<InsertResult> {
+        let page_data = self.storage.page_mut(page_no)?;
+        let mut leaf = LeafNodeMut::from_page(page_data)?;
+
+        let value_len_size = varint_len(value.len() as u64);
+        let cell_size = key.len() + value_len_size + value.len();
+        let space_needed = cell_size + SLOT_SIZE;
+
+        if leaf.free_space() as usize >= space_needed {
+            leaf.insert_cell_at(key, value, insert_pos)?;
+            return Ok(InsertResult::Ok);
+        }
+
+        self.split_leaf(page_no, key, value)
     }
 
     fn try_fastpath_insert(&mut self, hint_page: u32, key: &[u8], value: &[u8]) -> Result<bool> {
@@ -1563,6 +1658,76 @@ mod tests {
         // Let's try to insert a key that is extremely close to the separator.
 
         // Use keys that match prefix?
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_insert_if_not_exists_new_key() -> Result<()> {
+        let temp_file = NamedTempFile::new()?;
+        let mut storage = MmapStorage::create(temp_file.path(), 2)?;
+        let mut btree = BTree::create(&mut storage, 0)?;
+
+        let result = btree.insert_if_not_exists(b"key1", b"value1")?;
+        assert_eq!(result, InsertUniqueResult::Inserted);
+
+        let value = btree.get(b"key1")?;
+        assert_eq!(value, Some(&b"value1"[..]));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_insert_if_not_exists_duplicate_key() -> Result<()> {
+        let temp_file = NamedTempFile::new()?;
+        let mut storage = MmapStorage::create(temp_file.path(), 2)?;
+        let mut btree = BTree::create(&mut storage, 0)?;
+
+        btree.insert(b"key1", b"value1")?;
+
+        let result = btree.insert_if_not_exists(b"key1", b"value2")?;
+
+        match result {
+            InsertUniqueResult::Duplicate(handle) => {
+                let existing_value = btree.get_value(&handle)?;
+                assert_eq!(existing_value, b"value1");
+            }
+            InsertUniqueResult::Inserted => {
+                panic!("Expected Duplicate, got Inserted");
+            }
+        }
+
+        let value = btree.get(b"key1")?;
+        assert_eq!(value, Some(&b"value1"[..]));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_insert_if_not_exists_multiple_keys() -> Result<()> {
+        let temp_file = NamedTempFile::new()?;
+        let mut storage = MmapStorage::create(temp_file.path(), 2)?;
+        let mut btree = BTree::create(&mut storage, 0)?;
+
+        for i in 0..100u32 {
+            let key = format!("key{:04}", i);
+            let value = format!("value{}", i);
+            let result = btree.insert_if_not_exists(key.as_bytes(), value.as_bytes())?;
+            assert_eq!(result, InsertUniqueResult::Inserted);
+        }
+
+        for i in 0..100u32 {
+            let key = format!("key{:04}", i);
+            let result = btree.insert_if_not_exists(key.as_bytes(), b"new_value")?;
+            assert!(matches!(result, InsertUniqueResult::Duplicate(_)));
+        }
+
+        for i in 100..200u32 {
+            let key = format!("key{:04}", i);
+            let value = format!("value{}", i);
+            let result = btree.insert_if_not_exists(key.as_bytes(), value.as_bytes())?;
+            assert_eq!(result, InsertUniqueResult::Inserted);
+        }
 
         Ok(())
     }
