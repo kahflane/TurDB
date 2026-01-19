@@ -55,7 +55,7 @@ use crate::schema::ColumnDef as SchemaColumnDef;
 use crate::storage::{IndexFileHeader, TableFileHeader, DEFAULT_SCHEMA};
 use crate::types::{create_record_schema, OwnedValue};
 use bumpalo::Bump;
-use eyre::{bail, Result, WrapErr};
+use eyre::{bail, ensure, Result, WrapErr};
 
 impl Database {
     pub(crate) fn execute_create_table(
@@ -254,15 +254,7 @@ impl Database {
                 crate::schema::table::IndexType::BTree,
             );
 
-            let mut catalog_guard = self.shared.catalog.write();
-            let catalog = catalog_guard.as_mut().unwrap();
-            if let Some(schema) = catalog.get_schema_mut(schema_name) {
-                if let Some(table) = schema.get_table(table_name) {
-                    let table_with_index = table.clone().with_index(index_def);
-                    schema.remove_table(table_name);
-                    schema.add_table(table_with_index);
-                }
-            }
+            self.add_index_to_catalog(schema_name, table_name, index_def);
         }
 
         for table_constraint in create.constraints {
@@ -271,7 +263,7 @@ impl Database {
             match table_constraint {
                 TableConstraint::PrimaryKey { name, columns } | TableConstraint::Unique { name, columns } => {
                     let is_pk = matches!(table_constraint, TableConstraint::PrimaryKey { .. });
-                    let col_names: Vec<String> = columns.iter().map(|c| c.to_string()).collect();
+                    let col_names: Vec<&str> = columns.to_vec();
                     let col_indices: Vec<usize> = columns
                         .iter()
                         .filter_map(|col_name| {
@@ -279,9 +271,12 @@ impl Database {
                         })
                         .collect();
 
-                    if col_indices.len() != columns.len() {
-                        continue;
-                    }
+                    ensure!(
+                        col_indices.len() == columns.len(),
+                        "table-level {} constraint references unknown column in table '{}'",
+                        if is_pk { "PRIMARY KEY" } else { "UNIQUE" },
+                        table_name
+                    );
 
                     let index_name = if let Some(n) = name {
                         n.to_string()
@@ -315,15 +310,7 @@ impl Database {
                         crate::schema::table::IndexType::BTree,
                     );
 
-                    let mut catalog_guard = self.shared.catalog.write();
-                    let catalog = catalog_guard.as_mut().unwrap();
-                    if let Some(schema) = catalog.get_schema_mut(schema_name) {
-                        if let Some(table) = schema.get_table(table_name) {
-                            let table_with_index = table.clone().with_index(index_def);
-                            schema.remove_table(table_name);
-                            schema.add_table(table_with_index);
-                        }
-                    }
+                    self.add_index_to_catalog(schema_name, table_name, index_def);
                 }
                 TableConstraint::ForeignKey { .. } | TableConstraint::Check { .. } => {
                 }
@@ -1137,5 +1124,22 @@ impl Database {
         self.save_catalog()?;
 
         Ok(ExecuteResult::DropSchema { dropped: true })
+    }
+
+    fn add_index_to_catalog(
+        &self,
+        schema_name: &str,
+        table_name: &str,
+        index_def: crate::schema::table::IndexDef,
+    ) {
+        let mut catalog_guard = self.shared.catalog.write();
+        let catalog = catalog_guard.as_mut().unwrap();
+        if let Some(schema) = catalog.get_schema_mut(schema_name) {
+            if let Some(table) = schema.get_table(table_name) {
+                let table_with_index = table.clone().with_index(index_def);
+                schema.remove_table(table_name);
+                schema.add_table(table_with_index);
+            }
+        }
     }
 }
