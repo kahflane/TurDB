@@ -264,60 +264,44 @@ impl Database {
 
         let mut fk_table_columns: hashbrown::HashMap<String, Vec<crate::schema::ColumnDef>> =
             hashbrown::HashMap::new();
-        #[allow(clippy::type_complexity)]
-        let fk_constraints_with_cols: Vec<(
-            usize,
-            String,
-            String,
-            Option<String>,
-            usize,
-            Vec<crate::schema::ColumnDef>,
-        )> = columns
-            .iter()
-            .enumerate()
-            .flat_map(|(idx, col)| {
-                col.constraints().iter().filter_map(move |c| {
-                    if let Constraint::ForeignKey { table, column, .. } = c {
-                        let ref_table = catalog.resolve_table(table).ok()?;
+        let mut fk_constraints: Vec<(usize, String, String, Option<String>, usize)> = Vec::new();
+
+        for (idx, col) in columns.iter().enumerate() {
+            for c in col.constraints() {
+                if let Constraint::ForeignKey { table, column, .. } = c {
+                    if let Ok(ref_table) = catalog.resolve_table(table) {
                         let ref_columns = ref_table.columns();
-                        let ref_col_idx = ref_columns
+                        if let Some(ref_col_idx) = ref_columns
                             .iter()
-                            .position(|c| c.name().eq_ignore_ascii_case(column))?;
-                        let index_name = ref_table
-                            .indexes()
-                            .iter()
-                            .find(|idx_def| {
-                                idx_def.columns().next().is_some_and(|first_col| {
-                                    first_col.eq_ignore_ascii_case(column)
+                            .position(|c| c.name().eq_ignore_ascii_case(column))
+                        {
+                            fk_table_columns
+                                .entry(table.clone())
+                                .or_insert_with(|| ref_columns.to_vec());
+
+                            let index_name = ref_table
+                                .indexes()
+                                .iter()
+                                .find(|idx_def| {
+                                    idx_def
+                                        .columns()
+                                        .next()
+                                        .is_some_and(|first_col| first_col.eq_ignore_ascii_case(column))
                                 })
-                            })
-                            .map(|idx_def| idx_def.name().to_string());
-                        Some((
-                            idx,
-                            table.clone(),
-                            column.clone(),
-                            index_name,
-                            ref_col_idx,
-                            ref_columns.to_vec(),
-                        ))
-                    } else {
-                        None
+                                .map(|idx_def| idx_def.name().to_string());
+
+                            fk_constraints.push((
+                                idx,
+                                table.clone(),
+                                column.clone(),
+                                index_name,
+                                ref_col_idx,
+                            ));
+                        }
                     }
-                })
-            })
-            .collect();
-        for (_, fk_table, _, _, _, ref_cols) in &fk_constraints_with_cols {
-            if !fk_table_columns.contains_key(fk_table) {
-                fk_table_columns.insert(fk_table.clone(), ref_cols.clone());
+                }
             }
         }
-        let fk_constraints: Vec<(usize, String, String, Option<String>, usize)> =
-            fk_constraints_with_cols
-                .into_iter()
-                .map(|(idx, table, col, idx_name, ref_col_idx, _)| {
-                    (idx, table, col, idx_name, ref_col_idx)
-                })
-                .collect();
 
         let schema = create_record_schema(&columns);
 
