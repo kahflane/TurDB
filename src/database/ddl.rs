@@ -265,6 +265,71 @@ impl Database {
             }
         }
 
+        for table_constraint in create.constraints {
+            use crate::sql::ast::TableConstraint;
+
+            match table_constraint {
+                TableConstraint::PrimaryKey { name, columns } | TableConstraint::Unique { name, columns } => {
+                    let is_pk = matches!(table_constraint, TableConstraint::PrimaryKey { .. });
+                    let col_names: Vec<String> = columns.iter().map(|c| c.to_string()).collect();
+                    let col_indices: Vec<usize> = columns
+                        .iter()
+                        .filter_map(|col_name| {
+                            create.columns.iter().position(|c| c.name.eq_ignore_ascii_case(col_name))
+                        })
+                        .collect();
+
+                    if col_indices.len() != columns.len() {
+                        continue;
+                    }
+
+                    let index_name = if let Some(n) = name {
+                        n.to_string()
+                    } else if is_pk {
+                        format!("{}_cpkey", table_name)
+                    } else {
+                        format!("{}_{}_key", table_name, col_names.join("_"))
+                    };
+
+                    let index_id = self.allocate_index_id();
+                    file_manager.create_index(
+                        schema_name,
+                        table_name,
+                        &index_name,
+                        index_id,
+                        table_id,
+                        col_indices.len() as u32,
+                        true,
+                    )?;
+
+                    let index_storage_arc =
+                        file_manager.index_data_mut(schema_name, table_name, &index_name)?;
+                    let mut index_storage = index_storage_arc.write();
+                    index_storage.grow(2)?;
+                    crate::btree::BTree::create(&mut *index_storage, 1)?;
+
+                    let index_def = crate::schema::table::IndexDef::new(
+                        index_name.clone(),
+                        col_names,
+                        true,
+                        crate::schema::table::IndexType::BTree,
+                    );
+
+                    let mut catalog_guard = self.shared.catalog.write();
+                    let catalog = catalog_guard.as_mut().unwrap();
+                    if let Some(schema) = catalog.get_schema_mut(schema_name) {
+                        if let Some(table) = schema.get_table(table_name) {
+                            let table_with_index = table.clone().with_index(index_def);
+                            schema.remove_table(table_name);
+                            schema.add_table(table_with_index);
+                        }
+                    }
+                }
+                TableConstraint::ForeignKey { .. } | TableConstraint::Check { .. } => {
+                }
+            }
+        }
+
         self.save_catalog()?;
         self.save_meta()?;
 
