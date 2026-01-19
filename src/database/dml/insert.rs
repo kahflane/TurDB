@@ -262,30 +262,62 @@ impl Database {
             })
             .collect();
 
-        let fk_constraints: Vec<(usize, String, String, Option<String>)> = columns
+        let mut fk_table_columns: hashbrown::HashMap<String, Vec<crate::schema::ColumnDef>> =
+            hashbrown::HashMap::new();
+        #[allow(clippy::type_complexity)]
+        let fk_constraints_with_cols: Vec<(
+            usize,
+            String,
+            String,
+            Option<String>,
+            usize,
+            Vec<crate::schema::ColumnDef>,
+        )> = columns
             .iter()
             .enumerate()
             .flat_map(|(idx, col)| {
                 col.constraints().iter().filter_map(move |c| {
                     if let Constraint::ForeignKey { table, column, .. } = c {
-                        let index_name = catalog
-                            .resolve_table(table)
-                            .ok()
-                            .and_then(|ref_table| {
-                                ref_table.indexes().iter().find(|idx_def| {
-                                    idx_def.columns().next().is_some_and(|first_col| {
-                                        first_col.eq_ignore_ascii_case(column)
-                                    })
+                        let ref_table = catalog.resolve_table(table).ok()?;
+                        let ref_columns = ref_table.columns();
+                        let ref_col_idx = ref_columns
+                            .iter()
+                            .position(|c| c.name().eq_ignore_ascii_case(column))?;
+                        let index_name = ref_table
+                            .indexes()
+                            .iter()
+                            .find(|idx_def| {
+                                idx_def.columns().next().is_some_and(|first_col| {
+                                    first_col.eq_ignore_ascii_case(column)
                                 })
                             })
                             .map(|idx_def| idx_def.name().to_string());
-                        Some((idx, table.clone(), column.clone(), index_name))
+                        Some((
+                            idx,
+                            table.clone(),
+                            column.clone(),
+                            index_name,
+                            ref_col_idx,
+                            ref_columns.to_vec(),
+                        ))
                     } else {
                         None
                     }
                 })
             })
             .collect();
+        for (_, fk_table, _, _, _, ref_cols) in &fk_constraints_with_cols {
+            if !fk_table_columns.contains_key(fk_table) {
+                fk_table_columns.insert(fk_table.clone(), ref_cols.clone());
+            }
+        }
+        let fk_constraints: Vec<(usize, String, String, Option<String>, usize)> =
+            fk_constraints_with_cols
+                .into_iter()
+                .map(|(idx, table, col, idx_name, ref_col_idx, _)| {
+                    (idx, table, col, idx_name, ref_col_idx)
+                })
+                .collect();
 
         let schema = create_record_schema(&columns);
 
@@ -465,13 +497,13 @@ impl Database {
             }
         }
 
-        for (_, fk_table, _, fk_index_name) in &fk_constraints {
+        for (_, fk_table, _, fk_index_name, _) in &fk_constraints {
             if file_manager.table_exists(schema_name, fk_table) {
                 let storage = file_manager.table_data_mut(schema_name, fk_table)?;
                 let key = crate::storage::FileManager::make_table_key(schema_name, fk_table);
                 storage_map.insert(key, storage);
 
-                if let Some(idx_name) = fk_index_name {
+                if let Some(idx_name) = fk_index_name.as_ref() {
                     if file_manager.index_exists(schema_name, fk_table, idx_name) {
                         let idx_storage =
                             file_manager.index_data_mut(schema_name, fk_table, idx_name)?;
@@ -565,27 +597,10 @@ impl Database {
 
             let fk_enabled = self.foreign_keys_enabled.load(Ordering::Acquire);
             if fk_enabled && !fk_constraints.is_empty() {
-                let catalog_guard = self.shared.catalog.read();
-                let catalog = catalog_guard.as_ref().unwrap();
-
-                for (col_idx, fk_table, fk_column, fk_index_name) in &fk_constraints {
+                for (col_idx, fk_table, fk_column, fk_index_name, ref_col_idx) in &fk_constraints {
                     if let Some(value) = values.get(*col_idx) {
                         if value.is_null() {
                             continue;
-                        }
-
-                        let referenced_table = catalog.resolve_table(fk_table)?;
-                        let ref_columns = referenced_table.columns();
-                        let ref_col_idx = ref_columns
-                            .iter()
-                            .position(|c| c.name().eq_ignore_ascii_case(fk_column));
-
-                        if ref_col_idx.is_none() {
-                            bail!(
-                                "FOREIGN KEY constraint: column '{}' not found in table '{}'",
-                                fk_column,
-                                fk_table
-                            );
                         }
 
                         let found = if let Some(idx_name) = fk_index_name {
@@ -601,25 +616,35 @@ impl Database {
                                 buffers.key_buffer.clear();
                                 Self::encode_value_as_key(value, &mut buffers.key_buffer);
                                 idx_btree.search(&buffers.key_buffer)?.is_some()
-                            } else {
+                            } else if let Some(ref_columns) = fk_table_columns.get(fk_table) {
                                 Self::fk_table_scan_check(
                                     schema_name,
                                     fk_table,
                                     ref_columns,
-                                    ref_col_idx.unwrap(),
+                                    *ref_col_idx,
                                     value,
                                     &storage_map,
                                 )?
+                            } else {
+                                bail!(
+                                    "FK table '{}' column definitions not cached",
+                                    fk_table
+                                );
                             }
-                        } else {
+                        } else if let Some(ref_columns) = fk_table_columns.get(fk_table) {
                             Self::fk_table_scan_check(
                                 schema_name,
                                 fk_table,
                                 ref_columns,
-                                ref_col_idx.unwrap(),
+                                *ref_col_idx,
                                 value,
                                 &storage_map,
                             )?
+                        } else {
+                            bail!(
+                                "FK table '{}' column definitions not cached",
+                                fk_table
+                            );
                         };
 
                         if !found {
@@ -913,8 +938,17 @@ impl Database {
             )?;
 
             let (txn_id, in_transaction) = {
-                let active_txn = self.active_txn.lock();
-                if let Some(ref txn) = *active_txn {
+                let mut active_txn = self.active_txn.lock();
+                if let Some(ref mut txn) = *active_txn {
+                    txn.add_write_entry(WriteEntry {
+                        table_id: table_id as u32,
+                        key: row_key.to_vec(),
+                        page_id: 0,
+                        offset: 0,
+                        undo_page_id: None,
+                        undo_offset: None,
+                        is_insert: true,
+                    });
                     (txn.txn_id, true)
                 } else {
                     (
@@ -951,21 +985,6 @@ impl Database {
                 btree.insert(&row_key, &buffers.mvcc_buffer)?;
                 rightmost_hint = btree.rightmost_hint();
                 root_page = btree.root_page();
-            }
-
-            {
-                let mut active_txn = self.active_txn.lock();
-                if let Some(ref mut txn) = *active_txn {
-                    txn.add_write_entry(WriteEntry {
-                        table_id: table_id as u32,
-                        key: row_key.to_vec(),
-                        page_id: 0,
-                        offset: 0,
-                        undo_page_id: None,
-                        undo_offset: None,
-                        is_insert: true,
-                    });
-                }
             }
 
             for (col_idx, index_key, _, _) in &unique_column_keys {
@@ -1098,42 +1117,36 @@ impl Database {
             }
         }
 
-        if auto_increment_col_idx.is_some() && auto_increment_max > 0 {
+        let needs_header_update = (auto_increment_col_idx.is_some() && auto_increment_max > 0)
+            || rightmost_hint.is_some()
+            || count > 0
+            || root_page != initial_root_page;
+
+        if needs_header_update {
             if let Some(storage_arc) = storage_map.get(&table_file_key) {
                 let mut storage = storage_arc.write();
                 let page = storage.page_mut(0)?;
                 let header = TableFileHeader::from_bytes_mut(page)?;
-                if auto_increment_max > header.auto_increment() {
+
+                if auto_increment_col_idx.is_some()
+                    && auto_increment_max > 0
+                    && auto_increment_max > header.auto_increment()
+                {
                     header.set_auto_increment(auto_increment_max);
                 }
-            }
-        }
 
-        if let Some(hint) = rightmost_hint {
-            if let Some(storage_arc) = storage_map.get(&table_file_key) {
-                let mut storage = storage_arc.write();
-                let page = storage.page_mut(0)?;
-                let header = TableFileHeader::from_bytes_mut(page)?;
-                header.set_rightmost_hint(hint);
-            }
-        }
+                if let Some(hint) = rightmost_hint {
+                    header.set_rightmost_hint(hint);
+                }
 
-        if count > 0 {
-            if let Some(storage_arc) = storage_map.get(&table_file_key) {
-                let mut storage = storage_arc.write();
-                let page = storage.page_mut(0)?;
-                let header = TableFileHeader::from_bytes_mut(page)?;
-                let new_row_count = header.row_count().saturating_add(count as u64);
-                header.set_row_count(new_row_count);
-            }
-        }
+                if count > 0 {
+                    let new_row_count = header.row_count().saturating_add(count as u64);
+                    header.set_row_count(new_row_count);
+                }
 
-        if root_page != initial_root_page {
-            if let Some(storage_arc) = storage_map.get(&table_file_key) {
-                let mut storage = storage_arc.write();
-                let page = storage.page_mut(0)?;
-                let header = TableFileHeader::from_bytes_mut(page)?;
-                header.set_root_page(root_page);
+                if root_page != initial_root_page {
+                    header.set_root_page(root_page);
+                }
             }
         }
 
