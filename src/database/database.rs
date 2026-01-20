@@ -4391,16 +4391,16 @@ impl Database {
 
     fn eval_check_expr_recursive(expr_str: &str, col_name: &str, value: &OwnedValue) -> bool {
         let trimmed = expr_str.trim();
-        let lower = trimmed.to_lowercase();
+        let bytes = trimmed.as_bytes();
 
-        if let Some((left, right)) = Self::split_on_logical_op(&lower, trimmed, " and ") {
-            return Self::eval_check_expr_recursive(left, col_name, value)
-                && Self::eval_check_expr_recursive(right, col_name, value);
-        }
-
-        if let Some((left, right)) = Self::split_on_logical_op(&lower, trimmed, " or ") {
+        if let Some((left, right)) = Self::split_on_logical_op_bytes(bytes, trimmed, b" or ", b" OR ") {
             return Self::eval_check_expr_recursive(left, col_name, value)
                 || Self::eval_check_expr_recursive(right, col_name, value);
+        }
+
+        if let Some((left, right)) = Self::split_on_logical_op_bytes(bytes, trimmed, b" and ", b" AND ") {
+            return Self::eval_check_expr_recursive(left, col_name, value)
+                && Self::eval_check_expr_recursive(right, col_name, value);
         }
 
         let stripped = Self::strip_outer_parens(trimmed);
@@ -4411,27 +4411,29 @@ impl Database {
         Self::eval_simple_comparison(trimmed, col_name, value)
     }
 
-    fn split_on_logical_op<'a>(
-        lower: &str,
+    fn split_on_logical_op_bytes<'a>(
+        bytes: &[u8],
         original: &'a str,
-        op: &str,
+        op_lower: &[u8],
+        op_upper: &[u8],
     ) -> Option<(&'a str, &'a str)> {
         let mut depth = 0;
         let mut i = 0;
-        let lower_bytes = lower.as_bytes();
-        let op_bytes = op.as_bytes();
 
-        while i + op.len() <= lower.len() {
-            let c = lower_bytes[i];
+        while i + op_lower.len() <= bytes.len() {
+            let c = bytes[i];
             if c == b'(' {
                 depth += 1;
             } else if c == b')' {
                 depth -= 1;
-            } else if depth == 0 && lower_bytes[i..].starts_with(op_bytes) {
-                let left = original[..i].trim();
-                let right = original[i + op.len()..].trim();
-                if !left.is_empty() && !right.is_empty() {
-                    return Some((left, right));
+            } else if depth == 0 {
+                let slice = &bytes[i..];
+                if slice.starts_with(op_lower) || slice.starts_with(op_upper) {
+                    let left = original[..i].trim();
+                    let right = original[i + op_lower.len()..].trim();
+                    if !left.is_empty() && !right.is_empty() {
+                        return Some((left, right));
+                    }
                 }
             }
             i += 1;
@@ -4468,10 +4470,7 @@ impl Database {
     }
 
     fn eval_simple_comparison(expr_str: &str, col_name: &str, value: &OwnedValue) -> bool {
-        let expr_lower = expr_str.to_lowercase();
-        let col_lower = col_name.to_lowercase();
-
-        if !expr_lower.contains(&col_lower) {
+        if !Self::contains_ignore_ascii_case(expr_str, col_name) {
             return true;
         }
 
@@ -4496,18 +4495,44 @@ impl Database {
         true
     }
 
-    fn extract_numeric_operand(s: &str) -> Option<f64> {
-        let trimmed = s.trim();
-        let numeric_part: String = trimmed
-            .chars()
-            .take_while(|c| c.is_ascii_digit() || *c == '.' || *c == '-' || *c == '+')
-            .collect();
+    fn contains_ignore_ascii_case(haystack: &str, needle: &str) -> bool {
+        let haystack_bytes = haystack.as_bytes();
+        let needle_bytes = needle.as_bytes();
 
-        if numeric_part.is_empty() {
+        if needle_bytes.is_empty() {
+            return true;
+        }
+        if needle_bytes.len() > haystack_bytes.len() {
+            return false;
+        }
+
+        haystack_bytes
+            .windows(needle_bytes.len())
+            .any(|window| window.eq_ignore_ascii_case(needle_bytes))
+    }
+
+    fn extract_numeric_operand(s: &str) -> Option<f64> {
+        let bytes = s.trim_start().as_bytes();
+        if bytes.is_empty() {
             return None;
         }
 
-        numeric_part.parse::<f64>().ok()
+        let mut end = 0;
+        for &b in bytes {
+            if b.is_ascii_digit() || b == b'.' || b == b'-' || b == b'+' {
+                end += 1;
+            } else {
+                break;
+            }
+        }
+
+        if end == 0 {
+            return None;
+        }
+
+        std::str::from_utf8(&bytes[..end])
+            .ok()
+            .and_then(|s| s.parse::<f64>().ok())
     }
 
     fn compare_value_with_threshold<F>(value: &OwnedValue, threshold: f64, cmp: F) -> bool
