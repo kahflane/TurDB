@@ -95,7 +95,7 @@ use crate::sql::decoder::RecordDecoder;
 use crate::sql::executor::ExecutorRow;
 use crate::sql::predicate::CompiledPredicate;
 use crate::storage::{IndexFileHeader, DEFAULT_SCHEMA};
-use crate::types::{create_record_schema, owned_values_to_values, OwnedValue, Value};
+use crate::types::{create_record_schema, OwnedValue, Value};
 use bumpalo::Bump;
 use eyre::{bail, Result, WrapErr};
 use hashbrown::HashSet;
@@ -486,22 +486,29 @@ impl Database {
             set_param_count = param_idx;
         }
 
-        let predicate: Option<crate::sql::predicate::CompiledPredicate> =
-            if let Some(w) = update.where_clause {
-                let col_map = columns
+        let needs_column_map =
+            update.where_clause.is_some() || !deferred_assignments.is_empty();
+        let column_map: Option<Vec<(String, usize)>> = if needs_column_map {
+            Some(
+                columns
                     .iter()
                     .enumerate()
                     .map(|(i, c)| (c.name().to_string(), i))
-                    .collect();
-                Some(crate::sql::predicate::CompiledPredicate::with_params(
+                    .collect(),
+            )
+        } else {
+            None
+        };
+
+        let predicate: Option<crate::sql::predicate::CompiledPredicate> =
+            update.where_clause.map(|w| {
+                crate::sql::predicate::CompiledPredicate::with_params(
                     w,
-                    col_map,
+                    column_map.as_ref().unwrap().clone(),
                     params,
                     set_param_count,
-                ))
-            } else {
-                None
-            };
+                )
+            });
 
         let modified_col_indices: HashSet<usize> =
             assignment_indices.iter().map(|(idx, _)| *idx).collect();
@@ -655,17 +662,8 @@ impl Database {
         }
 
         // MULTIPASS: Fallback for complex queries
-        let column_map: Option<Vec<(String, usize)>> = if !deferred_assignments.is_empty() {
-            Some(
-                columns
-                    .iter()
-                    .enumerate()
-                    .map(|(i, c)| (c.name().to_string(), i))
-                    .collect(),
-            )
-        } else {
-            None
-        };
+        let mut deferred_values_buf: Vec<(usize, OwnedValue)> =
+            Vec::with_capacity(deferred_assignments.len());
 
         loop {
             let mut cursor = if let Some((ref key, _)) = pk_lookup_info {
@@ -699,8 +697,8 @@ impl Database {
                         false
                     }
                 } else if let Some(ref pred) = predicate {
-                    let values = owned_values_to_values(&row_values);
-                    let values_slice = arena.alloc_slice_fill_iter(values.into_iter());
+                    let values_iter = row_values.iter().map(|ov| ov.to_value());
+                    let values_slice = arena.alloc_slice_fill_iter(values_iter);
                     let exec_row = ExecutorRow::new(values_slice);
                     pred.evaluate(&exec_row)
                 } else {
@@ -720,23 +718,23 @@ impl Database {
                         row_values[*col_idx] = val.clone();
                     }
 
-                    if let Some(ref col_map) = column_map {
-                        let deferred_values: Vec<(usize, OwnedValue)> = {
+                    if !deferred_assignments.is_empty() {
+                        let col_map = column_map.as_ref().unwrap();
+                        deferred_values_buf.clear();
+                        {
                             let values_iter = row_values.iter().map(|ov| ov.to_value());
                             let values_slice = arena.alloc_slice_fill_iter(values_iter);
                             let exec_row = ExecutorRow::new(values_slice);
 
-                            let mut results = Vec::with_capacity(deferred_assignments.len());
                             for (col_idx, assign_idx) in &deferred_assignments {
                                 let (_, value_expr) = &assignment_indices[*assign_idx];
                                 let new_val =
                                     self.eval_expr_with_row(value_expr, &exec_row, col_map)?;
-                                results.push((*col_idx, new_val));
+                                deferred_values_buf.push((*col_idx, new_val));
                             }
-                            results
-                        };
+                        }
 
-                        for (col_idx, new_val) in deferred_values {
+                        for (col_idx, new_val) in deferred_values_buf.drain(..) {
                             if let OwnedValue::ToastPointer(_) = &row_values[col_idx] {
                                 old_toast_values.push((col_idx, row_values[col_idx].clone()));
                             }

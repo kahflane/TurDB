@@ -526,6 +526,30 @@ mod dml_tests {
     }
 
     #[test]
+    fn update_with_nested_binary_expression() {
+        let dir = tempdir().unwrap();
+        let db = Database::create(dir.path().join("test_db")).unwrap();
+        db.execute("CREATE TABLE items (id INTEGER PRIMARY KEY, value INTEGER)")
+            .unwrap();
+        db.execute("INSERT INTO items VALUES (1, 10)").unwrap();
+
+        let result = db.execute("UPDATE items SET value = (value * 2) + 5 WHERE id = 1");
+
+        assert!(
+            result.is_ok(),
+            "UPDATE with nested expression SHOULD succeed, got error: {:?}",
+            result.err()
+        );
+
+        let rows = db.query("SELECT id, value FROM items ORDER BY id").unwrap();
+        assert_eq!(
+            rows[0].values[1],
+            OwnedValue::Int(25),
+            "value SHOULD be (10 * 2) + 5 = 25"
+        );
+    }
+
+    #[test]
     fn delete_removes_matching_rows_and_returns_count() {
         let dir = tempdir().unwrap();
         let db = Database::create(dir.path().join("test_db")).unwrap();
