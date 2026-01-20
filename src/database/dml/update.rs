@@ -490,7 +490,7 @@ impl Database {
                                         expr_str,
                                         col.name(),
                                         col_value,
-                                    ) {
+                                    )? {
                                         bail!(
                                             "CHECK constraint violated on column '{}' in table '{}': {}",
                                             col.name(),
@@ -649,7 +649,7 @@ impl Database {
                         for constraint in col.constraints() {
                             if let Constraint::Check(expr_str) = constraint {
                                 let col_value = row_values.get(col_idx);
-                                if !Self::evaluate_check_expression(expr_str, col.name(), col_value)
+                                if !Self::evaluate_check_expression(expr_str, col.name(), col_value)?
                                 {
                                     bail!(
                                         "CHECK constraint violated on column '{}' in table '{}': {}",
@@ -1369,7 +1369,7 @@ impl Database {
                         for constraint in col.constraints() {
                             if let Constraint::Check(expr_str) = constraint {
                                 let col_value = row_values.get(col_idx);
-                                if !Self::evaluate_check_expression(expr_str, col.name(), col_value)
+                                if !Self::evaluate_check_expression(expr_str, col.name(), col_value)?
                                 {
                                     bail!(
                                         "CHECK constraint violated on column '{}' in table '{}': {}",

@@ -567,7 +567,7 @@ impl Database {
                 for constraint in col.constraints() {
                     if let Constraint::Check(expr_str) = constraint {
                         let col_value = values.get(col_idx);
-                        if !Database::evaluate_check_expression(expr_str, col.name(), col_value) {
+                        if !Database::evaluate_check_expression(expr_str, col.name(), col_value)? {
                             bail!(
                                 "CHECK constraint violated on column '{}' in table '{}': {}",
                                 col.name(),

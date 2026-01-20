@@ -375,6 +375,267 @@ mod check_constraint_tests {
             result.unwrap_err()
         );
     }
+
+    #[test]
+    fn check_constraint_handles_negative_numbers() {
+        let (_dir, db) = create_test_db();
+
+        db.execute(
+            "CREATE TABLE temperatures (
+                id INTEGER PRIMARY KEY,
+                temp REAL CHECK(temp >= -273.15)
+            )",
+        )
+        .expect("Failed to create table");
+
+        let stmt = db
+            .prepare("INSERT INTO temperatures VALUES (?, ?)")
+            .expect("Failed to prepare statement");
+
+        let result_valid = stmt
+            .bind(OwnedValue::Int(1))
+            .bind(OwnedValue::Float(-100.0))
+            .execute(&db);
+
+        assert!(
+            result_valid.is_ok(),
+            "INSERT with -100.0 (above -273.15) should succeed"
+        );
+
+        let stmt2 = db
+            .prepare("INSERT INTO temperatures VALUES (?, ?)")
+            .expect("Failed to prepare statement");
+
+        let result_invalid = stmt2
+            .bind(OwnedValue::Int(2))
+            .bind(OwnedValue::Float(-300.0))
+            .execute(&db);
+
+        assert!(
+            result_invalid.is_err(),
+            "INSERT with -300.0 (below -273.15) should fail"
+        );
+    }
+
+    #[test]
+    fn check_constraint_handles_float_range() {
+        let (_dir, db) = create_test_db();
+
+        db.execute(
+            "CREATE TABLE ratios (
+                id INTEGER PRIMARY KEY,
+                ratio REAL CHECK(ratio >= 0.0 AND ratio <= 1.0)
+            )",
+        )
+        .expect("Failed to create table");
+
+        let stmt = db
+            .prepare("INSERT INTO ratios VALUES (?, ?)")
+            .expect("Failed to prepare statement");
+
+        let result_valid = stmt
+            .bind(OwnedValue::Int(1))
+            .bind(OwnedValue::Float(0.5))
+            .execute(&db);
+
+        assert!(
+            result_valid.is_ok(),
+            "INSERT with 0.5 should succeed"
+        );
+
+        let stmt2 = db
+            .prepare("INSERT INTO ratios VALUES (?, ?)")
+            .expect("Failed to prepare statement");
+
+        let result_invalid = stmt2
+            .bind(OwnedValue::Int(2))
+            .bind(OwnedValue::Float(1.5))
+            .execute(&db);
+
+        assert!(
+            result_invalid.is_err(),
+            "INSERT with 1.5 (above 1.0) should fail"
+        );
+    }
+
+    #[test]
+    fn check_constraint_handles_deeply_nested_parentheses() {
+        let (_dir, db) = create_test_db();
+
+        db.execute(
+            "CREATE TABLE nested_check (
+                id INTEGER PRIMARY KEY,
+                age INTEGER CHECK((((age >= 0))))
+            )",
+        )
+        .expect("Failed to create table");
+
+        let stmt = db
+            .prepare("INSERT INTO nested_check VALUES (?, ?)")
+            .expect("Failed to prepare statement");
+
+        let result_valid = stmt
+            .bind(OwnedValue::Int(1))
+            .bind(OwnedValue::Int(25))
+            .execute(&db);
+
+        assert!(
+            result_valid.is_ok(),
+            "INSERT with valid value through nested parens should succeed"
+        );
+
+        let stmt2 = db
+            .prepare("INSERT INTO nested_check VALUES (?, ?)")
+            .expect("Failed to prepare statement");
+
+        let result_invalid = stmt2
+            .bind(OwnedValue::Int(2))
+            .bind(OwnedValue::Int(-5))
+            .execute(&db);
+
+        assert!(
+            result_invalid.is_err(),
+            "INSERT with invalid value through nested parens should fail"
+        );
+    }
+
+    #[test]
+    fn check_constraint_handles_mixed_case_operators() {
+        let (_dir, db) = create_test_db();
+
+        db.execute(
+            "CREATE TABLE mixed_case (
+                id INTEGER PRIMARY KEY,
+                age INTEGER CHECK(age >= 0 AnD age <= 150)
+            )",
+        )
+        .expect("Failed to create table");
+
+        let stmt = db
+            .prepare("INSERT INTO mixed_case VALUES (?, ?)")
+            .expect("Failed to prepare statement");
+
+        let result_valid = stmt
+            .bind(OwnedValue::Int(1))
+            .bind(OwnedValue::Int(75))
+            .execute(&db);
+
+        assert!(
+            result_valid.is_ok(),
+            "INSERT should succeed with mixed case AND operator"
+        );
+
+        let stmt2 = db
+            .prepare("INSERT INTO mixed_case VALUES (?, ?)")
+            .expect("Failed to prepare statement");
+
+        let result_high = stmt2
+            .bind(OwnedValue::Int(2))
+            .bind(OwnedValue::Int(200))
+            .execute(&db);
+
+        assert!(
+            result_high.is_err(),
+            "INSERT with value above 150 should fail"
+        );
+    }
+
+    #[test]
+    fn check_constraint_handles_multiple_or_conditions() {
+        let (_dir, db) = create_test_db();
+
+        db.execute(
+            "CREATE TABLE status_codes (
+                id INTEGER PRIMARY KEY,
+                code INTEGER CHECK(code >= 200 AND code <= 299 OR code >= 400 AND code <= 499)
+            )",
+        )
+        .expect("Failed to create table");
+
+        let stmt = db
+            .prepare("INSERT INTO status_codes VALUES (?, ?)")
+            .expect("Failed to prepare statement");
+
+        let result_200 = stmt
+            .bind(OwnedValue::Int(1))
+            .bind(OwnedValue::Int(200))
+            .execute(&db);
+
+        assert!(
+            result_200.is_ok(),
+            "INSERT with 200 should succeed"
+        );
+
+        let stmt2 = db
+            .prepare("INSERT INTO status_codes VALUES (?, ?)")
+            .expect("Failed to prepare statement");
+
+        let result_404 = stmt2
+            .bind(OwnedValue::Int(2))
+            .bind(OwnedValue::Int(404))
+            .execute(&db);
+
+        assert!(
+            result_404.is_ok(),
+            "INSERT with 404 should succeed"
+        );
+
+        let stmt3 = db
+            .prepare("INSERT INTO status_codes VALUES (?, ?)")
+            .expect("Failed to prepare statement");
+
+        let result_300 = stmt3
+            .bind(OwnedValue::Int(3))
+            .bind(OwnedValue::Int(300))
+            .execute(&db);
+
+        assert!(
+            result_300.is_err(),
+            "INSERT with 300 should fail (not in valid ranges)"
+        );
+    }
+
+    #[test]
+    fn check_constraint_max_depth_returns_error() {
+        let (_dir, db) = create_test_db();
+
+        let mut nested_expr = "age >= 0".to_string();
+        for i in 1..35 {
+            nested_expr = format!("({} AND age <= {})", nested_expr, 100 + i);
+        }
+
+        let create_sql = format!(
+            "CREATE TABLE deep_nesting (
+                id INTEGER PRIMARY KEY,
+                age INTEGER CHECK({})
+            )",
+            nested_expr
+        );
+
+        db.execute(&create_sql)
+            .expect("Failed to create table");
+
+        let stmt = db
+            .prepare("INSERT INTO deep_nesting VALUES (?, ?)")
+            .expect("Failed to prepare statement");
+
+        let result = stmt
+            .bind(OwnedValue::Int(1))
+            .bind(OwnedValue::Int(25))
+            .execute(&db);
+
+        assert!(
+            result.is_err(),
+            "INSERT with deeply nested AND expression (>32 levels) should return error"
+        );
+
+        let err_msg = result.unwrap_err().to_string().to_lowercase();
+        assert!(
+            err_msg.contains("depth") || err_msg.contains("nesting") || err_msg.contains("exceed"),
+            "Error should mention depth/nesting exceeded, got: {}",
+            err_msg
+        );
+    }
 }
 
 mod not_null_tests {

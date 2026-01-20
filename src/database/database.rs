@@ -184,15 +184,21 @@ impl SharedDatabase {
     }
 }
 
+/// Comparison operators for CHECK constraint evaluation.
 #[derive(Clone, Copy)]
 enum CheckCompareOp {
+    /// Greater than or equal (>=)
     Ge,
+    /// Less than or equal (<=)
     Le,
+    /// Greater than (>)
     Gt,
+    /// Less than (<)
     Lt,
 }
 
 impl CheckCompareOp {
+    /// Compares two f64 values using this operator.
     fn compare(self, lhs: f64, rhs: f64) -> bool {
         match self {
             CheckCompareOp::Ge => lhs >= rhs,
@@ -4396,13 +4402,13 @@ impl Database {
         expr_str: &str,
         col_name: &str,
         col_value: Option<&OwnedValue>,
-    ) -> bool {
+    ) -> Result<bool> {
         let Some(value) = col_value else {
-            return true;
+            return Ok(true);
         };
 
         if value.is_null() {
-            return true;
+            return Ok(true);
         }
 
         Self::eval_check_expr_recursive(expr_str, col_name, value)
@@ -4410,7 +4416,11 @@ impl Database {
 
     const MAX_CHECK_EXPR_DEPTH: usize = 32;
 
-    fn eval_check_expr_recursive(expr_str: &str, col_name: &str, value: &OwnedValue) -> bool {
+    fn eval_check_expr_recursive(
+        expr_str: &str,
+        col_name: &str,
+        value: &OwnedValue,
+    ) -> Result<bool> {
         Self::eval_check_expr_with_depth(expr_str, col_name, value, 0)
     }
 
@@ -4419,21 +4429,27 @@ impl Database {
         col_name: &str,
         value: &OwnedValue,
         depth: usize,
-    ) -> bool {
+    ) -> Result<bool> {
         if depth >= Self::MAX_CHECK_EXPR_DEPTH {
-            return false;
+            bail!(
+                "CHECK constraint expression exceeds maximum nesting depth of {} for column '{}'",
+                Self::MAX_CHECK_EXPR_DEPTH,
+                col_name
+            );
         }
 
         let trimmed = expr_str.trim();
 
         if let Some((left, right)) = Self::split_on_logical_op_case_insensitive(trimmed, b" or ") {
-            return Self::eval_check_expr_with_depth(left, col_name, value, depth + 1)
-                || Self::eval_check_expr_with_depth(right, col_name, value, depth + 1);
+            let left_result = Self::eval_check_expr_with_depth(left, col_name, value, depth + 1)?;
+            let right_result = Self::eval_check_expr_with_depth(right, col_name, value, depth + 1)?;
+            return Ok(left_result || right_result);
         }
 
         if let Some((left, right)) = Self::split_on_logical_op_case_insensitive(trimmed, b" and ") {
-            return Self::eval_check_expr_with_depth(left, col_name, value, depth + 1)
-                && Self::eval_check_expr_with_depth(right, col_name, value, depth + 1);
+            let left_result = Self::eval_check_expr_with_depth(left, col_name, value, depth + 1)?;
+            let right_result = Self::eval_check_expr_with_depth(right, col_name, value, depth + 1)?;
+            return Ok(left_result && right_result);
         }
 
         let stripped = Self::strip_outer_parens(trimmed);
@@ -4441,7 +4457,7 @@ impl Database {
             return Self::eval_check_expr_with_depth(stripped, col_name, value, depth + 1);
         }
 
-        Self::eval_simple_comparison(trimmed, col_name, value)
+        Ok(Self::eval_simple_comparison(trimmed, col_name, value))
     }
 
     fn split_on_logical_op_case_insensitive<'a>(
@@ -4449,18 +4465,18 @@ impl Database {
         op: &[u8],
     ) -> Option<(&'a str, &'a str)> {
         let bytes = original.as_bytes();
-        let mut depth: i32 = 0;
+        let mut depth: usize = 0;
         let mut i = 0;
 
         while i + op.len() <= bytes.len() {
             let c = bytes[i];
             if c == b'(' {
-                depth += 1;
+                depth = depth.saturating_add(1);
             } else if c == b')' {
                 if depth == 0 {
                     return None;
                 }
-                depth -= 1;
+                depth = depth.saturating_sub(1);
             } else if depth == 0 && bytes[i..i + op.len()].eq_ignore_ascii_case(op) {
                 let left = original[..i].trim();
                 let right = original[i + op.len()..].trim();
@@ -4505,25 +4521,39 @@ impl Database {
             return true;
         }
 
-        if let Some(op_idx) = expr_str.find(">=") {
-            if let Some(threshold) = Self::extract_numeric_operand(&expr_str[op_idx + 2..]) {
-                return Self::compare_value_with_threshold(value, threshold, CheckCompareOp::Ge);
-            }
-        } else if let Some(op_idx) = expr_str.find("<=") {
-            if let Some(threshold) = Self::extract_numeric_operand(&expr_str[op_idx + 2..]) {
-                return Self::compare_value_with_threshold(value, threshold, CheckCompareOp::Le);
-            }
-        } else if let Some(op_idx) = expr_str.find('>') {
-            if let Some(threshold) = Self::extract_numeric_operand(&expr_str[op_idx + 1..]) {
-                return Self::compare_value_with_threshold(value, threshold, CheckCompareOp::Gt);
-            }
-        } else if let Some(op_idx) = expr_str.find('<') {
-            if let Some(threshold) = Self::extract_numeric_operand(&expr_str[op_idx + 1..]) {
-                return Self::compare_value_with_threshold(value, threshold, CheckCompareOp::Lt);
+        if let Some((op, op_len, op_idx)) = Self::find_comparison_operator(expr_str) {
+            if let Some(threshold) = Self::extract_numeric_operand(&expr_str[op_idx + op_len..]) {
+                return Self::compare_value_with_threshold(value, threshold, op);
             }
         }
 
         false
+    }
+
+    fn find_comparison_operator(s: &str) -> Option<(CheckCompareOp, usize, usize)> {
+        let bytes = s.as_bytes();
+        let len = bytes.len();
+        let mut i = 0;
+
+        while i < len {
+            match bytes[i] {
+                b'>' => {
+                    if i + 1 < len && bytes[i + 1] == b'=' {
+                        return Some((CheckCompareOp::Ge, 2, i));
+                    }
+                    return Some((CheckCompareOp::Gt, 1, i));
+                }
+                b'<' => {
+                    if i + 1 < len && bytes[i + 1] == b'=' {
+                        return Some((CheckCompareOp::Le, 2, i));
+                    }
+                    return Some((CheckCompareOp::Lt, 1, i));
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        None
     }
 
     fn contains_ignore_ascii_case(haystack: &str, needle: &str) -> bool {
@@ -4548,22 +4578,35 @@ impl Database {
             return None;
         }
 
-        let mut end = 0;
-        for &b in bytes {
-            if b.is_ascii_digit() || b == b'.' || b == b'-' || b == b'+' {
-                end += 1;
-            } else {
-                break;
+        let mut i = 0;
+        let mut has_digit = false;
+        let mut has_dot = false;
+
+        if i < bytes.len() && (bytes[i] == b'-' || bytes[i] == b'+') {
+            i += 1;
+        }
+
+        while i < bytes.len() {
+            match bytes[i] {
+                b'0'..=b'9' => {
+                    has_digit = true;
+                    i += 1;
+                }
+                b'.' if !has_dot => {
+                    has_dot = true;
+                    i += 1;
+                }
+                _ => break,
             }
         }
 
-        if end == 0 {
+        if !has_digit || i == 0 {
             return None;
         }
 
-        std::str::from_utf8(&bytes[..end])
+        std::str::from_utf8(&bytes[..i])
             .ok()
-            .and_then(|s| s.parse::<f64>().ok())
+            .and_then(|num_str| num_str.parse::<f64>().ok())
     }
 
     fn compare_value_with_threshold(value: &OwnedValue, threshold: f64, op: CheckCompareOp) -> bool {
