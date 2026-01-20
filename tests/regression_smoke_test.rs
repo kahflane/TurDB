@@ -727,7 +727,7 @@ mod query_tests {
     }
 
     #[test]
-    fn select_with_group_by_and_having() {
+    fn having_sum_gt_250_returns_only_groups_above_threshold() {
         let (db, _dir) = create_test_db();
 
         db.execute(
@@ -744,11 +744,83 @@ mod query_tests {
         let rows = db
             .query(
                 "SELECT category, SUM(amount) as total FROM group_test
-                 GROUP BY category HAVING SUM(amount) >= 250",
+                 GROUP BY category HAVING SUM(amount) > 250",
             )
             .unwrap();
 
-        assert_eq!(rows.len(), 3);
+        assert_eq!(
+            rows.len(),
+            1,
+            "HAVING SUM(amount) > 250 should return only C (sum=300). A=250 and B=250 excluded"
+        );
+
+        match &rows[0].values[0] {
+            OwnedValue::Text(cat) => assert_eq!(cat, "C", "Only category C should pass HAVING"),
+            other => panic!("Expected Text(C), got {:?}", other),
+        }
+        match &rows[0].values[1] {
+            OwnedValue::Int(total) => assert_eq!(*total, 300, "SUM for C should be 300"),
+            other => panic!("Expected Int(300), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn having_count_ge_2_excludes_single_item_groups() {
+        let (db, _dir) = create_test_db();
+
+        db.execute(
+            "CREATE TABLE items (id INTEGER PRIMARY KEY, category TEXT, value INTEGER)",
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO items VALUES
+             (1, 'A', 10), (2, 'A', 20),
+             (3, 'B', 30), (4, 'B', 40),
+             (5, 'C', 50)",
+        )
+        .unwrap();
+
+        let rows = db
+            .query(
+                "SELECT category, COUNT(*) as cnt
+                 FROM items
+                 GROUP BY category
+                 HAVING COUNT(*) >= 2",
+            )
+            .unwrap();
+
+        assert_eq!(
+            rows.len(),
+            2,
+            "HAVING COUNT(*) >= 2 should filter to only A and B (each has 2 items), but got {} rows",
+            rows.len()
+        );
+
+        let mut found_a = false;
+        let mut found_b = false;
+        let mut found_c = false;
+
+        for row in &rows {
+            match &row.values[0] {
+                OwnedValue::Text(s) => {
+                    if s == "A" {
+                        found_a = true;
+                    } else if s == "B" {
+                        found_b = true;
+                    } else if s == "C" {
+                        found_c = true;
+                    }
+                }
+                other => panic!("Expected Text category, got {:?}", other),
+            }
+            match &row.values[1] {
+                OwnedValue::Int(cnt) => assert_eq!(*cnt, 2, "Each group should have COUNT=2"),
+                other => panic!("Expected Int(2), got {:?}", other),
+            }
+        }
+
+        assert!(found_a && found_b, "Should find categories A and B");
+        assert!(!found_c, "Should NOT find category C (only 1 item)");
     }
 
     #[test]
