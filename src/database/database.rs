@@ -43,7 +43,7 @@ use crate::database::dirty_tracker::ShardedDirtyTracker;
 use crate::database::query::{
     build_column_map_with_alias, build_simple_column_map, compare_owned_values, find_limit,
     find_nested_subquery, find_plan_source, find_projections, find_sort_exec, find_table_scan,
-    has_aggregate, has_filter, has_order_by_expression, has_window, is_simple_count_star,
+    has_aggregate, has_filter, has_non_simple_root, has_ordering, has_window, is_simple_count_star,
     materialize_table_rows, materialize_table_rows_with_tracker, PlanSource,
 };
 use crate::database::row::Row;
@@ -1609,8 +1609,13 @@ impl Database {
                 let plan_has_filter = has_filter(physical_plan.root);
                 let plan_has_aggregate = has_aggregate(physical_plan.root);
                 let plan_has_window = has_window(physical_plan.root);
-                let plan_has_order_by_expr = has_order_by_expression(physical_plan.root);
-                let needs_all_columns = plan_has_filter || plan_has_aggregate || plan_has_window || plan_has_order_by_expr;
+                let plan_has_ordering = has_ordering(physical_plan.root);
+                let plan_has_non_simple_root = has_non_simple_root(physical_plan.root);
+                let needs_all_columns = plan_has_filter
+                    || plan_has_aggregate
+                    || plan_has_window
+                    || plan_has_ordering
+                    || plan_has_non_simple_root;
                 let projections = if needs_all_columns {
                     None
                 } else {

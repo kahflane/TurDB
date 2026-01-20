@@ -7,7 +7,7 @@
 //! ## Functions
 //!
 //! - Plan source finding: `find_plan_source`, `find_table_scan`, `find_nested_subquery`
-//! - Plan analysis: `has_filter`, `has_aggregate`, `has_window`, `has_order_by_expression`
+//! - Plan analysis: `has_filter`, `has_aggregate`, `has_window`, `has_ordering`, `has_non_simple_root`
 //! - Operator finding: `find_limit`, `find_sort_exec`, `find_projections`
 //! - Optimization: `is_simple_count_star`
 //! - Value comparison: `compare_owned_values`
@@ -153,25 +153,6 @@ pub fn has_window(op: &PhysicalOperator<'_>) -> bool {
     }
 }
 
-/// Checks if the plan has an ORDER BY with non-column expressions.
-pub fn has_order_by_expression(op: &PhysicalOperator<'_>) -> bool {
-    match op {
-        PhysicalOperator::SortExec(sort) => sort
-            .order_by
-            .iter()
-            .any(|key| !matches!(key.expr, Expr::Column(_))),
-        PhysicalOperator::TopKExec(topk) => topk
-            .order_by
-            .iter()
-            .any(|key| !matches!(key.expr, Expr::Column(_))),
-        PhysicalOperator::ProjectExec(project) => has_order_by_expression(project.input),
-        PhysicalOperator::LimitExec(limit) => has_order_by_expression(limit.input),
-        PhysicalOperator::FilterExec(filter) => has_order_by_expression(filter.input),
-        PhysicalOperator::WindowExec(window) => has_order_by_expression(window.input),
-        _ => false,
-    }
-}
-
 /// Finds a LIMIT clause in the plan, returning (limit, offset).
 pub fn find_limit(op: &PhysicalOperator<'_>) -> Option<(Option<u64>, Option<u64>)> {
     match op {
@@ -195,6 +176,33 @@ pub fn find_sort_exec<'a>(op: &'a PhysicalOperator<'a>) -> Option<&'a PhysicalSo
         PhysicalOperator::WindowExec(window) => find_sort_exec(window.input),
         _ => None,
     }
+}
+
+/// Checks if the plan contains any ordering operation (SortExec or TopKExec).
+pub fn has_ordering(op: &PhysicalOperator<'_>) -> bool {
+    match op {
+        PhysicalOperator::SortExec(_) => true,
+        PhysicalOperator::TopKExec(_) => true,
+        PhysicalOperator::ProjectExec(project) => has_ordering(project.input),
+        PhysicalOperator::LimitExec(limit) => has_ordering(limit.input),
+        PhysicalOperator::FilterExec(filter) => has_ordering(filter.input),
+        PhysicalOperator::WindowExec(window) => has_ordering(window.input),
+        PhysicalOperator::HashAggregate(agg) => has_ordering(agg.input),
+        PhysicalOperator::SortedAggregate(agg) => has_ordering(agg.input),
+        _ => false,
+    }
+}
+
+/// Checks if the plan root is NOT a simple ProjectExec or TableScan.
+/// When the root is LimitExec, SortExec, etc., source-level projection
+/// optimization cannot be safely applied because executors expect full schema indices.
+pub fn has_non_simple_root(op: &PhysicalOperator<'_>) -> bool {
+    !matches!(
+        op,
+        PhysicalOperator::ProjectExec(_)
+            | PhysicalOperator::TableScan(_)
+            | PhysicalOperator::IndexScan(_)
+    )
 }
 
 /// Finds column projections in the plan and returns their indices in the table.
