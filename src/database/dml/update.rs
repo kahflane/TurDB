@@ -175,6 +175,7 @@ fn expr_contains_column_ref(expr: &crate::sql::ast::Expr) -> bool {
     }
 }
 
+/// Recursively collects scalar subqueries from an expression tree.
 fn collect_scalar_subqueries_from_expr<'a>(
     expr: &'a crate::sql::ast::Expr<'a>,
     subqueries: &mut SmallVec<[&'a crate::sql::ast::SelectStmt<'a>; 4]>,
@@ -237,6 +238,7 @@ fn collect_scalar_subqueries_from_expr<'a>(
     }
 }
 
+/// Finds a single aggregate function with expression in a query plan.
 fn find_expression_aggregate<'a>(
     op: &'a crate::sql::planner::PhysicalOperator<'a>,
 ) -> Option<(
@@ -274,6 +276,7 @@ fn find_expression_aggregate<'a>(
     }
 }
 
+/// Evaluates a binary operation on two OwnedValues.
 fn eval_binary_op(left: &OwnedValue, op: &crate::sql::ast::BinaryOperator, right: &OwnedValue) -> OwnedValue {
     use crate::sql::ast::BinaryOperator;
     match op {
@@ -309,6 +312,7 @@ fn eval_binary_op(left: &OwnedValue, op: &crate::sql::ast::BinaryOperator, right
     }
 }
 
+/// Evaluates an expression against a record for streaming aggregation.
 fn eval_expr_for_record_streaming(
     expr: &crate::sql::ast::Expr<'_>,
     record: &RecordView<'_>,
@@ -354,6 +358,48 @@ fn eval_expr_for_record_streaming(
     }
 }
 
+/// Compares i64 and f64 without precision loss for large integers.
+fn compare_int_float(i: i64, f: f64) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+
+    if f.is_nan() {
+        return Ordering::Less;
+    }
+    if f == f64::INFINITY {
+        return Ordering::Less;
+    }
+    if f == f64::NEG_INFINITY {
+        return Ordering::Greater;
+    }
+
+    const MAX_EXACT: i64 = 1i64 << 53;
+    const MIN_EXACT: i64 = -(1i64 << 53);
+
+    if (MIN_EXACT..=MAX_EXACT).contains(&i) {
+        let i_as_f64 = i as f64;
+        i_as_f64.partial_cmp(&f).unwrap_or(Ordering::Equal)
+    } else if f >= (i64::MAX as f64) {
+        Ordering::Less
+    } else if f <= (i64::MIN as f64) {
+        Ordering::Greater
+    } else {
+        let f_truncated = f as i64;
+        match i.cmp(&f_truncated) {
+            Ordering::Equal => {
+                let f_frac = f - (f_truncated as f64);
+                if f_frac > 0.0 {
+                    Ordering::Less
+                } else if f_frac < 0.0 {
+                    Ordering::Greater
+                } else {
+                    Ordering::Equal
+                }
+            }
+            other => other,
+        }
+    }
+}
+
 struct StreamingAggregateState {
     sum_int: i64,
     sum_float: f64,
@@ -382,15 +428,15 @@ impl StreamingAggregateState {
     fn update(&mut self, value: &OwnedValue) {
         match value {
             OwnedValue::Int(i) => {
-                self.sum_int += i;
-                self.count += 1;
+                self.sum_int = self.sum_int.saturating_add(*i);
+                self.count = self.count.saturating_add(1);
                 self.min_int = Some(self.min_int.map(|m| m.min(*i)).unwrap_or(*i));
                 self.max_int = Some(self.max_int.map(|m| m.max(*i)).unwrap_or(*i));
             }
             OwnedValue::Float(f) => {
                 self.sum_float += f;
                 self.has_float = true;
-                self.count += 1;
+                self.count = self.count.saturating_add(1);
                 self.min_float = Some(self.min_float.map(|m| m.min(*f)).unwrap_or(*f));
                 self.max_float = Some(self.max_float.map(|m| m.max(*f)).unwrap_or(*f));
             }
@@ -424,7 +470,7 @@ impl StreamingAggregateState {
                 if self.has_float {
                     match (self.min_int, self.min_float) {
                         (Some(i), Some(f)) => {
-                            if (i as f64) < f {
+                            if compare_int_float(i, f).is_lt() {
                                 OwnedValue::Int(i)
                             } else {
                                 OwnedValue::Float(f)
@@ -442,7 +488,7 @@ impl StreamingAggregateState {
                 if self.has_float {
                     match (self.max_int, self.max_float) {
                         (Some(i), Some(f)) => {
-                            if (i as f64) > f {
+                            if compare_int_float(i, f).is_gt() {
                                 OwnedValue::Int(i)
                             } else {
                                 OwnedValue::Float(f)
@@ -475,6 +521,7 @@ fn read_index_root_page(storage: &crate::storage::MmapStorage) -> Result<u32> {
 }
 
 impl Database {
+    /// Executes a scalar subquery and returns its single result value.
     fn execute_scalar_subquery_for_update<'a>(
         subq: &'a crate::sql::ast::SelectStmt<'a>,
         catalog: &crate::schema::catalog::Catalog,
@@ -486,7 +533,7 @@ impl Database {
         use crate::records::RecordView;
         use crate::sql::builder::ExecutorBuilder;
         use crate::sql::context::ExecutionContext;
-        use crate::sql::executor::{Executor, MaterializedRowSource, StreamingBTreeSource};
+        use crate::sql::executor::{Executor, StreamingBTreeSource};
         use crate::sql::planner::{Planner, ScanRange};
         use crate::types::create_record_schema;
 
@@ -593,13 +640,6 @@ impl Database {
                     .map(|(i, c)| (c.name().to_lowercase(), (i, c.data_type())))
                     .collect();
 
-                let column_map: Vec<(String, usize)> = table_def
-                    .columns()
-                    .iter()
-                    .enumerate()
-                    .map(|(idx, col)| (col.name().to_lowercase(), idx))
-                    .collect();
-
                 let row_id_suffix_len = if scan.is_unique_index { 0 } else { 8 };
 
                 if let Some((agg_func, expr)) = find_expression_aggregate(subq_plan.root) {
@@ -703,131 +743,90 @@ impl Database {
                     return Ok(agg_state.finalize(agg_func));
                 }
 
-                let row_keys: Vec<[u8; 8]> = {
-                    let index_storage_arc =
-                        file_manager.index_data(schema_name, table_name, index_name)
-                            .wrap_err_with(|| format!("failed to open index '{}' for table '{}'", index_name, table_name))?;
-                    let index_storage = index_storage_arc.read();
+                let index_storage_arc = file_manager.index_data(schema_name, table_name, index_name)
+                    .wrap_err_with(|| format!("failed to open index '{}' for table '{}'", index_name, table_name))?;
+                let index_storage = index_storage_arc.read();
+                let index_root = read_index_root_page(&index_storage)
+                    .wrap_err_with(|| format!("failed to read root page for index '{}'", index_name))?;
+                let index_reader = BTreeReader::new(&index_storage, index_root)?;
 
-                    let root_page = read_index_root_page(&index_storage)
-                        .wrap_err_with(|| format!("failed to read root page for index '{}'", index_name))?;
-                    let index_reader = BTreeReader::new(&index_storage, root_page)?;
+                let table_storage_arc = file_manager.table_data(schema_name, table_name)
+                    .wrap_err_with(|| format!("failed to open table data for '{}' in scalar subquery", table_name))?;
+                let table_storage = table_storage_arc.read();
+                let table_root = read_root_page(&table_storage)
+                    .wrap_err_with(|| format!("failed to read root page for table '{}'", table_name))?;
+                let table_reader = BTreeReader::new(&table_storage, table_root)?;
 
-                    let mut keys = Vec::new();
-
-                    let extract_row_key = |cursor: &mut crate::btree::Cursor<'_, crate::storage::MmapStorage>| -> Result<Option<[u8; 8]>> {
-                        let index_key = cursor.key()?;
-                        let row_id_bytes = if scan.is_unique_index {
-                            cursor.value()?
-                        } else {
-                            &index_key[index_key.len().saturating_sub(row_id_suffix_len)..]
-                        };
-                        if row_id_bytes.len() == 8 {
-                            let row_key: [u8; 8] = row_id_bytes.try_into()
-                                .map_err(|_| eyre::eyre!("invalid row key in index '{}': expected 8 bytes", index_name))?;
-                            Ok(Some(row_key))
-                        } else {
-                            Ok(None)
+                let extract_and_lookup_first_row =
+                    |cursor: &mut crate::btree::Cursor<'_, crate::storage::MmapStorage>| -> Result<Option<OwnedValue>> {
+                        while cursor.valid() {
+                            let index_key = cursor.key()?;
+                            let row_id_bytes = if scan.is_unique_index {
+                                cursor.value()?
+                            } else {
+                                &index_key[index_key.len().saturating_sub(row_id_suffix_len)..]
+                            };
+                            if row_id_bytes.len() == 8 {
+                                let row_key: [u8; 8] = row_id_bytes.try_into()
+                                    .map_err(|_| eyre::eyre!("invalid row key in index '{}': expected 8 bytes", index_name))?;
+                                if let Some(row_data) = table_reader.get(&row_key)? {
+                                    let user_data = crate::database::dml::mvcc_helpers::get_user_data(row_data);
+                                    let record = RecordView::new(user_data, &schema)?;
+                                    let first_col_type = columns.first().map(|c| c.data_type())
+                                        .ok_or_else(|| eyre::eyre!("table '{}' has no columns", table_name))?;
+                                    return Ok(Some(OwnedValue::from_record_column(&record, 0, first_col_type)
+                                        .unwrap_or(OwnedValue::Null)));
+                                }
+                            }
+                            if !cursor.advance()? {
+                                break;
+                            }
                         }
+                        Ok(None)
                     };
 
-                    match &scan.key_range {
-                        Some(ScanRange::PrefixScan { prefix }) => {
-                            let mut cursor = index_reader.cursor_seek(prefix)?;
-                            while cursor.valid() {
-                                let index_key = cursor.key()?;
-                                if !index_key.starts_with(prefix) {
-                                    break;
-                                }
-                                if let Some(row_key) = extract_row_key(&mut cursor)? {
-                                    keys.push(row_key);
-                                }
-                                if !cursor.advance()? {
-                                    break;
-                                }
-                            }
-                        }
-                        Some(ScanRange::RangeScan { start, end }) => {
-                            let mut cursor = if let Some(start_key) = start {
-                                index_reader.cursor_seek(start_key)?
+                let result = match &scan.key_range {
+                    Some(ScanRange::PrefixScan { prefix }) => {
+                        let mut cursor = index_reader.cursor_seek(prefix)?;
+                        if cursor.valid() {
+                            let index_key = cursor.key()?;
+                            if index_key.starts_with(prefix) {
+                                extract_and_lookup_first_row(&mut cursor)?
                             } else {
-                                index_reader.cursor_first()?
-                            };
-                            while cursor.valid() {
+                                None
+                            }
+                        } else {
+                            None
+                        }
+                    }
+                    Some(ScanRange::RangeScan { start, end }) => {
+                        let mut cursor = if let Some(start_key) = start {
+                            index_reader.cursor_seek(start_key)?
+                        } else {
+                            index_reader.cursor_first()?
+                        };
+                        if cursor.valid() {
+                            if let Some(end_key) = end {
                                 let index_key = cursor.key()?;
-                                if let Some(end_key) = end {
-                                    if index_key >= *end_key {
-                                        break;
-                                    }
+                                if index_key < *end_key {
+                                    extract_and_lookup_first_row(&mut cursor)?
+                                } else {
+                                    None
                                 }
-                                if let Some(row_key) = extract_row_key(&mut cursor)? {
-                                    keys.push(row_key);
-                                }
-                                if !cursor.advance()? {
-                                    break;
-                                }
+                            } else {
+                                extract_and_lookup_first_row(&mut cursor)?
                             }
-                        }
-                        Some(ScanRange::FullScan) | None => {
-                            let mut cursor = index_reader.cursor_first()?;
-                            while cursor.valid() {
-                                if let Some(row_key) = extract_row_key(&mut cursor)? {
-                                    keys.push(row_key);
-                                }
-                                if !cursor.advance()? {
-                                    break;
-                                }
-                            }
+                        } else {
+                            None
                         }
                     }
-                    keys
-                };
-
-                let mut materialized_rows: Vec<Vec<OwnedValue>> =
-                    Vec::with_capacity(row_keys.len());
-
-                {
-                    let table_storage_arc = file_manager.table_data(schema_name, table_name)
-                        .wrap_err_with(|| format!("failed to open table data for '{}' in scalar subquery", table_name))?;
-                    let table_storage = table_storage_arc.read();
-
-                    let root_page = read_root_page(&table_storage)
-                        .wrap_err_with(|| format!("failed to read root page for table '{}'", table_name))?;
-                    let table_reader = BTreeReader::new(&table_storage, root_page)?;
-
-                    for row_key in &row_keys {
-                        if let Some(row_data) = table_reader.get(row_key)? {
-                            let user_data =
-                                crate::database::dml::mvcc_helpers::get_user_data(row_data);
-                            let record = RecordView::new(user_data, &schema)?;
-                            let row_values = OwnedValue::extract_row_from_record(&record, columns)?;
-                            materialized_rows.push(row_values);
-                        }
+                    Some(ScanRange::FullScan) | None => {
+                        let mut cursor = index_reader.cursor_first()?;
+                        extract_and_lookup_first_row(&mut cursor)?
                     }
-                }
-
-                let materialized_source = MaterializedRowSource::new(materialized_rows);
-
-                let ctx = ExecutionContext::new(arena);
-                let builder = ExecutorBuilder::new(&ctx);
-
-                let mut executor = builder.build_with_source_and_column_map(
-                    &subq_plan,
-                    materialized_source,
-                    &column_map,
-                )?;
-
-                executor.open()?;
-                let result = if let Some(row) = executor.next()? {
-                    row.values
-                        .first()
-                        .map(OwnedValue::from)
-                        .unwrap_or(OwnedValue::Null)
-                } else {
-                    OwnedValue::Null
                 };
-                executor.close()?;
-                Ok(result)
+
+                Ok(result.unwrap_or(OwnedValue::Null))
             }
             _ => Ok(OwnedValue::Null),
         }
@@ -1025,10 +1024,10 @@ impl Database {
                 let fm = fm_guard.as_mut().unwrap();
                 for subq in subqueries {
                     let key = std::ptr::from_ref(subq) as usize;
-                    if !scalar_subquery_results.iter().any(|(k, _)| *k == key) {
+                    if !scalar_subquery_results.contains_key(&key) {
                         let result =
                             Self::execute_scalar_subquery_for_update(subq, catalog, fm, arena)?;
-                        scalar_subquery_results.push((key, result));
+                        scalar_subquery_results.insert(key, result);
                     }
                 }
             }

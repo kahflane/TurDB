@@ -446,10 +446,9 @@ impl Database {
             Expr::Subquery(subq) => {
                 let key = std::ptr::from_ref(*subq) as usize;
                 scalar_subquery_results
-                    .iter()
-                    .find(|(k, _)| *k == key)
-                    .map(|(_, v)| v.clone())
-                    .ok_or_else(|| eyre::eyre!("scalar subquery result not found in pre-computed results"))
+                    .get(&key)
+                    .cloned()
+                    .ok_or_else(|| eyre::eyre!("scalar subquery result not found for key 0x{:x}", key))
             }
             Expr::BinaryOp { left, op, right } => {
                 let left_val = Self::eval_expr_with_params_and_subqueries(

@@ -286,9 +286,8 @@ impl<'a> CompiledPredicate<'a> {
             Expr::Subquery(subq) => {
                 let key = std::ptr::from_ref(*subq) as usize;
                 self.scalar_subquery_results
-                    .iter()
-                    .find(|(k, _)| *k == key)
-                    .map(|(_, v)| self.owned_value_to_value(v))
+                    .get(&key)
+                    .map(|v| self.owned_value_to_value(v))
             }
             _ => None,
         }

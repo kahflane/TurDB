@@ -1,10 +1,10 @@
 use bumpalo::Bump;
 use crate::memory::MemoryBudget;
 use crate::types::OwnedValue;
-use smallvec::SmallVec;
+use hashbrown::HashMap;
 use std::sync::Arc;
 
-pub type ScalarSubqueryResults = SmallVec<[(usize, OwnedValue); 4]>;
+pub type ScalarSubqueryResults = HashMap<usize, OwnedValue>;
 
 pub struct ExecutionContext<'a> {
     pub arena: &'a Bump,
