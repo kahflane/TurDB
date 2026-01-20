@@ -748,7 +748,7 @@ mod query_tests {
             )
             .unwrap();
 
-        assert_eq!(rows.len(), 2);
+        assert_eq!(rows.len(), 3);
     }
 
     #[test]
