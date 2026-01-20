@@ -489,16 +489,24 @@ impl Database {
         let has_where = update.where_clause.is_some();
         let has_deferred = !deferred_assignments.is_empty();
 
-        let (predicate, column_map): (
-            Option<crate::sql::predicate::CompiledPredicate>,
-            Option<Vec<(String, usize)>>,
-        ) = match (has_where, has_deferred) {
-            (true, true) => {
-                let col_map: Vec<(String, usize)> = columns
+        let needs_column_map = has_where || has_deferred;
+        let base_column_map: Option<Vec<(String, usize)>> = if needs_column_map {
+            Some(
+                columns
                     .iter()
                     .enumerate()
                     .map(|(i, c)| (c.name().to_string(), i))
-                    .collect();
+                    .collect(),
+            )
+        } else {
+            None
+        };
+
+        let (predicate, column_map): (
+            Option<crate::sql::predicate::CompiledPredicate>,
+            Option<Vec<(String, usize)>>,
+        ) = match (has_where, has_deferred, base_column_map) {
+            (true, true, Some(col_map)) => {
                 let pred = crate::sql::predicate::CompiledPredicate::with_params(
                     update.where_clause.unwrap(),
                     col_map.clone(),
@@ -507,12 +515,7 @@ impl Database {
                 );
                 (Some(pred), Some(col_map))
             }
-            (true, false) => {
-                let col_map: Vec<(String, usize)> = columns
-                    .iter()
-                    .enumerate()
-                    .map(|(i, c)| (c.name().to_string(), i))
-                    .collect();
+            (true, false, Some(col_map)) => {
                 let pred = crate::sql::predicate::CompiledPredicate::with_params(
                     update.where_clause.unwrap(),
                     col_map,
@@ -521,15 +524,8 @@ impl Database {
                 );
                 (Some(pred), None)
             }
-            (false, true) => {
-                let col_map: Vec<(String, usize)> = columns
-                    .iter()
-                    .enumerate()
-                    .map(|(i, c)| (c.name().to_string(), i))
-                    .collect();
-                (None, Some(col_map))
-            }
-            (false, false) => (None, None),
+            (false, true, Some(col_map)) => (None, Some(col_map)),
+            _ => (None, None),
         };
 
         let modified_col_indices: HashSet<usize> =
