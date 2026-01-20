@@ -507,9 +507,9 @@ impl Database {
             Option<Vec<(String, usize)>>,
         ) = match (has_where, has_deferred, base_column_map) {
             (true, true, Some(col_map)) => {
-                let pred = crate::sql::predicate::CompiledPredicate::with_params(
+                let pred = crate::sql::predicate::CompiledPredicate::with_params_from_slice(
                     update.where_clause.unwrap(),
-                    col_map.clone(),
+                    &col_map,
                     params,
                     set_param_count,
                 );
