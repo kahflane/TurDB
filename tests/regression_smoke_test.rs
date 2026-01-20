@@ -1378,6 +1378,111 @@ mod real_world_scenario {
     }
 
     #[test]
+    fn update_with_subquery_sum_computes_total_correctly() {
+        let (db, _dir) = create_test_db();
+
+        db.execute("CREATE TABLE orders (id INTEGER PRIMARY KEY, total REAL)")
+            .unwrap();
+        db.execute("CREATE TABLE order_items (order_id INTEGER, amount REAL)")
+            .unwrap();
+
+        db.execute("INSERT INTO orders (id, total) VALUES (1, 0.0)")
+            .unwrap();
+        db.execute("INSERT INTO order_items (order_id, amount) VALUES (1, 25.0)")
+            .unwrap();
+        db.execute("INSERT INTO order_items (order_id, amount) VALUES (1, 75.0)")
+            .unwrap();
+
+        db.execute(
+            "UPDATE orders SET total = (SELECT SUM(amount) FROM order_items) WHERE id = 1",
+        )
+        .unwrap();
+
+        let rows = db.query("SELECT total FROM orders WHERE id = 1").unwrap();
+        match &rows[0].values[0] {
+            OwnedValue::Float(v) => assert!((*v - 100.0).abs() < 0.01, "Expected 100.0, got {}", v),
+            other => panic!("Expected Float, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn update_with_subquery_avg_computes_average_correctly() {
+        let (db, _dir) = create_test_db();
+
+        db.execute("CREATE TABLE stats (id INTEGER PRIMARY KEY, avg_value REAL)")
+            .unwrap();
+        db.execute("CREATE TABLE values_table (value REAL)")
+            .unwrap();
+
+        db.execute("INSERT INTO stats (id, avg_value) VALUES (1, 0.0)")
+            .unwrap();
+        db.execute("INSERT INTO values_table (value) VALUES (10.0)")
+            .unwrap();
+        db.execute("INSERT INTO values_table (value) VALUES (20.0)")
+            .unwrap();
+        db.execute("INSERT INTO values_table (value) VALUES (30.0)")
+            .unwrap();
+
+        db.execute(
+            "UPDATE stats SET avg_value = (SELECT AVG(value) FROM values_table) WHERE id = 1",
+        )
+        .unwrap();
+
+        let rows = db
+            .query("SELECT avg_value FROM stats WHERE id = 1")
+            .unwrap();
+        match &rows[0].values[0] {
+            OwnedValue::Float(v) => assert!((*v - 20.0).abs() < 0.01, "Expected 20.0, got {}", v),
+            other => panic!("Expected Float, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn update_with_multiple_subqueries_in_set_clause() {
+        let (db, _dir) = create_test_db();
+
+        db.execute("CREATE TABLE summary (id INTEGER PRIMARY KEY, min_val REAL, max_val REAL, sum_val REAL)")
+            .unwrap();
+        db.execute("CREATE TABLE data_points (value REAL)")
+            .unwrap();
+
+        db.execute("INSERT INTO summary (id, min_val, max_val, sum_val) VALUES (1, 0, 0, 0)")
+            .unwrap();
+        db.execute("INSERT INTO data_points (value) VALUES (10.0)")
+            .unwrap();
+        db.execute("INSERT INTO data_points (value) VALUES (20.0)")
+            .unwrap();
+        db.execute("INSERT INTO data_points (value) VALUES (30.0)")
+            .unwrap();
+
+        db.execute(
+            "UPDATE summary SET
+                min_val = (SELECT MIN(value) FROM data_points),
+                max_val = (SELECT MAX(value) FROM data_points),
+                sum_val = (SELECT SUM(value) FROM data_points)
+             WHERE id = 1",
+        )
+        .unwrap();
+
+        let rows = db
+            .query("SELECT min_val, max_val, sum_val FROM summary WHERE id = 1")
+            .unwrap();
+
+        match &rows[0].values[0] {
+            OwnedValue::Float(v) => assert!((*v - 10.0).abs() < 0.01, "Expected min 10.0, got {}", v),
+            other => panic!("Expected Float for min_val, got {:?}", other),
+        }
+        match &rows[0].values[1] {
+            OwnedValue::Float(v) => assert!((*v - 30.0).abs() < 0.01, "Expected max 30.0, got {}", v),
+            other => panic!("Expected Float for max_val, got {:?}", other),
+        }
+        match &rows[0].values[2] {
+            OwnedValue::Float(v) => assert!((*v - 60.0).abs() < 0.01, "Expected sum 60.0, got {}", v),
+            other => panic!("Expected Float for sum_val, got {:?}", other),
+        }
+    }
+
+    #[test]
     fn blog_platform_scenario() {
         let (db, _dir) = create_test_db();
 

@@ -82,6 +82,41 @@
 //!
 //! UPDATE acquires write lock on file_manager. Transaction write entries
 //! include undo data (old row value) for rollback support.
+//!
+//! ## Scalar Subquery Support
+//!
+//! UPDATE SET clauses support scalar subqueries in value expressions:
+//! ```sql
+//! UPDATE orders SET total = (SELECT SUM(amount) FROM order_items WHERE order_id = 1)
+//! ```
+//!
+//! ### Strategy
+//!
+//! 1. **Collection**: All scalar subqueries are collected from SET expressions before
+//!    the UPDATE loop begins
+//! 2. **Pre-computation**: Subquery results are computed once and stored in a HashMap
+//!    keyed by AST node address (stable within the function scope)
+//! 3. **Substitution**: During expression evaluation, subquery nodes are replaced with
+//!    their pre-computed results
+//!
+//! ### Streaming Aggregate Optimization
+//!
+//! For simple aggregate subqueries (SUM, AVG, MIN, MAX, COUNT over a single expression),
+//! we bypass the full executor and stream directly through BTree cursors:
+//! - Creates `StreamingAggregateState` to accumulate results
+//! - Iterates through table/index cursors evaluating expressions per-row
+//! - Avoids materializing all rows into memory
+//!
+//! This optimization applies when the subquery plan has:
+//! - A single aggregate function
+//! - An expression to aggregate (e.g., `SUM(quantity * price)`)
+//! - No complex operators like joins or sorts
+//!
+//! ### Limitations
+//!
+//! - Subqueries are not correlated (cannot reference outer UPDATE row)
+//! - Streaming optimization bypasses WHERE filters (full table scan for aggregates)
+//! - Multiple rows from non-aggregate subqueries return only the first row
 
 use crate::btree::BTree;
 use crate::database::dml::mvcc_helpers::{get_user_data, wrap_record_for_update};
@@ -1023,6 +1058,10 @@ impl Database {
                 let mut fm_guard = self.shared.file_manager.write();
                 let fm = fm_guard.as_mut().unwrap();
                 for subq in subqueries {
+                    // SAFETY: Using AST node address as HashMap key is safe because:
+                    // 1. The AST is arena-allocated and lives for the duration of this function
+                    // 2. We only read from scalar_subquery_results within this same scope
+                    // 3. The same subquery AST node will have the same address when looked up
                     let key = std::ptr::from_ref(subq) as usize;
                     if !scalar_subquery_results.contains_key(&key) {
                         let result =
