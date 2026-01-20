@@ -744,11 +744,79 @@ mod query_tests {
         let rows = db
             .query(
                 "SELECT category, SUM(amount) as total FROM group_test
-                 GROUP BY category HAVING SUM(amount) >= 250",
+                 GROUP BY category HAVING SUM(amount) > 250",
             )
             .unwrap();
 
-        assert_eq!(rows.len(), 3);
+        assert_eq!(
+            rows.len(),
+            1,
+            "HAVING SUM(amount) > 250 should return only C (sum=300). A=250 and B=250 excluded"
+        );
+    }
+
+    #[test]
+    fn having_filters_groups_by_count() {
+        let (db, _dir) = create_test_db();
+
+        db.execute(
+            "CREATE TABLE items (id INTEGER PRIMARY KEY, category TEXT, value INTEGER)",
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO items VALUES
+             (1, 'A', 10), (2, 'A', 20),
+             (3, 'B', 30), (4, 'B', 40),
+             (5, 'C', 50)",
+        )
+        .unwrap();
+
+        let rows = db
+            .query(
+                "SELECT category, COUNT(*) as cnt
+                 FROM items
+                 GROUP BY category
+                 HAVING COUNT(*) >= 2",
+            )
+            .unwrap();
+
+        assert_eq!(
+            rows.len(),
+            2,
+            "HAVING COUNT(*) >= 2 should filter to only A and B (each has 2 items), but got {} rows",
+            rows.len()
+        );
+    }
+
+    #[test]
+    fn having_filters_groups_by_sum() {
+        let (db, _dir) = create_test_db();
+
+        db.execute(
+            "CREATE TABLE group_test2 (id INTEGER PRIMARY KEY, category TEXT, amount INTEGER)",
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO group_test2 VALUES
+             (1, 'A', 100), (2, 'A', 150),
+             (3, 'B', 200), (4, 'B', 50),
+             (5, 'C', 300)",
+        )
+        .unwrap();
+
+        let rows = db
+            .query(
+                "SELECT category, SUM(amount) as total FROM group_test2
+                 GROUP BY category HAVING SUM(amount) > 250",
+            )
+            .unwrap();
+
+        assert_eq!(
+            rows.len(),
+            1,
+            "HAVING SUM(amount) > 250 should return only C (sum=300). A=250, B=250 should be excluded, but got {} rows",
+            rows.len()
+        );
     }
 
     #[test]
