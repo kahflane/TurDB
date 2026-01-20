@@ -1483,6 +1483,46 @@ mod real_world_scenario {
     }
 
     #[test]
+    fn update_with_subquery_where_filter_applied_correctly() {
+        let (db, _dir) = create_test_db();
+
+        db.execute("CREATE TABLE orders (id INTEGER PRIMARY KEY, total REAL)")
+            .unwrap();
+        db.execute("CREATE TABLE order_items (order_id INTEGER, amount REAL)")
+            .unwrap();
+
+        db.execute("INSERT INTO orders (id, total) VALUES (1, 0.0)")
+            .unwrap();
+        db.execute("INSERT INTO orders (id, total) VALUES (2, 0.0)")
+            .unwrap();
+        db.execute("INSERT INTO order_items (order_id, amount) VALUES (1, 10.0)")
+            .unwrap();
+        db.execute("INSERT INTO order_items (order_id, amount) VALUES (1, 15.0)")
+            .unwrap();
+        db.execute("INSERT INTO order_items (order_id, amount) VALUES (2, 100.0)")
+            .unwrap();
+        db.execute("INSERT INTO order_items (order_id, amount) VALUES (2, 200.0)")
+            .unwrap();
+
+        db.execute(
+            "UPDATE orders SET total = (SELECT SUM(amount) FROM order_items WHERE order_id = 1) WHERE id = 1",
+        )
+        .unwrap();
+
+        let rows = db.query("SELECT total FROM orders WHERE id = 1").unwrap();
+        match &rows[0].values[0] {
+            OwnedValue::Float(v) => {
+                assert!(
+                    (*v - 25.0).abs() < 0.01,
+                    "Expected 25.0 (sum of order_id=1 items only), got {}. WHERE filter may not be applied.",
+                    v
+                );
+            }
+            other => panic!("Expected Float, got {:?}", other),
+        }
+    }
+
+    #[test]
     fn blog_platform_scenario() {
         let (db, _dir) = create_test_db();
 

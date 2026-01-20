@@ -115,7 +115,8 @@
 //! ### Limitations
 //!
 //! - Subqueries are not correlated (cannot reference outer UPDATE row)
-//! - Streaming optimization bypasses WHERE filters (full table scan for aggregates)
+//! - Streaming optimization only applies when no WHERE filters are present
+//!   (filtered queries fall back to the full executor)
 //! - Multiple rows from non-aggregate subqueries return only the first row
 
 use crate::btree::BTree;
@@ -465,15 +466,15 @@ impl StreamingAggregateState {
             OwnedValue::Int(i) => {
                 self.sum_int = self.sum_int.saturating_add(*i);
                 self.count = self.count.saturating_add(1);
-                self.min_int = Some(self.min_int.map(|m| m.min(*i)).unwrap_or(*i));
-                self.max_int = Some(self.max_int.map(|m| m.max(*i)).unwrap_or(*i));
+                self.min_int = Some(self.min_int.map_or(*i, |m| m.min(*i)));
+                self.max_int = Some(self.max_int.map_or(*i, |m| m.max(*i)));
             }
             OwnedValue::Float(f) => {
                 self.sum_float += f;
                 self.has_float = true;
                 self.count = self.count.saturating_add(1);
-                self.min_float = Some(self.min_float.map(|m| m.min(*f)).unwrap_or(*f));
-                self.max_float = Some(self.max_float.map(|m| m.max(*f)).unwrap_or(*f));
+                self.min_float = Some(self.min_float.map_or(*f, |m| m.min(*f)));
+                self.max_float = Some(self.max_float.map_or(*f, |m| m.max(*f)));
             }
             _ => {}
         }
@@ -538,6 +539,24 @@ impl StreamingAggregateState {
                 }
             }
         }
+    }
+}
+
+fn plan_has_filter(op: &crate::sql::planner::physical::PhysicalOperator<'_>) -> bool {
+    use crate::sql::planner::physical::PhysicalOperator;
+    match op {
+        PhysicalOperator::FilterExec(_) => true,
+        PhysicalOperator::ProjectExec(p) => plan_has_filter(p.input),
+        PhysicalOperator::LimitExec(l) => plan_has_filter(l.input),
+        PhysicalOperator::SortExec(s) => plan_has_filter(s.input),
+        PhysicalOperator::TopKExec(t) => plan_has_filter(t.input),
+        PhysicalOperator::HashAggregate(a) => plan_has_filter(a.input),
+        PhysicalOperator::SortedAggregate(a) => plan_has_filter(a.input),
+        PhysicalOperator::WindowExec(w) => plan_has_filter(w.input),
+        PhysicalOperator::ScalarSubqueryExec(s) => plan_has_filter(s.subquery),
+        PhysicalOperator::ExistsSubqueryExec(s) => plan_has_filter(s.subquery),
+        PhysicalOperator::InListSubqueryExec(s) => plan_has_filter(s.subquery),
+        _ => false,
     }
 }
 
@@ -611,25 +630,28 @@ impl Database {
                     .map(|(i, c)| (c.name().to_lowercase(), i))
                     .collect();
 
-                if let Some((agg_func, expr)) = find_expression_aggregate(subq_plan.root) {
-                    let schema = create_record_schema(columns);
-                    let table_reader = crate::btree::BTreeReader::new(&storage, root_page)
-                        .wrap_err_with(|| format!("failed to create BTreeReader for table '{}'", table_name))?;
-                    let mut cursor = table_reader.cursor_first()?;
-                    let mut agg_state = StreamingAggregateState::new();
+                let has_filter = plan_has_filter(subq_plan.root) || scan.post_scan_filter.is_some();
+                if !has_filter {
+                    if let Some((agg_func, expr)) = find_expression_aggregate(subq_plan.root) {
+                        let schema = create_record_schema(columns);
+                        let table_reader = crate::btree::BTreeReader::new(&storage, root_page)
+                            .wrap_err_with(|| format!("failed to create BTreeReader for table '{}'", table_name))?;
+                        let mut cursor = table_reader.cursor_first()?;
+                        let mut agg_state = StreamingAggregateState::new();
 
-                    while cursor.valid() {
-                        let row_data = cursor.value()?;
-                        let user_data = crate::database::dml::mvcc_helpers::get_user_data(row_data);
-                        let record = RecordView::new(user_data, &schema)?;
-                        let expr_value = eval_expr_for_record_streaming(expr, &record, &column_info);
-                        agg_state.update(&expr_value);
-                        if !cursor.advance()? {
-                            break;
+                        while cursor.valid() {
+                            let row_data = cursor.value()?;
+                            let user_data = crate::database::dml::mvcc_helpers::get_user_data(row_data);
+                            let record = RecordView::new(user_data, &schema)?;
+                            let expr_value = eval_expr_for_record_streaming(expr, &record, &column_info);
+                            agg_state.update(&expr_value);
+                            if !cursor.advance()? {
+                                break;
+                            }
                         }
-                    }
 
-                    return Ok(agg_state.finalize(agg_func));
+                        return Ok(agg_state.finalize(agg_func));
+                    }
                 }
 
                 let source = StreamingBTreeSource::from_btree_scan_with_projections(
@@ -677,7 +699,9 @@ impl Database {
 
                 let row_id_suffix_len = if scan.is_unique_index { 0 } else { 8 };
 
-                if let Some((agg_func, expr)) = find_expression_aggregate(subq_plan.root) {
+                let has_filter = plan_has_filter(subq_plan.root);
+                if !has_filter {
+                    if let Some((agg_func, expr)) = find_expression_aggregate(subq_plan.root) {
                     let mut agg_state = StreamingAggregateState::new();
 
                     let index_storage_arc = file_manager.index_data(schema_name, table_name, index_name)
@@ -775,7 +799,8 @@ impl Database {
                         }
                     }
 
-                    return Ok(agg_state.finalize(agg_func));
+                        return Ok(agg_state.finalize(agg_func));
+                    }
                 }
 
                 let index_storage_arc = file_manager.index_data(schema_name, table_name, index_name)
