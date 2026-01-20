@@ -583,11 +583,11 @@ mod auto_increment_tests {
     }
 }
 
-mod composite_unique_tests {
+mod composite_pk_tests {
     use super::*;
 
     #[test]
-    fn prepared_insert_validates_composite_unique_index() {
+    fn prepared_insert_validates_composite_primary_key() {
         let (_dir, db) = create_test_db();
 
         db.execute(
@@ -621,7 +621,7 @@ mod composite_unique_tests {
     }
 
     #[test]
-    fn prepared_insert_allows_partial_composite_key_match() {
+    fn prepared_insert_allows_partial_composite_pk_match() {
         let (_dir, db) = create_test_db();
 
         db.execute(
@@ -650,6 +650,80 @@ mod composite_unique_tests {
         assert!(
             result.is_ok(),
             "Prepared INSERT with different composite key should succeed, but got: {:?}",
+            result.unwrap_err()
+        );
+    }
+}
+
+mod composite_unique_tests {
+    use super::*;
+
+    #[test]
+    fn prepared_insert_validates_composite_unique_constraint() {
+        let (_dir, db) = create_test_db();
+
+        db.execute(
+            "CREATE TABLE reservations (
+                id INTEGER PRIMARY KEY,
+                user_id INTEGER,
+                resource_id INTEGER,
+                date TEXT,
+                UNIQUE (user_id, resource_id)
+            )",
+        )
+        .expect("Failed to create table");
+
+        db.execute("INSERT INTO reservations VALUES (1, 10, 100, '2024-01-01')")
+            .expect("Initial insert should succeed");
+
+        let stmt = db
+            .prepare("INSERT INTO reservations VALUES (?, ?, ?, ?)")
+            .expect("Failed to prepare statement");
+
+        let result = stmt
+            .bind(OwnedValue::Int(2))
+            .bind(OwnedValue::Int(10))
+            .bind(OwnedValue::Int(100))
+            .bind(OwnedValue::Text("2024-02-01".to_string()))
+            .execute(&db);
+
+        assert!(
+            result.is_err(),
+            "Prepared INSERT with duplicate composite UNIQUE should fail, but got: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn prepared_insert_allows_partial_composite_unique_match() {
+        let (_dir, db) = create_test_db();
+
+        db.execute(
+            "CREATE TABLE bookings (
+                id INTEGER PRIMARY KEY,
+                room_id INTEGER,
+                date TEXT,
+                UNIQUE (room_id, date)
+            )",
+        )
+        .expect("Failed to create table");
+
+        db.execute("INSERT INTO bookings VALUES (1, 100, '2024-01-01')")
+            .expect("Initial insert should succeed");
+
+        let stmt = db
+            .prepare("INSERT INTO bookings VALUES (?, ?, ?)")
+            .expect("Failed to prepare statement");
+
+        let result = stmt
+            .bind(OwnedValue::Int(2))
+            .bind(OwnedValue::Int(100))
+            .bind(OwnedValue::Text("2024-01-02".to_string()))
+            .execute(&db);
+
+        assert!(
+            result.is_ok(),
+            "Prepared INSERT with different composite UNIQUE key should succeed, but got: {:?}",
             result.unwrap_err()
         );
     }
