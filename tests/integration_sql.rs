@@ -351,6 +351,77 @@ mod dml_tests {
     }
 
     #[test]
+    fn update_with_binary_expression_doubles_values() {
+        let dir = tempdir().unwrap();
+        let db = Database::create(dir.path().join("test_db")).unwrap();
+        db.execute("CREATE TABLE items (id INTEGER PRIMARY KEY, value INTEGER)")
+            .unwrap();
+        db.execute("INSERT INTO items VALUES (1, 10)").unwrap();
+        db.execute("INSERT INTO items VALUES (2, 20)").unwrap();
+
+        let result = db.execute("UPDATE items SET value = value * 2");
+
+        assert!(
+            result.is_ok(),
+            "UPDATE with binary expression SHOULD succeed, got error: {:?}",
+            result.err()
+        );
+        assert!(
+            matches!(
+                result.unwrap(),
+                ExecuteResult::Update {
+                    rows_affected: 2,
+                    ..
+                }
+            ),
+            "UPDATE SHOULD affect 2 rows"
+        );
+
+        let rows = db.query("SELECT id, value FROM items ORDER BY id").unwrap();
+        assert_eq!(rows.len(), 2, "2 rows SHOULD exist");
+        assert_eq!(
+            rows[0].values[1],
+            OwnedValue::Int(20),
+            "First row value SHOULD be 10 * 2 = 20"
+        );
+        assert_eq!(
+            rows[1].values[1],
+            OwnedValue::Int(40),
+            "Second row value SHOULD be 20 * 2 = 40"
+        );
+    }
+
+    #[test]
+    fn update_with_addition_expression_adds_constant() {
+        let dir = tempdir().unwrap();
+        let db = Database::create(dir.path().join("test_db")).unwrap();
+        db.execute("CREATE TABLE items (id INTEGER PRIMARY KEY, value INTEGER)")
+            .unwrap();
+        db.execute("INSERT INTO items VALUES (1, 10)").unwrap();
+        db.execute("INSERT INTO items VALUES (2, 20)").unwrap();
+
+        let result = db.execute("UPDATE items SET value = value + 5");
+
+        assert!(
+            result.is_ok(),
+            "UPDATE with addition expression SHOULD succeed, got error: {:?}",
+            result.err()
+        );
+
+        let rows = db.query("SELECT id, value FROM items ORDER BY id").unwrap();
+        assert_eq!(
+            rows[0].values[1],
+            OwnedValue::Int(15),
+            "First row value SHOULD be 10 + 5 = 15"
+        );
+        assert_eq!(
+            rows[1].values[1],
+            OwnedValue::Int(25),
+            "Second row value SHOULD be 20 + 5 = 25"
+        );
+    }
+
+    #[test]
     fn delete_removes_matching_rows_and_returns_count() {
         let dir = tempdir().unwrap();
         let db = Database::create(dir.path().join("test_db")).unwrap();

@@ -116,6 +116,26 @@ fn count_params_in_expr(expr: &crate::sql::ast::Expr) -> usize {
     }
 }
 
+fn expr_contains_column_ref(expr: &crate::sql::ast::Expr) -> bool {
+    use crate::sql::ast::Expr;
+    match expr {
+        Expr::Column(_) => true,
+        Expr::BinaryOp { left, right, .. } => {
+            expr_contains_column_ref(left) || expr_contains_column_ref(right)
+        }
+        Expr::UnaryOp { expr, .. } => expr_contains_column_ref(expr),
+        Expr::Cast { expr, .. } => expr_contains_column_ref(expr),
+        Expr::Function(func) => {
+            if let crate::sql::ast::FunctionArgs::Args(args) = &func.args {
+                args.iter().any(|arg| expr_contains_column_ref(arg.value))
+            } else {
+                false
+            }
+        }
+        _ => false,
+    }
+}
+
 impl Database {
     pub(crate) fn execute_update(
         &self,
@@ -412,16 +432,28 @@ impl Database {
         )> = Vec::new();
 
         let mut precomputed_assignments: Vec<(usize, OwnedValue)> = Vec::new();
+        let mut deferred_assignments: Vec<(usize, usize)> = Vec::new();
         let set_param_count: usize;
         {
             let mut param_idx = 0;
-            for (col_idx, value_expr) in &assignment_indices {
-                let val =
-                    Self::eval_expr_with_params(value_expr, column_types.get(*col_idx), Some(params), &mut param_idx)?;
-                precomputed_assignments.push((*col_idx, val));
+            for (assign_idx, (col_idx, value_expr)) in assignment_indices.iter().enumerate() {
+                if expr_contains_column_ref(value_expr) {
+                    deferred_assignments.push((*col_idx, assign_idx));
+                    param_idx += count_params_in_expr(value_expr);
+                } else {
+                    let val =
+                        Self::eval_expr_with_params(value_expr, column_types.get(*col_idx), Some(params), &mut param_idx)?;
+                    precomputed_assignments.push((*col_idx, val));
+                }
             }
             set_param_count = param_idx;
         }
+
+        let column_map: Vec<(String, usize)> = columns
+            .iter()
+            .enumerate()
+            .map(|(i, c)| (c.name().to_string(), i))
+            .collect();
 
         let predicate: Option<crate::sql::predicate::CompiledPredicate> =
             if let Some(w) = update.where_clause {
@@ -454,7 +486,10 @@ impl Database {
             .map(|(idx, _)| idx)
             .collect();
 
-        let can_onepass = pk_lookup_info.is_some() && unique_col_indices.is_empty() && !has_toast;
+        let can_onepass = pk_lookup_info.is_some()
+            && unique_col_indices.is_empty()
+            && !has_toast
+            && deferred_assignments.is_empty();
 
         if can_onepass {
             if let Some((ref target_key, ref target_val)) = pk_lookup_info {
@@ -640,6 +675,30 @@ impl Database {
                             old_toast_values.push((*col_idx, row_values[*col_idx].clone()));
                         }
                         row_values[*col_idx] = val.clone();
+                    }
+
+                    if !deferred_assignments.is_empty() {
+                        let deferred_values: Vec<(usize, OwnedValue)> = {
+                            let values = owned_values_to_values(&row_values);
+                            let values_slice = arena.alloc_slice_fill_iter(values.into_iter());
+                            let exec_row = ExecutorRow::new(values_slice);
+
+                            let mut results = Vec::with_capacity(deferred_assignments.len());
+                            for (col_idx, assign_idx) in &deferred_assignments {
+                                let (_, value_expr) = &assignment_indices[*assign_idx];
+                                let new_val =
+                                    self.eval_expr_with_row(value_expr, &exec_row, &column_map)?;
+                                results.push((*col_idx, new_val));
+                            }
+                            results
+                        };
+
+                        for (col_idx, new_val) in deferred_values {
+                            if let OwnedValue::ToastPointer(_) = &row_values[col_idx] {
+                                old_toast_values.push((col_idx, row_values[col_idx].clone()));
+                            }
+                            row_values[col_idx] = new_val;
+                        }
                     }
 
                     let validator = crate::constraints::ConstraintValidator::new(&table_def);
