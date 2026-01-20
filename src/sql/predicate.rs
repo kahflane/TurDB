@@ -108,7 +108,7 @@ impl<'a> CompiledPredicate<'a> {
                 _ => true,
             },
             Expr::Literal(Literal::Boolean(b)) => *b,
-            Expr::Like { .. } | Expr::Between { .. } | Expr::InList { .. } => {
+            Expr::Like { .. } | Expr::Between { .. } | Expr::InList { .. } | Expr::IsNull { .. } => {
                 match self.eval_value(expr, row) {
                     Some(Value::Int(n)) => n != 0,
                     _ => false,
