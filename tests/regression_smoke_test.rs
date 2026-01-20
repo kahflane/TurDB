@@ -1060,6 +1060,25 @@ mod edge_cases {
     }
 
     #[test]
+    fn count_with_where_matching_no_rows_returns_one_row_with_zero() {
+        let (db, _dir) = create_test_db();
+
+        db.execute("CREATE TABLE count_test (id INTEGER PRIMARY KEY, status TEXT)")
+            .unwrap();
+        db.execute("INSERT INTO count_test VALUES (1, 'active')").unwrap();
+        db.execute("INSERT INTO count_test VALUES (2, 'active')").unwrap();
+
+        let rows = db
+            .query("SELECT COUNT(*) as cnt FROM count_test WHERE status = 'nonexistent'")
+            .unwrap();
+        assert_eq!(rows.len(), 1, "COUNT with WHERE matching no rows should return 1 row");
+        match &rows[0].values[0] {
+            OwnedValue::Int(v) => assert_eq!(*v, 0, "COUNT should be 0 when no rows match"),
+            other => panic!("Expected Int(0), got {:?}", other),
+        }
+    }
+
+    #[test]
     fn null_handling() {
         let (db, _dir) = create_test_db();
 

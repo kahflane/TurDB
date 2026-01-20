@@ -2898,6 +2898,18 @@ impl<'a, S: RowSource> Executor<'a> for DynamicExecutor<'a, S> {
                         }
                     }
 
+                    if state.groups.is_empty()
+                        && state.group_by.is_empty()
+                        && state.group_by_exprs.is_none()
+                    {
+                        let initial_states: Vec<AggregateState> = state
+                            .aggregates
+                            .iter()
+                            .map(|_| AggregateState::new())
+                            .collect();
+                        state.groups.insert(Vec::new(), (Vec::new(), initial_states));
+                    }
+
                     let results: Vec<(Vec<Value<'static>>, Vec<AggregateState>)> =
                         state.groups.drain().map(|(_, v)| v).collect();
                     state.result_iter = Some(results.into_iter());
