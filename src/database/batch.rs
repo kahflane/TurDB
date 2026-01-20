@@ -35,7 +35,7 @@ use crate::database::timing::{
 use crate::database::Database;
 use crate::storage::{TableFileHeader, WalStoragePerTable, DEFAULT_SCHEMA};
 use crate::types::{create_record_schema, OwnedValue};
-use eyre::{Result, WrapErr};
+use eyre::{bail, Result, WrapErr};
 use std::sync::atomic::Ordering;
 
 impl Database {
@@ -279,6 +279,47 @@ impl Database {
         #[cfg(feature = "timing")]
         MVCC_WRAP_NS.fetch_add(mvcc_start.elapsed().as_nanos() as u64, Ordering::Relaxed);
 
+        for index_plan in &plan.indexes {
+            if !index_plan.is_unique && !index_plan.is_pk {
+                continue;
+            }
+
+            let all_null = index_plan
+                .col_indices
+                .iter()
+                .all(|&idx| params.get(idx).map(|v| v.is_null()).unwrap_or(true));
+            if all_null {
+                continue;
+            }
+
+            let index_storage_arc = self.get_or_load_index_storage(
+                index_plan,
+                &plan.schema_name,
+                &plan.table_name,
+                "constraint check",
+            )?;
+            let mut index_storage_guard = index_storage_arc.write();
+            let index_root = Self::get_index_root(index_plan, &mut index_storage_guard)?;
+
+            Self::build_index_key(index_plan, params);
+            let key_buf_guard = index_plan.key_buffer.borrow();
+
+            let index_btree = BTree::new(&mut *index_storage_guard, index_root)?;
+            if index_btree.search(&key_buf_guard)?.is_some() {
+                let constraint_type = if index_plan.is_pk {
+                    "PRIMARY KEY"
+                } else {
+                    "UNIQUE"
+                };
+                bail!(
+                    "{} constraint violated on index '{}' in table '{}': value already exists",
+                    constraint_type,
+                    index_plan.name,
+                    plan.table_name
+                );
+            }
+        }
+
         let row_id = self.shared.next_row_id.fetch_add(1, Ordering::Relaxed);
         let row_key = Self::generate_row_key(row_id);
 
@@ -315,52 +356,17 @@ impl Database {
 
         let row_id_bytes = row_id.to_be_bytes();
         for index_plan in &plan.indexes {
-            let index_storage_arc = if let Some(weak) = index_plan.storage.borrow().as_ref() {
-                weak.upgrade()
-            } else {
-                None
-            };
-
-            let index_storage_arc = if let Some(arc) = index_storage_arc {
-                arc
-            } else {
-                let mut file_manager_guard = self.shared.file_manager.write();
-                let file_manager = file_manager_guard.as_mut().unwrap();
-                let arc = file_manager
-                    .index_data_mut(&plan.schema_name, &plan.table_name, &index_plan.name)
-                    .wrap_err_with(|| {
-                        format!(
-                            "failed to open index '{}' for table '{}.{}' during insert",
-                            index_plan.name, plan.schema_name, plan.table_name
-                        )
-                    })?;
-                *index_plan.storage.borrow_mut() = Some(std::sync::Arc::downgrade(&arc));
-                arc
-            };
-
+            let index_storage_arc = self.get_or_load_index_storage(
+                index_plan,
+                &plan.schema_name,
+                &plan.table_name,
+                "insert",
+            )?;
             let mut index_storage_guard = index_storage_arc.write();
+            let index_root = Self::get_index_root(index_plan, &mut index_storage_guard)?;
 
-            let index_root = {
-                let cached_root = index_plan.root_page.get();
-                if cached_root > 0 {
-                    cached_root
-                } else {
-                    use crate::storage::IndexFileHeader;
-                    let page = index_storage_guard.page(0)?;
-                    let header = IndexFileHeader::from_bytes(page)?;
-                    let root = header.root_page();
-                    index_plan.root_page.set(root);
-                    root
-                }
-            };
-
-            let mut key_buf_guard = index_plan.key_buffer.borrow_mut();
-            key_buf_guard.clear();
-            for &col_idx in &index_plan.col_indices {
-                if let Some(val) = params.get(col_idx) {
-                    Self::encode_value_as_key(val, &mut *key_buf_guard);
-                }
-            }
+            Self::build_index_key(index_plan, params);
+            let key_buf_guard = index_plan.key_buffer.borrow();
 
             let index_rightmost = index_plan.rightmost_hint.get();
             let mut index_btree =
@@ -482,5 +488,61 @@ impl Database {
         }
 
         Ok(stats.row_count)
+    }
+
+    fn get_or_load_index_storage(
+        &self,
+        index_plan: &crate::database::prepared::CachedIndexPlan,
+        schema_name: &str,
+        table_name: &str,
+        operation: &str,
+    ) -> Result<std::sync::Arc<parking_lot::RwLock<crate::storage::MmapStorage>>> {
+        if let Some(weak) = index_plan.storage.borrow().as_ref() {
+            if let Some(arc) = weak.upgrade() {
+                return Ok(arc);
+            }
+        }
+
+        let mut file_manager_guard = self.shared.file_manager.write();
+        let file_manager = file_manager_guard.as_mut().unwrap();
+        let arc = file_manager
+            .index_data_mut(schema_name, table_name, &index_plan.name)
+            .wrap_err_with(|| {
+                format!(
+                    "failed to open index '{}' for table '{}.{}' during {}",
+                    index_plan.name, schema_name, table_name, operation
+                )
+            })?;
+        *index_plan.storage.borrow_mut() = Some(std::sync::Arc::downgrade(&arc));
+        Ok(arc)
+    }
+
+    fn get_index_root(
+        index_plan: &crate::database::prepared::CachedIndexPlan,
+        storage: &mut crate::storage::MmapStorage,
+    ) -> Result<u32> {
+        let cached_root = index_plan.root_page.get();
+        if cached_root > 0 {
+            return Ok(cached_root);
+        }
+
+        use crate::storage::IndexFileHeader;
+        let page = storage.page(0)?;
+        let header = IndexFileHeader::from_bytes(page)?;
+        let root = header.root_page();
+        index_plan.root_page.set(root);
+        Ok(root)
+    }
+
+    fn build_index_key(
+        index_plan: &crate::database::prepared::CachedIndexPlan,
+        params: &[OwnedValue],
+    ) {
+        let mut key_buf = index_plan.key_buffer.borrow_mut();
+        key_buf.clear();
+        for &col_idx in &index_plan.col_indices {
+            let val = params.get(col_idx).unwrap_or(&OwnedValue::Null);
+            Self::encode_value_as_key(val, &mut *key_buf);
+        }
     }
 }
