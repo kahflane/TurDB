@@ -1,4 +1,5 @@
 use crate::sql::executor::ExecutorRow;
+use crate::sql::state::GroupValues;
 use crate::types::Value;
 use bumpalo::Bump;
 use std::cmp::Ordering;
@@ -62,7 +63,7 @@ pub fn compute_group_key_from_exprs<'a>(
 pub fn evaluate_group_by_exprs<'a>(
     row: &ExecutorRow<'a>,
     group_by_exprs: &[crate::sql::predicate::CompiledPredicate<'a>],
-) -> Vec<Value<'static>> {
+) -> GroupValues {
     group_by_exprs
         .iter()
         .map(|expr| {

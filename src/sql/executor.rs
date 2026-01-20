@@ -78,9 +78,9 @@ use crate::sql::decoder::SimpleDecoder;
 use crate::sql::predicate::CompiledPredicate;
 use crate::sql::partition_spiller::PartitionSpiller;
 use crate::sql::state::{
-    AggregateState, GraceHashJoinState, HashAggregateState, HashAntiJoinState, HashSemiJoinState,
-    IndexScanState, LimitState, NestedLoopJoinState, SortState, StreamingHashJoinState, TopKState,
-    WindowState,
+    AggregateState, GraceHashJoinState, GroupAggStates, GroupValues, HashAggregateState,
+    HashAntiJoinState, HashSemiJoinState, IndexScanState, LimitState, NestedLoopJoinState,
+    SortState, StreamingHashJoinState, TopKState, WindowState,
 };
 use crate::sql::util::{
     allocate_value_to_arena, clone_value_owned, clone_value_ref_to_arena, compare_values_for_sort,
@@ -1378,7 +1378,6 @@ pub enum AggregateFunction {
 }
 
 type GroupValue = SmallVec<[Value<'static>; 8]>;
-type GroupAggStates = SmallVec<[AggregateState; 4]>;
 
 #[allow(clippy::type_complexity)]
 pub struct HashAggregateExecutor<'a, E>
@@ -2862,7 +2861,7 @@ impl<'a, S: RowSource> Executor<'a> for DynamicExecutor<'a, S> {
                                 (key, values)
                             } else {
                                 let key = compute_group_key_for_dynamic(&row, &state.group_by);
-                                let values: Vec<Value<'static>> = state
+                                let values: GroupValues = state
                                     .group_by
                                     .iter()
                                     .map(|&col| {
@@ -2885,11 +2884,7 @@ impl<'a, S: RowSource> Executor<'a> for DynamicExecutor<'a, S> {
                         }
 
                         let entry = state.groups.entry(group_key).or_insert_with(|| {
-                            let initial_states: Vec<AggregateState> = state
-                                .aggregates
-                                .iter()
-                                .map(|_| AggregateState::new())
-                                .collect();
+                            let initial_states = AggregateState::create_initial_states(state.aggregates.len());
                             (group_values.clone(), initial_states)
                         });
 
@@ -2902,15 +2897,11 @@ impl<'a, S: RowSource> Executor<'a> for DynamicExecutor<'a, S> {
                         && state.group_by.is_empty()
                         && state.group_by_exprs.is_none()
                     {
-                        let initial_states: Vec<AggregateState> = state
-                            .aggregates
-                            .iter()
-                            .map(|_| AggregateState::new())
-                            .collect();
-                        state.groups.insert(Vec::new(), (Vec::new(), initial_states));
+                        let initial_states = AggregateState::create_initial_states(state.aggregates.len());
+                        state.groups.insert(Vec::new(), (GroupValues::new(), initial_states));
                     }
 
-                    let results: Vec<(Vec<Value<'static>>, Vec<AggregateState>)> =
+                    let results: Vec<(GroupValues, GroupAggStates)> =
                         state.groups.drain().map(|(_, v)| v).collect();
                     state.result_iter = Some(results.into_iter());
                     state.computed = true;
