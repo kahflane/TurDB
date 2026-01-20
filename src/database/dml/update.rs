@@ -95,11 +95,11 @@ use crate::sql::context::ScalarSubqueryResults;
 use crate::sql::decoder::RecordDecoder;
 use crate::sql::executor::ExecutorRow;
 use crate::sql::predicate::CompiledPredicate;
-use crate::storage::{IndexFileHeader, DEFAULT_SCHEMA};
+use crate::storage::{IndexFileHeader, TableFileHeader, DEFAULT_SCHEMA};
 use crate::types::{create_record_schema, OwnedValue, Value};
 use bumpalo::Bump;
 use eyre::{bail, Result, WrapErr};
-use hashbrown::HashSet;
+use hashbrown::{HashMap, HashSet};
 use smallvec::SmallVec;
 use std::borrow::Cow;
 use std::sync::atomic::Ordering;
@@ -274,22 +274,53 @@ fn find_expression_aggregate<'a>(
     }
 }
 
-fn eval_expr_for_row(
+fn eval_binary_op(left: &OwnedValue, op: &crate::sql::ast::BinaryOperator, right: &OwnedValue) -> OwnedValue {
+    use crate::sql::ast::BinaryOperator;
+    match op {
+        BinaryOperator::Plus => match (left, right) {
+            (OwnedValue::Int(a), OwnedValue::Int(b)) => OwnedValue::Int(a + b),
+            (OwnedValue::Float(a), OwnedValue::Float(b)) => OwnedValue::Float(a + b),
+            (OwnedValue::Int(a), OwnedValue::Float(b)) => OwnedValue::Float(*a as f64 + b),
+            (OwnedValue::Float(a), OwnedValue::Int(b)) => OwnedValue::Float(a + *b as f64),
+            _ => OwnedValue::Null,
+        },
+        BinaryOperator::Minus => match (left, right) {
+            (OwnedValue::Int(a), OwnedValue::Int(b)) => OwnedValue::Int(a - b),
+            (OwnedValue::Float(a), OwnedValue::Float(b)) => OwnedValue::Float(a - b),
+            (OwnedValue::Int(a), OwnedValue::Float(b)) => OwnedValue::Float(*a as f64 - b),
+            (OwnedValue::Float(a), OwnedValue::Int(b)) => OwnedValue::Float(a - *b as f64),
+            _ => OwnedValue::Null,
+        },
+        BinaryOperator::Multiply => match (left, right) {
+            (OwnedValue::Int(a), OwnedValue::Int(b)) => OwnedValue::Int(a * b),
+            (OwnedValue::Float(a), OwnedValue::Float(b)) => OwnedValue::Float(a * b),
+            (OwnedValue::Int(a), OwnedValue::Float(b)) => OwnedValue::Float(*a as f64 * b),
+            (OwnedValue::Float(a), OwnedValue::Int(b)) => OwnedValue::Float(a * *b as f64),
+            _ => OwnedValue::Null,
+        },
+        BinaryOperator::Divide => match (left, right) {
+            (OwnedValue::Int(a), OwnedValue::Int(b)) if *b != 0 => OwnedValue::Int(a / b),
+            (OwnedValue::Float(a), OwnedValue::Float(b)) if *b != 0.0 => OwnedValue::Float(a / b),
+            (OwnedValue::Int(a), OwnedValue::Float(b)) if *b != 0.0 => OwnedValue::Float(*a as f64 / b),
+            (OwnedValue::Float(a), OwnedValue::Int(b)) if *b != 0 => OwnedValue::Float(a / *b as f64),
+            _ => OwnedValue::Null,
+        },
+        _ => OwnedValue::Null,
+    }
+}
+
+fn eval_expr_for_record_streaming(
     expr: &crate::sql::ast::Expr<'_>,
-    row: &[OwnedValue],
-    column_map: &[(String, usize)],
+    record: &RecordView<'_>,
+    column_info: &HashMap<String, (usize, crate::records::types::DataType)>,
 ) -> OwnedValue {
-    use crate::sql::ast::{BinaryOperator, Expr, Literal};
+    use crate::sql::ast::{Expr, Literal};
 
     match expr {
         Expr::Column(col_ref) => {
-            let col_name = col_ref.column.to_lowercase();
-            let idx = column_map
-                .iter()
-                .find(|(name, _)| name == &col_name)
-                .map(|(_, idx)| *idx);
-            if let Some(i) = idx {
-                row.get(i).cloned().unwrap_or(OwnedValue::Null)
+            let col_lower = col_ref.column.to_lowercase();
+            if let Some(&(idx, data_type)) = column_info.get(&col_lower) {
+                OwnedValue::from_record_column(record, idx, data_type).unwrap_or(OwnedValue::Null)
             } else {
                 OwnedValue::Null
             }
@@ -303,48 +334,12 @@ fn eval_expr_for_row(
             _ => OwnedValue::Null,
         },
         Expr::BinaryOp { left, op, right } => {
-            let left_val = eval_expr_for_row(left, row, column_map);
-            let right_val = eval_expr_for_row(right, row, column_map);
-            match op {
-                BinaryOperator::Plus => match (&left_val, &right_val) {
-                    (OwnedValue::Int(a), OwnedValue::Int(b)) => OwnedValue::Int(a + b),
-                    (OwnedValue::Float(a), OwnedValue::Float(b)) => OwnedValue::Float(a + b),
-                    (OwnedValue::Int(a), OwnedValue::Float(b)) => OwnedValue::Float(*a as f64 + b),
-                    (OwnedValue::Float(a), OwnedValue::Int(b)) => OwnedValue::Float(a + *b as f64),
-                    _ => OwnedValue::Null,
-                },
-                BinaryOperator::Minus => match (&left_val, &right_val) {
-                    (OwnedValue::Int(a), OwnedValue::Int(b)) => OwnedValue::Int(a - b),
-                    (OwnedValue::Float(a), OwnedValue::Float(b)) => OwnedValue::Float(a - b),
-                    (OwnedValue::Int(a), OwnedValue::Float(b)) => OwnedValue::Float(*a as f64 - b),
-                    (OwnedValue::Float(a), OwnedValue::Int(b)) => OwnedValue::Float(a - *b as f64),
-                    _ => OwnedValue::Null,
-                },
-                BinaryOperator::Multiply => match (&left_val, &right_val) {
-                    (OwnedValue::Int(a), OwnedValue::Int(b)) => OwnedValue::Int(a * b),
-                    (OwnedValue::Float(a), OwnedValue::Float(b)) => OwnedValue::Float(a * b),
-                    (OwnedValue::Int(a), OwnedValue::Float(b)) => OwnedValue::Float(*a as f64 * b),
-                    (OwnedValue::Float(a), OwnedValue::Int(b)) => OwnedValue::Float(a * *b as f64),
-                    _ => OwnedValue::Null,
-                },
-                BinaryOperator::Divide => match (&left_val, &right_val) {
-                    (OwnedValue::Int(a), OwnedValue::Int(b)) if *b != 0 => OwnedValue::Int(a / b),
-                    (OwnedValue::Float(a), OwnedValue::Float(b)) if *b != 0.0 => {
-                        OwnedValue::Float(a / b)
-                    }
-                    (OwnedValue::Int(a), OwnedValue::Float(b)) if *b != 0.0 => {
-                        OwnedValue::Float(*a as f64 / b)
-                    }
-                    (OwnedValue::Float(a), OwnedValue::Int(b)) if *b != 0 => {
-                        OwnedValue::Float(a / *b as f64)
-                    }
-                    _ => OwnedValue::Null,
-                },
-                _ => OwnedValue::Null,
-            }
+            let left_val = eval_expr_for_record_streaming(left, record, column_info);
+            let right_val = eval_expr_for_record_streaming(right, record, column_info);
+            eval_binary_op(&left_val, op, &right_val)
         }
-        Expr::UnaryOp { op, expr } => {
-            let val = eval_expr_for_row(expr, row, column_map);
+        Expr::UnaryOp { op, expr: inner } => {
+            let val = eval_expr_for_record_streaming(inner, record, column_info);
             match op {
                 crate::sql::ast::UnaryOperator::Minus => match val {
                     OwnedValue::Int(i) => OwnedValue::Int(-i),
@@ -359,103 +354,124 @@ fn eval_expr_for_row(
     }
 }
 
-fn compute_aggregate_manually(
-    agg_func: &crate::sql::planner::AggregateFunction,
-    expr: &crate::sql::ast::Expr<'_>,
-    rows: &[Vec<OwnedValue>],
-    column_map: &[(String, usize)],
-) -> OwnedValue {
-    use crate::sql::planner::AggregateFunction;
+struct StreamingAggregateState {
+    sum_int: i64,
+    sum_float: f64,
+    has_float: bool,
+    count: usize,
+    min_int: Option<i64>,
+    min_float: Option<f64>,
+    max_int: Option<i64>,
+    max_float: Option<f64>,
+}
 
-    match agg_func {
-        AggregateFunction::Sum => {
-            let mut sum_int: i64 = 0;
-            let mut sum_float: f64 = 0.0;
-            let mut has_float = false;
-
-            for row in rows {
-                let val = eval_expr_for_row(expr, row, column_map);
-                match val {
-                    OwnedValue::Int(i) => sum_int += i,
-                    OwnedValue::Float(f) => {
-                        sum_float += f;
-                        has_float = true;
-                    }
-                    _ => {}
-                }
-            }
-
-            if has_float {
-                OwnedValue::Float(sum_float + sum_int as f64)
-            } else {
-                OwnedValue::Int(sum_int)
-            }
-        }
-        AggregateFunction::Avg => {
-            let mut sum: f64 = 0.0;
-            let mut count: usize = 0;
-
-            for row in rows {
-                let val = eval_expr_for_row(expr, row, column_map);
-                match val {
-                    OwnedValue::Int(i) => {
-                        sum += i as f64;
-                        count += 1;
-                    }
-                    OwnedValue::Float(f) => {
-                        sum += f;
-                        count += 1;
-                    }
-                    _ => {}
-                }
-            }
-
-            if count > 0 {
-                OwnedValue::Float(sum / count as f64)
-            } else {
-                OwnedValue::Null
-            }
-        }
-        AggregateFunction::Count => OwnedValue::Int(rows.len() as i64),
-        AggregateFunction::Min => {
-            let mut min_val: Option<OwnedValue> = None;
-
-            for row in rows {
-                let val = eval_expr_for_row(expr, row, column_map);
-                match (&min_val, &val) {
-                    (None, v) if !matches!(v, OwnedValue::Null) => min_val = Some(val),
-                    (Some(OwnedValue::Int(m)), OwnedValue::Int(i)) if *i < *m => {
-                        min_val = Some(val)
-                    }
-                    (Some(OwnedValue::Float(m)), OwnedValue::Float(f)) if *f < *m => {
-                        min_val = Some(val)
-                    }
-                    _ => {}
-                }
-            }
-
-            min_val.unwrap_or(OwnedValue::Null)
-        }
-        AggregateFunction::Max => {
-            let mut max_val: Option<OwnedValue> = None;
-
-            for row in rows {
-                let val = eval_expr_for_row(expr, row, column_map);
-                match (&max_val, &val) {
-                    (None, v) if !matches!(v, OwnedValue::Null) => max_val = Some(val),
-                    (Some(OwnedValue::Int(m)), OwnedValue::Int(i)) if *i > *m => {
-                        max_val = Some(val)
-                    }
-                    (Some(OwnedValue::Float(m)), OwnedValue::Float(f)) if *f > *m => {
-                        max_val = Some(val)
-                    }
-                    _ => {}
-                }
-            }
-
-            max_val.unwrap_or(OwnedValue::Null)
+impl StreamingAggregateState {
+    fn new() -> Self {
+        Self {
+            sum_int: 0,
+            sum_float: 0.0,
+            has_float: false,
+            count: 0,
+            min_int: None,
+            min_float: None,
+            max_int: None,
+            max_float: None,
         }
     }
+
+    fn update(&mut self, value: &OwnedValue) {
+        match value {
+            OwnedValue::Int(i) => {
+                self.sum_int += i;
+                self.count += 1;
+                self.min_int = Some(self.min_int.map(|m| m.min(*i)).unwrap_or(*i));
+                self.max_int = Some(self.max_int.map(|m| m.max(*i)).unwrap_or(*i));
+            }
+            OwnedValue::Float(f) => {
+                self.sum_float += f;
+                self.has_float = true;
+                self.count += 1;
+                self.min_float = Some(self.min_float.map(|m| m.min(*f)).unwrap_or(*f));
+                self.max_float = Some(self.max_float.map(|m| m.max(*f)).unwrap_or(*f));
+            }
+            _ => {}
+        }
+    }
+
+    fn finalize(&self, agg_func: &crate::sql::planner::AggregateFunction) -> OwnedValue {
+        use crate::sql::planner::AggregateFunction;
+
+        match agg_func {
+            AggregateFunction::Sum => {
+                if self.has_float {
+                    OwnedValue::Float(self.sum_float + self.sum_int as f64)
+                } else if self.count > 0 {
+                    OwnedValue::Int(self.sum_int)
+                } else {
+                    OwnedValue::Null
+                }
+            }
+            AggregateFunction::Avg => {
+                if self.count > 0 {
+                    let total = self.sum_float + self.sum_int as f64;
+                    OwnedValue::Float(total / self.count as f64)
+                } else {
+                    OwnedValue::Null
+                }
+            }
+            AggregateFunction::Count => OwnedValue::Int(self.count as i64),
+            AggregateFunction::Min => {
+                if self.has_float {
+                    match (self.min_int, self.min_float) {
+                        (Some(i), Some(f)) => {
+                            if (i as f64) < f {
+                                OwnedValue::Int(i)
+                            } else {
+                                OwnedValue::Float(f)
+                            }
+                        }
+                        (None, Some(f)) => OwnedValue::Float(f),
+                        (Some(i), None) => OwnedValue::Int(i),
+                        (None, None) => OwnedValue::Null,
+                    }
+                } else {
+                    self.min_int.map(OwnedValue::Int).unwrap_or(OwnedValue::Null)
+                }
+            }
+            AggregateFunction::Max => {
+                if self.has_float {
+                    match (self.max_int, self.max_float) {
+                        (Some(i), Some(f)) => {
+                            if (i as f64) > f {
+                                OwnedValue::Int(i)
+                            } else {
+                                OwnedValue::Float(f)
+                            }
+                        }
+                        (None, Some(f)) => OwnedValue::Float(f),
+                        (Some(i), None) => OwnedValue::Int(i),
+                        (None, None) => OwnedValue::Null,
+                    }
+                } else {
+                    self.max_int.map(OwnedValue::Int).unwrap_or(OwnedValue::Null)
+                }
+            }
+        }
+    }
+}
+
+fn read_root_page(storage: &crate::storage::MmapStorage) -> Result<u32> {
+    let page = storage.page(0)?;
+    TableFileHeader::from_bytes(page)
+        .map(|h| h.root_page())
+        .wrap_err("failed to read table file header for root page")
+}
+
+fn read_index_root_page(storage: &crate::storage::MmapStorage) -> Result<u32> {
+    let page = storage.page(0)?;
+    IndexFileHeader::from_bytes(page)
+        .map(|h| h.root_page())
+        .wrap_err("failed to read index file header for root page")
 }
 
 impl Database {
@@ -476,36 +492,35 @@ impl Database {
 
         let planner = Planner::new(catalog, arena);
         let stmt = crate::sql::ast::Statement::Select(subq);
-        let subq_plan = planner.create_physical_plan(&stmt)?;
+        let subq_plan = planner.create_physical_plan(&stmt)
+            .wrap_err("failed to create physical plan for scalar subquery")?;
 
         let plan_source = find_plan_source(subq_plan.root);
-
-        fn read_root_page(storage: &crate::storage::MmapStorage) -> Result<u32> {
-            use crate::storage::TableFileHeader;
-            let page = storage.page(0)?;
-            Ok(TableFileHeader::from_bytes(page)?.root_page())
-        }
-
-        fn read_index_root_page(storage: &crate::storage::MmapStorage) -> Result<u32> {
-            use crate::storage::IndexFileHeader;
-            let page = storage.page(0)?;
-            Ok(IndexFileHeader::from_bytes(page)?.root_page())
-        }
 
         match plan_source {
             Some(PlanSource::TableScan(scan)) => {
                 let schema_name = scan.schema.unwrap_or(DEFAULT_SCHEMA);
                 let table_name = scan.table;
 
-                let table_def = catalog.resolve_table_in_schema(scan.schema, table_name)?;
+                let table_def = catalog.resolve_table_in_schema(scan.schema, table_name)
+                    .wrap_err_with(|| format!("failed to resolve table '{}' in scalar subquery", table_name))?;
                 let column_types: Vec<_> =
                     table_def.columns().iter().map(|c| c.data_type()).collect();
                 let columns = table_def.columns();
 
-                let storage_arc = file_manager.table_data(schema_name, table_name)?;
+                let storage_arc = file_manager.table_data(schema_name, table_name)
+                    .wrap_err_with(|| format!("failed to open table data for '{}' in scalar subquery", table_name))?;
                 let storage = storage_arc.read();
 
-                let root_page = read_root_page(&storage)?;
+                let root_page = read_root_page(&storage)
+                    .wrap_err_with(|| format!("failed to read root page for table '{}'", table_name))?;
+
+                let column_info: HashMap<String, (usize, crate::records::types::DataType)> = table_def
+                    .columns()
+                    .iter()
+                    .enumerate()
+                    .map(|(i, c)| (c.name().to_lowercase(), (i, c.data_type())))
+                    .collect();
 
                 let column_map: Vec<(String, usize)> = table_def
                     .columns()
@@ -516,24 +531,23 @@ impl Database {
 
                 if let Some((agg_func, expr)) = find_expression_aggregate(subq_plan.root) {
                     let schema = create_record_schema(columns);
-                    let table_reader = crate::btree::BTreeReader::new(&storage, root_page)?;
+                    let table_reader = crate::btree::BTreeReader::new(&storage, root_page)
+                        .wrap_err_with(|| format!("failed to create BTreeReader for table '{}'", table_name))?;
                     let mut cursor = table_reader.cursor_first()?;
-                    let mut materialized_rows: Vec<Vec<OwnedValue>> = Vec::new();
+                    let mut agg_state = StreamingAggregateState::new();
 
                     while cursor.valid() {
                         let row_data = cursor.value()?;
                         let user_data = crate::database::dml::mvcc_helpers::get_user_data(row_data);
                         let record = RecordView::new(user_data, &schema)?;
-                        let row_values = OwnedValue::extract_row_from_record(&record, columns)?;
-                        materialized_rows.push(row_values);
+                        let expr_value = eval_expr_for_record_streaming(expr, &record, &column_info);
+                        agg_state.update(&expr_value);
                         if !cursor.advance()? {
                             break;
                         }
                     }
 
-                    let result =
-                        compute_aggregate_manually(agg_func, expr, &materialized_rows, &column_map);
-                    return Ok(result);
+                    return Ok(agg_state.finalize(agg_func));
                 }
 
                 let source = StreamingBTreeSource::from_btree_scan_with_projections(
@@ -566,48 +580,79 @@ impl Database {
                 let index_name = scan.index_name;
 
                 let table_def = scan.table_def.ok_or_else(|| {
-                    eyre::eyre!("SecondaryIndexScan missing table_def for {}", table_name)
+                    eyre::eyre!("SecondaryIndexScan missing table_def for table '{}' in scalar subquery", table_name)
                 })?;
 
                 let columns = table_def.columns();
                 let schema = create_record_schema(columns);
 
+                let column_info: HashMap<String, (usize, crate::records::types::DataType)> = table_def
+                    .columns()
+                    .iter()
+                    .enumerate()
+                    .map(|(i, c)| (c.name().to_lowercase(), (i, c.data_type())))
+                    .collect();
+
+                let column_map: Vec<(String, usize)> = table_def
+                    .columns()
+                    .iter()
+                    .enumerate()
+                    .map(|(idx, col)| (col.name().to_lowercase(), idx))
+                    .collect();
+
                 let row_id_suffix_len = if scan.is_unique_index { 0 } else { 8 };
 
-                let row_keys: Vec<[u8; 8]> = {
-                    let index_storage_arc =
-                        file_manager.index_data(schema_name, table_name, index_name)?;
+                if let Some((agg_func, expr)) = find_expression_aggregate(subq_plan.root) {
+                    let mut agg_state = StreamingAggregateState::new();
+
+                    let index_storage_arc = file_manager.index_data(schema_name, table_name, index_name)
+                        .wrap_err_with(|| format!("failed to open index '{}' for table '{}'", index_name, table_name))?;
                     let index_storage = index_storage_arc.read();
+                    let index_root = read_index_root_page(&index_storage)
+                        .wrap_err_with(|| format!("failed to read root page for index '{}'", index_name))?;
+                    let index_reader = BTreeReader::new(&index_storage, index_root)?;
 
-                    let root_page = read_index_root_page(&index_storage)?;
-                    let index_reader = BTreeReader::new(&index_storage, root_page)?;
+                    let table_storage_arc = file_manager.table_data(schema_name, table_name)
+                        .wrap_err_with(|| format!("failed to open table data for '{}' in scalar subquery", table_name))?;
+                    let table_storage = table_storage_arc.read();
+                    let table_root = read_root_page(&table_storage)
+                        .wrap_err_with(|| format!("failed to read root page for table '{}'", table_name))?;
+                    let table_reader = BTreeReader::new(&table_storage, table_root)?;
 
-                    let mut keys = Vec::new();
+                    let process_index_cursor = |cursor: &mut crate::btree::Cursor<'_, crate::storage::MmapStorage>| -> Result<Option<[u8; 8]>> {
+                        let index_key = cursor.key()?;
+                        let row_id_bytes = if scan.is_unique_index {
+                            cursor.value()?
+                        } else {
+                            &index_key[index_key.len().saturating_sub(row_id_suffix_len)..]
+                        };
+                        if row_id_bytes.len() == 8 {
+                            let row_key: [u8; 8] = row_id_bytes.try_into()
+                                .map_err(|_| eyre::eyre!("invalid row key in index '{}': expected 8 bytes", index_name))?;
+                            Ok(Some(row_key))
+                        } else {
+                            Ok(None)
+                        }
+                    };
 
                     match &scan.key_range {
                         Some(ScanRange::PrefixScan { prefix }) => {
                             let mut cursor = index_reader.cursor_seek(prefix)?;
-                            if cursor.valid() {
-                                loop {
-                                    let index_key = cursor.key()?;
-                                    if !index_key.starts_with(prefix) {
-                                        break;
+                            while cursor.valid() {
+                                let index_key = cursor.key()?;
+                                if !index_key.starts_with(prefix) {
+                                    break;
+                                }
+                                if let Some(row_key) = process_index_cursor(&mut cursor)? {
+                                    if let Some(row_data) = table_reader.get(&row_key)? {
+                                        let user_data = crate::database::dml::mvcc_helpers::get_user_data(row_data);
+                                        let record = RecordView::new(user_data, &schema)?;
+                                        let expr_value = eval_expr_for_record_streaming(expr, &record, &column_info);
+                                        agg_state.update(&expr_value);
                                     }
-
-                                    let row_id_bytes = if scan.is_unique_index {
-                                        cursor.value()?
-                                    } else {
-                                        &index_key[index_key.len().saturating_sub(row_id_suffix_len)..]
-                                    };
-
-                                    if row_id_bytes.len() == 8 {
-                                        let row_key: [u8; 8] = row_id_bytes.try_into().unwrap();
-                                        keys.push(row_key);
-                                    }
-
-                                    if !cursor.advance()? {
-                                        break;
-                                    }
+                                }
+                                if !cursor.advance()? {
+                                    break;
                                 }
                             }
                         }
@@ -617,52 +662,120 @@ impl Database {
                             } else {
                                 index_reader.cursor_first()?
                             };
-
-                            if cursor.valid() {
-                                loop {
-                                    let index_key = cursor.key()?;
-                                    if let Some(end_key) = end {
-                                        if index_key >= *end_key {
-                                            break;
-                                        }
-                                    }
-
-                                    let row_id_bytes = if scan.is_unique_index {
-                                        cursor.value()?
-                                    } else {
-                                        &index_key[index_key.len().saturating_sub(row_id_suffix_len)..]
-                                    };
-
-                                    if row_id_bytes.len() == 8 {
-                                        let row_key: [u8; 8] = row_id_bytes.try_into().unwrap();
-                                        keys.push(row_key);
-                                    }
-
-                                    if !cursor.advance()? {
+                            while cursor.valid() {
+                                let index_key = cursor.key()?;
+                                if let Some(end_key) = end {
+                                    if index_key >= *end_key {
                                         break;
                                     }
+                                }
+                                if let Some(row_key) = process_index_cursor(&mut cursor)? {
+                                    if let Some(row_data) = table_reader.get(&row_key)? {
+                                        let user_data = crate::database::dml::mvcc_helpers::get_user_data(row_data);
+                                        let record = RecordView::new(user_data, &schema)?;
+                                        let expr_value = eval_expr_for_record_streaming(expr, &record, &column_info);
+                                        agg_state.update(&expr_value);
+                                    }
+                                }
+                                if !cursor.advance()? {
+                                    break;
                                 }
                             }
                         }
                         Some(ScanRange::FullScan) | None => {
                             let mut cursor = index_reader.cursor_first()?;
-                            if cursor.valid() {
-                                loop {
-                                    let index_key = cursor.key()?;
-                                    let row_id_bytes = if scan.is_unique_index {
-                                        cursor.value()?
-                                    } else {
-                                        &index_key[index_key.len().saturating_sub(row_id_suffix_len)..]
-                                    };
-
-                                    if row_id_bytes.len() == 8 {
-                                        let row_key: [u8; 8] = row_id_bytes.try_into().unwrap();
-                                        keys.push(row_key);
+                            while cursor.valid() {
+                                if let Some(row_key) = process_index_cursor(&mut cursor)? {
+                                    if let Some(row_data) = table_reader.get(&row_key)? {
+                                        let user_data = crate::database::dml::mvcc_helpers::get_user_data(row_data);
+                                        let record = RecordView::new(user_data, &schema)?;
+                                        let expr_value = eval_expr_for_record_streaming(expr, &record, &column_info);
+                                        agg_state.update(&expr_value);
                                     }
+                                }
+                                if !cursor.advance()? {
+                                    break;
+                                }
+                            }
+                        }
+                    }
 
-                                    if !cursor.advance()? {
+                    return Ok(agg_state.finalize(agg_func));
+                }
+
+                let row_keys: Vec<[u8; 8]> = {
+                    let index_storage_arc =
+                        file_manager.index_data(schema_name, table_name, index_name)
+                            .wrap_err_with(|| format!("failed to open index '{}' for table '{}'", index_name, table_name))?;
+                    let index_storage = index_storage_arc.read();
+
+                    let root_page = read_index_root_page(&index_storage)
+                        .wrap_err_with(|| format!("failed to read root page for index '{}'", index_name))?;
+                    let index_reader = BTreeReader::new(&index_storage, root_page)?;
+
+                    let mut keys = Vec::new();
+
+                    let extract_row_key = |cursor: &mut crate::btree::Cursor<'_, crate::storage::MmapStorage>| -> Result<Option<[u8; 8]>> {
+                        let index_key = cursor.key()?;
+                        let row_id_bytes = if scan.is_unique_index {
+                            cursor.value()?
+                        } else {
+                            &index_key[index_key.len().saturating_sub(row_id_suffix_len)..]
+                        };
+                        if row_id_bytes.len() == 8 {
+                            let row_key: [u8; 8] = row_id_bytes.try_into()
+                                .map_err(|_| eyre::eyre!("invalid row key in index '{}': expected 8 bytes", index_name))?;
+                            Ok(Some(row_key))
+                        } else {
+                            Ok(None)
+                        }
+                    };
+
+                    match &scan.key_range {
+                        Some(ScanRange::PrefixScan { prefix }) => {
+                            let mut cursor = index_reader.cursor_seek(prefix)?;
+                            while cursor.valid() {
+                                let index_key = cursor.key()?;
+                                if !index_key.starts_with(prefix) {
+                                    break;
+                                }
+                                if let Some(row_key) = extract_row_key(&mut cursor)? {
+                                    keys.push(row_key);
+                                }
+                                if !cursor.advance()? {
+                                    break;
+                                }
+                            }
+                        }
+                        Some(ScanRange::RangeScan { start, end }) => {
+                            let mut cursor = if let Some(start_key) = start {
+                                index_reader.cursor_seek(start_key)?
+                            } else {
+                                index_reader.cursor_first()?
+                            };
+                            while cursor.valid() {
+                                let index_key = cursor.key()?;
+                                if let Some(end_key) = end {
+                                    if index_key >= *end_key {
                                         break;
                                     }
+                                }
+                                if let Some(row_key) = extract_row_key(&mut cursor)? {
+                                    keys.push(row_key);
+                                }
+                                if !cursor.advance()? {
+                                    break;
+                                }
+                            }
+                        }
+                        Some(ScanRange::FullScan) | None => {
+                            let mut cursor = index_reader.cursor_first()?;
+                            while cursor.valid() {
+                                if let Some(row_key) = extract_row_key(&mut cursor)? {
+                                    keys.push(row_key);
+                                }
+                                if !cursor.advance()? {
+                                    break;
                                 }
                             }
                         }
@@ -670,21 +783,16 @@ impl Database {
                     keys
                 };
 
-                let column_map: Vec<(String, usize)> = table_def
-                    .columns()
-                    .iter()
-                    .enumerate()
-                    .map(|(idx, col)| (col.name().to_lowercase(), idx))
-                    .collect();
-
                 let mut materialized_rows: Vec<Vec<OwnedValue>> =
                     Vec::with_capacity(row_keys.len());
 
                 {
-                    let table_storage_arc = file_manager.table_data(schema_name, table_name)?;
+                    let table_storage_arc = file_manager.table_data(schema_name, table_name)
+                        .wrap_err_with(|| format!("failed to open table data for '{}' in scalar subquery", table_name))?;
                     let table_storage = table_storage_arc.read();
 
-                    let root_page = read_root_page(&table_storage)?;
+                    let root_page = read_root_page(&table_storage)
+                        .wrap_err_with(|| format!("failed to read root page for table '{}'", table_name))?;
                     let table_reader = BTreeReader::new(&table_storage, root_page)?;
 
                     for row_key in &row_keys {
@@ -696,12 +804,6 @@ impl Database {
                             materialized_rows.push(row_values);
                         }
                     }
-                }
-
-                if let Some((agg_func, expr)) = find_expression_aggregate(subq_plan.root) {
-                    let result =
-                        compute_aggregate_manually(agg_func, expr, &materialized_rows, &column_map);
-                    return Ok(result);
                 }
 
                 let materialized_source = MaterializedRowSource::new(materialized_rows);
