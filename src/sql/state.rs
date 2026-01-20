@@ -43,14 +43,17 @@ pub struct TopKState<'a, S: RowSource> {
     pub last_reported_bytes: usize,
 }
 
+pub type GroupValues = SmallVec<[Value<'static>; 8]>;
+pub type GroupAggStates = SmallVec<[AggregateState; 4]>;
+
 pub struct HashAggregateState<'a, S: RowSource> {
     pub child: Box<DynamicExecutor<'a, S>>,
     pub group_by: Vec<usize>,
     pub group_by_exprs: Option<Vec<CompiledPredicate<'a>>>,
     pub aggregates: Vec<AggregateFunction>,
     pub arena: &'a Bump,
-    pub groups: hashbrown::HashMap<Vec<u8>, (Vec<Value<'static>>, Vec<AggregateState>)>,
-    pub result_iter: Option<std::vec::IntoIter<(Vec<Value<'static>>, Vec<AggregateState>)>>,
+    pub groups: hashbrown::HashMap<Vec<u8>, (GroupValues, GroupAggStates)>,
+    pub result_iter: Option<std::vec::IntoIter<(GroupValues, GroupAggStates)>>,
     pub computed: bool,
     pub memory_budget: Option<&'a Arc<MemoryBudget>>,
     pub last_reported_bytes: usize,
@@ -78,6 +81,10 @@ impl AggregateState {
             min_float: None,
             max_float: None,
         }
+    }
+
+    pub(crate) fn create_initial_states(count: usize) -> GroupAggStates {
+        (0..count).map(|_| Self::new()).collect()
     }
 
     pub(crate) fn update(&mut self, func: &AggregateFunction, row: &ExecutorRow) {

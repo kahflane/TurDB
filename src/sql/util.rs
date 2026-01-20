@@ -1,4 +1,5 @@
 use crate::sql::executor::ExecutorRow;
+use crate::sql::state::GroupValues;
 use crate::types::Value;
 use bumpalo::Bump;
 use std::cmp::Ordering;
@@ -62,7 +63,7 @@ pub fn compute_group_key_from_exprs<'a>(
 pub fn evaluate_group_by_exprs<'a>(
     row: &ExecutorRow<'a>,
     group_by_exprs: &[crate::sql::predicate::CompiledPredicate<'a>],
-) -> Vec<Value<'static>> {
+) -> GroupValues {
     group_by_exprs
         .iter()
         .map(|expr| {
@@ -70,6 +71,14 @@ pub fn evaluate_group_by_exprs<'a>(
                 .map(|v| v.to_owned_static())
                 .unwrap_or(Value::Null)
         })
+        .collect()
+}
+
+/// Extracts group values from a row using column indices.
+pub fn extract_group_values<'a>(row: &ExecutorRow<'a>, group_by: &[usize]) -> GroupValues {
+    group_by
+        .iter()
+        .map(|&col| row.get(col).map(clone_value_owned).unwrap_or(Value::Null))
         .collect()
 }
 
