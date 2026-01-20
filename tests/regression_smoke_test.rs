@@ -727,7 +727,7 @@ mod query_tests {
     }
 
     #[test]
-    fn select_with_group_by_and_having() {
+    fn having_sum_gt_250_returns_only_groups_above_threshold() {
         let (db, _dir) = create_test_db();
 
         db.execute(
@@ -765,7 +765,7 @@ mod query_tests {
     }
 
     #[test]
-    fn having_filters_groups_by_count() {
+    fn having_count_ge_2_excludes_single_item_groups() {
         let (db, _dir) = create_test_db();
 
         db.execute(
@@ -796,30 +796,31 @@ mod query_tests {
             rows.len()
         );
 
-        let categories: Vec<&str> = rows
-            .iter()
-            .filter_map(|row| match &row.values[0] {
-                OwnedValue::Text(s) => Some(s.as_str()),
-                _ => None,
-            })
-            .collect();
-        assert!(
-            categories.contains(&"A") && categories.contains(&"B"),
-            "Should contain A and B, got {:?}",
-            categories
-        );
-        assert!(
-            !categories.contains(&"C"),
-            "Should NOT contain C (only 1 item), got {:?}",
-            categories
-        );
+        let mut found_a = false;
+        let mut found_b = false;
+        let mut found_c = false;
 
         for row in &rows {
+            match &row.values[0] {
+                OwnedValue::Text(s) => {
+                    if s == "A" {
+                        found_a = true;
+                    } else if s == "B" {
+                        found_b = true;
+                    } else if s == "C" {
+                        found_c = true;
+                    }
+                }
+                other => panic!("Expected Text category, got {:?}", other),
+            }
             match &row.values[1] {
                 OwnedValue::Int(cnt) => assert_eq!(*cnt, 2, "Each group should have COUNT=2"),
                 other => panic!("Expected Int(2), got {:?}", other),
             }
         }
+
+        assert!(found_a && found_b, "Should find categories A and B");
+        assert!(!found_c, "Should NOT find category C (only 1 item)");
     }
 
     #[test]
