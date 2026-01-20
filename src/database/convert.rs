@@ -404,6 +404,126 @@ impl Database {
         Self::eval_literal_with_type(expr, target_type)
     }
 
+    pub(crate) fn eval_expr_with_params_and_subqueries(
+        expr: &crate::sql::ast::Expr<'_>,
+        target_type: Option<&crate::records::types::DataType>,
+        params: Option<&[OwnedValue]>,
+        param_idx: &mut usize,
+        scalar_subquery_results: &crate::sql::context::ScalarSubqueryResults,
+    ) -> Result<OwnedValue> {
+        use crate::sql::ast::{Expr, ParameterRef};
+
+        match expr {
+            Expr::Parameter(param_ref) => {
+                if let Some(params) = params {
+                    let idx = match param_ref {
+                        ParameterRef::Anonymous => {
+                            let i = *param_idx;
+                            *param_idx += 1;
+                            i
+                        }
+                        ParameterRef::Positional(n) => (*n as usize).saturating_sub(1),
+                        ParameterRef::Named(_) => {
+                            let i = *param_idx;
+                            *param_idx += 1;
+                            i
+                        }
+                    };
+
+                    if idx >= params.len() {
+                        bail!(
+                            "parameter index {} out of range (only {} parameters bound)",
+                            idx + 1,
+                            params.len()
+                        );
+                    }
+
+                    Ok(params[idx].clone())
+                } else {
+                    bail!("parameter placeholder found but no parameters were bound")
+                }
+            }
+            Expr::Subquery(subq) => {
+                let key = std::ptr::from_ref(*subq) as usize;
+                scalar_subquery_results
+                    .iter()
+                    .find(|(k, _)| *k == key)
+                    .map(|(_, v)| v.clone())
+                    .ok_or_else(|| eyre::eyre!("scalar subquery result not found in pre-computed results"))
+            }
+            Expr::BinaryOp { left, op, right } => {
+                let left_val = Self::eval_expr_with_params_and_subqueries(
+                    left,
+                    target_type,
+                    params,
+                    param_idx,
+                    scalar_subquery_results,
+                )?;
+                let right_val = Self::eval_expr_with_params_and_subqueries(
+                    right,
+                    target_type,
+                    params,
+                    param_idx,
+                    scalar_subquery_results,
+                )?;
+
+                use crate::sql::ast::BinaryOperator;
+                match op {
+                    BinaryOperator::Plus => match (&left_val, &right_val) {
+                        (OwnedValue::Int(a), OwnedValue::Int(b)) => Ok(OwnedValue::Int(a + b)),
+                        (OwnedValue::Float(a), OwnedValue::Float(b)) => Ok(OwnedValue::Float(a + b)),
+                        (OwnedValue::Int(a), OwnedValue::Float(b)) => {
+                            Ok(OwnedValue::Float(*a as f64 + b))
+                        }
+                        (OwnedValue::Float(a), OwnedValue::Int(b)) => {
+                            Ok(OwnedValue::Float(a + *b as f64))
+                        }
+                        _ => bail!("unsupported types for addition in UPDATE SET"),
+                    },
+                    BinaryOperator::Minus => match (&left_val, &right_val) {
+                        (OwnedValue::Int(a), OwnedValue::Int(b)) => Ok(OwnedValue::Int(a - b)),
+                        (OwnedValue::Float(a), OwnedValue::Float(b)) => Ok(OwnedValue::Float(a - b)),
+                        (OwnedValue::Int(a), OwnedValue::Float(b)) => {
+                            Ok(OwnedValue::Float(*a as f64 - b))
+                        }
+                        (OwnedValue::Float(a), OwnedValue::Int(b)) => {
+                            Ok(OwnedValue::Float(a - *b as f64))
+                        }
+                        _ => bail!("unsupported types for subtraction in UPDATE SET"),
+                    },
+                    BinaryOperator::Multiply => match (&left_val, &right_val) {
+                        (OwnedValue::Int(a), OwnedValue::Int(b)) => Ok(OwnedValue::Int(a * b)),
+                        (OwnedValue::Float(a), OwnedValue::Float(b)) => Ok(OwnedValue::Float(a * b)),
+                        (OwnedValue::Int(a), OwnedValue::Float(b)) => {
+                            Ok(OwnedValue::Float(*a as f64 * b))
+                        }
+                        (OwnedValue::Float(a), OwnedValue::Int(b)) => {
+                            Ok(OwnedValue::Float(a * *b as f64))
+                        }
+                        _ => bail!("unsupported types for multiplication in UPDATE SET"),
+                    },
+                    BinaryOperator::Divide => match (&left_val, &right_val) {
+                        (OwnedValue::Int(a), OwnedValue::Int(b)) if *b != 0 => {
+                            Ok(OwnedValue::Int(a / b))
+                        }
+                        (OwnedValue::Float(a), OwnedValue::Float(b)) if *b != 0.0 => {
+                            Ok(OwnedValue::Float(a / b))
+                        }
+                        (OwnedValue::Int(a), OwnedValue::Float(b)) if *b != 0.0 => {
+                            Ok(OwnedValue::Float(*a as f64 / b))
+                        }
+                        (OwnedValue::Float(a), OwnedValue::Int(b)) if *b != 0 => {
+                            Ok(OwnedValue::Float(a / *b as f64))
+                        }
+                        _ => bail!("division by zero or unsupported types"),
+                    },
+                    _ => Self::eval_literal_with_type(expr, target_type),
+                }
+            }
+            _ => Self::eval_literal_with_type(expr, target_type),
+        }
+    }
+
     pub(crate) fn parse_json_string(s: &str) -> Result<OwnedValue> {
         let value = Self::parse_json_to_value(s.trim())?;
         let bytes = Self::jsonb_value_to_bytes(&value);

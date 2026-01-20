@@ -91,6 +91,7 @@ use crate::database::{Database, ExecuteResult};
 use crate::mvcc::WriteEntry;
 use crate::records::RecordView;
 use crate::schema::table::{Constraint, IndexType};
+use crate::sql::context::ScalarSubqueryResults;
 use crate::sql::decoder::RecordDecoder;
 use crate::sql::executor::ExecutorRow;
 use crate::sql::predicate::CompiledPredicate;
@@ -147,7 +148,8 @@ fn expr_contains_column_ref(expr: &crate::sql::ast::Expr) -> bool {
         Expr::InList { expr, list, .. } => {
             expr_contains_column_ref(expr) || list.iter().any(|e| expr_contains_column_ref(e))
         }
-        Expr::InSubquery { .. } | Expr::Subquery(_) | Expr::Exists { .. } => true,
+        Expr::InSubquery { .. } | Expr::Exists { .. } => true,
+        Expr::Subquery(_) => false,
         Expr::IsDistinctFrom { left, right, .. } => {
             expr_contains_column_ref(left) || expr_contains_column_ref(right)
         }
@@ -173,7 +175,562 @@ fn expr_contains_column_ref(expr: &crate::sql::ast::Expr) -> bool {
     }
 }
 
+fn collect_scalar_subqueries_from_expr<'a>(
+    expr: &'a crate::sql::ast::Expr<'a>,
+    subqueries: &mut SmallVec<[&'a crate::sql::ast::SelectStmt<'a>; 4]>,
+) {
+    use crate::sql::ast::Expr;
+    match expr {
+        Expr::Subquery(subq) => {
+            subqueries.push(subq);
+        }
+        Expr::BinaryOp { left, right, .. } => {
+            collect_scalar_subqueries_from_expr(left, subqueries);
+            collect_scalar_subqueries_from_expr(right, subqueries);
+        }
+        Expr::UnaryOp { expr, .. } => {
+            collect_scalar_subqueries_from_expr(expr, subqueries);
+        }
+        Expr::IsNull { expr, .. } => {
+            collect_scalar_subqueries_from_expr(expr, subqueries);
+        }
+        Expr::InList { expr, list, .. } => {
+            collect_scalar_subqueries_from_expr(expr, subqueries);
+            for item in list.iter() {
+                collect_scalar_subqueries_from_expr(item, subqueries);
+            }
+        }
+        Expr::Between {
+            expr, low, high, ..
+        } => {
+            collect_scalar_subqueries_from_expr(expr, subqueries);
+            collect_scalar_subqueries_from_expr(low, subqueries);
+            collect_scalar_subqueries_from_expr(high, subqueries);
+        }
+        Expr::Case {
+            operand,
+            conditions,
+            else_result,
+        } => {
+            if let Some(op) = operand {
+                collect_scalar_subqueries_from_expr(op, subqueries);
+            }
+            for cond in conditions.iter() {
+                collect_scalar_subqueries_from_expr(cond.condition, subqueries);
+                collect_scalar_subqueries_from_expr(cond.result, subqueries);
+            }
+            if let Some(else_e) = else_result {
+                collect_scalar_subqueries_from_expr(else_e, subqueries);
+            }
+        }
+        Expr::Cast { expr, .. } => {
+            collect_scalar_subqueries_from_expr(expr, subqueries);
+        }
+        Expr::Function(func) => {
+            if let crate::sql::ast::FunctionArgs::Args(args) = &func.args {
+                for arg in args.iter() {
+                    collect_scalar_subqueries_from_expr(arg.value, subqueries);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn find_expression_aggregate<'a>(
+    op: &'a crate::sql::planner::PhysicalOperator<'a>,
+) -> Option<(
+    &'a crate::sql::planner::AggregateFunction,
+    &'a crate::sql::ast::Expr<'a>,
+)> {
+    use crate::sql::planner::PhysicalOperator;
+
+    match op {
+        PhysicalOperator::HashAggregate(agg) => {
+            for agg_expr in agg.aggregates.iter() {
+                if let Some(arg) = agg_expr.argument {
+                    if !matches!(arg, crate::sql::ast::Expr::Column(_)) {
+                        return Some((&agg_expr.function, arg));
+                    }
+                }
+            }
+            find_expression_aggregate(agg.input)
+        }
+        PhysicalOperator::SortedAggregate(agg) => {
+            for agg_expr in agg.aggregates.iter() {
+                if let Some(arg) = agg_expr.argument {
+                    if !matches!(arg, crate::sql::ast::Expr::Column(_)) {
+                        return Some((&agg_expr.function, arg));
+                    }
+                }
+            }
+            find_expression_aggregate(agg.input)
+        }
+        PhysicalOperator::FilterExec(f) => find_expression_aggregate(f.input),
+        PhysicalOperator::ProjectExec(p) => find_expression_aggregate(p.input),
+        PhysicalOperator::SortExec(s) => find_expression_aggregate(s.input),
+        PhysicalOperator::LimitExec(l) => find_expression_aggregate(l.input),
+        _ => None,
+    }
+}
+
+fn eval_expr_for_row(
+    expr: &crate::sql::ast::Expr<'_>,
+    row: &[OwnedValue],
+    column_map: &[(String, usize)],
+) -> OwnedValue {
+    use crate::sql::ast::{BinaryOperator, Expr, Literal};
+
+    match expr {
+        Expr::Column(col_ref) => {
+            let col_name = col_ref.column.to_lowercase();
+            let idx = column_map
+                .iter()
+                .find(|(name, _)| name == &col_name)
+                .map(|(_, idx)| *idx);
+            if let Some(i) = idx {
+                row.get(i).cloned().unwrap_or(OwnedValue::Null)
+            } else {
+                OwnedValue::Null
+            }
+        }
+        Expr::Literal(lit) => match lit {
+            Literal::Integer(s) => s.parse::<i64>().map(OwnedValue::Int).unwrap_or(OwnedValue::Null),
+            Literal::Float(s) => s.parse::<f64>().map(OwnedValue::Float).unwrap_or(OwnedValue::Null),
+            Literal::String(s) => OwnedValue::Text((*s).to_string()),
+            Literal::Boolean(b) => OwnedValue::Int(if *b { 1 } else { 0 }),
+            Literal::Null => OwnedValue::Null,
+            _ => OwnedValue::Null,
+        },
+        Expr::BinaryOp { left, op, right } => {
+            let left_val = eval_expr_for_row(left, row, column_map);
+            let right_val = eval_expr_for_row(right, row, column_map);
+            match op {
+                BinaryOperator::Plus => match (&left_val, &right_val) {
+                    (OwnedValue::Int(a), OwnedValue::Int(b)) => OwnedValue::Int(a + b),
+                    (OwnedValue::Float(a), OwnedValue::Float(b)) => OwnedValue::Float(a + b),
+                    (OwnedValue::Int(a), OwnedValue::Float(b)) => OwnedValue::Float(*a as f64 + b),
+                    (OwnedValue::Float(a), OwnedValue::Int(b)) => OwnedValue::Float(a + *b as f64),
+                    _ => OwnedValue::Null,
+                },
+                BinaryOperator::Minus => match (&left_val, &right_val) {
+                    (OwnedValue::Int(a), OwnedValue::Int(b)) => OwnedValue::Int(a - b),
+                    (OwnedValue::Float(a), OwnedValue::Float(b)) => OwnedValue::Float(a - b),
+                    (OwnedValue::Int(a), OwnedValue::Float(b)) => OwnedValue::Float(*a as f64 - b),
+                    (OwnedValue::Float(a), OwnedValue::Int(b)) => OwnedValue::Float(a - *b as f64),
+                    _ => OwnedValue::Null,
+                },
+                BinaryOperator::Multiply => match (&left_val, &right_val) {
+                    (OwnedValue::Int(a), OwnedValue::Int(b)) => OwnedValue::Int(a * b),
+                    (OwnedValue::Float(a), OwnedValue::Float(b)) => OwnedValue::Float(a * b),
+                    (OwnedValue::Int(a), OwnedValue::Float(b)) => OwnedValue::Float(*a as f64 * b),
+                    (OwnedValue::Float(a), OwnedValue::Int(b)) => OwnedValue::Float(a * *b as f64),
+                    _ => OwnedValue::Null,
+                },
+                BinaryOperator::Divide => match (&left_val, &right_val) {
+                    (OwnedValue::Int(a), OwnedValue::Int(b)) if *b != 0 => OwnedValue::Int(a / b),
+                    (OwnedValue::Float(a), OwnedValue::Float(b)) if *b != 0.0 => {
+                        OwnedValue::Float(a / b)
+                    }
+                    (OwnedValue::Int(a), OwnedValue::Float(b)) if *b != 0.0 => {
+                        OwnedValue::Float(*a as f64 / b)
+                    }
+                    (OwnedValue::Float(a), OwnedValue::Int(b)) if *b != 0 => {
+                        OwnedValue::Float(a / *b as f64)
+                    }
+                    _ => OwnedValue::Null,
+                },
+                _ => OwnedValue::Null,
+            }
+        }
+        Expr::UnaryOp { op, expr } => {
+            let val = eval_expr_for_row(expr, row, column_map);
+            match op {
+                crate::sql::ast::UnaryOperator::Minus => match val {
+                    OwnedValue::Int(i) => OwnedValue::Int(-i),
+                    OwnedValue::Float(f) => OwnedValue::Float(-f),
+                    _ => OwnedValue::Null,
+                },
+                crate::sql::ast::UnaryOperator::Plus => val,
+                _ => OwnedValue::Null,
+            }
+        }
+        _ => OwnedValue::Null,
+    }
+}
+
+fn compute_aggregate_manually(
+    agg_func: &crate::sql::planner::AggregateFunction,
+    expr: &crate::sql::ast::Expr<'_>,
+    rows: &[Vec<OwnedValue>],
+    column_map: &[(String, usize)],
+) -> OwnedValue {
+    use crate::sql::planner::AggregateFunction;
+
+    match agg_func {
+        AggregateFunction::Sum => {
+            let mut sum_int: i64 = 0;
+            let mut sum_float: f64 = 0.0;
+            let mut has_float = false;
+
+            for row in rows {
+                let val = eval_expr_for_row(expr, row, column_map);
+                match val {
+                    OwnedValue::Int(i) => sum_int += i,
+                    OwnedValue::Float(f) => {
+                        sum_float += f;
+                        has_float = true;
+                    }
+                    _ => {}
+                }
+            }
+
+            if has_float {
+                OwnedValue::Float(sum_float + sum_int as f64)
+            } else {
+                OwnedValue::Int(sum_int)
+            }
+        }
+        AggregateFunction::Avg => {
+            let mut sum: f64 = 0.0;
+            let mut count: usize = 0;
+
+            for row in rows {
+                let val = eval_expr_for_row(expr, row, column_map);
+                match val {
+                    OwnedValue::Int(i) => {
+                        sum += i as f64;
+                        count += 1;
+                    }
+                    OwnedValue::Float(f) => {
+                        sum += f;
+                        count += 1;
+                    }
+                    _ => {}
+                }
+            }
+
+            if count > 0 {
+                OwnedValue::Float(sum / count as f64)
+            } else {
+                OwnedValue::Null
+            }
+        }
+        AggregateFunction::Count => OwnedValue::Int(rows.len() as i64),
+        AggregateFunction::Min => {
+            let mut min_val: Option<OwnedValue> = None;
+
+            for row in rows {
+                let val = eval_expr_for_row(expr, row, column_map);
+                match (&min_val, &val) {
+                    (None, v) if !matches!(v, OwnedValue::Null) => min_val = Some(val),
+                    (Some(OwnedValue::Int(m)), OwnedValue::Int(i)) if *i < *m => {
+                        min_val = Some(val)
+                    }
+                    (Some(OwnedValue::Float(m)), OwnedValue::Float(f)) if *f < *m => {
+                        min_val = Some(val)
+                    }
+                    _ => {}
+                }
+            }
+
+            min_val.unwrap_or(OwnedValue::Null)
+        }
+        AggregateFunction::Max => {
+            let mut max_val: Option<OwnedValue> = None;
+
+            for row in rows {
+                let val = eval_expr_for_row(expr, row, column_map);
+                match (&max_val, &val) {
+                    (None, v) if !matches!(v, OwnedValue::Null) => max_val = Some(val),
+                    (Some(OwnedValue::Int(m)), OwnedValue::Int(i)) if *i > *m => {
+                        max_val = Some(val)
+                    }
+                    (Some(OwnedValue::Float(m)), OwnedValue::Float(f)) if *f > *m => {
+                        max_val = Some(val)
+                    }
+                    _ => {}
+                }
+            }
+
+            max_val.unwrap_or(OwnedValue::Null)
+        }
+    }
+}
+
 impl Database {
+    fn execute_scalar_subquery_for_update<'a>(
+        subq: &'a crate::sql::ast::SelectStmt<'a>,
+        catalog: &crate::schema::catalog::Catalog,
+        file_manager: &mut crate::storage::FileManager,
+        arena: &'a Bump,
+    ) -> Result<OwnedValue> {
+        use crate::btree::BTreeReader;
+        use crate::database::query::{find_plan_source, PlanSource};
+        use crate::records::RecordView;
+        use crate::sql::builder::ExecutorBuilder;
+        use crate::sql::context::ExecutionContext;
+        use crate::sql::executor::{Executor, MaterializedRowSource, StreamingBTreeSource};
+        use crate::sql::planner::{Planner, ScanRange};
+        use crate::types::create_record_schema;
+
+        let planner = Planner::new(catalog, arena);
+        let stmt = crate::sql::ast::Statement::Select(subq);
+        let subq_plan = planner.create_physical_plan(&stmt)?;
+
+        let plan_source = find_plan_source(subq_plan.root);
+
+        fn read_root_page(storage: &crate::storage::MmapStorage) -> Result<u32> {
+            use crate::storage::TableFileHeader;
+            let page = storage.page(0)?;
+            Ok(TableFileHeader::from_bytes(page)?.root_page())
+        }
+
+        fn read_index_root_page(storage: &crate::storage::MmapStorage) -> Result<u32> {
+            use crate::storage::IndexFileHeader;
+            let page = storage.page(0)?;
+            Ok(IndexFileHeader::from_bytes(page)?.root_page())
+        }
+
+        match plan_source {
+            Some(PlanSource::TableScan(scan)) => {
+                let schema_name = scan.schema.unwrap_or(DEFAULT_SCHEMA);
+                let table_name = scan.table;
+
+                let table_def = catalog.resolve_table_in_schema(scan.schema, table_name)?;
+                let column_types: Vec<_> =
+                    table_def.columns().iter().map(|c| c.data_type()).collect();
+                let columns = table_def.columns();
+
+                let storage_arc = file_manager.table_data(schema_name, table_name)?;
+                let storage = storage_arc.read();
+
+                let root_page = read_root_page(&storage)?;
+
+                let column_map: Vec<(String, usize)> = table_def
+                    .columns()
+                    .iter()
+                    .enumerate()
+                    .map(|(i, c)| (c.name().to_lowercase(), i))
+                    .collect();
+
+                if let Some((agg_func, expr)) = find_expression_aggregate(subq_plan.root) {
+                    let schema = create_record_schema(columns);
+                    let table_reader = crate::btree::BTreeReader::new(&storage, root_page)?;
+                    let mut cursor = table_reader.cursor_first()?;
+                    let mut materialized_rows: Vec<Vec<OwnedValue>> = Vec::new();
+
+                    while cursor.valid() {
+                        let row_data = cursor.value()?;
+                        let user_data = crate::database::dml::mvcc_helpers::get_user_data(row_data);
+                        let record = RecordView::new(user_data, &schema)?;
+                        let row_values = OwnedValue::extract_row_from_record(&record, columns)?;
+                        materialized_rows.push(row_values);
+                        if !cursor.advance()? {
+                            break;
+                        }
+                    }
+
+                    let result =
+                        compute_aggregate_manually(agg_func, expr, &materialized_rows, &column_map);
+                    return Ok(result);
+                }
+
+                let source = StreamingBTreeSource::from_btree_scan_with_projections(
+                    &storage,
+                    root_page,
+                    column_types,
+                    None,
+                )?;
+
+                let ctx = ExecutionContext::new(arena);
+                let builder = ExecutorBuilder::new(&ctx);
+                let mut executor =
+                    builder.build_with_source_and_column_map(&subq_plan, source, &column_map)?;
+
+                executor.open()?;
+                let result = if let Some(row) = executor.next()? {
+                    row.values
+                        .first()
+                        .map(OwnedValue::from)
+                        .unwrap_or(OwnedValue::Null)
+                } else {
+                    OwnedValue::Null
+                };
+                executor.close()?;
+                Ok(result)
+            }
+            Some(PlanSource::SecondaryIndexScan(scan)) => {
+                let schema_name = scan.schema.unwrap_or(DEFAULT_SCHEMA);
+                let table_name = scan.table;
+                let index_name = scan.index_name;
+
+                let table_def = scan.table_def.ok_or_else(|| {
+                    eyre::eyre!("SecondaryIndexScan missing table_def for {}", table_name)
+                })?;
+
+                let columns = table_def.columns();
+                let schema = create_record_schema(columns);
+
+                let row_id_suffix_len = if scan.is_unique_index { 0 } else { 8 };
+
+                let row_keys: Vec<[u8; 8]> = {
+                    let index_storage_arc =
+                        file_manager.index_data(schema_name, table_name, index_name)?;
+                    let index_storage = index_storage_arc.read();
+
+                    let root_page = read_index_root_page(&index_storage)?;
+                    let index_reader = BTreeReader::new(&index_storage, root_page)?;
+
+                    let mut keys = Vec::new();
+
+                    match &scan.key_range {
+                        Some(ScanRange::PrefixScan { prefix }) => {
+                            let mut cursor = index_reader.cursor_seek(prefix)?;
+                            if cursor.valid() {
+                                loop {
+                                    let index_key = cursor.key()?;
+                                    if !index_key.starts_with(prefix) {
+                                        break;
+                                    }
+
+                                    let row_id_bytes = if scan.is_unique_index {
+                                        cursor.value()?
+                                    } else {
+                                        &index_key[index_key.len().saturating_sub(row_id_suffix_len)..]
+                                    };
+
+                                    if row_id_bytes.len() == 8 {
+                                        let row_key: [u8; 8] = row_id_bytes.try_into().unwrap();
+                                        keys.push(row_key);
+                                    }
+
+                                    if !cursor.advance()? {
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        Some(ScanRange::RangeScan { start, end }) => {
+                            let mut cursor = if let Some(start_key) = start {
+                                index_reader.cursor_seek(start_key)?
+                            } else {
+                                index_reader.cursor_first()?
+                            };
+
+                            if cursor.valid() {
+                                loop {
+                                    let index_key = cursor.key()?;
+                                    if let Some(end_key) = end {
+                                        if index_key >= *end_key {
+                                            break;
+                                        }
+                                    }
+
+                                    let row_id_bytes = if scan.is_unique_index {
+                                        cursor.value()?
+                                    } else {
+                                        &index_key[index_key.len().saturating_sub(row_id_suffix_len)..]
+                                    };
+
+                                    if row_id_bytes.len() == 8 {
+                                        let row_key: [u8; 8] = row_id_bytes.try_into().unwrap();
+                                        keys.push(row_key);
+                                    }
+
+                                    if !cursor.advance()? {
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        Some(ScanRange::FullScan) | None => {
+                            let mut cursor = index_reader.cursor_first()?;
+                            if cursor.valid() {
+                                loop {
+                                    let index_key = cursor.key()?;
+                                    let row_id_bytes = if scan.is_unique_index {
+                                        cursor.value()?
+                                    } else {
+                                        &index_key[index_key.len().saturating_sub(row_id_suffix_len)..]
+                                    };
+
+                                    if row_id_bytes.len() == 8 {
+                                        let row_key: [u8; 8] = row_id_bytes.try_into().unwrap();
+                                        keys.push(row_key);
+                                    }
+
+                                    if !cursor.advance()? {
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    keys
+                };
+
+                let column_map: Vec<(String, usize)> = table_def
+                    .columns()
+                    .iter()
+                    .enumerate()
+                    .map(|(idx, col)| (col.name().to_lowercase(), idx))
+                    .collect();
+
+                let mut materialized_rows: Vec<Vec<OwnedValue>> =
+                    Vec::with_capacity(row_keys.len());
+
+                {
+                    let table_storage_arc = file_manager.table_data(schema_name, table_name)?;
+                    let table_storage = table_storage_arc.read();
+
+                    let root_page = read_root_page(&table_storage)?;
+                    let table_reader = BTreeReader::new(&table_storage, root_page)?;
+
+                    for row_key in &row_keys {
+                        if let Some(row_data) = table_reader.get(row_key)? {
+                            let user_data =
+                                crate::database::dml::mvcc_helpers::get_user_data(row_data);
+                            let record = RecordView::new(user_data, &schema)?;
+                            let row_values = OwnedValue::extract_row_from_record(&record, columns)?;
+                            materialized_rows.push(row_values);
+                        }
+                    }
+                }
+
+                if let Some((agg_func, expr)) = find_expression_aggregate(subq_plan.root) {
+                    let result =
+                        compute_aggregate_manually(agg_func, expr, &materialized_rows, &column_map);
+                    return Ok(result);
+                }
+
+                let materialized_source = MaterializedRowSource::new(materialized_rows);
+
+                let ctx = ExecutionContext::new(arena);
+                let builder = ExecutorBuilder::new(&ctx);
+
+                let mut executor = builder.build_with_source_and_column_map(
+                    &subq_plan,
+                    materialized_source,
+                    &column_map,
+                )?;
+
+                executor.open()?;
+                let result = if let Some(row) = executor.next()? {
+                    row.values
+                        .first()
+                        .map(OwnedValue::from)
+                        .unwrap_or(OwnedValue::Null)
+                } else {
+                    OwnedValue::Null
+                };
+                executor.close()?;
+                Ok(result)
+            }
+            _ => Ok(OwnedValue::Null),
+        }
+    }
+
     pub(crate) fn execute_update(
         &self,
         update: &crate::sql::ast::UpdateStmt<'_>,
@@ -325,11 +882,10 @@ impl Database {
             })
             .collect();
 
-        drop(catalog_guard);
-
         let schema = create_record_schema(&columns);
 
         if let Some(from_tables) = from_tables_data {
+            drop(catalog_guard);
             return self.execute_update_with_from(
                 update,
                 arena,
@@ -354,6 +910,29 @@ impl Database {
                     .map(|idx| (idx, a.value))
             })
             .collect();
+
+        let mut scalar_subquery_results: ScalarSubqueryResults = ScalarSubqueryResults::new();
+        {
+            let mut subqueries: SmallVec<[&crate::sql::ast::SelectStmt<'_>; 4]> = SmallVec::new();
+            for (_, value_expr) in &assignment_indices {
+                collect_scalar_subqueries_from_expr(value_expr, &mut subqueries);
+            }
+
+            if !subqueries.is_empty() {
+                let mut fm_guard = self.shared.file_manager.write();
+                let fm = fm_guard.as_mut().unwrap();
+                for subq in subqueries {
+                    let key = std::ptr::from_ref(subq) as usize;
+                    if !scalar_subquery_results.iter().any(|(k, _)| *k == key) {
+                        let result =
+                            Self::execute_scalar_subquery_for_update(subq, catalog, fm, arena)?;
+                        scalar_subquery_results.push((key, result));
+                    }
+                }
+            }
+        }
+
+        drop(catalog_guard);
 
         let mut file_manager_guard = self.shared.file_manager.write();
         let file_manager = file_manager_guard.as_mut().unwrap();
@@ -478,8 +1057,13 @@ impl Database {
                     deferred_assignments.push((*col_idx, assign_idx));
                     param_idx += count_params_in_expr(value_expr);
                 } else {
-                    let val =
-                        Self::eval_expr_with_params(value_expr, column_types.get(*col_idx), Some(params), &mut param_idx)?;
+                    let val = Self::eval_expr_with_params_and_subqueries(
+                        value_expr,
+                        column_types.get(*col_idx),
+                        Some(params),
+                        &mut param_idx,
+                        &scalar_subquery_results,
+                    )?;
                     precomputed_assignments.push((*col_idx, val));
                 }
             }
