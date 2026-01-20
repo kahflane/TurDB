@@ -591,6 +591,51 @@ impl OwnedValue {
             JsonbValue::Object(view) => OwnedValue::Jsonb(view.data().to_vec()),
         })
     }
+
+    pub fn eval_arithmetic(
+        left: &OwnedValue,
+        op: ArithmeticOp,
+        right: &OwnedValue,
+    ) -> Option<OwnedValue> {
+        match op {
+            ArithmeticOp::Plus => match (left, right) {
+                (OwnedValue::Int(a), OwnedValue::Int(b)) => Some(OwnedValue::Int(a + b)),
+                (OwnedValue::Float(a), OwnedValue::Float(b)) => Some(OwnedValue::Float(a + b)),
+                (OwnedValue::Int(a), OwnedValue::Float(b)) => Some(OwnedValue::Float(*a as f64 + b)),
+                (OwnedValue::Float(a), OwnedValue::Int(b)) => Some(OwnedValue::Float(a + *b as f64)),
+                _ => None,
+            },
+            ArithmeticOp::Minus => match (left, right) {
+                (OwnedValue::Int(a), OwnedValue::Int(b)) => Some(OwnedValue::Int(a - b)),
+                (OwnedValue::Float(a), OwnedValue::Float(b)) => Some(OwnedValue::Float(a - b)),
+                (OwnedValue::Int(a), OwnedValue::Float(b)) => Some(OwnedValue::Float(*a as f64 - b)),
+                (OwnedValue::Float(a), OwnedValue::Int(b)) => Some(OwnedValue::Float(a - *b as f64)),
+                _ => None,
+            },
+            ArithmeticOp::Multiply => match (left, right) {
+                (OwnedValue::Int(a), OwnedValue::Int(b)) => Some(OwnedValue::Int(a * b)),
+                (OwnedValue::Float(a), OwnedValue::Float(b)) => Some(OwnedValue::Float(a * b)),
+                (OwnedValue::Int(a), OwnedValue::Float(b)) => Some(OwnedValue::Float(*a as f64 * b)),
+                (OwnedValue::Float(a), OwnedValue::Int(b)) => Some(OwnedValue::Float(a * *b as f64)),
+                _ => None,
+            },
+            ArithmeticOp::Divide => match (left, right) {
+                (OwnedValue::Int(a), OwnedValue::Int(b)) if *b != 0 => Some(OwnedValue::Int(a / b)),
+                (OwnedValue::Float(a), OwnedValue::Float(b)) if *b != 0.0 => Some(OwnedValue::Float(a / b)),
+                (OwnedValue::Int(a), OwnedValue::Float(b)) if *b != 0.0 => Some(OwnedValue::Float(*a as f64 / b)),
+                (OwnedValue::Float(a), OwnedValue::Int(b)) if *b != 0 => Some(OwnedValue::Float(a / *b as f64)),
+                _ => None,
+            },
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArithmeticOp {
+    Plus,
+    Minus,
+    Multiply,
+    Divide,
 }
 
 mod hex {

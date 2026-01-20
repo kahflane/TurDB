@@ -102,7 +102,7 @@ use crate::parsing::{
     parse_binary_blob, parse_date, parse_hex_blob, parse_interval, parse_time, parse_timestamp,
     parse_uuid, parse_vector,
 };
-use crate::types::{DataType, OwnedValue, Value};
+use crate::types::{ArithmeticOp, DataType, OwnedValue, Value};
 use eyre::{bail, Result, WrapErr};
 use std::borrow::Cow;
 
@@ -468,56 +468,24 @@ impl Database {
                 )?;
 
                 use crate::sql::ast::BinaryOperator;
-                match op {
-                    BinaryOperator::Plus => match (left_val.as_ref(), right_val.as_ref()) {
-                        (OwnedValue::Int(a), OwnedValue::Int(b)) => Ok(Cow::Owned(OwnedValue::Int(a + b))),
-                        (OwnedValue::Float(a), OwnedValue::Float(b)) => Ok(Cow::Owned(OwnedValue::Float(a + b))),
-                        (OwnedValue::Int(a), OwnedValue::Float(b)) => {
-                            Ok(Cow::Owned(OwnedValue::Float(*a as f64 + b)))
-                        }
-                        (OwnedValue::Float(a), OwnedValue::Int(b)) => {
-                            Ok(Cow::Owned(OwnedValue::Float(a + *b as f64)))
-                        }
-                        _ => bail!("unsupported types for addition in UPDATE SET"),
-                    },
-                    BinaryOperator::Minus => match (left_val.as_ref(), right_val.as_ref()) {
-                        (OwnedValue::Int(a), OwnedValue::Int(b)) => Ok(Cow::Owned(OwnedValue::Int(a - b))),
-                        (OwnedValue::Float(a), OwnedValue::Float(b)) => Ok(Cow::Owned(OwnedValue::Float(a - b))),
-                        (OwnedValue::Int(a), OwnedValue::Float(b)) => {
-                            Ok(Cow::Owned(OwnedValue::Float(*a as f64 - b)))
-                        }
-                        (OwnedValue::Float(a), OwnedValue::Int(b)) => {
-                            Ok(Cow::Owned(OwnedValue::Float(a - *b as f64)))
-                        }
-                        _ => bail!("unsupported types for subtraction in UPDATE SET"),
-                    },
-                    BinaryOperator::Multiply => match (left_val.as_ref(), right_val.as_ref()) {
-                        (OwnedValue::Int(a), OwnedValue::Int(b)) => Ok(Cow::Owned(OwnedValue::Int(a * b))),
-                        (OwnedValue::Float(a), OwnedValue::Float(b)) => Ok(Cow::Owned(OwnedValue::Float(a * b))),
-                        (OwnedValue::Int(a), OwnedValue::Float(b)) => {
-                            Ok(Cow::Owned(OwnedValue::Float(*a as f64 * b)))
-                        }
-                        (OwnedValue::Float(a), OwnedValue::Int(b)) => {
-                            Ok(Cow::Owned(OwnedValue::Float(a * *b as f64)))
-                        }
-                        _ => bail!("unsupported types for multiplication in UPDATE SET"),
-                    },
-                    BinaryOperator::Divide => match (left_val.as_ref(), right_val.as_ref()) {
-                        (OwnedValue::Int(a), OwnedValue::Int(b)) if *b != 0 => {
-                            Ok(Cow::Owned(OwnedValue::Int(a / b)))
-                        }
-                        (OwnedValue::Float(a), OwnedValue::Float(b)) if *b != 0.0 => {
-                            Ok(Cow::Owned(OwnedValue::Float(a / b)))
-                        }
-                        (OwnedValue::Int(a), OwnedValue::Float(b)) if *b != 0.0 => {
-                            Ok(Cow::Owned(OwnedValue::Float(*a as f64 / b)))
-                        }
-                        (OwnedValue::Float(a), OwnedValue::Int(b)) if *b != 0 => {
-                            Ok(Cow::Owned(OwnedValue::Float(a / *b as f64)))
-                        }
-                        _ => bail!("division by zero or unsupported types"),
-                    },
-                    _ => Self::eval_literal_with_type(expr, target_type).map(Cow::Owned),
+                let arith_op = match op {
+                    BinaryOperator::Plus => Some(ArithmeticOp::Plus),
+                    BinaryOperator::Minus => Some(ArithmeticOp::Minus),
+                    BinaryOperator::Multiply => Some(ArithmeticOp::Multiply),
+                    BinaryOperator::Divide => Some(ArithmeticOp::Divide),
+                    _ => None,
+                };
+                if let Some(aop) = arith_op {
+                    OwnedValue::eval_arithmetic(left_val.as_ref(), aop, right_val.as_ref())
+                        .map(Cow::Owned)
+                        .ok_or_else(|| {
+                            eyre::eyre!(
+                                "unsupported types or division by zero for {:?} in UPDATE SET",
+                                aop
+                            )
+                        })
+                } else {
+                    Self::eval_literal_with_type(expr, target_type).map(Cow::Owned)
                 }
             }
             _ => Self::eval_literal_with_type(expr, target_type).map(Cow::Owned),

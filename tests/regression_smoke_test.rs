@@ -1523,6 +1523,51 @@ mod real_world_scenario {
     }
 
     #[test]
+    fn update_with_subquery_secondary_index_where_filter_applied() {
+        let (db, _dir) = create_test_db();
+
+        db.execute("CREATE TABLE products (id INTEGER PRIMARY KEY, category INTEGER, price REAL)")
+            .unwrap();
+        db.execute("CREATE TABLE summary (category INTEGER PRIMARY KEY, total_price REAL)")
+            .unwrap();
+        db.execute("CREATE INDEX idx_products_category ON products(category)")
+            .unwrap();
+
+        db.execute("INSERT INTO products (id, category, price) VALUES (1, 1, 10.0)")
+            .unwrap();
+        db.execute("INSERT INTO products (id, category, price) VALUES (2, 1, 20.0)")
+            .unwrap();
+        db.execute("INSERT INTO products (id, category, price) VALUES (3, 2, 100.0)")
+            .unwrap();
+        db.execute("INSERT INTO products (id, category, price) VALUES (4, 2, 200.0)")
+            .unwrap();
+
+        db.execute("INSERT INTO summary (category, total_price) VALUES (1, 0.0)")
+            .unwrap();
+        db.execute("INSERT INTO summary (category, total_price) VALUES (2, 0.0)")
+            .unwrap();
+
+        db.execute(
+            "UPDATE summary SET total_price = (SELECT SUM(price) FROM products WHERE category = 1) WHERE category = 1",
+        )
+        .unwrap();
+
+        let rows = db
+            .query("SELECT total_price FROM summary WHERE category = 1")
+            .unwrap();
+        match &rows[0].values[0] {
+            OwnedValue::Float(v) => {
+                assert!(
+                    (*v - 30.0).abs() < 0.01,
+                    "Expected 30.0 (sum of category 1: 10+20), got {}. SecondaryIndexScan WHERE filter may not be applied.",
+                    v
+                );
+            }
+            other => panic!("Expected Float, got {:?}", other),
+        }
+    }
+
+    #[test]
     fn blog_platform_scenario() {
         let (db, _dir) = create_test_db();
 

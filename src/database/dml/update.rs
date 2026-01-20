@@ -132,7 +132,7 @@ use crate::sql::decoder::RecordDecoder;
 use crate::sql::executor::ExecutorRow;
 use crate::sql::predicate::CompiledPredicate;
 use crate::storage::{IndexFileHeader, TableFileHeader, DEFAULT_SCHEMA};
-use crate::types::{create_record_schema, OwnedValue, Value};
+use crate::types::{create_record_schema, ArithmeticOp, OwnedValue, Value};
 use bumpalo::Bump;
 use eyre::{bail, Result, WrapErr};
 use hashbrown::{HashMap, HashSet};
@@ -312,40 +312,53 @@ fn find_expression_aggregate<'a>(
     }
 }
 
+/// Finds ANY single aggregate function in a query plan (including simple column aggregates).
+fn find_any_aggregate<'a>(
+    op: &'a crate::sql::planner::PhysicalOperator<'a>,
+) -> Option<(
+    &'a crate::sql::planner::AggregateFunction,
+    &'a crate::sql::ast::Expr<'a>,
+)> {
+    use crate::sql::planner::PhysicalOperator;
+
+    match op {
+        PhysicalOperator::HashAggregate(agg) => {
+            for agg_expr in agg.aggregates.iter() {
+                if let Some(arg) = agg_expr.argument {
+                    return Some((&agg_expr.function, arg));
+                }
+            }
+            find_any_aggregate(agg.input)
+        }
+        PhysicalOperator::SortedAggregate(agg) => {
+            for agg_expr in agg.aggregates.iter() {
+                if let Some(arg) = agg_expr.argument {
+                    return Some((&agg_expr.function, arg));
+                }
+            }
+            find_any_aggregate(agg.input)
+        }
+        PhysicalOperator::FilterExec(f) => find_any_aggregate(f.input),
+        PhysicalOperator::ProjectExec(p) => find_any_aggregate(p.input),
+        PhysicalOperator::SortExec(s) => find_any_aggregate(s.input),
+        PhysicalOperator::LimitExec(l) => find_any_aggregate(l.input),
+        _ => None,
+    }
+}
+
 /// Evaluates a binary operation on two OwnedValues.
 fn eval_binary_op(left: &OwnedValue, op: &crate::sql::ast::BinaryOperator, right: &OwnedValue) -> OwnedValue {
     use crate::sql::ast::BinaryOperator;
-    match op {
-        BinaryOperator::Plus => match (left, right) {
-            (OwnedValue::Int(a), OwnedValue::Int(b)) => OwnedValue::Int(a + b),
-            (OwnedValue::Float(a), OwnedValue::Float(b)) => OwnedValue::Float(a + b),
-            (OwnedValue::Int(a), OwnedValue::Float(b)) => OwnedValue::Float(*a as f64 + b),
-            (OwnedValue::Float(a), OwnedValue::Int(b)) => OwnedValue::Float(a + *b as f64),
-            _ => OwnedValue::Null,
-        },
-        BinaryOperator::Minus => match (left, right) {
-            (OwnedValue::Int(a), OwnedValue::Int(b)) => OwnedValue::Int(a - b),
-            (OwnedValue::Float(a), OwnedValue::Float(b)) => OwnedValue::Float(a - b),
-            (OwnedValue::Int(a), OwnedValue::Float(b)) => OwnedValue::Float(*a as f64 - b),
-            (OwnedValue::Float(a), OwnedValue::Int(b)) => OwnedValue::Float(a - *b as f64),
-            _ => OwnedValue::Null,
-        },
-        BinaryOperator::Multiply => match (left, right) {
-            (OwnedValue::Int(a), OwnedValue::Int(b)) => OwnedValue::Int(a * b),
-            (OwnedValue::Float(a), OwnedValue::Float(b)) => OwnedValue::Float(a * b),
-            (OwnedValue::Int(a), OwnedValue::Float(b)) => OwnedValue::Float(*a as f64 * b),
-            (OwnedValue::Float(a), OwnedValue::Int(b)) => OwnedValue::Float(a * *b as f64),
-            _ => OwnedValue::Null,
-        },
-        BinaryOperator::Divide => match (left, right) {
-            (OwnedValue::Int(a), OwnedValue::Int(b)) if *b != 0 => OwnedValue::Int(a / b),
-            (OwnedValue::Float(a), OwnedValue::Float(b)) if *b != 0.0 => OwnedValue::Float(a / b),
-            (OwnedValue::Int(a), OwnedValue::Float(b)) if *b != 0.0 => OwnedValue::Float(*a as f64 / b),
-            (OwnedValue::Float(a), OwnedValue::Int(b)) if *b != 0 => OwnedValue::Float(a / *b as f64),
-            _ => OwnedValue::Null,
-        },
-        _ => OwnedValue::Null,
-    }
+    let arith_op = match op {
+        BinaryOperator::Plus => Some(ArithmeticOp::Plus),
+        BinaryOperator::Minus => Some(ArithmeticOp::Minus),
+        BinaryOperator::Multiply => Some(ArithmeticOp::Multiply),
+        BinaryOperator::Divide => Some(ArithmeticOp::Divide),
+        _ => None,
+    };
+    arith_op
+        .and_then(|aop| OwnedValue::eval_arithmetic(left, aop, right))
+        .unwrap_or(OwnedValue::Null)
 }
 
 /// Evaluates an expression against a record for streaming aggregation.
@@ -701,7 +714,7 @@ impl Database {
 
                 let has_filter = plan_has_filter(subq_plan.root);
                 if !has_filter {
-                    if let Some((agg_func, expr)) = find_expression_aggregate(subq_plan.root) {
+                    if let Some((agg_func, expr)) = find_any_aggregate(subq_plan.root) {
                     let mut agg_state = StreamingAggregateState::new();
 
                     let index_storage_arc = file_manager.index_data(schema_name, table_name, index_name)
@@ -2474,68 +2487,27 @@ impl Database {
                 let left_val = self.eval_expr_with_row(left, row, column_map)?;
                 let right_val = self.eval_expr_with_row(right, row, column_map)?;
 
-                match op {
-                    BinaryOperator::Plus => match (&left_val, &right_val) {
-                        (OwnedValue::Int(a), OwnedValue::Int(b)) => Ok(OwnedValue::Int(a + b)),
-                        (OwnedValue::Float(a), OwnedValue::Float(b)) => {
-                            Ok(OwnedValue::Float(a + b))
-                        }
-                        (OwnedValue::Int(a), OwnedValue::Float(b)) => {
-                            Ok(OwnedValue::Float(*a as f64 + b))
-                        }
-                        (OwnedValue::Float(a), OwnedValue::Int(b)) => {
-                            Ok(OwnedValue::Float(a + *b as f64))
-                        }
-                        _ => bail!("unsupported types for addition"),
-                    },
-                    BinaryOperator::Minus => match (&left_val, &right_val) {
-                        (OwnedValue::Int(a), OwnedValue::Int(b)) => Ok(OwnedValue::Int(a - b)),
-                        (OwnedValue::Float(a), OwnedValue::Float(b)) => {
-                            Ok(OwnedValue::Float(a - b))
-                        }
-                        (OwnedValue::Int(a), OwnedValue::Float(b)) => {
-                            Ok(OwnedValue::Float(*a as f64 - b))
-                        }
-                        (OwnedValue::Float(a), OwnedValue::Int(b)) => {
-                            Ok(OwnedValue::Float(a - *b as f64))
-                        }
-                        _ => bail!("unsupported types for subtraction"),
-                    },
-                    BinaryOperator::Multiply => match (&left_val, &right_val) {
-                        (OwnedValue::Int(a), OwnedValue::Int(b)) => Ok(OwnedValue::Int(a * b)),
-                        (OwnedValue::Float(a), OwnedValue::Float(b)) => {
-                            Ok(OwnedValue::Float(a * b))
-                        }
-                        (OwnedValue::Int(a), OwnedValue::Float(b)) => {
-                            Ok(OwnedValue::Float(*a as f64 * b))
-                        }
-                        (OwnedValue::Float(a), OwnedValue::Int(b)) => {
-                            Ok(OwnedValue::Float(a * *b as f64))
-                        }
-                        _ => bail!("unsupported types for multiplication"),
-                    },
-                    BinaryOperator::Divide => match (&left_val, &right_val) {
-                        (OwnedValue::Int(a), OwnedValue::Int(b)) if *b != 0 => {
-                            Ok(OwnedValue::Int(a / b))
-                        }
-                        (OwnedValue::Float(a), OwnedValue::Float(b)) if *b != 0.0 => {
-                            Ok(OwnedValue::Float(a / b))
-                        }
-                        (OwnedValue::Int(a), OwnedValue::Float(b)) if *b != 0.0 => {
-                            Ok(OwnedValue::Float(*a as f64 / b))
-                        }
-                        (OwnedValue::Float(a), OwnedValue::Int(b)) if *b != 0 => {
-                            Ok(OwnedValue::Float(a / *b as f64))
-                        }
-                        _ => bail!("division by zero or unsupported types"),
-                    },
-                    BinaryOperator::Concat => match (&left_val, &right_val) {
-                        (OwnedValue::Text(a), OwnedValue::Text(b)) => {
-                            Ok(OwnedValue::Text(format!("{}{}", a, b)))
-                        }
-                        _ => bail!("unsupported types for concatenation"),
-                    },
-                    _ => bail!("unsupported binary operator in UPDATE...FROM SET expression"),
+                let arith_op = match op {
+                    BinaryOperator::Plus => Some(ArithmeticOp::Plus),
+                    BinaryOperator::Minus => Some(ArithmeticOp::Minus),
+                    BinaryOperator::Multiply => Some(ArithmeticOp::Multiply),
+                    BinaryOperator::Divide => Some(ArithmeticOp::Divide),
+                    _ => None,
+                };
+                if let Some(aop) = arith_op {
+                    OwnedValue::eval_arithmetic(&left_val, aop, &right_val).ok_or_else(|| {
+                        eyre::eyre!("unsupported types or division by zero for {:?}", aop)
+                    })
+                } else {
+                    match op {
+                        BinaryOperator::Concat => match (&left_val, &right_val) {
+                            (OwnedValue::Text(a), OwnedValue::Text(b)) => {
+                                Ok(OwnedValue::Text(format!("{}{}", a, b)))
+                            }
+                            _ => bail!("unsupported types for concatenation"),
+                        },
+                        _ => bail!("unsupported binary operator in UPDATE...FROM SET expression"),
+                    }
                 }
             }
             Expr::UnaryOp { op, expr: inner } => {
