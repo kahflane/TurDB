@@ -668,10 +668,10 @@ impl Database {
 
                 executor.open()?;
                 let result = if let Some(row) = executor.next()? {
-                    row.values
-                        .first()
-                        .map(OwnedValue::from)
-                        .unwrap_or(OwnedValue::Null)
+                    if row.values.is_empty() {
+                        bail!("scalar subquery returned row with no columns for table '{}'", table_name);
+                    }
+                    OwnedValue::from(row.values.first().unwrap())
                 } else {
                     OwnedValue::Null
                 };
@@ -834,8 +834,12 @@ impl Database {
                                     let record = RecordView::new(user_data, &schema)?;
                                     let first_col_type = columns.first().map(|c| c.data_type())
                                         .ok_or_else(|| eyre::eyre!("table '{}' has no columns", table_name))?;
-                                    return Ok(Some(OwnedValue::from_record_column(&record, 0, first_col_type)
-                                        .unwrap_or(OwnedValue::Null)));
+                                    let col_value = OwnedValue::from_record_column(&record, 0, first_col_type)
+                                        .wrap_err_with(|| eyre::eyre!(
+                                            "failed to read column 0 from record in table '{}' via index '{}'",
+                                            table_name, index_name
+                                        ))?;
+                                    return Ok(Some(col_value));
                                 }
                             }
                             if !cursor.advance()? {
@@ -1228,7 +1232,8 @@ impl Database {
                         Some(params),
                         &mut param_idx,
                         &scalar_subquery_results,
-                    )?;
+                    )?
+                    .into_owned();
                     precomputed_assignments.push((*col_idx, val));
                 }
             }
