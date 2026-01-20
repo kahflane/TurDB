@@ -4386,62 +4386,139 @@ impl Database {
             return true;
         }
 
+        Self::eval_check_expr_recursive(expr_str, col_name, value)
+    }
+
+    fn eval_check_expr_recursive(expr_str: &str, col_name: &str, value: &OwnedValue) -> bool {
+        let trimmed = expr_str.trim();
+        let lower = trimmed.to_lowercase();
+
+        if let Some((left, right)) = Self::split_on_logical_op(&lower, trimmed, " and ") {
+            return Self::eval_check_expr_recursive(left, col_name, value)
+                && Self::eval_check_expr_recursive(right, col_name, value);
+        }
+
+        if let Some((left, right)) = Self::split_on_logical_op(&lower, trimmed, " or ") {
+            return Self::eval_check_expr_recursive(left, col_name, value)
+                || Self::eval_check_expr_recursive(right, col_name, value);
+        }
+
+        let stripped = Self::strip_outer_parens(trimmed);
+        if stripped != trimmed {
+            return Self::eval_check_expr_recursive(stripped, col_name, value);
+        }
+
+        Self::eval_simple_comparison(trimmed, col_name, value)
+    }
+
+    fn split_on_logical_op<'a>(
+        lower: &str,
+        original: &'a str,
+        op: &str,
+    ) -> Option<(&'a str, &'a str)> {
+        let mut depth = 0;
+        let mut i = 0;
+        let lower_bytes = lower.as_bytes();
+        let op_bytes = op.as_bytes();
+
+        while i + op.len() <= lower.len() {
+            let c = lower_bytes[i];
+            if c == b'(' {
+                depth += 1;
+            } else if c == b')' {
+                depth -= 1;
+            } else if depth == 0 && lower_bytes[i..].starts_with(op_bytes) {
+                let left = original[..i].trim();
+                let right = original[i + op.len()..].trim();
+                if !left.is_empty() && !right.is_empty() {
+                    return Some((left, right));
+                }
+            }
+            i += 1;
+        }
+        None
+    }
+
+    fn strip_outer_parens(s: &str) -> &str {
+        let trimmed = s.trim();
+        if !trimmed.starts_with('(') || !trimmed.ends_with(')') {
+            return trimmed;
+        }
+
+        let inner = &trimmed[1..trimmed.len() - 1];
+        let mut depth = 0;
+        for c in inner.chars() {
+            match c {
+                '(' => depth += 1,
+                ')' => {
+                    depth -= 1;
+                    if depth < 0 {
+                        return trimmed;
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        if depth == 0 {
+            inner
+        } else {
+            trimmed
+        }
+    }
+
+    fn eval_simple_comparison(expr_str: &str, col_name: &str, value: &OwnedValue) -> bool {
         let expr_lower = expr_str.to_lowercase();
         let col_lower = col_name.to_lowercase();
 
-        if expr_lower.contains(&col_lower) {
-            if let Some(op_idx) = expr_str.find(">=") {
-                let right_part = expr_str[op_idx + 2..].trim();
-                if let Ok(threshold) = right_part.parse::<i64>() {
-                    if let OwnedValue::Int(v) = value {
-                        return *v >= threshold;
-                    }
-                }
-                if let Ok(threshold) = right_part.parse::<f64>() {
-                    if let OwnedValue::Float(v) = value {
-                        return *v >= threshold;
-                    }
-                }
-            } else if let Some(op_idx) = expr_str.find("<=") {
-                let right_part = expr_str[op_idx + 2..].trim();
-                if let Ok(threshold) = right_part.parse::<i64>() {
-                    if let OwnedValue::Int(v) = value {
-                        return *v <= threshold;
-                    }
-                }
-                if let Ok(threshold) = right_part.parse::<f64>() {
-                    if let OwnedValue::Float(v) = value {
-                        return *v <= threshold;
-                    }
-                }
-            } else if let Some(op_idx) = expr_str.find('>') {
-                let right_part = expr_str[op_idx + 1..].trim();
-                if let Ok(threshold) = right_part.parse::<i64>() {
-                    if let OwnedValue::Int(v) = value {
-                        return *v > threshold;
-                    }
-                }
-                if let Ok(threshold) = right_part.parse::<f64>() {
-                    if let OwnedValue::Float(v) = value {
-                        return *v > threshold;
-                    }
-                }
-            } else if let Some(op_idx) = expr_str.find('<') {
-                let right_part = expr_str[op_idx + 1..].trim();
-                if let Ok(threshold) = right_part.parse::<i64>() {
-                    if let OwnedValue::Int(v) = value {
-                        return *v < threshold;
-                    }
-                }
-                if let Ok(threshold) = right_part.parse::<f64>() {
-                    if let OwnedValue::Float(v) = value {
-                        return *v < threshold;
-                    }
-                }
+        if !expr_lower.contains(&col_lower) {
+            return true;
+        }
+
+        if let Some(op_idx) = expr_str.find(">=") {
+            if let Some(threshold) = Self::extract_numeric_operand(&expr_str[op_idx + 2..]) {
+                return Self::compare_value_with_threshold(value, threshold, |v, t| v >= t);
+            }
+        } else if let Some(op_idx) = expr_str.find("<=") {
+            if let Some(threshold) = Self::extract_numeric_operand(&expr_str[op_idx + 2..]) {
+                return Self::compare_value_with_threshold(value, threshold, |v, t| v <= t);
+            }
+        } else if let Some(op_idx) = expr_str.find('>') {
+            if let Some(threshold) = Self::extract_numeric_operand(&expr_str[op_idx + 1..]) {
+                return Self::compare_value_with_threshold(value, threshold, |v, t| v > t);
+            }
+        } else if let Some(op_idx) = expr_str.find('<') {
+            if let Some(threshold) = Self::extract_numeric_operand(&expr_str[op_idx + 1..]) {
+                return Self::compare_value_with_threshold(value, threshold, |v, t| v < t);
             }
         }
 
         true
+    }
+
+    fn extract_numeric_operand(s: &str) -> Option<f64> {
+        let trimmed = s.trim();
+        let numeric_part: String = trimmed
+            .chars()
+            .take_while(|c| c.is_ascii_digit() || *c == '.' || *c == '-' || *c == '+')
+            .collect();
+
+        if numeric_part.is_empty() {
+            return None;
+        }
+
+        numeric_part.parse::<f64>().ok()
+    }
+
+    fn compare_value_with_threshold<F>(value: &OwnedValue, threshold: f64, cmp: F) -> bool
+    where
+        F: Fn(f64, f64) -> bool,
+    {
+        match value {
+            OwnedValue::Int(v) => cmp(*v as f64, threshold),
+            OwnedValue::Float(v) => cmp(*v, threshold),
+            _ => true,
+        }
     }
 
     pub(crate) fn get_or_create_hnsw_index(
