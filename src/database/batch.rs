@@ -26,7 +26,7 @@
 //! - `insert_cached`: Fastest for repeated single-row inserts
 //! - `bulk_insert`: Best throughput for large loads (100K+ rows)
 
-use crate::btree::BTree;
+use crate::btree::{BTree, BTreeReader};
 #[cfg(feature = "timing")]
 use crate::database::timing::{
     BTREE_INSERT_NS, INDEX_UPDATE_NS, INSERT_COUNT, MVCC_WRAP_NS, PAGE0_READ_NS, PAGE0_UPDATE_NS,
@@ -298,14 +298,14 @@ impl Database {
                 &plan.table_name,
                 "constraint check",
             )?;
-            let mut index_storage_guard = index_storage_arc.write();
-            let index_root = Self::get_index_root(index_plan, &mut index_storage_guard)?;
+            let index_storage_guard = index_storage_arc.read();
+            let index_root = Self::get_index_root(index_plan, &index_storage_guard)?;
 
             Self::build_index_key(index_plan, params);
             let key_buf_guard = index_plan.key_buffer.borrow();
 
-            let index_btree = BTree::new(&mut *index_storage_guard, index_root)?;
-            if index_btree.search(&key_buf_guard)?.is_some() {
+            let index_btree = BTreeReader::new(&index_storage_guard, index_root)?;
+            if index_btree.get(&key_buf_guard)?.is_some() {
                 let constraint_type = if index_plan.is_pk {
                     "PRIMARY KEY"
                 } else {
@@ -363,7 +363,7 @@ impl Database {
                 "insert",
             )?;
             let mut index_storage_guard = index_storage_arc.write();
-            let index_root = Self::get_index_root(index_plan, &mut index_storage_guard)?;
+            let index_root = Self::get_index_root(index_plan, &index_storage_guard)?;
 
             Self::build_index_key(index_plan, params);
             let key_buf_guard = index_plan.key_buffer.borrow();
@@ -519,7 +519,7 @@ impl Database {
 
     fn get_index_root(
         index_plan: &crate::database::prepared::CachedIndexPlan,
-        storage: &mut crate::storage::MmapStorage,
+        storage: &crate::storage::MmapStorage,
     ) -> Result<u32> {
         let cached_root = index_plan.root_page.get();
         if cached_root > 0 {
