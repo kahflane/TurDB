@@ -292,44 +292,14 @@ impl Database {
                 continue;
             }
 
-            let index_storage_arc = if let Some(weak) = index_plan.storage.borrow().as_ref() {
-                weak.upgrade()
-            } else {
-                None
-            };
-
-            let index_storage_arc = if let Some(arc) = index_storage_arc {
-                arc
-            } else {
-                let mut file_manager_guard = self.shared.file_manager.write();
-                let file_manager = file_manager_guard.as_mut().unwrap();
-                let arc = file_manager
-                    .index_data_mut(&plan.schema_name, &plan.table_name, &index_plan.name)
-                    .wrap_err_with(|| {
-                        format!(
-                            "failed to open index '{}' for table '{}.{}' during constraint check",
-                            index_plan.name, plan.schema_name, plan.table_name
-                        )
-                    })?;
-                *index_plan.storage.borrow_mut() = Some(std::sync::Arc::downgrade(&arc));
-                arc
-            };
-
+            let index_storage_arc = self.get_or_load_index_storage(
+                index_plan,
+                &plan.schema_name,
+                &plan.table_name,
+                "constraint check",
+            )?;
             let mut index_storage_guard = index_storage_arc.write();
-
-            let index_root = {
-                let cached_root = index_plan.root_page.get();
-                if cached_root > 0 {
-                    cached_root
-                } else {
-                    use crate::storage::IndexFileHeader;
-                    let page = index_storage_guard.page(0)?;
-                    let header = IndexFileHeader::from_bytes(page)?;
-                    let root = header.root_page();
-                    index_plan.root_page.set(root);
-                    root
-                }
-            };
+            let index_root = Self::get_index_root(index_plan, &mut index_storage_guard)?;
 
             let mut key_buf_guard = index_plan.key_buffer.borrow_mut();
             key_buf_guard.clear();
@@ -391,44 +361,14 @@ impl Database {
 
         let row_id_bytes = row_id.to_be_bytes();
         for index_plan in &plan.indexes {
-            let index_storage_arc = if let Some(weak) = index_plan.storage.borrow().as_ref() {
-                weak.upgrade()
-            } else {
-                None
-            };
-
-            let index_storage_arc = if let Some(arc) = index_storage_arc {
-                arc
-            } else {
-                let mut file_manager_guard = self.shared.file_manager.write();
-                let file_manager = file_manager_guard.as_mut().unwrap();
-                let arc = file_manager
-                    .index_data_mut(&plan.schema_name, &plan.table_name, &index_plan.name)
-                    .wrap_err_with(|| {
-                        format!(
-                            "failed to open index '{}' for table '{}.{}' during insert",
-                            index_plan.name, plan.schema_name, plan.table_name
-                        )
-                    })?;
-                *index_plan.storage.borrow_mut() = Some(std::sync::Arc::downgrade(&arc));
-                arc
-            };
-
+            let index_storage_arc = self.get_or_load_index_storage(
+                index_plan,
+                &plan.schema_name,
+                &plan.table_name,
+                "insert",
+            )?;
             let mut index_storage_guard = index_storage_arc.write();
-
-            let index_root = {
-                let cached_root = index_plan.root_page.get();
-                if cached_root > 0 {
-                    cached_root
-                } else {
-                    use crate::storage::IndexFileHeader;
-                    let page = index_storage_guard.page(0)?;
-                    let header = IndexFileHeader::from_bytes(page)?;
-                    let root = header.root_page();
-                    index_plan.root_page.set(root);
-                    root
-                }
-            };
+            let index_root = Self::get_index_root(index_plan, &mut index_storage_guard)?;
 
             let mut key_buf_guard = index_plan.key_buffer.borrow_mut();
             key_buf_guard.clear();
@@ -558,5 +498,49 @@ impl Database {
         }
 
         Ok(stats.row_count)
+    }
+
+    fn get_or_load_index_storage(
+        &self,
+        index_plan: &crate::database::prepared::CachedIndexPlan,
+        schema_name: &str,
+        table_name: &str,
+        operation: &str,
+    ) -> Result<std::sync::Arc<parking_lot::RwLock<crate::storage::MmapStorage>>> {
+        if let Some(weak) = index_plan.storage.borrow().as_ref() {
+            if let Some(arc) = weak.upgrade() {
+                return Ok(arc);
+            }
+        }
+
+        let mut file_manager_guard = self.shared.file_manager.write();
+        let file_manager = file_manager_guard.as_mut().unwrap();
+        let arc = file_manager
+            .index_data_mut(schema_name, table_name, &index_plan.name)
+            .wrap_err_with(|| {
+                format!(
+                    "failed to open index '{}' for table '{}.{}' during {}",
+                    index_plan.name, schema_name, table_name, operation
+                )
+            })?;
+        *index_plan.storage.borrow_mut() = Some(std::sync::Arc::downgrade(&arc));
+        Ok(arc)
+    }
+
+    fn get_index_root(
+        index_plan: &crate::database::prepared::CachedIndexPlan,
+        storage: &mut crate::storage::MmapStorage,
+    ) -> Result<u32> {
+        let cached_root = index_plan.root_page.get();
+        if cached_root > 0 {
+            return Ok(cached_root);
+        }
+
+        use crate::storage::IndexFileHeader;
+        let page = storage.page(0)?;
+        let header = IndexFileHeader::from_bytes(page)?;
+        let root = header.root_page();
+        index_plan.root_page.set(root);
+        Ok(root)
     }
 }

@@ -263,7 +263,6 @@ impl Database {
             match table_constraint {
                 TableConstraint::PrimaryKey { name, columns } | TableConstraint::Unique { name, columns } => {
                     let is_pk = matches!(table_constraint, TableConstraint::PrimaryKey { .. });
-                    let col_names: Vec<&str> = columns.to_vec();
                     let col_indices: Vec<usize> = columns
                         .iter()
                         .filter_map(|col_name| {
@@ -283,7 +282,7 @@ impl Database {
                     } else if is_pk {
                         format!("{}_cpkey", table_name)
                     } else {
-                        format!("{}_{}_key", table_name, col_names.join("_"))
+                        format!("{}_{}_key", table_name, columns.join("_"))
                     };
 
                     let index_id = self.allocate_index_id();
@@ -304,8 +303,8 @@ impl Database {
                     crate::btree::BTree::create(&mut *index_storage, 1)?;
 
                     let index_def = crate::schema::table::IndexDef::new(
-                        index_name.clone(),
-                        col_names,
+                        index_name,
+                        columns.to_vec(),
                         true,
                         crate::schema::table::IndexType::BTree,
                     );
