@@ -1132,7 +1132,7 @@ impl Database {
         };
         let btree = BTree::new(&mut *storage, root_page)?;
 
-        let mut pk_lookup_info: Option<(Vec<u8>, OwnedValue)> = 'pk_analysis: {
+        let mut pk_lookup_info: Option<(SmallVec<[u8; 16]>, OwnedValue)> = 'pk_analysis: {
             if let Some(crate::sql::ast::Expr::BinaryOp {
                 left,
                 op: crate::sql::ast::BinaryOperator::Eq,
@@ -1203,12 +1203,12 @@ impl Database {
                                     let index_btree =
                                         BTree::new(&mut *index_storage, index_root_page)?;
 
-                                    let mut index_key = Vec::new();
+                                    let mut index_key: SmallVec<[u8; 16]> = SmallVec::new();
                                     Self::encode_value_as_key(&val, &mut index_key);
 
                                     if let Some(handle) = index_btree.search(&index_key)? {
-                                        let row_key = index_btree.get_value(&handle)?.to_vec();
-                                        break 'pk_analysis Some((row_key, val));
+                                        let row_key_slice = index_btree.get_value(&handle)?;
+                                        break 'pk_analysis Some((SmallVec::from_slice(row_key_slice), val));
                                     }
                                 }
                             }
@@ -1229,8 +1229,8 @@ impl Database {
             Vec<(usize, OwnedValue)>,
         )> = Vec::new();
 
-        let mut precomputed_assignments: Vec<(usize, OwnedValue)> = Vec::new();
-        let mut deferred_assignments: Vec<(usize, usize)> = Vec::new();
+        let mut precomputed_assignments: SmallVec<[(usize, OwnedValue); 8]> = SmallVec::new();
+        let mut deferred_assignments: SmallVec<[(usize, usize); 4]> = SmallVec::new();
         let set_param_count: usize;
         {
             let mut param_idx = 0;
@@ -1419,7 +1419,7 @@ impl Database {
                                 txn.add_write_entry_with_undo(
                                     WriteEntry {
                                         table_id: table_id as u32,
-                                        key: target_key.clone(),
+                                        key: target_key.to_vec(),
                                         page_id: 0,
                                         offset: 0,
                                         undo_page_id: None,
