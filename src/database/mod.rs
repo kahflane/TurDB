@@ -1409,6 +1409,47 @@ mod tests {
     }
 
     #[test]
+    fn test_evaluate_check_expression_with_negative_threshold() {
+        use crate::types::OwnedValue;
+
+        let result = Database::evaluate_check_expression(
+            "temp >= -273.15",
+            "temp",
+            Some(&OwnedValue::Float(-100.0)),
+        )
+        .unwrap();
+        assert!(result, "-100.0 >= -273.15 should be true");
+
+        let result = Database::evaluate_check_expression(
+            "temp >= -273.15",
+            "temp",
+            Some(&OwnedValue::Float(-300.0)),
+        )
+        .unwrap();
+        assert!(!result, "-300.0 >= -273.15 should be false");
+    }
+
+    #[test]
+    fn test_check_constraint_with_negative_threshold_rejects_value() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("test_db");
+
+        let db = Database::create(&db_path).unwrap();
+
+        db.execute("CREATE TABLE temps (id INT, temp REAL CHECK(temp >= -273.15))")
+            .unwrap();
+
+        db.execute("INSERT INTO temps VALUES (1, -100.0)")
+            .expect("Insert with -100.0 (above -273.15) should succeed");
+
+        let result = db.execute("INSERT INTO temps VALUES (2, -300.0)");
+        assert!(
+            result.is_err(),
+            "CHECK constraint should reject -300.0 (below -273.15)"
+        );
+    }
+
+    #[test]
     fn test_foreign_key_rejects_missing_reference_on_insert() {
         let dir = tempdir().unwrap();
         let db_path = dir.path().join("test_db");

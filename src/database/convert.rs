@@ -204,7 +204,7 @@ impl Database {
     }
 
     pub(crate) fn expr_to_string(expr: &crate::sql::ast::Expr<'_>) -> Option<String> {
-        use crate::sql::ast::{BinaryOperator, Expr};
+        use crate::sql::ast::{BinaryOperator, Expr, UnaryOperator};
 
         match expr {
             Expr::BinaryOp { left, op, right } => {
@@ -227,6 +227,16 @@ impl Database {
                     _ => "?",
                 };
                 Some(format!("{} {} {}", left_str, op_str, right_str))
+            }
+            Expr::UnaryOp { op, expr: inner } => {
+                let inner_str = Self::expr_to_string(inner)?;
+                let op_str = match op {
+                    UnaryOperator::Minus => "-",
+                    UnaryOperator::Plus => "+",
+                    UnaryOperator::Not => "NOT ",
+                    UnaryOperator::BitwiseNot => "~",
+                };
+                Some(format!("{}{}", op_str, inner_str))
             }
             Expr::Column(col_ref) => Some(col_ref.column.to_string()),
             Expr::Literal(lit) => match lit {
