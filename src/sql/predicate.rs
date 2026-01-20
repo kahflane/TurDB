@@ -53,6 +53,21 @@ impl<'a> CompiledPredicate<'a> {
         }
     }
 
+    pub fn with_params_from_slice(
+        expr: &'a crate::sql::ast::Expr<'a>,
+        column_map: &[(String, usize)],
+        params: &'a [OwnedValue],
+        set_param_count: usize,
+    ) -> Self {
+        Self {
+            expr,
+            column_map: column_map.iter().cloned().collect(),
+            params: Some(Cow::Borrowed(params)),
+            set_param_count,
+            scalar_subquery_results: ScalarSubqueryResults::new(),
+        }
+    }
+
     pub fn with_scalar_subqueries(
         expr: &'a crate::sql::ast::Expr<'a>,
         column_map: Vec<(String, usize)>,
@@ -64,6 +79,21 @@ impl<'a> CompiledPredicate<'a> {
             params: None,
             set_param_count: 0,
             scalar_subquery_results: scalar_results,
+        }
+    }
+
+    pub fn with_params_hashmap(
+        expr: &'a crate::sql::ast::Expr<'a>,
+        column_map: FastHashMap<String, usize>,
+        params: &'a [OwnedValue],
+        set_param_count: usize,
+    ) -> Self {
+        Self {
+            expr,
+            column_map,
+            params: Some(Cow::Borrowed(params)),
+            set_param_count,
+            scalar_subquery_results: ScalarSubqueryResults::new(),
         }
     }
 

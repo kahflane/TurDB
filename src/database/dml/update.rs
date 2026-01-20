@@ -95,7 +95,7 @@ use crate::sql::decoder::RecordDecoder;
 use crate::sql::executor::ExecutorRow;
 use crate::sql::predicate::CompiledPredicate;
 use crate::storage::{IndexFileHeader, DEFAULT_SCHEMA};
-use crate::types::{create_record_schema, owned_values_to_values, OwnedValue, Value};
+use crate::types::{create_record_schema, OwnedValue, Value};
 use bumpalo::Bump;
 use eyre::{bail, Result, WrapErr};
 use hashbrown::HashSet;
@@ -113,6 +113,63 @@ fn count_params_in_expr(expr: &crate::sql::ast::Expr) -> usize {
         Expr::UnaryOp { expr, .. } => count_params_in_expr(expr),
         Expr::Cast { expr, .. } => count_params_in_expr(expr),
         _ => 0,
+    }
+}
+
+fn expr_contains_column_ref(expr: &crate::sql::ast::Expr) -> bool {
+    use crate::sql::ast::Expr;
+    match expr {
+        Expr::Column(_) => true,
+        Expr::Literal(_) | Expr::Parameter(_) => false,
+        Expr::BinaryOp { left, right, .. } => {
+            expr_contains_column_ref(left) || expr_contains_column_ref(right)
+        }
+        Expr::UnaryOp { expr, .. } => expr_contains_column_ref(expr),
+        Expr::Cast { expr, .. } => expr_contains_column_ref(expr),
+        Expr::IsNull { expr, .. } => expr_contains_column_ref(expr),
+        Expr::Between {
+            expr, low, high, ..
+        } => {
+            expr_contains_column_ref(expr)
+                || expr_contains_column_ref(low)
+                || expr_contains_column_ref(high)
+        }
+        Expr::Like {
+            expr,
+            pattern,
+            escape,
+            ..
+        } => {
+            expr_contains_column_ref(expr)
+                || expr_contains_column_ref(pattern)
+                || escape.is_some_and(expr_contains_column_ref)
+        }
+        Expr::InList { expr, list, .. } => {
+            expr_contains_column_ref(expr) || list.iter().any(|e| expr_contains_column_ref(e))
+        }
+        Expr::InSubquery { .. } | Expr::Subquery(_) | Expr::Exists { .. } => true,
+        Expr::IsDistinctFrom { left, right, .. } => {
+            expr_contains_column_ref(left) || expr_contains_column_ref(right)
+        }
+        Expr::Case {
+            operand,
+            conditions,
+            else_result,
+        } => {
+            operand.is_some_and(expr_contains_column_ref)
+                || conditions.iter().any(|wc| {
+                    expr_contains_column_ref(wc.condition) || expr_contains_column_ref(wc.result)
+                })
+                || else_result.is_some_and(expr_contains_column_ref)
+        }
+        Expr::Function(func) => {
+            if let crate::sql::ast::FunctionArgs::Args(args) = &func.args {
+                args.iter().any(|arg| expr_contains_column_ref(arg.value))
+            } else {
+                false
+            }
+        }
+        _ => false,
     }
 }
 
@@ -412,33 +469,64 @@ impl Database {
         )> = Vec::new();
 
         let mut precomputed_assignments: Vec<(usize, OwnedValue)> = Vec::new();
+        let mut deferred_assignments: Vec<(usize, usize)> = Vec::new();
         let set_param_count: usize;
         {
             let mut param_idx = 0;
-            for (col_idx, value_expr) in &assignment_indices {
-                let val =
-                    Self::eval_expr_with_params(value_expr, column_types.get(*col_idx), Some(params), &mut param_idx)?;
-                precomputed_assignments.push((*col_idx, val));
+            for (assign_idx, (col_idx, value_expr)) in assignment_indices.iter().enumerate() {
+                if expr_contains_column_ref(value_expr) {
+                    deferred_assignments.push((*col_idx, assign_idx));
+                    param_idx += count_params_in_expr(value_expr);
+                } else {
+                    let val =
+                        Self::eval_expr_with_params(value_expr, column_types.get(*col_idx), Some(params), &mut param_idx)?;
+                    precomputed_assignments.push((*col_idx, val));
+                }
             }
             set_param_count = param_idx;
         }
 
-        let predicate: Option<crate::sql::predicate::CompiledPredicate> =
-            if let Some(w) = update.where_clause {
-                let col_map = columns
+        let has_where = update.where_clause.is_some();
+        let has_deferred = !deferred_assignments.is_empty();
+
+        let needs_column_map = has_where || has_deferred;
+        let base_column_map: Option<Vec<(String, usize)>> = if needs_column_map {
+            Some(
+                columns
                     .iter()
                     .enumerate()
                     .map(|(i, c)| (c.name().to_string(), i))
-                    .collect();
-                Some(crate::sql::predicate::CompiledPredicate::with_params(
-                    w,
+                    .collect(),
+            )
+        } else {
+            None
+        };
+
+        let (predicate, column_map): (
+            Option<crate::sql::predicate::CompiledPredicate>,
+            Option<Vec<(String, usize)>>,
+        ) = match (has_where, has_deferred, base_column_map) {
+            (true, true, Some(col_map)) => {
+                let pred = crate::sql::predicate::CompiledPredicate::with_params_from_slice(
+                    update.where_clause.unwrap(),
+                    &col_map,
+                    params,
+                    set_param_count,
+                );
+                (Some(pred), Some(col_map))
+            }
+            (true, false, Some(col_map)) => {
+                let pred = crate::sql::predicate::CompiledPredicate::with_params(
+                    update.where_clause.unwrap(),
                     col_map,
                     params,
                     set_param_count,
-                ))
-            } else {
-                None
-            };
+                );
+                (Some(pred), None)
+            }
+            (false, true, Some(col_map)) => (None, Some(col_map)),
+            _ => (None, None),
+        };
 
         let modified_col_indices: HashSet<usize> =
             assignment_indices.iter().map(|(idx, _)| *idx).collect();
@@ -454,7 +542,10 @@ impl Database {
             .map(|(idx, _)| idx)
             .collect();
 
-        let can_onepass = pk_lookup_info.is_some() && unique_col_indices.is_empty() && !has_toast;
+        let can_onepass = pk_lookup_info.is_some()
+            && unique_col_indices.is_empty()
+            && !has_toast
+            && deferred_assignments.is_empty();
 
         if can_onepass {
             if let Some((ref target_key, ref target_val)) = pk_lookup_info {
@@ -589,6 +680,9 @@ impl Database {
         }
 
         // MULTIPASS: Fallback for complex queries
+        let mut deferred_values_buf: Vec<(usize, OwnedValue)> =
+            Vec::with_capacity(deferred_assignments.len());
+
         loop {
             let mut cursor = if let Some((ref key, _)) = pk_lookup_info {
                 btree.cursor_seek(key)?
@@ -621,8 +715,8 @@ impl Database {
                         false
                     }
                 } else if let Some(ref pred) = predicate {
-                    let values = owned_values_to_values(&row_values);
-                    let values_slice = arena.alloc_slice_fill_iter(values.into_iter());
+                    let values_iter = row_values.iter().map(|ov| ov.to_value());
+                    let values_slice = arena.alloc_slice_fill_iter(values_iter);
                     let exec_row = ExecutorRow::new(values_slice);
                     pred.evaluate(&exec_row)
                 } else {
@@ -640,6 +734,30 @@ impl Database {
                             old_toast_values.push((*col_idx, row_values[*col_idx].clone()));
                         }
                         row_values[*col_idx] = val.clone();
+                    }
+
+                    if !deferred_assignments.is_empty() {
+                        let col_map = column_map.as_ref().unwrap();
+                        deferred_values_buf.clear();
+                        {
+                            let values_iter = row_values.iter().map(|ov| ov.to_value());
+                            let values_slice = arena.alloc_slice_fill_iter(values_iter);
+                            let exec_row = ExecutorRow::new(values_slice);
+
+                            for (col_idx, assign_idx) in &deferred_assignments {
+                                let (_, value_expr) = &assignment_indices[*assign_idx];
+                                let new_val =
+                                    self.eval_expr_with_row(value_expr, &exec_row, col_map)?;
+                                deferred_values_buf.push((*col_idx, new_val));
+                            }
+                        }
+
+                        for (col_idx, new_val) in deferred_values_buf.drain(..) {
+                            if let OwnedValue::ToastPointer(_) = &row_values[col_idx] {
+                                old_toast_values.push((col_idx, row_values[col_idx].clone()));
+                            }
+                            row_values[col_idx] = new_val;
+                        }
                     }
 
                     let validator = crate::constraints::ConstraintValidator::new(&table_def);
@@ -1580,22 +1698,10 @@ impl Database {
         match expr {
             Expr::Literal(_) => Self::eval_literal(expr),
             Expr::Column(col_ref) => {
-                let col_name = if let Some(table) = col_ref.table {
-                    format!("{}.{}", table, col_ref.column)
-                } else {
-                    col_ref.column.to_string()
-                };
-
                 let col_idx = column_map
                     .iter()
-                    .find(|(name, _)| name.eq_ignore_ascii_case(&col_name))
-                    .map(|(_, idx)| *idx)
-                    .or_else(|| {
-                        column_map
-                            .iter()
-                            .find(|(name, _)| name.eq_ignore_ascii_case(col_ref.column))
-                            .map(|(_, idx)| *idx)
-                    });
+                    .find(|(name, _)| name.eq_ignore_ascii_case(col_ref.column))
+                    .map(|(_, idx)| *idx);
 
                 if let Some(idx) = col_idx {
                     if let Some(val) = row.get(idx) {
@@ -1604,7 +1710,10 @@ impl Database {
                         Ok(OwnedValue::Null)
                     }
                 } else {
-                    bail!("column '{}' not found in UPDATE...FROM context", col_name)
+                    bail!(
+                        "column '{}' not found in UPDATE context",
+                        col_ref.column
+                    )
                 }
             }
             Expr::BinaryOp { left, op, right } => {
