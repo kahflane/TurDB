@@ -120,11 +120,48 @@ fn expr_contains_column_ref(expr: &crate::sql::ast::Expr) -> bool {
     use crate::sql::ast::Expr;
     match expr {
         Expr::Column(_) => true,
+        Expr::Literal(_) | Expr::Parameter(_) => false,
         Expr::BinaryOp { left, right, .. } => {
             expr_contains_column_ref(left) || expr_contains_column_ref(right)
         }
         Expr::UnaryOp { expr, .. } => expr_contains_column_ref(expr),
         Expr::Cast { expr, .. } => expr_contains_column_ref(expr),
+        Expr::IsNull { expr, .. } => expr_contains_column_ref(expr),
+        Expr::Between {
+            expr, low, high, ..
+        } => {
+            expr_contains_column_ref(expr)
+                || expr_contains_column_ref(low)
+                || expr_contains_column_ref(high)
+        }
+        Expr::Like {
+            expr,
+            pattern,
+            escape,
+            ..
+        } => {
+            expr_contains_column_ref(expr)
+                || expr_contains_column_ref(pattern)
+                || escape.is_some_and(expr_contains_column_ref)
+        }
+        Expr::InList { expr, list, .. } => {
+            expr_contains_column_ref(expr) || list.iter().any(|e| expr_contains_column_ref(e))
+        }
+        Expr::InSubquery { .. } | Expr::Subquery(_) | Expr::Exists { .. } => true,
+        Expr::IsDistinctFrom { left, right, .. } => {
+            expr_contains_column_ref(left) || expr_contains_column_ref(right)
+        }
+        Expr::Case {
+            operand,
+            conditions,
+            else_result,
+        } => {
+            operand.is_some_and(expr_contains_column_ref)
+                || conditions.iter().any(|wc| {
+                    expr_contains_column_ref(wc.condition) || expr_contains_column_ref(wc.result)
+                })
+                || else_result.is_some_and(expr_contains_column_ref)
+        }
         Expr::Function(func) => {
             if let crate::sql::ast::FunctionArgs::Args(args) = &func.args {
                 args.iter().any(|arg| expr_contains_column_ref(arg.value))
@@ -449,12 +486,6 @@ impl Database {
             set_param_count = param_idx;
         }
 
-        let column_map: Vec<(String, usize)> = columns
-            .iter()
-            .enumerate()
-            .map(|(i, c)| (c.name().to_string(), i))
-            .collect();
-
         let predicate: Option<crate::sql::predicate::CompiledPredicate> =
             if let Some(w) = update.where_clause {
                 let col_map = columns
@@ -624,6 +655,18 @@ impl Database {
         }
 
         // MULTIPASS: Fallback for complex queries
+        let column_map: Option<Vec<(String, usize)>> = if !deferred_assignments.is_empty() {
+            Some(
+                columns
+                    .iter()
+                    .enumerate()
+                    .map(|(i, c)| (c.name().to_string(), i))
+                    .collect(),
+            )
+        } else {
+            None
+        };
+
         loop {
             let mut cursor = if let Some((ref key, _)) = pk_lookup_info {
                 btree.cursor_seek(key)?
@@ -677,17 +720,17 @@ impl Database {
                         row_values[*col_idx] = val.clone();
                     }
 
-                    if !deferred_assignments.is_empty() {
+                    if let Some(ref col_map) = column_map {
                         let deferred_values: Vec<(usize, OwnedValue)> = {
-                            let values = owned_values_to_values(&row_values);
-                            let values_slice = arena.alloc_slice_fill_iter(values.into_iter());
+                            let values_iter = row_values.iter().map(|ov| ov.to_value());
+                            let values_slice = arena.alloc_slice_fill_iter(values_iter);
                             let exec_row = ExecutorRow::new(values_slice);
 
                             let mut results = Vec::with_capacity(deferred_assignments.len());
                             for (col_idx, assign_idx) in &deferred_assignments {
                                 let (_, value_expr) = &assignment_indices[*assign_idx];
                                 let new_val =
-                                    self.eval_expr_with_row(value_expr, &exec_row, &column_map)?;
+                                    self.eval_expr_with_row(value_expr, &exec_row, col_map)?;
                                 results.push((*col_idx, new_val));
                             }
                             results

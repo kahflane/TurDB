@@ -422,6 +422,110 @@ mod dml_tests {
     }
 
     #[test]
+    fn update_with_binary_expression_and_where_clause() {
+        let dir = tempdir().unwrap();
+        let db = Database::create(dir.path().join("test_db")).unwrap();
+        db.execute("CREATE TABLE items (id INTEGER PRIMARY KEY, value INTEGER)")
+            .unwrap();
+        db.execute("INSERT INTO items VALUES (1, 10)").unwrap();
+        db.execute("INSERT INTO items VALUES (2, 20)").unwrap();
+        db.execute("INSERT INTO items VALUES (3, 30)").unwrap();
+
+        let result = db.execute("UPDATE items SET value = value * 2 WHERE id = 2");
+
+        assert!(
+            result.is_ok(),
+            "UPDATE with binary expression and WHERE SHOULD succeed, got error: {:?}",
+            result.err()
+        );
+        assert!(
+            matches!(
+                result.unwrap(),
+                ExecuteResult::Update {
+                    rows_affected: 1,
+                    ..
+                }
+            ),
+            "UPDATE SHOULD affect only 1 row"
+        );
+
+        let rows = db.query("SELECT id, value FROM items ORDER BY id").unwrap();
+        assert_eq!(rows[0].values[1], OwnedValue::Int(10), "Row 1 SHOULD be unchanged");
+        assert_eq!(rows[1].values[1], OwnedValue::Int(40), "Row 2 SHOULD be 20 * 2 = 40");
+        assert_eq!(rows[2].values[1], OwnedValue::Int(30), "Row 3 SHOULD be unchanged");
+    }
+
+    #[test]
+    fn update_with_single_row_binary_expression() {
+        let dir = tempdir().unwrap();
+        let db = Database::create(dir.path().join("test_db")).unwrap();
+        db.execute("CREATE TABLE items (id INTEGER PRIMARY KEY, value INTEGER)")
+            .unwrap();
+        db.execute("INSERT INTO items VALUES (1, 10)").unwrap();
+
+        let result = db.execute("UPDATE items SET value = value * 2");
+
+        assert!(
+            result.is_ok(),
+            "UPDATE with binary expression (single row) SHOULD succeed, got error: {:?}",
+            result.err()
+        );
+
+        let rows = db.query("SELECT id, value FROM items ORDER BY id").unwrap();
+        assert_eq!(
+            rows[0].values[1],
+            OwnedValue::Int(20),
+            "value SHOULD be 10 * 2 = 20"
+        );
+    }
+
+    #[test]
+    fn update_with_multiple_deferred_assignments() {
+        let dir = tempdir().unwrap();
+        let db = Database::create(dir.path().join("test_db")).unwrap();
+        db.execute("CREATE TABLE items (id INTEGER PRIMARY KEY, val1 INTEGER, val2 INTEGER)")
+            .unwrap();
+        db.execute("INSERT INTO items VALUES (1, 10, 100)").unwrap();
+
+        let result = db.execute("UPDATE items SET val1 = val1 + 1, val2 = val2 * 2");
+
+        assert!(
+            result.is_ok(),
+            "UPDATE with multiple deferred assignments SHOULD succeed, got error: {:?}",
+            result.err()
+        );
+
+        let rows = db
+            .query("SELECT id, val1, val2 FROM items ORDER BY id")
+            .unwrap();
+        assert_eq!(rows[0].values[1], OwnedValue::Int(11), "val1 SHOULD be 10 + 1 = 11");
+        assert_eq!(rows[0].values[2], OwnedValue::Int(200), "val2 SHOULD be 100 * 2 = 200");
+    }
+
+    #[test]
+    fn update_with_mixed_precomputed_and_deferred() {
+        let dir = tempdir().unwrap();
+        let db = Database::create(dir.path().join("test_db")).unwrap();
+        db.execute("CREATE TABLE items (id INTEGER PRIMARY KEY, val1 INTEGER, val2 INTEGER)")
+            .unwrap();
+        db.execute("INSERT INTO items VALUES (1, 10, 100)").unwrap();
+
+        let result = db.execute("UPDATE items SET val1 = 99, val2 = val2 * 2");
+
+        assert!(
+            result.is_ok(),
+            "UPDATE with mixed assignments SHOULD succeed, got error: {:?}",
+            result.err()
+        );
+
+        let rows = db
+            .query("SELECT id, val1, val2 FROM items ORDER BY id")
+            .unwrap();
+        assert_eq!(rows[0].values[1], OwnedValue::Int(99), "val1 SHOULD be literal 99");
+        assert_eq!(rows[0].values[2], OwnedValue::Int(200), "val2 SHOULD be 100 * 2 = 200");
+    }
+
+    #[test]
     fn delete_removes_matching_rows_and_returns_count() {
         let dir = tempdir().unwrap();
         let db = Database::create(dir.path().join("test_db")).unwrap();
