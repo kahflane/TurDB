@@ -301,13 +301,8 @@ impl Database {
             let mut index_storage_guard = index_storage_arc.write();
             let index_root = Self::get_index_root(index_plan, &mut index_storage_guard)?;
 
-            let mut key_buf_guard = index_plan.key_buffer.borrow_mut();
-            key_buf_guard.clear();
-            for &col_idx in &index_plan.col_indices {
-                if let Some(val) = params.get(col_idx) {
-                    Self::encode_value_as_key(val, &mut *key_buf_guard);
-                }
-            }
+            Self::build_index_key(index_plan, params);
+            let key_buf_guard = index_plan.key_buffer.borrow();
 
             let index_btree = BTree::new(&mut *index_storage_guard, index_root)?;
             if index_btree.search(&key_buf_guard)?.is_some() {
@@ -370,13 +365,8 @@ impl Database {
             let mut index_storage_guard = index_storage_arc.write();
             let index_root = Self::get_index_root(index_plan, &mut index_storage_guard)?;
 
-            let mut key_buf_guard = index_plan.key_buffer.borrow_mut();
-            key_buf_guard.clear();
-            for &col_idx in &index_plan.col_indices {
-                if let Some(val) = params.get(col_idx) {
-                    Self::encode_value_as_key(val, &mut *key_buf_guard);
-                }
-            }
+            Self::build_index_key(index_plan, params);
+            let key_buf_guard = index_plan.key_buffer.borrow();
 
             let index_rightmost = index_plan.rightmost_hint.get();
             let mut index_btree =
@@ -542,5 +532,17 @@ impl Database {
         let root = header.root_page();
         index_plan.root_page.set(root);
         Ok(root)
+    }
+
+    fn build_index_key(
+        index_plan: &crate::database::prepared::CachedIndexPlan,
+        params: &[OwnedValue],
+    ) {
+        let mut key_buf = index_plan.key_buffer.borrow_mut();
+        key_buf.clear();
+        for &col_idx in &index_plan.col_indices {
+            let val = params.get(col_idx).unwrap_or(&OwnedValue::Null);
+            Self::encode_value_as_key(val, &mut *key_buf);
+        }
     }
 }
