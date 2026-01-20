@@ -1698,22 +1698,10 @@ impl Database {
         match expr {
             Expr::Literal(_) => Self::eval_literal(expr),
             Expr::Column(col_ref) => {
-                let col_name = if let Some(table) = col_ref.table {
-                    format!("{}.{}", table, col_ref.column)
-                } else {
-                    col_ref.column.to_string()
-                };
-
                 let col_idx = column_map
                     .iter()
-                    .find(|(name, _)| name.eq_ignore_ascii_case(&col_name))
-                    .map(|(_, idx)| *idx)
-                    .or_else(|| {
-                        column_map
-                            .iter()
-                            .find(|(name, _)| name.eq_ignore_ascii_case(col_ref.column))
-                            .map(|(_, idx)| *idx)
-                    });
+                    .find(|(name, _)| name.eq_ignore_ascii_case(col_ref.column))
+                    .map(|(_, idx)| *idx);
 
                 if let Some(idx) = col_idx {
                     if let Some(val) = row.get(idx) {
@@ -1722,7 +1710,10 @@ impl Database {
                         Ok(OwnedValue::Null)
                     }
                 } else {
-                    bail!("column '{}' not found in UPDATE...FROM context", col_name)
+                    bail!(
+                        "column '{}' not found in UPDATE context",
+                        col_ref.column
+                    )
                 }
             }
             Expr::BinaryOp { left, op, right } => {
