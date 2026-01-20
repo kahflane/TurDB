@@ -49,8 +49,10 @@
 //! This is done in batches (10,000 rows) to avoid holding locks too long.
 //! Related indexes are automatically dropped before the column is removed.
 
+use crate::database::dml::mvcc_helpers::wrap_record_for_insert;
 use crate::database::{Database, ExecuteResult};
 use crate::memory::Pool;
+use crate::mvcc::RecordHeader;
 use crate::schema::ColumnDef as SchemaColumnDef;
 use crate::storage::{IndexFileHeader, TableFileHeader, DEFAULT_SCHEMA};
 use crate::types::{create_record_schema, OwnedValue};
@@ -919,14 +921,23 @@ impl Database {
                     for key in chunk {
                         if let Some(handle) = btree.search(key)? {
                             let value = btree.get_value(&handle)?;
-                            let values = decoder.decode(key, value)?;
+                            ensure!(
+                                value.len() >= RecordHeader::SIZE,
+                                "record too small: expected at least {} bytes for MVCC header, got {}",
+                                RecordHeader::SIZE,
+                                value.len()
+                            );
+                            let user_data = &value[RecordHeader::SIZE..];
+                            let values = decoder.decode(key, user_data)?;
                             let mut owned_values: Vec<OwnedValue> =
                                 values.into_iter().map(OwnedValue::from).collect();
                             owned_values.remove(drop_idx);
 
-                            let new_record =
+                            let new_user_record =
                                 OwnedValue::build_record_from_values(&owned_values, &new_schema)?;
-                            batch.push((key.clone(), new_record));
+                            let wrapped_record =
+                                wrap_record_for_insert(0, &new_user_record, false);
+                            batch.push((key.clone(), wrapped_record));
                         }
                     }
                 }
