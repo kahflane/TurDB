@@ -184,6 +184,25 @@ impl SharedDatabase {
     }
 }
 
+#[derive(Clone, Copy)]
+enum CheckCompareOp {
+    Ge,
+    Le,
+    Gt,
+    Lt,
+}
+
+impl CheckCompareOp {
+    fn compare(self, lhs: f64, rhs: f64) -> bool {
+        match self {
+            CheckCompareOp::Ge => lhs >= rhs,
+            CheckCompareOp::Le => lhs <= rhs,
+            CheckCompareOp::Gt => lhs > rhs,
+            CheckCompareOp::Lt => lhs < rhs,
+        }
+    }
+}
+
 impl Database {
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
         Self::open_with_recovery(path).map(|(db, _)| db)
@@ -4389,53 +4408,65 @@ impl Database {
         Self::eval_check_expr_recursive(expr_str, col_name, value)
     }
 
+    const MAX_CHECK_EXPR_DEPTH: usize = 32;
+
     fn eval_check_expr_recursive(expr_str: &str, col_name: &str, value: &OwnedValue) -> bool {
+        Self::eval_check_expr_with_depth(expr_str, col_name, value, 0)
+    }
+
+    fn eval_check_expr_with_depth(
+        expr_str: &str,
+        col_name: &str,
+        value: &OwnedValue,
+        depth: usize,
+    ) -> bool {
+        if depth >= Self::MAX_CHECK_EXPR_DEPTH {
+            return false;
+        }
+
         let trimmed = expr_str.trim();
         let bytes = trimmed.as_bytes();
 
-        if let Some((left, right)) = Self::split_on_logical_op_bytes(bytes, trimmed, b" or ", b" OR ") {
-            return Self::eval_check_expr_recursive(left, col_name, value)
-                || Self::eval_check_expr_recursive(right, col_name, value);
+        if let Some((left, right)) = Self::split_on_logical_op_case_insensitive(bytes, trimmed, b" or ") {
+            return Self::eval_check_expr_with_depth(left, col_name, value, depth + 1)
+                || Self::eval_check_expr_with_depth(right, col_name, value, depth + 1);
         }
 
-        if let Some((left, right)) = Self::split_on_logical_op_bytes(bytes, trimmed, b" and ", b" AND ") {
-            return Self::eval_check_expr_recursive(left, col_name, value)
-                && Self::eval_check_expr_recursive(right, col_name, value);
+        if let Some((left, right)) = Self::split_on_logical_op_case_insensitive(bytes, trimmed, b" and ") {
+            return Self::eval_check_expr_with_depth(left, col_name, value, depth + 1)
+                && Self::eval_check_expr_with_depth(right, col_name, value, depth + 1);
         }
 
         let stripped = Self::strip_outer_parens(trimmed);
         if stripped != trimmed {
-            return Self::eval_check_expr_recursive(stripped, col_name, value);
+            return Self::eval_check_expr_with_depth(stripped, col_name, value, depth + 1);
         }
 
         Self::eval_simple_comparison(trimmed, col_name, value)
     }
 
-    fn split_on_logical_op_bytes<'a>(
+    fn split_on_logical_op_case_insensitive<'a>(
         bytes: &[u8],
         original: &'a str,
-        op_lower: &[u8],
-        op_upper: &[u8],
+        op: &[u8],
     ) -> Option<(&'a str, &'a str)> {
         let mut depth = 0;
         let mut i = 0;
 
-        while i + op_lower.len() <= bytes.len() {
+        while i + op.len() <= bytes.len() {
             let c = bytes[i];
             if c == b'(' {
                 depth += 1;
             } else if c == b')' {
                 depth -= 1;
-            } else if depth == 0 {
-                let slice = &bytes[i..];
-                if slice.starts_with(op_lower) || slice.starts_with(op_upper) {
+            } else if depth == 0 && bytes[i..].len() >= op.len()
+                && bytes[i..i + op.len()].eq_ignore_ascii_case(op) {
                     let left = original[..i].trim();
-                    let right = original[i + op_lower.len()..].trim();
+                    let right = original[i + op.len()..].trim();
                     if !left.is_empty() && !right.is_empty() {
                         return Some((left, right));
                     }
                 }
-            }
             i += 1;
         }
         None
@@ -4476,23 +4507,23 @@ impl Database {
 
         if let Some(op_idx) = expr_str.find(">=") {
             if let Some(threshold) = Self::extract_numeric_operand(&expr_str[op_idx + 2..]) {
-                return Self::compare_value_with_threshold(value, threshold, |v, t| v >= t);
+                return Self::compare_value_with_threshold(value, threshold, CheckCompareOp::Ge);
             }
         } else if let Some(op_idx) = expr_str.find("<=") {
             if let Some(threshold) = Self::extract_numeric_operand(&expr_str[op_idx + 2..]) {
-                return Self::compare_value_with_threshold(value, threshold, |v, t| v <= t);
+                return Self::compare_value_with_threshold(value, threshold, CheckCompareOp::Le);
             }
         } else if let Some(op_idx) = expr_str.find('>') {
             if let Some(threshold) = Self::extract_numeric_operand(&expr_str[op_idx + 1..]) {
-                return Self::compare_value_with_threshold(value, threshold, |v, t| v > t);
+                return Self::compare_value_with_threshold(value, threshold, CheckCompareOp::Gt);
             }
         } else if let Some(op_idx) = expr_str.find('<') {
             if let Some(threshold) = Self::extract_numeric_operand(&expr_str[op_idx + 1..]) {
-                return Self::compare_value_with_threshold(value, threshold, |v, t| v < t);
+                return Self::compare_value_with_threshold(value, threshold, CheckCompareOp::Lt);
             }
         }
 
-        true
+        false
     }
 
     fn contains_ignore_ascii_case(haystack: &str, needle: &str) -> bool {
@@ -4535,14 +4566,11 @@ impl Database {
             .and_then(|s| s.parse::<f64>().ok())
     }
 
-    fn compare_value_with_threshold<F>(value: &OwnedValue, threshold: f64, cmp: F) -> bool
-    where
-        F: Fn(f64, f64) -> bool,
-    {
+    fn compare_value_with_threshold(value: &OwnedValue, threshold: f64, op: CheckCompareOp) -> bool {
         match value {
-            OwnedValue::Int(v) => cmp(*v as f64, threshold),
-            OwnedValue::Float(v) => cmp(*v, threshold),
-            _ => true,
+            OwnedValue::Int(v) => op.compare(*v as f64, threshold),
+            OwnedValue::Float(v) => op.compare(*v, threshold),
+            _ => false,
         }
     }
 
