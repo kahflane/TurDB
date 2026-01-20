@@ -85,7 +85,8 @@ use crate::sql::state::{
 use crate::sql::util::{
     allocate_value_to_arena, clone_value_owned, clone_value_ref_to_arena, compare_values_for_sort,
     compute_group_key_for_dynamic, compute_group_key_from_exprs, encode_value_to_key,
-    evaluate_group_by_exprs, hash_keys, hash_keys_static, hash_value, keys_match_static,
+    evaluate_group_by_exprs, extract_group_values, hash_keys, hash_keys_static, hash_value,
+    keys_match_static,
 };
 use crate::types::Value;
 use bumpalo::Bump;
@@ -2854,39 +2855,38 @@ impl<'a, S: RowSource> Executor<'a> for DynamicExecutor<'a, S> {
             DynamicExecutor::HashAggregate(state) => {
                 if !state.computed {
                     while let Some(row) = state.child.next()? {
-                        let (group_key, group_values) =
-                            if let Some(ref group_by_exprs) = state.group_by_exprs {
-                                let key = compute_group_key_from_exprs(&row, group_by_exprs);
-                                let values = evaluate_group_by_exprs(&row, group_by_exprs);
-                                (key, values)
-                            } else {
-                                let key = compute_group_key_for_dynamic(&row, &state.group_by);
-                                let values: GroupValues = state
-                                    .group_by
-                                    .iter()
-                                    .map(|&col| {
-                                        row.get(col).map(clone_value_owned).unwrap_or(Value::Null)
-                                    })
-                                    .collect();
-                                (key, values)
-                            };
+                        let group_key = if state.group_by_exprs.is_some() {
+                            compute_group_key_from_exprs(
+                                &row,
+                                state.group_by_exprs.as_ref().unwrap(),
+                            )
+                        } else {
+                            compute_group_key_for_dynamic(&row, &state.group_by)
+                        };
 
-                        let is_new_group = !state.groups.contains_key(&group_key);
-                        if is_new_group {
-                            if let Some(budget) = state.memory_budget {
-                                let next_size = (state.groups.len() + 1) * 256;
-                                if next_size > state.last_reported_bytes + SYNC_INTERVAL {
-                                    let delta = next_size - state.last_reported_bytes;
-                                    budget.allocate(Pool::Query, delta)?;
-                                    state.last_reported_bytes = next_size;
+                        let current_group_count = state.groups.len();
+                        let entry = match state.groups.entry(group_key) {
+                            hashbrown::hash_map::Entry::Occupied(e) => e.into_mut(),
+                            hashbrown::hash_map::Entry::Vacant(e) => {
+                                if let Some(budget) = state.memory_budget {
+                                    let next_size = (current_group_count + 1) * 256;
+                                    if next_size > state.last_reported_bytes + SYNC_INTERVAL {
+                                        let delta = next_size - state.last_reported_bytes;
+                                        budget.allocate(Pool::Query, delta)?;
+                                        state.last_reported_bytes = next_size;
+                                    }
                                 }
+                                let group_values =
+                                    if let Some(ref group_by_exprs) = state.group_by_exprs {
+                                        evaluate_group_by_exprs(&row, group_by_exprs)
+                                    } else {
+                                        extract_group_values(&row, &state.group_by)
+                                    };
+                                let initial_states =
+                                    AggregateState::create_initial_states(state.aggregates.len());
+                                e.insert((group_values, initial_states))
                             }
-                        }
-
-                        let entry = state.groups.entry(group_key).or_insert_with(|| {
-                            let initial_states = AggregateState::create_initial_states(state.aggregates.len());
-                            (group_values.clone(), initial_states)
-                        });
+                        };
 
                         for (idx, agg_fn) in state.aggregates.iter().enumerate() {
                             entry.1[idx].update(agg_fn, &row);
