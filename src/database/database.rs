@@ -4425,14 +4425,13 @@ impl Database {
         }
 
         let trimmed = expr_str.trim();
-        let bytes = trimmed.as_bytes();
 
-        if let Some((left, right)) = Self::split_on_logical_op_case_insensitive(bytes, trimmed, b" or ") {
+        if let Some((left, right)) = Self::split_on_logical_op_case_insensitive(trimmed, b" or ") {
             return Self::eval_check_expr_with_depth(left, col_name, value, depth + 1)
                 || Self::eval_check_expr_with_depth(right, col_name, value, depth + 1);
         }
 
-        if let Some((left, right)) = Self::split_on_logical_op_case_insensitive(bytes, trimmed, b" and ") {
+        if let Some((left, right)) = Self::split_on_logical_op_case_insensitive(trimmed, b" and ") {
             return Self::eval_check_expr_with_depth(left, col_name, value, depth + 1)
                 && Self::eval_check_expr_with_depth(right, col_name, value, depth + 1);
         }
@@ -4446,11 +4445,11 @@ impl Database {
     }
 
     fn split_on_logical_op_case_insensitive<'a>(
-        bytes: &[u8],
         original: &'a str,
         op: &[u8],
     ) -> Option<(&'a str, &'a str)> {
-        let mut depth = 0;
+        let bytes = original.as_bytes();
+        let mut depth: i32 = 0;
         let mut i = 0;
 
         while i + op.len() <= bytes.len() {
@@ -4458,27 +4457,28 @@ impl Database {
             if c == b'(' {
                 depth += 1;
             } else if c == b')' {
-                depth -= 1;
-            } else if depth == 0 && bytes[i..].len() >= op.len()
-                && bytes[i..i + op.len()].eq_ignore_ascii_case(op) {
-                    let left = original[..i].trim();
-                    let right = original[i + op.len()..].trim();
-                    if !left.is_empty() && !right.is_empty() {
-                        return Some((left, right));
-                    }
+                if depth == 0 {
+                    return None;
                 }
+                depth -= 1;
+            } else if depth == 0 && bytes[i..i + op.len()].eq_ignore_ascii_case(op) {
+                let left = original[..i].trim();
+                let right = original[i + op.len()..].trim();
+                if !left.is_empty() && !right.is_empty() {
+                    return Some((left, right));
+                }
+            }
             i += 1;
         }
         None
     }
 
     fn strip_outer_parens(s: &str) -> &str {
-        let trimmed = s.trim();
-        if !trimmed.starts_with('(') || !trimmed.ends_with(')') {
-            return trimmed;
+        if !s.starts_with('(') || !s.ends_with(')') {
+            return s;
         }
 
-        let inner = &trimmed[1..trimmed.len() - 1];
+        let inner = &s[1..s.len() - 1];
         let mut depth = 0;
         for c in inner.chars() {
             match c {
@@ -4486,7 +4486,7 @@ impl Database {
                 ')' => {
                     depth -= 1;
                     if depth < 0 {
-                        return trimmed;
+                        return s;
                     }
                 }
                 _ => {}
@@ -4496,7 +4496,7 @@ impl Database {
         if depth == 0 {
             inner
         } else {
-            trimmed
+            s
         }
     }
 
@@ -4568,7 +4568,22 @@ impl Database {
 
     fn compare_value_with_threshold(value: &OwnedValue, threshold: f64, op: CheckCompareOp) -> bool {
         match value {
-            OwnedValue::Int(v) => op.compare(*v as f64, threshold),
+            OwnedValue::Int(v) => {
+                if threshold.fract() == 0.0
+                    && threshold >= i64::MIN as f64
+                    && threshold <= i64::MAX as f64
+                {
+                    let threshold_i64 = threshold as i64;
+                    match op {
+                        CheckCompareOp::Ge => *v >= threshold_i64,
+                        CheckCompareOp::Le => *v <= threshold_i64,
+                        CheckCompareOp::Gt => *v > threshold_i64,
+                        CheckCompareOp::Lt => *v < threshold_i64,
+                    }
+                } else {
+                    op.compare(*v as f64, threshold)
+                }
+            }
             OwnedValue::Float(v) => op.compare(*v, threshold),
             _ => false,
         }
