@@ -753,6 +753,15 @@ mod query_tests {
             1,
             "HAVING SUM(amount) > 250 should return only C (sum=300). A=250 and B=250 excluded"
         );
+
+        match &rows[0].values[0] {
+            OwnedValue::Text(cat) => assert_eq!(cat, "C", "Only category C should pass HAVING"),
+            other => panic!("Expected Text(C), got {:?}", other),
+        }
+        match &rows[0].values[1] {
+            OwnedValue::Int(total) => assert_eq!(*total, 300, "SUM for C should be 300"),
+            other => panic!("Expected Int(300), got {:?}", other),
+        }
     }
 
     #[test]
@@ -786,37 +795,31 @@ mod query_tests {
             "HAVING COUNT(*) >= 2 should filter to only A and B (each has 2 items), but got {} rows",
             rows.len()
         );
-    }
 
-    #[test]
-    fn having_filters_groups_by_sum() {
-        let (db, _dir) = create_test_db();
-
-        db.execute(
-            "CREATE TABLE group_test2 (id INTEGER PRIMARY KEY, category TEXT, amount INTEGER)",
-        )
-        .unwrap();
-        db.execute(
-            "INSERT INTO group_test2 VALUES
-             (1, 'A', 100), (2, 'A', 150),
-             (3, 'B', 200), (4, 'B', 50),
-             (5, 'C', 300)",
-        )
-        .unwrap();
-
-        let rows = db
-            .query(
-                "SELECT category, SUM(amount) as total FROM group_test2
-                 GROUP BY category HAVING SUM(amount) > 250",
-            )
-            .unwrap();
-
-        assert_eq!(
-            rows.len(),
-            1,
-            "HAVING SUM(amount) > 250 should return only C (sum=300). A=250, B=250 should be excluded, but got {} rows",
-            rows.len()
+        let categories: Vec<&str> = rows
+            .iter()
+            .filter_map(|row| match &row.values[0] {
+                OwnedValue::Text(s) => Some(s.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            categories.contains(&"A") && categories.contains(&"B"),
+            "Should contain A and B, got {:?}",
+            categories
         );
+        assert!(
+            !categories.contains(&"C"),
+            "Should NOT contain C (only 1 item), got {:?}",
+            categories
+        );
+
+        for row in &rows {
+            match &row.values[1] {
+                OwnedValue::Int(cnt) => assert_eq!(*cnt, 2, "Each group should have COUNT=2"),
+                other => panic!("Expected Int(2), got {:?}", other),
+            }
+        }
     }
 
     #[test]
