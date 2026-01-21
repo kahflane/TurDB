@@ -1298,6 +1298,10 @@ impl Database {
         let modified_col_indices: HashSet<usize> =
             assignment_indices.iter().map(|(idx, _)| *idx).collect();
 
+        let needs_old_row_for_secondary_index = secondary_indexes
+            .iter()
+            .any(|(_, col_indices)| col_indices.iter().any(|idx| modified_col_indices.contains(idx)));
+
         let unique_col_indices: Vec<usize> = columns
             .iter()
             .enumerate()
@@ -1492,15 +1496,19 @@ impl Database {
 
                 if should_update {
                     let old_value = value.to_vec();
-                    let old_row_values = row_values.clone();
+                    let old_row_values = if needs_old_row_for_secondary_index {
+                        row_values.clone()
+                    } else {
+                        Vec::new()
+                    };
 
                     let mut old_toast_values: Vec<(usize, OwnedValue)> = Vec::new();
 
                     for (col_idx, val) in &precomputed_assignments {
-                        if let OwnedValue::ToastPointer(_) = &row_values[*col_idx] {
-                            old_toast_values.push((*col_idx, row_values[*col_idx].clone()));
+                        let old = std::mem::replace(&mut row_values[*col_idx], val.clone());
+                        if let OwnedValue::ToastPointer(_) = old {
+                            old_toast_values.push((*col_idx, old));
                         }
-                        row_values[*col_idx] = val.clone();
                     }
 
                     if !deferred_assignments.is_empty() {
@@ -1520,10 +1528,10 @@ impl Database {
                         }
 
                         for (col_idx, new_val) in deferred_values_buf.drain(..) {
-                            if let OwnedValue::ToastPointer(_) = &row_values[col_idx] {
-                                old_toast_values.push((col_idx, row_values[col_idx].clone()));
+                            let old = std::mem::replace(&mut row_values[col_idx], new_val);
+                            if let OwnedValue::ToastPointer(_) = old {
+                                old_toast_values.push((col_idx, old));
                             }
-                            row_values[col_idx] = new_val;
                         }
                     }
 
