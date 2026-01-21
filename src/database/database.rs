@@ -966,9 +966,9 @@ impl Database {
 
                 for subq in subqueries {
                     let key = std::ptr::from_ref(subq) as usize;
-                    if !scalar_subquery_results.iter().any(|(k, _)| *k == key) {
+                    if !scalar_subquery_results.contains_key(&key) {
                         let result = execute_scalar_subquery(subq, catalog, file_manager, &arena)?;
-                        scalar_subquery_results.push((key, result));
+                        scalar_subquery_results.insert(key, result);
                     }
                 }
             }

@@ -41,6 +41,6 @@ mod value;
 pub use column::{range_flags, ColumnDef, DecimalView, Range};
 pub use data_type::{DataType, TypeAffinity};
 pub use owned_value::{
-    create_column_map, create_record_schema, owned_values_to_values, OwnedValue,
+    create_column_map, create_record_schema, owned_values_to_values, ArithmeticOp, OwnedValue,
 };
 pub use value::Value;
